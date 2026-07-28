@@ -10,6 +10,7 @@ __pycache__/
 # Third-party (only mpv submodule is tracked)
 third_party/*
 !third_party/mpv
+!third_party/nvofapi
 
 # Local environment
 .env
