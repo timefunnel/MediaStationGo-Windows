@@ -398,7 +398,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), InterpolationError
 fn validate_dynamic_range(value: Option<&str>) -> Result<(), InterpolationError> {
     let normalized = value.unwrap_or_default().trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "sdr" | "hdr10" => Ok(()),
+        "" | "sdr" | "hdr10" => Ok(()),
         "hlg" => Err(InterpolationError::new(
             "frame_interpolation_hlg_not_validated",
             "HLG interpolation has not completed output validation",
@@ -427,7 +427,10 @@ fn validate_transfer(
         .trim()
         .to_ascii_lowercase();
     let transfer = transfer.unwrap_or_default().trim().to_ascii_lowercase();
-    if range == "hdr10" && !matches!(transfer.as_str(), "pq" | "smpte2084" | "st2084") {
+    if range == "hdr10"
+        && !transfer.is_empty()
+        && !matches!(transfer.as_str(), "pq" | "smpte2084" | "st2084")
+    {
         return Err(InterpolationError::new(
             "frame_interpolation_hdr10_transfer_invalid",
             format!("HDR10 requires PQ/ST2084 transfer metadata, received {transfer}"),
@@ -510,7 +513,7 @@ fn rational_frame_rate(value: f64) -> Result<(u32, u32), InterpolationError> {
 fn normalize_matrix(value: Option<&str>) -> Result<(), InterpolationError> {
     let normalized = value.unwrap_or_default().trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "bt709" | "709" | "bt2020nc" | "bt2020ncl" | "2020ncl" | "bt2020" | "smpte170m"
+        "" | "bt709" | "709" | "bt2020nc" | "bt2020ncl" | "2020ncl" | "bt2020" | "smpte170m"
         | "bt470bg" | "bt601" | "601" => Ok(()),
         _ => Err(InterpolationError::new(
             "frame_interpolation_color_space_unsupported",
@@ -522,7 +525,7 @@ fn normalize_matrix(value: Option<&str>) -> Result<(), InterpolationError> {
 fn normalize_color_range(value: Option<&str>) -> Result<(), InterpolationError> {
     let normalized = value.unwrap_or_default().trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "tv" | "limited" | "mpeg" | "pc" | "full" | "jpeg" => Ok(()),
+        "" | "tv" | "limited" | "mpeg" | "pc" | "full" | "jpeg" => Ok(()),
         _ => Err(InterpolationError::new(
             "frame_interpolation_color_range_unsupported",
             format!("Unsupported or missing color range: {normalized}"),
@@ -654,6 +657,29 @@ mod tests {
                 .code,
             "frame_interpolation_hdr10_transfer_invalid"
         );
+    }
+
+    #[test]
+    fn missing_server_color_metadata_is_deferred_to_native_frames() {
+        let mut input = request(InterpolationMode::Fps60, 1920, 1080, 24.0);
+        input.dynamic_range = None;
+        input.color_space = None;
+        input.color_transfer = None;
+        input.color_range = None;
+        let plan =
+            build_plan(&ready_report(), input).expect("native filter validates decoded frames");
+        assert_eq!(plan.hwdec, "d3d11va");
+    }
+
+    #[test]
+    fn missing_hdr10_transfer_is_deferred_to_native_frames() {
+        let mut input = request(InterpolationMode::Fps60, 3840, 2160, 24.0);
+        input.dynamic_range = Some("HDR10".to_string());
+        input.color_space = Some("bt2020nc".to_string());
+        input.color_transfer = None;
+        let plan =
+            build_plan(&ready_report(), input).expect("native filter validates decoded frames");
+        assert_eq!(plan.hwdec, "d3d11va");
     }
 
     #[test]
