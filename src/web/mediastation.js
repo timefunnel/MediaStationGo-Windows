@@ -16,6 +16,7 @@
     const imagePending = new Map();
     const imageQueue = [];
     const libraryCache = new Map();
+    const scrollMotions = new WeakMap();
     const history = [];
     const homeRefreshDelayMs = 1200;
     const heroRotationIntervalMs = 9000;
@@ -36,6 +37,7 @@
     let homeData = null;
     let heroRevision = 0;
     let heroSlideTimer = 0;
+    let heroCopyTimer = 0;
     let lastHeroBackdropSrc = '';
     let controlsTimer = 0;
     let feedbackTimer = 0;
@@ -150,9 +152,121 @@
         }
     }
 
+    function clamp(value, minimum, maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    function scrollLimit(node, axis) {
+        return axis === 'x'
+            ? Math.max(0, node.scrollWidth - node.clientWidth)
+            : Math.max(0, node.scrollHeight - node.clientHeight);
+    }
+
+    function stopSmoothScroll(node) {
+        const motion = scrollMotions.get(node);
+        if (!motion) return;
+        if (motion.frame) window.cancelAnimationFrame(motion.frame);
+        scrollMotions.delete(node);
+    }
+
+    function smoothScrollTo(node, requested = {}) {
+        if (!node) return;
+        const targetX = clamp(requested.left ?? node.scrollLeft, 0, scrollLimit(node, 'x'));
+        const targetY = clamp(requested.top ?? node.scrollTop, 0, scrollLimit(node, 'y'));
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            stopSmoothScroll(node);
+            node.scrollLeft = targetX;
+            node.scrollTop = targetY;
+            return;
+        }
+
+        let motion = scrollMotions.get(node);
+        if (!motion) {
+            motion = {
+                x: node.scrollLeft,
+                y: node.scrollTop,
+                vx: 0,
+                vy: 0,
+                targetX,
+                targetY,
+                frame: 0,
+                previousTime: 0,
+            };
+            scrollMotions.set(node, motion);
+        } else {
+            motion.targetX = targetX;
+            motion.targetY = targetY;
+        }
+        if (motion.frame) return;
+
+        const advance = (time) => {
+            if (!node.isConnected) {
+                scrollMotions.delete(node);
+                return;
+            }
+            const elapsed = motion.previousTime ? (time - motion.previousTime) / 1000 : 1 / 60;
+            const delta = clamp(elapsed, 1 / 240, 1 / 30);
+            motion.previousTime = time;
+            const stiffness = 190;
+            const damping = 27;
+            motion.vx += ((motion.targetX - motion.x) * stiffness - motion.vx * damping) * delta;
+            motion.vy += ((motion.targetY - motion.y) * stiffness - motion.vy * damping) * delta;
+            motion.x += motion.vx * delta;
+            motion.y += motion.vy * delta;
+
+            const settledX = Math.abs(motion.targetX - motion.x) < 0.35 && Math.abs(motion.vx) < 4;
+            const settledY = Math.abs(motion.targetY - motion.y) < 0.35 && Math.abs(motion.vy) < 4;
+            if (settledX) {
+                motion.x = motion.targetX;
+                motion.vx = 0;
+            }
+            if (settledY) {
+                motion.y = motion.targetY;
+                motion.vy = 0;
+            }
+            node.scrollLeft = motion.x;
+            node.scrollTop = motion.y;
+            if (settledX && settledY) {
+                motion.frame = 0;
+                scrollMotions.delete(node);
+                return;
+            }
+            motion.frame = window.requestAnimationFrame(advance);
+        };
+        motion.frame = window.requestAnimationFrame(advance);
+    }
+
+    function nudgeSmoothScroll(node, deltaX, deltaY) {
+        const motion = scrollMotions.get(node);
+        const baseX = motion?.targetX ?? node.scrollLeft;
+        const baseY = motion?.targetY ?? node.scrollTop;
+        const maximumXLead = Math.max(360, node.clientWidth * 1.25);
+        const maximumYLead = Math.max(420, node.clientHeight * 1.1);
+        smoothScrollTo(node, {
+            left: clamp(baseX + deltaX, node.scrollLeft - maximumXLead, node.scrollLeft + maximumXLead),
+            top: clamp(baseY + deltaY, node.scrollTop - maximumYLead, node.scrollTop + maximumYLead),
+        });
+    }
+
+    function revealTarget(container, node, axis, alignment) {
+        const containerRect = container.getBoundingClientRect();
+        const nodeRect = node.getBoundingClientRect();
+        const current = axis === 'x' ? container.scrollLeft : container.scrollTop;
+        const viewportSize = axis === 'x' ? container.clientWidth : container.clientHeight;
+        const start = current + (axis === 'x' ? nodeRect.left - containerRect.left : nodeRect.top - containerRect.top);
+        const size = axis === 'x' ? nodeRect.width : nodeRect.height;
+        if (alignment === 'center') return start - (viewportSize - size) / 2;
+        if (alignment === 'start') return start;
+        if (start < current) return start;
+        if (start + size > current + viewportSize) return start + size - viewportSize;
+        return current;
+    }
+
     function focusAndReveal(node, inline = 'center', block = 'nearest') {
         if (!node) return;
-        node.scrollIntoView({ behavior: 'smooth', inline, block });
+        const row = node.closest('.media-row');
+        if (row) smoothScrollTo(row, { left: revealTarget(row, node, 'x', inline) });
+        smoothScrollTo(content, { top: revealTarget(content, node, 'y', block) });
         focusElement(node);
     }
 
@@ -255,6 +369,9 @@
         heroRevision += 1;
         window.clearTimeout(heroSlideTimer);
         heroSlideTimer = 0;
+        window.clearTimeout(heroCopyTimer);
+        heroCopyTimer = 0;
+        stopSmoothScroll(content);
         lastHeroBackdropSrc = '';
         imageCache.clear();
         imagePending.clear();
@@ -347,7 +464,7 @@
         content.classList.add(`content-enter-${direction}`);
         contentTransitionTimer = window.setTimeout(() => {
             content.classList.remove('content-enter-forward', 'content-enter-back');
-        }, 220);
+        }, 300);
     }
 
     function restoreScroll(view) {
@@ -379,6 +496,7 @@
     }
 
     function renderCurrentView(transition = '') {
+        stopSmoothScroll(content);
         if (currentView?.kind !== 'home') stopHeroCarousel();
         updateNavState();
         switch (currentView?.kind) {
@@ -680,13 +798,13 @@
         if (!card) return;
         const revision = ++heroRevision;
         const copy = hero.querySelector('.hero-copy');
-        copy.replaceChildren();
-        copy.append(element('h1', '', cardTitle(card, true)));
+        const nextCopy = document.createDocumentFragment();
+        nextCopy.append(element('h1', '', cardTitle(card, true)));
         const meta = element('p', 'hero-meta');
         [card.year, card.dynamicRange, formatDuration(card.durationMs), card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '']
             .filter(Boolean).forEach((value) => meta.append(element('span', '', value)));
-        copy.append(meta);
-        if (card.overview) copy.append(element('p', 'hero-overview', card.overview));
+        nextCopy.append(meta);
+        if (card.overview) nextCopy.append(element('p', 'hero-overview', card.overview));
         const actions = element('div', 'hero-actions');
         const primary = element('button', 'primary-command hero-primary');
         primary.type = 'button';
@@ -708,8 +826,24 @@
             detail.addEventListener('click', () => openDetail(card));
             actions.append(detail);
         }
-        copy.append(actions);
+        nextCopy.append(actions);
+        let copyApplied = false;
+        const applyCopy = (animate) => {
+            if (copyApplied) return;
+            copyApplied = true;
+            window.clearTimeout(heroCopyTimer);
+            copy.classList.remove('hero-copy-enter');
+            copy.replaceChildren(nextCopy);
+            if (!animate) return;
+            void copy.offsetWidth;
+            copy.classList.add('hero-copy-enter');
+            heroCopyTimer = window.setTimeout(() => {
+                copy.classList.remove('hero-copy-enter');
+                heroCopyTimer = 0;
+            }, 340);
+        };
         const ref = card.backdropImage || card.landscapeImage;
+        if (!copy.childElementCount || !ref) applyCopy(false);
         if (!ref) return;
         requestImage(ref, imageWidthFor(ref, true, true)).then((src) => {
             if (revision !== heroRevision || !hero.isConnected) return;
@@ -717,6 +851,7 @@
             if (layers.length !== 2) return;
             const activeIndex = Number(hero.dataset.backdropLayer ?? -1);
             const nextIndex = activeIndex === 0 ? 1 : 0;
+            applyCopy(activeIndex >= 0);
             window.clearTimeout(heroSlideTimer);
             heroSlideTimer = 0;
             layers.forEach((layer) => {
@@ -2081,6 +2216,35 @@
             focusAndReveal(next, 'center', 'center');
         }
     });
+
+    function wheelPixels(value, mode, pageSize) {
+        if (!Number.isFinite(value)) return 0;
+        if (mode === WheelEvent.DOM_DELTA_LINE) return value * 30;
+        if (mode === WheelEvent.DOM_DELTA_PAGE) return value * pageSize;
+        return value;
+    }
+
+    content.addEventListener('wheel', (event) => {
+        const row = event.target.closest?.('.media-row');
+        const deltaX = wheelPixels(event.deltaX, event.deltaMode, row?.clientWidth || content.clientWidth);
+        const deltaY = wheelPixels(event.deltaY, event.deltaMode, row?.clientWidth || content.clientHeight);
+        if (row) {
+            const amount = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY;
+            if (!amount) return;
+            event.preventDefault();
+            nudgeSmoothScroll(row, amount, 0);
+            return;
+        }
+        if (!deltaY) return;
+        event.preventDefault();
+        nudgeSmoothScroll(content, 0, deltaY);
+    }, { passive: false });
+
+    content.addEventListener('pointerdown', (event) => {
+        stopSmoothScroll(content);
+        const row = event.target.closest?.('.media-row');
+        if (row) stopSmoothScroll(row);
+    }, { passive: true });
 
     document.addEventListener('keyup', (event) => {
         if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') seekRepeatCount = 0;
