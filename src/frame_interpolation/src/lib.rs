@@ -190,7 +190,7 @@ fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
 
 #[cfg(target_os = "windows")]
 fn probe_nvofa_api() -> Result<u32, InterpolationError> {
-    use std::ffi::{CString, OsStr};
+    use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -210,9 +210,8 @@ fn probe_nvofa_api() -> Result<u32, InterpolationError> {
             ),
         ));
     }
-    let symbol =
-        CString::new("NvOFGetMaxSupportedApiVersion").expect("static NVOFA symbol has no NUL");
-    let address = unsafe { GetProcAddress(module, symbol.as_ptr().cast()) };
+    let address =
+        unsafe { GetProcAddress(module, c"NvOFGetMaxSupportedApiVersion".as_ptr().cast()) };
     let result = if let Some(address) = address {
         let function: GetMaxSupportedApiVersion = unsafe { std::mem::transmute(address) };
         let mut version = 0_u32;
