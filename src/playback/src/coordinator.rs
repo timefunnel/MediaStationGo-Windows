@@ -30,6 +30,7 @@ pub enum Input {
     Position(i64),
     MediaType(MediaType),
     VideoFrameAvailable(bool),
+    PlaybackRestart,
     Speed(f64),
     Duration(i64),
     Fullscreen {
@@ -213,6 +214,7 @@ fn worker(shared: Arc<Shared>) {
 }
 
 fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEvent>) {
+    let diagnostic = diagnostic_input(&input);
     let mut emitted = match input {
         Input::FileLoaded => sm.on_file_loaded(),
         Input::LoadStarting(id) => sm.on_load_starting(id),
@@ -227,6 +229,7 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
         Input::Position(p) => sm.on_position(p),
         Input::MediaType(t) => sm.on_media_type(t),
         Input::VideoFrameAvailable(a) => sm.on_video_frame_available(a),
+        Input::PlaybackRestart => sm.on_playback_restart(),
         Input::Speed(r) => sm.on_speed(r),
         Input::Duration(d) => sm.on_duration(d),
         Input::Fullscreen {
@@ -264,7 +267,37 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
             events
         }
     };
+    if let Some(input) = diagnostic {
+        let snapshot = sm.snapshot();
+        let events = emitted
+            .iter()
+            .map(|event| format!("{:?}", event.kind))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::debug!(
+            target: "Playback",
+            "state input={input} phase={:?} media={:?} buffering={} seeking={} emitted=[{events}]",
+            snapshot.phase,
+            snapshot.media_type,
+            snapshot.buffering,
+            snapshot.seeking
+        );
+    }
     out.append(&mut emitted);
+}
+
+fn diagnostic_input(input: &Input) -> Option<String> {
+    match input {
+        Input::FileLoaded => Some("file-loaded".to_string()),
+        Input::LoadStarting(_) => Some("load-starting".to_string()),
+        Input::PauseChanged(paused) => Some(format!("pause={paused}")),
+        Input::EndFile { reason, .. } => Some(format!("end-file={reason:?}")),
+        Input::PausedForCache(paused) => Some(format!("paused-for-cache={paused}")),
+        Input::CoreIdle(idle) => Some(format!("core-idle={idle}")),
+        Input::MediaType(media_type) => Some(format!("media-type={media_type:?}")),
+        Input::PlaybackRestart => Some("playback-restart".to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

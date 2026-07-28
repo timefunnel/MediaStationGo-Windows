@@ -93,8 +93,13 @@ pub fn jfn_playback_shutdown() {
     }
 }
 
-pub fn register_event_sink(sink: EventSink) {
-    with_coord(|c| c.add_event_sink(sink));
+pub fn register_event_sink(sink: EventSink) -> bool {
+    let guard = coord_slot().lock();
+    let Some(coordinator) = guard.as_ref() else {
+        return false;
+    };
+    coordinator.add_event_sink(sink);
+    true
 }
 
 pub fn register_action_sink(sink: ActionSink) {

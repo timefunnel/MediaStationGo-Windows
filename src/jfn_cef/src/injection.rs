@@ -64,6 +64,14 @@ pub(crate) enum NativeFunction {
     CsdReady,
     MenuItemSelected,
     MenuDismissed,
+    MediaStationAuthenticate,
+    MediaStationSessionStatus,
+    MediaStationLogout,
+    MediaStationCatalog,
+    MediaStationImage,
+    MediaStationLoad,
+    MediaStationTracks,
+    MediaStationSelectTrack,
 }
 
 impl NativeFunction {
@@ -114,6 +122,14 @@ impl NativeFunction {
             "csdReady" => Self::CsdReady,
             "menuItemSelected" => Self::MenuItemSelected,
             "menuDismissed" => Self::MenuDismissed,
+            "mediaStationAuthenticate" => Self::MediaStationAuthenticate,
+            "mediaStationSessionStatus" => Self::MediaStationSessionStatus,
+            "mediaStationLogout" => Self::MediaStationLogout,
+            "mediaStationCatalog" => Self::MediaStationCatalog,
+            "mediaStationImage" => Self::MediaStationImage,
+            "mediaStationLoad" => Self::MediaStationLoad,
+            "mediaStationTracks" => Self::MediaStationTracks,
+            "mediaStationSelectTrack" => Self::MediaStationSelectTrack,
             _ => return None,
         })
     }
@@ -165,6 +181,14 @@ impl NativeFunction {
             Self::CsdReady => "csdReady",
             Self::MenuItemSelected => "menuItemSelected",
             Self::MenuDismissed => "menuDismissed",
+            Self::MediaStationAuthenticate => "mediaStationAuthenticate",
+            Self::MediaStationSessionStatus => "mediaStationSessionStatus",
+            Self::MediaStationLogout => "mediaStationLogout",
+            Self::MediaStationCatalog => "mediaStationCatalog",
+            Self::MediaStationImage => "mediaStationImage",
+            Self::MediaStationLoad => "mediaStationLoad",
+            Self::MediaStationTracks => "mediaStationTracks",
+            Self::MediaStationSelectTrack => "mediaStationSelectTrack",
         }
     }
 }
@@ -256,6 +280,14 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::ThemeColor,
     NativeFunction::SetOsdVisible,
     NativeFunction::ToggleFullscreen,
+    NativeFunction::MediaStationAuthenticate,
+    NativeFunction::MediaStationSessionStatus,
+    NativeFunction::MediaStationLogout,
+    NativeFunction::MediaStationCatalog,
+    NativeFunction::MediaStationImage,
+    NativeFunction::MediaStationLoad,
+    NativeFunction::MediaStationTracks,
+    NativeFunction::MediaStationSelectTrack,
 ];
 
 const WEB_SCRIPTS: &[InjectedScript] = &[

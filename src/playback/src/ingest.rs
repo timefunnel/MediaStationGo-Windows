@@ -138,6 +138,7 @@ pub(crate) fn ingest<C: IngestCtx>(event: &Event, state: &IngestState, ctx: &C) 
     match event {
         Event::Shutdown => vec![IngestOut::Shutdown],
         Event::FileLoaded => vec![IngestOut::Input(Input::FileLoaded)],
+        Event::PlaybackRestart => vec![IngestOut::Input(Input::PlaybackRestart)],
         Event::EndFile(reason) => Some(end_file_input(reason))
             .into_iter()
             .map(IngestOut::Input)
@@ -375,6 +376,16 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         matches!(out[0], IngestOut::Input(Input::PauseChanged(true)));
+    }
+
+    #[test]
+    fn playback_restart_round_trips() {
+        let state = IngestState::new();
+        let out = ingest(&Event::PlaybackRestart, &state, &ctx(1.0));
+        assert!(matches!(
+            out.as_slice(),
+            [IngestOut::Input(Input::PlaybackRestart)]
+        ));
     }
 
     #[test]

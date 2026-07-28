@@ -13,6 +13,7 @@ members = [
     "logging",
     "macos",
     "macos_sink",
+    "mediastation",
     "menu",
     "mpris",
     "mpv",
@@ -33,6 +34,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+base64 = "0.22"
 cef = { version = "=150.0.0", default-features = false }
 gethostname = "1"
 gix = { version = "0.85", default-features = false, features = ["status", "sha1"] }
@@ -42,9 +44,12 @@ objc2 = "0.6"
 parking_lot = "0.12"
 objc2-foundation = "0.3"
 serde_json = "1"
+sha2 = "0.10"
 slotmap = "1"
 tempfile = "3"
 tracing = "0.1"
+ureq = "=3.3.0"
+url = "=2.5.8"
 windows = "0.62"
 windows-core = "0.62"
 windows-sys = "0.61"

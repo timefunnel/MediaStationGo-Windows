@@ -58,7 +58,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .join("resources")
             .join("win")
             .join("iconres.rc.in");
+        let icon_source = repo_root
+            .join("resources")
+            .join("win")
+            .join("mediastationgo.ico");
+        let manifest_source = repo_root
+            .join("resources")
+            .join("win")
+            .join("jellium.manifest");
         println!("cargo:rerun-if-changed={}", rc_template.display());
+        println!("cargo:rerun-if-changed={}", icon_source.display());
+        println!("cargo:rerun-if-changed={}", manifest_source.display());
 
         let template = std::fs::read_to_string(&rc_template)?;
 
@@ -100,16 +110,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         track_git_refs(repo_root);
 
-        let cmake_source_dir = repo_root.to_string_lossy().replace('\\', "/");
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+        let icon_out = out_dir.join("mediastationgo.ico");
+        let manifest_out = out_dir.join("jellium.manifest");
+        std::fs::copy(&icon_source, &icon_out)?;
+        std::fs::copy(&manifest_source, &manifest_out)?;
+        let icon_path = icon_out.to_string_lossy().replace('\\', "/");
+        let manifest_path = manifest_out.to_string_lossy().replace('\\', "/");
         let expanded = template
             .replace("@APP_VERSION_MAJOR@", &major.to_string())
             .replace("@APP_VERSION_MINOR@", &minor.to_string())
             .replace("@APP_VERSION_PATCH@", &patch.to_string())
             .replace("@APP_VERSION_FILEFLAGS@", fileflags)
             .replace("@APP_VERSION_FULL@", &version_full)
-            .replace("@CMAKE_SOURCE_DIR@", &cmake_source_dir);
+            .replace("@ICON_PATH@", &icon_path)
+            .replace("@MANIFEST_PATH@", &manifest_path);
 
-        let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
         let rc_out = out_dir.join("iconres.rc");
         std::fs::write(&rc_out, expanded)?;
 

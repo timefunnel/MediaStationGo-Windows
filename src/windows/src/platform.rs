@@ -23,7 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HHOOK, IsIconic, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
-    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE, WM_SIZE, WS_CAPTION, WS_THICKFRAME,
+    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE, WM_SETFOCUS, WM_SIZE, WS_CAPTION,
+    WS_THICKFRAME,
 };
 
 use jfn_mpv::api::{
@@ -37,8 +38,8 @@ use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 // Input thread lives in `crate::input`.
 use crate::input::{
-    jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
-    jfn_input_windows_stop_input_thread,
+    jfn_input_windows_focus, jfn_input_windows_resize_to_parent,
+    jfn_input_windows_run_input_thread, jfn_input_windows_stop_input_thread,
 };
 
 // =====================================================================
@@ -236,12 +237,11 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                 let pw = (lparam & 0xFFFF) as c_int;
                 let ph = ((lparam >> 16) & 0xFFFF) as c_int;
                 if pw > 0 && ph > 0 {
-                    jfn_input_windows_resize_to_parent(pw, ph);
-
                     let cached = STATE.lock().cached_scale;
                     let scale = if cached > 0.0 { cached } else { 1.0 };
-                    let lw = (pw as f32 / scale) as c_int;
-                    let lh = (ph as f32 / scale) as c_int;
+                    let lw = (pw as f32 / scale).round() as c_int;
+                    let lh = (ph as f32 / scale).round() as c_int;
+                    jfn_input_windows_resize_to_parent(lw, lh, pw, ph);
 
                     let style =
                         unsafe { GetWindowLongPtrW(hwnd_from_raw(target_hwnd_raw), GWL_STYLE) };
@@ -290,6 +290,8 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                         fs_changed || recovering_from_minimize,
                     );
                 }
+            } else if msg.message == WM_SETFOCUS {
+                jfn_input_windows_focus();
             } else if msg.message == WM_CLOSE {
                 jfn_shutdown_initiate();
             }

@@ -11,6 +11,11 @@ use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, WindowGeometry};
 
 use crate::cli;
 
+#[cfg(target_os = "windows")]
+const APP_DISPLAY_NAME: &str = "MediaStationGo";
+#[cfg(not(target_os = "windows"))]
+const APP_DISPLAY_NAME: &str = "Jellium Desktop";
+
 // Shorthand for the installed Platform backend. `install()` happens before
 // any of the call sites here run.
 fn plat() -> &'static dyn Platform {
@@ -227,7 +232,11 @@ struct MpvInitOptions<'a> {
 fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
     let geometry_c = opts.boot_geometry.map(cs);
     let hwdec_c = cs(opts.hwdec);
-    let user_agent_c = cs(&format!("JelliumDesktop/{}", APP_VERSION_FULL));
+    let user_agent_c = cs(&format!(
+        "{}/{}",
+        APP_DISPLAY_NAME.replace(' ', ""),
+        APP_VERSION_FULL
+    ));
     let passthrough_c = cs(opts.audio_passthrough);
     let channels_c = cs(opts.audio_channels);
     let mpv_log_level_c = cs(opts.mpv_log_level);
@@ -336,7 +345,7 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
     let profile = jfn_jellyfin::build_device_profile(
         &decoders,
         &caps.demuxers,
-        "Jellium Desktop",
+        APP_DISPLAY_NAME,
         APP_VERSION_FULL,
         force,
     );
@@ -515,20 +524,16 @@ fn init_main_browser(
     let main_layer = unsafe { jfn_cef::browsers::jfn_browsers_create(web_kind.as_ptr()) };
     jfn_cef::business_web::jfn_web_init(main_layer);
 
-    let server_url = jfn_config::server_url();
-    tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) url={server_url}");
+    let main_url = "app://resources/mediastation.html";
+    tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) local MediaStation shell");
     unsafe {
         jfn_cef::client::jfn_cef_layer_create(
             main_layer,
-            server_url.as_ptr() as *const _,
-            server_url.len(),
+            main_url.as_ptr() as *const _,
+            main_url.len(),
         );
     }
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");
-
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
-    jfn_cef::business_overlay::jfn_overlay_init(main_layer);
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
 
     (manager_thread, main_layer)
 }
@@ -562,6 +567,7 @@ pub fn jfn_app_main() -> c_int {
     let opts = resolve_startup_options(&cli);
 
     init_logging(opts.log_file, &opts.log_level);
+    tracing::info!(target: "Main", "Requested hwdec mode: {}", opts.hwdec);
 
     crate::platform_install::install_from_cli(&cli);
 
@@ -817,11 +823,11 @@ unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
-
     if !start_playback_coordination() {
         return 1;
     }
+
+    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
 
     // 14. Wait for the main browser to finish loading. Skipped when the
     //     platform pumps CEF itself (external pump on the main thread):

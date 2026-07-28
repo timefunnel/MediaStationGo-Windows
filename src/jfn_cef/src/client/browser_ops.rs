@@ -30,6 +30,10 @@ impl Inner {
         b.focused_frame().or_else(|| b.main_frame())
     }
 
+    pub(crate) fn main_frame(&self) -> Option<Frame> {
+        self.browser_clone()?.main_frame()
+    }
+
     pub(super) fn notify_screen_info_changed(&self) {
         if let Some(h) = self.host() {
             h.notify_screen_info_changed();

@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
 
-use crate::sys;
+use crate::{command::LoadFileCommand, sys};
 
 // =============================================================================
 // Internal helpers
@@ -36,6 +36,15 @@ use crate::sys;
 
 fn raw() -> *mut sys::mpv_handle {
     crate::boot::current_raw_handle().unwrap_or(std::ptr::null_mut())
+}
+
+fn checked_raw() -> crate::Result<*mut sys::mpv_handle> {
+    let handle = raw();
+    if handle.is_null() {
+        Err(crate::Error::new(sys::mpv_error::MPV_ERROR_UNINITIALIZED.0))
+    } else {
+        Ok(handle)
+    }
 }
 
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
@@ -177,6 +186,24 @@ pub unsafe fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
     out.into_raw()
 }
 
+/// Sync node property read. The returned tree owns all copied values.
+/// Must not be called from the mpv event thread.
+pub fn jfn_mpv_get_property_node(name: &CStr) -> crate::Result<crate::Node> {
+    let handle = checked_raw()?;
+    let mut raw_node: sys::mpv_node = unsafe { std::mem::zeroed() };
+    crate::error::check(unsafe {
+        sys::mpv_get_property(
+            handle,
+            name.as_ptr(),
+            sys::mpv_format::MPV_FORMAT_NODE,
+            &mut raw_node as *mut _ as *mut c_void,
+        )
+    })?;
+    let node = unsafe { crate::Node::from_raw(&raw_node) };
+    unsafe { sys::mpv_free_node_contents(&mut raw_node) };
+    Ok(node)
+}
+
 pub unsafe fn jfn_mpv_free_string(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
@@ -281,6 +308,27 @@ unsafe fn set_double(name: &CStr, v: f64) {
 unsafe fn set_str(name: &CStr, v: &CStr) {
     unsafe { jfn_mpv_set_property_string_async(name.as_ptr(), v.as_ptr()) };
 }
+
+fn set_str_checked(name: &CStr, value: &CStr) -> crate::Result<()> {
+    let handle = checked_raw()?;
+    let mut value_ptr = value.as_ptr();
+    crate::error::check(unsafe {
+        sys::mpv_set_property(
+            handle,
+            name.as_ptr(),
+            sys::mpv_format::MPV_FORMAT_STRING,
+            &mut value_ptr as *mut _ as *mut c_void,
+        )
+    })
+}
+
+fn cmd_checked(args: &[&CStr]) -> crate::Result<()> {
+    let handle = checked_raw()?;
+    let mut pointers: Vec<*const c_char> = args.iter().map(|value| value.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    crate::error::check(unsafe { sys::mpv_command(handle, pointers.as_mut_ptr()) })
+}
+
 fn cmd(args: &[&CStr]) {
     let ptrs: Vec<*const c_char> = args.iter().map(|s| s.as_ptr()).collect();
     unsafe { jfn_mpv_command_async(ptrs.as_ptr(), ptrs.len()) };
@@ -339,9 +387,19 @@ pub fn jfn_mpv_set_audio_track(id: i64) {
     unsafe { set_str(c"aid", &s) };
 }
 
+pub fn jfn_mpv_set_audio_track_checked(id: i64) -> crate::Result<()> {
+    let value = track_to_mpv_str(id);
+    set_str_checked(c"aid", &value)
+}
+
 pub fn jfn_mpv_set_subtitle_track(id: i64) {
     let s = track_to_mpv_str(id);
     unsafe { set_str(c"sid", &s) };
+}
+
+pub fn jfn_mpv_set_subtitle_track_checked(id: i64) -> crate::Result<()> {
+    let value = track_to_mpv_str(id);
+    set_str_checked(c"sid", &value)
 }
 
 pub unsafe fn jfn_mpv_sub_add(url: *const c_char) {
@@ -349,6 +407,18 @@ pub unsafe fn jfn_mpv_sub_add(url: *const c_char) {
         return;
     };
     cmd(&[c"sub-add", u, c"select"]);
+}
+
+pub fn jfn_mpv_sub_add_checked(url: &CStr) -> crate::Result<()> {
+    cmd_checked(&[c"sub-add", url, c"select"])
+}
+
+pub fn jfn_mpv_sub_remove_current() {
+    cmd(&[c"sub-remove"]);
+}
+
+pub fn jfn_mpv_sub_remove_current_checked() -> crate::Result<()> {
+    cmd_checked(&[c"sub-remove"])
 }
 
 pub unsafe fn jfn_mpv_audio_add(url: *const c_char) {
@@ -371,8 +441,31 @@ pub struct JfnMpvLoadOptions {
     pub sub_track: i64,
     pub external_audio_url: *const c_char,
     pub external_sub_url: *const c_char,
+    /// Comma-separated mpv `http-header-fields` string-list value.
+    pub http_header_fields: *const c_char,
     pub is_infinite_stream: bool,
 }
+
+#[derive(Debug)]
+pub enum LoadError {
+    HandleUnavailable,
+    InvalidArgument(&'static str),
+    InvalidOption(std::ffi::NulError),
+    Command(crate::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HandleUnavailable => formatter.write_str("mpv handle is unavailable"),
+            Self::InvalidArgument(name) => write!(formatter, "invalid load argument: {name}"),
+            Self::InvalidOption(error) => write!(formatter, "invalid load option: {error}"),
+            Self::Command(error) => write!(formatter, "mpv rejected loadfile: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
 
 struct PendingTrack {
     vid: i64,
@@ -406,18 +499,43 @@ unsafe fn cstr_to_string(p: *const c_char) -> String {
         .unwrap_or_default()
 }
 
-pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOptions) {
+pub unsafe fn jfn_mpv_load_file(
+    path: *const c_char,
+    opts: *const JfnMpvLoadOptions,
+) -> Result<(), LoadError> {
     let Some(path_c) = (unsafe { cstr(path) }) else {
-        return;
+        return Err(LoadError::InvalidArgument("path"));
     };
     let Some(o) = (unsafe { opts.as_ref() }) else {
-        return;
+        return Err(LoadError::InvalidArgument("options"));
     };
 
     let ext_audio = unsafe { cstr_to_string(o.external_audio_url) };
     let ext_sub = unsafe { cstr_to_string(o.external_sub_url) };
+    let http_header_fields = unsafe { cstr_to_string(o.http_header_fields) };
     let defer_audio =
         o.is_infinite_stream && o.audio_track == TRACK_DISABLE && ext_audio.is_empty();
+
+    let mut load_options = vec![
+        ("start".to_string(), o.start_secs.to_string()),
+        ("pause".to_string(), "yes".to_string()),
+    ];
+    if defer_audio {
+        // Per-file enable so mpv's demuxer picks the format-correct
+        // audio track (HLS DEFAULT=YES, MPEG-TS first PMT, etc.). We
+        // explicitly write `sid=no` after FILE_LOADED to keep subs off.
+        load_options.push(("track-auto-selection".to_string(), "yes".to_string()));
+    }
+    if !http_header_fields.is_empty() {
+        load_options.push(("http-header-fields".to_string(), http_header_fields));
+    }
+
+    let mut command =
+        LoadFileCommand::new(path_c, &load_options).map_err(LoadError::InvalidOption)?;
+    let handle = raw();
+    if handle.is_null() {
+        return Err(LoadError::HandleUnavailable);
+    }
 
     // Track selection is owned by Jellyfin. With track-auto-selection=no,
     // mpv silently drops aid/vid/sid in loadfile options (loadfile.c
@@ -436,16 +554,12 @@ pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOpti
         s.defer_audio_to_mpv = defer_audio;
         s.valid = true;
     }
-
-    let mut opts_str = format!("start={},pause=yes", o.start_secs);
-    if defer_audio {
-        // Per-file enable so mpv's demuxer picks the format-correct
-        // audio track (HLS DEFAULT=YES, MPEG-TS first PMT, etc.). We
-        // explicitly write `sid=no` after FILE_LOADED to keep subs off.
-        opts_str.push_str(",track-auto-selection=yes");
+    let result = unsafe { sys::mpv_command_node_async(handle, 0, command.as_mut_ptr()) };
+    if let Err(error) = crate::error::check(result) {
+        pending_slot().lock().valid = false;
+        return Err(LoadError::Command(error));
     }
-    let opts_c = CString::new(opts_str).unwrap_or_default();
-    cmd(&[c"loadfile", path_c, c"replace", c"-1", &opts_c]);
+    Ok(())
 }
 
 pub fn jfn_mpv_apply_pending_track_selection_and_play() {

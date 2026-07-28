@@ -46,7 +46,7 @@ pub struct Cli {
     #[arg(long, env = ENV_CACHE_DIR)]
     pub cache_dir: Option<String>,
 
-    /// Hardware decoding mode (default: no).
+    /// Hardware decoding mode (default: auto on Windows, no elsewhere).
     #[arg(long)]
     pub hwdec: Option<String>,
 
@@ -331,6 +331,9 @@ mod tests {
     // links them to the consts, so guard the drift here.
     #[test]
     fn const_defaults_match_help_text() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(jfn_mpv::HWDEC_DEFAULT, "auto");
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(jfn_mpv::HWDEC_DEFAULT, "no");
         assert_eq!(crate::app::DEFAULT_LOG_FILTER, "info");
     }

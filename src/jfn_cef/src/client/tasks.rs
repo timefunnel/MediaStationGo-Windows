@@ -1,11 +1,61 @@
 use cef::rc::Rc;
-use cef::{ImplTask, Task, ThreadId, WrapTask, post_delayed_task, post_task, wrap_task};
+use cef::{
+    CefString, ImplListValue, ImplTask, Task, ThreadId, WrapTask, post_delayed_task, post_task,
+    wrap_task,
+};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
 use super::Inner;
 use jfn_playback::shutdown::jfn_shutting_down;
+
+#[derive(Clone, Debug)]
+pub(crate) enum RendererValue {
+    String(String),
+    Bool(bool),
+}
+
+wrap_task! {
+    struct RendererMessageTask {
+        inner: Arc<Inner>,
+        name: String,
+        values: Vec<RendererValue>,
+    }
+    impl Task {
+        fn execute(&self) {
+            let Some(frame) = self.inner.main_frame() else {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "renderer message dropped because the main frame is unavailable",
+                );
+                return;
+            };
+            crate::ipc::send_to_renderer(&frame, &self.name, |args| {
+                for (index, value) in self.values.iter().enumerate() {
+                    match value {
+                        RendererValue::String(value) => {
+                            args.set_string(index, Some(&CefString::from(value.as_str())));
+                        }
+                        RendererValue::Bool(value) => {
+                            args.set_bool(index, if *value { 1 } else { 0 });
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+pub(crate) fn post_renderer_message(
+    inner: Arc<Inner>,
+    name: impl Into<String>,
+    values: Vec<RendererValue>,
+) -> bool {
+    let mut task = RendererMessageTask::new(inner, name.into(), values);
+    post_task(ThreadId::UI, Some(&mut task)) != 0
+}
 
 wrap_task! {
     struct ApplyResizeTask {

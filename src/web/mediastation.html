@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MediaStationGo</title>
+  <link rel="stylesheet" href="mediastation.css">
+</head>
+<body>
+  <section id="splash" class="splash" aria-live="polite">
+    <div class="brand brand-large"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></div>
+    <div class="splash-line"></div>
+  </section>
+
+  <section id="login-view" class="login-view hidden" aria-labelledby="login-title">
+    <header class="login-brand">
+      <div class="brand brand-large"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></div>
+    </header>
+    <main class="login-layout">
+      <form id="login-form" class="login-panel" autocomplete="on">
+        <p class="eyebrow">WINDOWS PLAYER</p>
+        <h1 id="login-title">登录媒体服务器</h1>
+        <label>服务器地址<input id="server-url" name="server" type="url" inputmode="url" placeholder="https://example.com" required></label>
+        <label>用户名<input id="username" name="username" autocomplete="username" required></label>
+        <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
+        <div class="login-actions">
+          <button id="login-cancel" class="secondary-command hidden" type="button">取消</button>
+          <button id="login-submit" class="primary-command" type="submit"><span aria-hidden="true">&#9654;</span><span>登录</span></button>
+        </div>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+      <div class="login-visual" aria-hidden="true">
+        <img class="login-emblem" src="mediastationgo-icon.png" alt="">
+        <div class="login-wordmark"><strong>MediaStationGo</strong><span>Windows Player</span></div>
+      </div>
+    </main>
+  </section>
+
+  <div id="app-shell" class="app-shell hidden">
+    <header class="topbar">
+      <button id="brand-home" class="brand brand-button" type="button" title="返回首页"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></button>
+      <button id="topbar-home-shortcut" class="icon-button topbar-home-shortcut hidden" type="button" title="返回首页" aria-label="返回首页"><span aria-hidden="true">⌂</span></button>
+      <nav class="top-nav" aria-label="主导航">
+        <button id="nav-home" class="nav-command active" type="button">首页</button>
+        <button id="nav-library" class="nav-command" type="button">媒体库</button>
+      </nav>
+      <div class="top-actions">
+        <button id="search-open" class="icon-button" type="button" title="搜索" aria-label="搜索"><span class="symbol-icon" aria-hidden="true">&#x1F50D;&#xFE0E;</span></button>
+        <button id="account-open" class="account-button" type="button" title="账号"><span id="account-avatar" aria-hidden="true">M</span><span id="account-name"></span></button>
+        <button id="settings-open" class="icon-button" type="button" title="设置" aria-label="设置"><span class="symbol-icon" aria-hidden="true">&#x2699;&#xFE0E;</span></button>
+      </div>
+    </header>
+    <main id="content" class="content" tabindex="-1"></main>
+  </div>
+
+  <section id="player-view" class="player-view hidden" aria-label="播放器">
+    <div id="player-controls" class="player-controls visible">
+      <div class="player-topline">
+        <button id="player-exit" class="icon-button control-button" type="button" title="退出播放" aria-label="退出播放">&#8592;</button>
+      </div>
+      <div id="player-loading" class="player-loading"><span></span><p id="player-loading-label">正在准备播放</p></div>
+      <div id="player-feedback" class="player-feedback hidden" aria-hidden="true"><span></span></div>
+      <div class="player-bottom">
+        <div class="player-heading"><strong id="player-title"></strong><span id="player-subtitle"></span></div>
+        <div class="player-timeline">
+          <span id="player-current">00:00</span>
+          <input id="player-progress" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+          <span id="player-duration">00:00</span>
+        </div>
+        <div class="player-tools" role="toolbar" aria-label="播放选项">
+          <button id="player-playback" class="icon-button control-button player-playback" type="button" title="暂停" aria-label="暂停"><span aria-hidden="true">&#x23F8;&#xFE0E;</span></button>
+          <div class="player-tools-secondary">
+            <button id="player-subtitles" class="icon-button control-button" type="button" title="字幕" aria-label="字幕"><span aria-hidden="true">CC</span></button>
+            <button id="player-audio" class="icon-button control-button" type="button" title="音轨" aria-label="音轨"><span aria-hidden="true">&#9835;</span></button>
+            <button id="player-info" class="icon-button control-button" type="button" title="播放信息" aria-label="播放信息"><span aria-hidden="true">&#9432;</span></button>
+            <button id="player-fullscreen" class="icon-button control-button player-fullscreen" type="button" title="进入全屏" aria-label="进入全屏" aria-pressed="false"><span aria-hidden="true"><i></i><i></i><i></i><i></i></span></button>
+          </div>
+        </div>
+      </div>
+      <section id="player-panel" class="player-panel hidden" aria-label="播放选项面板">
+        <header><h2 id="player-panel-title"></h2></header>
+        <div id="player-panel-content" class="player-panel-content"></div>
+      </section>
+    </div>
+  </section>
+
+  <div id="drawer-scrim" class="drawer-scrim hidden"></div>
+  <aside id="account-drawer" class="drawer" aria-hidden="true">
+    <header><h2>账号</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+    <div class="drawer-body">
+      <div class="account-summary"><span id="drawer-avatar" aria-hidden="true">M</span><div><strong id="drawer-user"></strong><p id="drawer-server"></p></div></div>
+      <button id="change-account-button" class="secondary-command drawer-command" type="button">新增或切换用户</button>
+      <button id="logout-button" class="danger-command" type="button">退出当前账号</button>
+    </div>
+  </aside>
+  <aside id="settings-drawer" class="drawer" aria-hidden="true">
+    <header><h2>设置</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+    <div class="drawer-body settings-list">
+      <section class="setting-toggle-row">
+        <label for="playback-info-enabled">播放信息浮窗</label>
+        <input id="playback-info-enabled" type="checkbox" role="switch">
+      </section>
+      <section><h3>图片缓存</h3><p id="image-cache-status">0 张图片</p><button id="clear-image-cache" class="secondary-command" type="button">清除图片缓存</button></section>
+    </div>
+  </aside>
+
+  <div id="overview-scrim" class="modal-scrim hidden">
+    <section id="overview-dialog" class="reading-panel" role="dialog" aria-modal="true" aria-labelledby="overview-title">
+      <header><h2 id="overview-title"></h2><button id="overview-close" class="icon-button" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+      <p id="overview-body"></p>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="mediastation.js"></script>
+</body>
+</html>

@@ -44,6 +44,7 @@ use windows::core::{PCWSTR, w};
 
 // Not re-exported by windows-rs 0.62's WindowsAndMessaging metadata.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_APP_FOCUS_INPUT: u32 = 0x8000 + 1;
 
 // =====================================================================
 // CEF cursor-type ordinals + event flags (mirrors cef_types.h)
@@ -76,13 +77,50 @@ struct State {
     input_hwnd_raw: usize,
     thread_id: u32,
     cursor_type: i32,
+    geometry: InputGeometry,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     input_hwnd_raw: 0,
     thread_id: 0,
     cursor_type: CursorShape::Pointer.as_raw(),
+    geometry: InputGeometry::EMPTY,
 });
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct InputGeometry {
+    logical_w: i32,
+    logical_h: i32,
+    physical_w: i32,
+    physical_h: i32,
+}
+
+impl InputGeometry {
+    const EMPTY: Self = Self {
+        logical_w: 0,
+        logical_h: 0,
+        physical_w: 0,
+        physical_h: 0,
+    };
+
+    fn map_point(self, x: i32, y: i32) -> (i32, i32) {
+        fn map_axis(value: i32, logical: i32, physical: i32) -> i32 {
+            if logical <= 0 || physical <= 0 || logical == physical {
+                return value;
+            }
+            (i64::from(value) * i64::from(logical) / i64::from(physical)) as i32
+        }
+
+        (
+            map_axis(x, self.logical_w, self.physical_w),
+            map_axis(y, self.logical_h, self.physical_h),
+        )
+    }
+}
+
+fn map_client_point(x: i32, y: i32) -> (i32, i32) {
+    STATE.lock().geometry.map_point(x, y)
+}
 
 // =====================================================================
 // Win32 macro helpers — windows-rs doesn't ship the *_LPARAM / *_WPARAM
@@ -298,12 +336,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSEMOVE => {
-            jfn_input_dispatch_mouse_move(
-                get_x_lparam(lp),
-                get_y_lparam(lp),
-                mouse_modifiers(wp),
-                0,
-            );
+            let (x, y) = map_client_point(get_x_lparam(lp), get_y_lparam(lp));
+            jfn_input_dispatch_mouse_move(x, y, mouse_modifiers(wp), 0);
             return LRESULT(0);
         }
 
@@ -318,11 +352,12 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             if down {
                 let _ = unsafe { SetFocus(Some(hwnd)) };
             }
+            let (x, y) = map_client_point(get_x_lparam(lp), get_y_lparam(lp));
             jfn_input_dispatch_mouse_button(
                 msg_to_button_code(msg),
                 if down { 1 } else { 0 },
-                get_x_lparam(lp),
-                get_y_lparam(lp),
+                x,
+                y,
                 mouse_modifiers(wp),
             );
             return LRESULT(0);
@@ -358,8 +393,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             unsafe {
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
+            let (x, y) = map_client_point(pt.x, pt.y);
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, 0, delta, mouse_modifiers(wp));
+            jfn_input_dispatch_scroll(x, y, 0, delta, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -371,8 +407,14 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             unsafe {
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
+            let (x, y) = map_client_point(pt.x, pt.y);
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, delta, 0, mouse_modifiers(wp));
+            jfn_input_dispatch_scroll(x, y, delta, 0, mouse_modifiers(wp));
+            return LRESULT(0);
+        }
+
+        WM_APP_FOCUS_INPUT => {
+            let _ = unsafe { SetFocus(Some(hwnd)) };
             return LRESULT(0);
         }
 
@@ -466,6 +508,15 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
 
     let mut rc = RECT::default();
     let _ = unsafe { GetClientRect(mpv, &mut rc) };
+    let physical_w = rc.right - rc.left;
+    let physical_h = rc.bottom - rc.top;
+    let scale = crate::platform::win_get_scale().max(1.0);
+    STATE.lock().geometry = InputGeometry {
+        logical_w: (physical_w as f32 / scale).round() as i32,
+        logical_h: (physical_h as f32 / scale).round() as i32,
+        physical_w,
+        physical_h,
+    };
 
     let input_hwnd = unsafe {
         CreateWindowExW(
@@ -523,15 +574,38 @@ pub fn jfn_input_windows_stop_input_thread() {
     }
 }
 
-pub fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {
-    let hwnd_raw = STATE.lock().input_hwnd_raw;
+pub fn jfn_input_windows_resize_to_parent(
+    logical_w: c_int,
+    logical_h: c_int,
+    physical_w: c_int,
+    physical_h: c_int,
+) {
+    let hwnd_raw = {
+        let mut state = STATE.lock();
+        state.geometry = InputGeometry {
+            logical_w,
+            logical_h,
+            physical_w,
+            physical_h,
+        };
+        state.input_hwnd_raw
+    };
     if hwnd_raw == 0 {
         return;
     }
     let hwnd = HWND(hwnd_raw as *mut _);
     let flags: SET_WINDOW_POS_FLAGS =
         SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOMOVE.0 | SWP_NOACTIVATE.0);
-    let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, pw, ph, flags) };
+    let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, physical_w, physical_h, flags) };
+}
+
+pub fn jfn_input_windows_focus() {
+    let hwnd_raw = STATE.lock().input_hwnd_raw;
+    if hwnd_raw == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd_raw as *mut _);
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_FOCUS_INPUT, WPARAM(0), LPARAM(0)) };
 }
 
 /// Platform::set_cursor — invoked from the CEF UI thread. Stores the
@@ -549,4 +623,35 @@ pub fn jfn_input_windows_set_cursor(t: c_int) {
     let hwnd = HWND(hwnd_raw as *mut _);
     // wparam = hwnd, lparam = MAKELPARAM(HTCLIENT=1, 0)
     let _ = unsafe { PostMessageW(Some(hwnd), WM_SETCURSOR, WPARAM(hwnd_raw), LPARAM(1)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputGeometry;
+
+    #[test]
+    fn maps_physical_client_coordinates_to_cef_logical_coordinates() {
+        let geometry = InputGeometry {
+            logical_w: 1048,
+            logical_h: 551,
+            physical_w: 1311,
+            physical_h: 689,
+        };
+
+        assert_eq!(geometry.map_point(169, 603), (135, 482));
+        assert_eq!(geometry.map_point(1310, 688), (1047, 550));
+    }
+
+    #[test]
+    fn identity_and_unknown_geometry_keep_coordinates_unchanged() {
+        let identity = InputGeometry {
+            logical_w: 1920,
+            logical_h: 1080,
+            physical_w: 1920,
+            physical_h: 1080,
+        };
+
+        assert_eq!(identity.map_point(640, 360), (640, 360));
+        assert_eq!(InputGeometry::EMPTY.map_point(640, 360), (640, 360));
+    }
 }

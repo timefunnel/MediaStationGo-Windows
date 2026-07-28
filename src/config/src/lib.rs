@@ -15,6 +15,9 @@ use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 const DEVICE_NAME_MAX: usize = 64;
+#[cfg(target_os = "windows")]
+const HWDEC_DEFAULT: &str = "auto";
+#[cfg(not(target_os = "windows"))]
 const HWDEC_DEFAULT: &str = "no";
 
 #[derive(Clone, Copy, Debug)]
@@ -590,7 +593,7 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_device_name;
+    use super::{HWDEC_DEFAULT, SettingsData, normalize_device_name};
 
     const PLATFORM: &str = "platform-host";
 
@@ -644,5 +647,29 @@ mod tests {
     fn clears_override_when_whitespace_padded_default() {
         let padded = format!("  {}  ", PLATFORM);
         assert_eq!(normalize_device_name(&padded, PLATFORM), "");
+    }
+
+    #[test]
+    fn omits_platform_default_hwdec_from_settings() {
+        let settings = SettingsData {
+            hwdec: HWDEC_DEFAULT.to_string(),
+            ..SettingsData::default()
+        };
+
+        assert!(settings.to_json().get("hwdec").is_none());
+    }
+
+    #[test]
+    fn persists_explicit_non_default_hwdec() {
+        let explicit = if HWDEC_DEFAULT == "no" { "auto" } else { "no" };
+        let settings = SettingsData {
+            hwdec: explicit.to_string(),
+            ..SettingsData::default()
+        };
+
+        assert_eq!(
+            settings.to_json().get("hwdec").and_then(|v| v.as_str()),
+            Some(explicit)
+        );
     }
 }

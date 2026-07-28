@@ -9,6 +9,7 @@ name = "jfn_cef"
 crate-type = ["rlib"]
 
 [dependencies]
+base64.workspace = true
 parking_lot.workspace = true
 cef = { workspace = true }
 jfn-color = { path = "../color" }
@@ -16,12 +17,19 @@ jfn-config = { path = "../config" }
 jfn-input = { path = "../input" }
 jfn-jellyfin = { path = "../jellyfin" }
 jfn-logging = { path = "../logging" }
+jfn-mediastation = { path = "../mediastation" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-playback = { path = "../playback" }
 serde_json.workspace = true
+sha2.workspace = true
 slotmap.workspace = true
+tempfile.workspace = true
+url.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 
 [build-dependencies]

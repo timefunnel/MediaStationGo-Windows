@@ -1,5 +1,8 @@
 //! Hwdec mode policy: which mpv hardware-decode backends each OS offers.
 
+#[cfg(target_os = "windows")]
+pub const HWDEC_DEFAULT: &str = "auto";
+#[cfg(not(target_os = "windows"))]
 pub const HWDEC_DEFAULT: &str = "no";
 
 #[expect(
@@ -40,6 +43,14 @@ mod tests {
         assert!(is_valid_hwdec("auto"));
         assert!(is_valid_hwdec("no"));
         assert!(is_valid_hwdec(HWDEC_DEFAULT));
+    }
+
+    #[test]
+    fn platform_default_matches_decode_policy() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(HWDEC_DEFAULT, "auto");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(HWDEC_DEFAULT, "no");
     }
 
     #[test]

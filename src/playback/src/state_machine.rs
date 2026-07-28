@@ -86,8 +86,16 @@ impl PlaybackStateMachine {
             if self.s.phase == PlaybackPhase::Paused {
                 return vec![];
             }
+            let mut out = vec![];
+            if self.s.buffering {
+                self.s.buffering = false;
+                let mut buffering = PlaybackEvent::new(PlaybackEventKind::BufferingChanged);
+                buffering.flag = false;
+                out.push(buffering);
+            }
             self.s.phase = PlaybackPhase::Paused;
-            return vec![PlaybackEvent::new(PlaybackEventKind::Paused)];
+            out.push(PlaybackEvent::new(PlaybackEventKind::Paused));
+            return out;
         }
 
         if self.s.phase == PlaybackPhase::Playing {
@@ -180,6 +188,9 @@ impl PlaybackStateMachine {
         if !is_active_phase(self.s.phase) {
             return vec![];
         }
+        if self.s.phase == PlaybackPhase::Paused {
+            return vec![];
+        }
         apply_buffering_change(
             &mut self.s,
             self.paused_for_cache,
@@ -195,6 +206,9 @@ impl PlaybackStateMachine {
         }
         self.core_idle = core_idle;
         if !is_active_phase(self.s.phase) {
+            return vec![];
+        }
+        if self.s.phase == PlaybackPhase::Paused {
             return vec![];
         }
         apply_buffering_change(
@@ -254,6 +268,20 @@ impl PlaybackStateMachine {
         if !self.pause_requested {
             return vec![];
         }
+        if self.s.buffering {
+            return vec![];
+        }
+        let mut out = vec![];
+        transition_to_playing(&mut self.s, &mut out);
+        out
+    }
+
+    pub fn on_playback_restart(&mut self) -> Vec<PlaybackEvent> {
+        self.frame_available = true;
+        if self.s.phase != PlaybackPhase::Starting {
+            return vec![];
+        }
+        self.pause_requested = true;
         if self.s.buffering {
             return vec![];
         }
@@ -378,6 +406,47 @@ mod tests {
         let s = sm.snapshot();
         assert_eq!(s.presence, PlayerPresence::Present);
         assert_eq!(s.phase, PlaybackPhase::Starting);
+    }
+
+    #[test]
+    fn playback_restart_promotes_starting_video_without_pause_property_edge() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("item-A".into());
+        sm.on_media_type(MediaType::Video);
+        sm.on_file_loaded();
+
+        let out = sm.on_playback_restart();
+
+        assert!(has(&out, PlaybackEventKind::Started));
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Playing);
+    }
+
+    #[test]
+    fn playback_restart_waits_for_core_idle_clear_without_pause_property_edge() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("item-A".into());
+        sm.on_media_type(MediaType::Video);
+        sm.on_core_idle(true);
+        sm.on_file_loaded();
+
+        let restart = sm.on_playback_restart();
+        assert!(!has(&restart, PlaybackEventKind::Started));
+
+        let ready = sm.on_core_idle(false);
+        assert!(has(&ready, PlaybackEventKind::Started));
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Playing);
+    }
+
+    #[test]
+    fn playback_restart_does_not_resume_an_explicit_pause() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_file_loaded();
+        sm.on_pause_changed(true);
+
+        let out = sm.on_playback_restart();
+
+        assert!(!has(&out, PlaybackEventKind::Started));
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Paused);
     }
 
     #[test]
@@ -607,6 +676,39 @@ mod tests {
         assert!(has(&r, PlaybackEventKind::Started));
         let r2 = sm.on_pause_changed(false);
         assert!(r2.is_empty());
+    }
+
+    #[test]
+    fn intentional_pause_does_not_surface_core_idle_as_buffering() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_file_loaded();
+        sm.on_pause_changed(false);
+        sm.on_pause_changed(true);
+
+        let idle = sm.on_core_idle(true);
+
+        assert!(idle.is_empty());
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Paused);
+        assert!(!sm.snapshot().buffering);
+    }
+
+    #[test]
+    fn intentional_pause_clears_active_buffering() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_file_loaded();
+        sm.on_pause_changed(false);
+        sm.on_paused_for_cache(true);
+        assert!(sm.snapshot().buffering);
+
+        let paused = sm.on_pause_changed(true);
+
+        assert!(
+            paused
+                .iter()
+                .any(|event| { event.kind == PlaybackEventKind::BufferingChanged && !event.flag })
+        );
+        assert!(has(&paused, PlaybackEventKind::Paused));
+        assert!(!sm.snapshot().buffering);
     }
 
     #[test]

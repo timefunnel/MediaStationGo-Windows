@@ -22,8 +22,9 @@ pub use compositor::{
     win_surface_resize, win_surface_set_visible,
 };
 pub use input::{
-    jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
-    jfn_input_windows_set_cursor, jfn_input_windows_stop_input_thread,
+    jfn_input_windows_focus, jfn_input_windows_resize_to_parent,
+    jfn_input_windows_run_input_thread, jfn_input_windows_set_cursor,
+    jfn_input_windows_stop_input_thread,
 };
 pub use platform::{
     jfn_win_get_hwnd, win_clamp_window_geometry, win_cleanup, win_early_init,

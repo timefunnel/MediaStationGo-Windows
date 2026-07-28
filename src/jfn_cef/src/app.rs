@@ -237,7 +237,7 @@ wrap_render_process_handler! {
                 "savedServerUrl" => {
                     let Some(args) = args else { return 1 };
                     let url = userfree_to_string(&args.string(0));
-                    call_js_global_string(frame, "_onSavedServerUrl", &[Arg::Str(&url)]);
+                    let _ = call_js_global_string(frame, "_onSavedServerUrl", &[Arg::Str(&url)]);
                     1
                 }
                 "serverConnectivityResult" => {
@@ -245,11 +245,35 @@ wrap_render_process_handler! {
                     let url = userfree_to_string(&args.string(0));
                     let ok = args.bool(1) != 0;
                     let detail = userfree_to_string(&args.string(2));
-                    call_js_global_string(
+                    let _ = call_js_global_string(
                         frame,
                         "_onServerConnectivityResult",
                         &[Arg::Str(&url), Arg::Bool(ok), Arg::Str(&detail)],
                     );
+                    1
+                }
+                "mediaStationResponse" => {
+                    let Some(args) = args else { return 1 };
+                    let request_id = userfree_to_string(&args.string(0));
+                    let operation = userfree_to_string(&args.string(1));
+                    let ok = args.bool(2) != 0;
+                    let payload = userfree_to_string(&args.string(3));
+                    if !call_js_global_string(
+                        frame,
+                        "_onMediaStationResponse",
+                        &[
+                            Arg::Str(&request_id),
+                            Arg::Str(&operation),
+                            Arg::Bool(ok),
+                            Arg::Str(&payload),
+                        ],
+                    ) {
+                        jfn_logging::log(
+                            jfn_logging::CATEGORY_CEF,
+                            jfn_logging::LEVEL_ERROR,
+                            "MediaStation response reached the renderer without a response handler",
+                        );
+                    }
                     1
                 }
                 "getPopupOptions" => {
@@ -295,21 +319,23 @@ enum Arg<'a> {
     Bool(bool),
 }
 
-fn call_js_global_string(frame: &Frame, fn_name: &str, args: &[Arg<'_>]) {
+fn call_js_global_string(frame: &Frame, fn_name: &str, args: &[Arg<'_>]) -> bool {
     let Some(ctx) = frame.v8_context() else {
-        return;
+        return false;
     };
     if ctx.enter() != 1 {
-        return;
+        return false;
     }
     let _drop = ContextExit(&ctx);
-    let Some(global) = ctx.global() else { return };
+    let Some(global) = ctx.global() else {
+        return false;
+    };
     let fn_key = CefString::from(fn_name);
     let Some(fn_val) = global.value_bykey(Some(&fn_key)) else {
-        return;
+        return false;
     };
     if fn_val.is_function() != 1 {
-        return;
+        return false;
     }
     let v8_args: Vec<Option<V8Value>> = args
         .iter()
@@ -319,6 +345,7 @@ fn call_js_global_string(frame: &Frame, fn_name: &str, args: &[Arg<'_>]) {
         })
         .collect();
     fn_val.execute_function(None, Some(&v8_args));
+    true
 }
 
 struct ContextExit<'a>(&'a V8Context);

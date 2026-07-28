@@ -401,11 +401,46 @@ fn event_loop(handle_addr: usize, stop: std::sync::Arc<AtomicBool>) {
         let scale = snapshot_scale();
         let mac = snapshot_macos_logical();
         let ctx = CallerCtx { scale, mac };
+        log_playback_signal(&event);
         let outs = ingest_event_for_ffi(&event, state(), &ctx);
         let flags = dispatch(outs);
         if flags & INGEST_FLAG_SHUTDOWN != 0 {
             invoke_shutdown_handler();
             return;
         }
+    }
+}
+
+fn log_playback_signal(event: &Event) {
+    use crate::ingest::observe_id;
+
+    match event {
+        Event::StartFile => tracing::debug!(target: "Playback", "mpv event: start-file"),
+        Event::FileLoaded => tracing::debug!(target: "Playback", "mpv event: file-loaded"),
+        Event::PlaybackRestart => {
+            tracing::debug!(target: "Playback", "mpv event: playback-restart")
+        }
+        Event::EndFile(reason) => {
+            tracing::debug!(target: "Playback", ?reason, "mpv event: end-file")
+        }
+        Event::PropertyChange { id, value, .. } => {
+            let (property, state) = match *id {
+                observe_id::PAUSE => ("pause", property_flag(value)),
+                observe_id::PAUSED_FOR_CACHE => ("paused-for-cache", property_flag(value)),
+                observe_id::CORE_IDLE => ("core-idle", property_flag(value)),
+                _ => return,
+            };
+            tracing::debug!(target: "Playback", "mpv property changed: {property}={state}");
+        }
+        _ => {}
+    }
+}
+
+fn property_flag(value: &PropertyValue) -> &'static str {
+    match value {
+        PropertyValue::Flag(true) => "true",
+        PropertyValue::Flag(false) => "false",
+        PropertyValue::None => "none",
+        _ => "unexpected",
     }
 }

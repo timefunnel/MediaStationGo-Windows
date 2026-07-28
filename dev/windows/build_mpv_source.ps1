@@ -286,19 +286,20 @@ resolve_deps() {
     local path=`"`$2`"
     [ -n `"`${seen[`$dll]}`" ] && return
     seen[`$dll]=1
-    objdump -p `"`$path`" 2>/dev/null | grep 'DLL Name' | awk '{print `$3}' | while read dep; do
+    while read -r dep; do
         if [ -f `"`$MSYS_BIN/`$dep`" ] && [ -z `"`${seen[`$dep]}`" ]; then
             cp -v `"`$MSYS_BIN/`$dep`" `"`$OUT_DIR/`"
             resolve_deps `"`$dep`" `"`$MSYS_BIN/`$dep`"
         fi
-    done
+    done < <(objdump -p `"`$path`" 2>/dev/null | awk '/DLL Name/ {print `$3}')
 }
 
 resolve_deps libmpv-2.dll `"`$OUT_DIR/libmpv-2.dll`"
 "@
 
 $DepScriptPath = Join-Path $MesonBuildDir "resolve_deps.sh"
-Set-Content -Path $DepScriptPath -Value $DepScript -NoNewline
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($DepScriptPath, $DepScript, $Utf8NoBom)
 $MsysDepScript = ConvertTo-MsysPath $DepScriptPath
 
 Invoke-Msys2 "bash '$MsysDepScript'" -Description "Copying MSYS2 runtime dependencies"

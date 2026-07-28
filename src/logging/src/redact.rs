@@ -1,6 +1,5 @@
-//! Token redaction for log output. Detects known query-param / JSON / header
-//! patterns that precede a Jellyfin access token and overwrites the token
-//! value with 'x' characters in place, preserving URL/JSON shape.
+//! Secret redaction for log output. Known token values and every HTTP(S) URL
+//! query are overwritten in place so signed CDN links cannot enter logs.
 
 struct PatternRule {
     needle: &'static [u8],
@@ -8,7 +7,9 @@ struct PatternRule {
 }
 
 const URL_TERMINATORS: &[u8] = b"&\"' \t\r\n;<>";
+const FULL_URL_TERMINATORS: &[u8] = b"\"' \t\r\n;<>()[]{}";
 const JSON_TERMINATORS: &[u8] = b"\"";
+const HTTP_PREFIXES: &[&[u8]] = &[b"http://", b"https://"];
 
 const RULES: &[PatternRule] = &[
     PatternRule {
@@ -71,6 +72,29 @@ fn elide(buf: &mut [u8], rule: &PatternRule) {
     }
 }
 
+fn find_url_query(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let url_start = HTTP_PREFIXES
+        .iter()
+        .filter_map(|prefix| find_subslice(buf, prefix, from))
+        .min()?;
+    let url_end = find_token_end(buf, url_start, FULL_URL_TERMINATORS);
+    let query_start = buf[url_start..url_end]
+        .iter()
+        .position(|byte| *byte == b'?')
+        .map(|position| url_start + position + 1)?;
+    (query_start < url_end).then_some((query_start, url_end))
+}
+
+fn elide_url_queries(buf: &mut [u8]) {
+    let mut start = 0;
+    while let Some((query_start, url_end)) = find_url_query(buf, start) {
+        for byte in &mut buf[query_start..url_end] {
+            *byte = b'x';
+        }
+        start = url_end;
+    }
+}
+
 pub fn contains_secret(buf: &[u8]) -> bool {
     for rule in RULES {
         if let Some(pos) = find_subslice(buf, rule.needle, 0) {
@@ -80,13 +104,14 @@ pub fn contains_secret(buf: &[u8]) -> bool {
             }
         }
     }
-    false
+    find_url_query(buf, 0).is_some()
 }
 
 pub fn censor(buf: &mut [u8]) {
     for rule in RULES {
         elide(buf, rule);
     }
+    elide_url_queries(buf);
 }
 
 #[cfg(test)]
@@ -128,6 +153,31 @@ mod tests {
             censor_str("X-MediaBrowser-Token%3Dabcdef HTTP"),
             "X-MediaBrowser-Token%3Dxxxxxx HTTP"
         );
+    }
+
+    #[test]
+    fn signed_cdn_query_is_fully_redacted() {
+        let output = censor_str(
+            "Opening https://cdn.example/video.mkv?t=123&u=456&k=private-signature next",
+        );
+        let redacted_query = output
+            .strip_prefix("Opening https://cdn.example/video.mkv?")
+            .and_then(|value| value.strip_suffix(" next"))
+            .expect("redacted URL shape should be preserved");
+        assert!(redacted_query.chars().all(|character| character == 'x'));
+        assert!(contains_secret(
+            b"Opening https://cdn.example/video.mkv?t=123&k=secret"
+        ));
+        assert!(!output.contains("private-signature"));
+    }
+
+    #[test]
+    fn queryless_url_is_not_changed() {
+        assert_eq!(
+            censor_str("Opening https://cdn.example/video.mkv"),
+            "Opening https://cdn.example/video.mkv"
+        );
+        assert!(!contains_secret(b"Opening https://cdn.example/video.mkv"));
     }
 
     #[test]

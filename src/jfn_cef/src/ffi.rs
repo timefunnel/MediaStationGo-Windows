@@ -230,10 +230,15 @@ pub fn jfn_cef_shutdown() {
 // ---- helpers ---------------------------------------------------------------
 
 fn log_severity_from_int(v: c_int) -> LogSeverity {
-    // cef_log_severity_t is a u32 C enum. Cast through the sys type so we
-    // don't depend on private repr details.
-    let raw: sys::cef_log_severity_t = unsafe { std::mem::transmute(v as u32) };
-    LogSeverity::from(raw)
+    match v {
+        -1 => LogSeverity::VERBOSE,
+        0 => LogSeverity::INFO,
+        1 => LogSeverity::WARNING,
+        2 => LogSeverity::ERROR,
+        3 => LogSeverity::FATAL,
+        99 => LogSeverity::DISABLE,
+        _ => LogSeverity::DEFAULT,
+    }
 }
 
 fn fill_paths(settings: &mut Settings) {
@@ -252,4 +257,17 @@ fn fill_paths(settings: &mut Settings) {
     set(&mut settings.framework_dir_path, paths.framework_dir_path);
     set(&mut settings.resources_dir_path, paths.resources_dir_path);
     set(&mut settings.locales_dir_path, paths.locales_dir_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_severity_conversion_handles_cef_verbose_without_invalid_enum() {
+        assert_eq!(log_severity_from_int(-1), LogSeverity::VERBOSE);
+        assert_eq!(log_severity_from_int(0), LogSeverity::INFO);
+        assert_eq!(log_severity_from_int(99), LogSeverity::DISABLE);
+        assert_eq!(log_severity_from_int(42), LogSeverity::DEFAULT);
+    }
 }

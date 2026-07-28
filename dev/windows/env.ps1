@@ -3,6 +3,21 @@
 # and points bindgen at msys64's libclang.
 
 $ErrorActionPreference = "Stop"
+$RepoRootEnv = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+
+if (-not $env:CARGO_TARGET_DIR -and $RepoRootEnv -match '[^\x00-\x7F]') {
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $PathBytes = [System.Text.Encoding]::UTF8.GetBytes($RepoRootEnv.ToLowerInvariant())
+        $HashBytes = $Sha256.ComputeHash($PathBytes)
+    } finally {
+        $Sha256.Dispose()
+    }
+    $RepoHash = -join ($HashBytes | ForEach-Object { $_.ToString("x2") })
+    $env:CARGO_TARGET_DIR = "C:\codex-target\jellium-$($RepoHash.Substring(0, 12))"
+    Write-Host "Non-ASCII repository path detected." -ForegroundColor Yellow
+    Write-Host "Using CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR for CEF/CMake compatibility."
+}
 
 if (-not $env:VSINSTALLDIR) {
     Write-Host "MSVC environment not detected." -ForegroundColor Yellow
@@ -13,16 +28,24 @@ if (-not $env:VSINSTALLDIR) {
         $VsPath = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         $VcVars = Join-Path $VsPath "VC\Auxiliary\Build\vcvars64.bat"
         if (Test-Path $VcVars) {
-            $TempBat = Join-Path $env:TEMP "jfn_vcvars_build.bat"
-            Set-Content $TempBat -Value ('@call "' + $VcVars + '"') -Encoding ASCII
-            Add-Content $TempBat -Value '@set' -Encoding ASCII
-            cmd /c $TempBat | ForEach-Object {
-                if ($_ -match "^([^=]+)=(.*)$") {
-                    [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            $TempBat = Join-Path $env:TEMP ("jfn_vcvars_build_{0}_{1}.bat" -f $PID, [Guid]::NewGuid().ToString("N"))
+            try {
+                Set-Content $TempBat -Value ('@call "' + $VcVars + '"') -Encoding ASCII
+                Add-Content $TempBat -Value '@set' -Encoding ASCII
+                cmd /c $TempBat | ForEach-Object {
+                    if ($_ -match "^([^=]+)=(.*)$") {
+                        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+                    }
                 }
+                if ($LASTEXITCODE -ne 0) {
+                    throw "vcvars64.bat failed with exit code $LASTEXITCODE"
+                }
+            } finally {
+                Remove-Item -LiteralPath $TempBat -ErrorAction SilentlyContinue
             }
-            Remove-Item $TempBat -ErrorAction SilentlyContinue
-            Write-Host "Loaded Visual Studio environment" -ForegroundColor Green
+            if ($env:VSINSTALLDIR) {
+                Write-Host "Loaded Visual Studio environment" -ForegroundColor Green
+            }
         }
     }
 
@@ -62,7 +85,6 @@ if (-not $env:LIBCLANG_PATH) {
 # EXTERNAL_MPV_DIR; without it, avcodec discovery falls back to pkg-config and
 # finds msys64's mingw ffmpeg, whose headers don't parse under the MSVC target.
 if (-not $env:EXTERNAL_MPV_DIR) {
-    $RepoRootEnv = (Get-Item $PSScriptRoot).Parent.Parent.FullName
     foreach ($d in @("third_party\mpv-install", "third_party\mpv")) {
         $p = Join-Path $RepoRootEnv $d
         if (Test-Path (Join-Path $p "lib\mpv.lib")) {

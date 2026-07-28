@@ -31,9 +31,13 @@ use jfn_mpv::api::{
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::ingest_driver::jfn_playback_fullscreen;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
-use jfn_playback::{Input as PbInput, MediaType as PbMediaType, post as pb_post};
+use jfn_playback::{EndReason, Input as PbInput, MediaType as PbMediaType, post as pb_post};
 
 use jfn_mpv::api::JfnMpvLoadOptions;
+
+pub use crate::mediastation_runtime::{
+    jfn_web_clear_mediastation_session, jfn_web_configure_mediastation_session,
+};
 
 // MediaType matching jfn-playback's enum: Unknown=0, Audio=1, Video=2.
 const MT_UNKNOWN: u8 = 0;
@@ -58,6 +62,13 @@ struct WebState {
 
 static INSTANCE: Mutex<Option<WebState>> = Mutex::new(None);
 
+pub(crate) fn active_web_layer() -> Option<Arc<Inner>> {
+    INSTANCE
+        .lock()
+        .as_ref()
+        .map(|state| Arc::clone(&state.layer))
+}
+
 pub fn jfn_web_init(layer: *mut JfnCefLayer) {
     if layer.is_null() {
         return;
@@ -73,6 +84,20 @@ pub fn jfn_web_init(layer: *mut JfnCefLayer) {
 
     let inner = unsafe { jfn_cef_layer_inner(layer) };
     install_handlers(layer, Arc::clone(&inner));
+
+    match crate::mediastation_runtime::restore_persisted_session_on_startup() {
+        Ok(true) => jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_INFO,
+            "MediaStation native session restored from Windows Credential Manager",
+        ),
+        Ok(false) => {}
+        Err(code) => jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_ERROR,
+            &format!("MediaStation native session restore failed: code={code}"),
+        ),
+    }
 
     *INSTANCE.lock() = Some(WebState {
         layer: inner,
@@ -118,6 +143,7 @@ fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
     // BeforeClose: clear INSTANCE so any post-close jfn_web_exec_js becomes
     // a no-op instead of touching a torn-down layer.
     l.set_before_close_callback_rust(Some(Box::new(|| {
+        crate::mediastation_runtime::shutdown_playback_resources();
         *INSTANCE.lock() = None;
     })));
 
@@ -223,7 +249,10 @@ fn handle_player_load(args: &ListValue) {
         &format!(
             "playerLoad: video={video_idx} audio={audio_idx} sub={sub_idx} \
              start={start_ms}ms infinite={is_infinite_stream} \
-             extAudio={external_audio_url} extSub={external_sub_url} url={url}"
+             hasExtAudio={} hasExtSub={} hasUrl={} ",
+            !external_audio_url.is_empty(),
+            !external_sub_url.is_empty(),
+            !url.is_empty(),
         ),
     );
 
@@ -259,9 +288,21 @@ fn handle_player_load(args: &ListValue) {
         sub_track: sub_idx,
         external_audio_url: ext_audio_c.as_ptr(),
         external_sub_url: ext_sub_c.as_ptr(),
+        http_header_fields: c"".as_ptr(),
         is_infinite_stream,
     };
-    unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) };
+    if let Err(error) = unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) } {
+        let error_message = error.to_string();
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_ERROR,
+            &format!("playerLoad failed: {error_message}"),
+        );
+        pb_post(PbInput::EndFile {
+            reason: EndReason::Error,
+            error_message,
+        });
+    }
 }
 
 /// Run `f` if the IPC arrived with an args list. Always returns `true` —
@@ -277,15 +318,61 @@ fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
 fn handle_message(message: BrowserMessage) -> bool {
     let args = message.args();
 
+    let web_layer = active_web_layer;
+
+    if message.name() == "mediaStationAuthenticate" {
+        return crate::mediastation_runtime::handle_authenticate_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationSessionStatus" {
+        return crate::mediastation_runtime::handle_session_status_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationLogout" {
+        return crate::mediastation_runtime::handle_logout_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationCatalog" {
+        return crate::mediastation_runtime::handle_catalog_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationImage" {
+        return crate::mediastation_runtime::handle_image_message(web_layer(), args);
+    }
+
+    if message.name() == "mediaStationLoad" {
+        return crate::mediastation_runtime::handle_load_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationTracks" {
+        return crate::mediastation_runtime::handle_tracks_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationSelectTrack" {
+        return crate::mediastation_runtime::handle_track_selection_message(web_layer(), args);
+    }
+
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
     if jfn_mpv_handle_get().is_null() {
         return false;
     }
 
     match message.name() {
-        "playerLoad" => with_args(args, handle_player_load),
+        "playerLoad" => {
+            if crate::mediastation_runtime::session_is_configured() {
+                let error_message =
+                    "legacy playerLoad is disabled while a native MediaStation session is active";
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    error_message,
+                );
+                pb_post(PbInput::EndFile {
+                    reason: EndReason::Error,
+                    error_message: error_message.to_string(),
+                });
+                true
+            } else {
+                with_args(args, handle_player_load)
+            }
+        }
         "playerStop" => {
             jfn_mpv_stop();
+            crate::mediastation_runtime::release_playback_resources();
             true
         }
         "playerPause" => {
@@ -322,8 +409,16 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddSubtitle: {url}"),
+                &format!("playerAddSubtitle: hasUrl={}", !url.is_empty()),
             );
+            if crate::mediastation_runtime::session_is_configured() {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "legacy playerAddSubtitle URL is disabled for native MediaStation sessions",
+                );
+                return;
+            }
             if let Some(c) = js_cstr_or_warn("playerAddSubtitle url", &url) {
                 unsafe { jfn_mpv_sub_add(c.as_ptr()) };
             }
@@ -336,8 +431,16 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddAudio: {url}"),
+                &format!("playerAddAudio: hasUrl={}", !url.is_empty()),
             );
+            if crate::mediastation_runtime::session_is_configured() {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "legacy playerAddAudio URL is disabled for native MediaStation sessions",
+                );
+                return;
+            }
             if let Some(c) = js_cstr_or_warn("playerAddAudio url", &url) {
                 unsafe { jfn_mpv_audio_add(c.as_ptr()) };
             }
