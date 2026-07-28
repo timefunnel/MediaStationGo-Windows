@@ -101,6 +101,19 @@
         <label for="playback-info-enabled">播放信息浮窗</label>
         <input id="playback-info-enabled" type="checkbox" role="switch">
       </section>
+      <section class="setting-block">
+        <div class="setting-select-row">
+          <label for="frame-interpolation-mode">RTX 插帧</label>
+          <select id="frame-interpolation-mode">
+            <option value="off">关闭</option>
+            <option value="auto">自动</option>
+            <option value="60">60 FPS</option>
+            <option value="90">90 FPS</option>
+            <option value="120">120 FPS</option>
+          </select>
+        </div>
+        <p id="frame-interpolation-status" class="component-status">正在检测组件</p>
+      </section>
       <section><h3>图片缓存</h3><p id="image-cache-status">0 张图片</p><button id="clear-image-cache" class="secondary-command" type="button">清除图片缓存</button></section>
     </div>
   </aside>

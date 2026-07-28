@@ -1,5 +1,8 @@
 use base64::Engine as _;
 use cef::{ImplListValue, ListValue, sys};
+use jfn_frame_interpolation::{
+    InterpolationMode, InterpolationPlan, PlanRequest, prepare_plan, refresh_engine_state,
+};
 use jfn_mediastation::{
     ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
     MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaStationApiClient,
@@ -8,9 +11,10 @@ use jfn_mediastation::{
     SubtitleTrack, UreqTransport, build_playback_track_plan,
 };
 use jfn_mpv::api::{
-    JfnMpvLoadOptions, LoadError, jfn_mpv_get_property_node, jfn_mpv_load_file,
-    jfn_mpv_set_audio_track_checked, jfn_mpv_set_subtitle_track_checked, jfn_mpv_sub_add_checked,
-    jfn_mpv_sub_remove_current_checked,
+    JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
+    jfn_mpv_get_property_int, jfn_mpv_get_property_node, jfn_mpv_get_property_string,
+    jfn_mpv_load_file, jfn_mpv_set_audio_track_checked, jfn_mpv_set_subtitle_track_checked,
+    jfn_mpv_sub_add_checked, jfn_mpv_sub_remove_current_checked,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::{
@@ -21,7 +25,7 @@ use parking_lot::{Condvar, Mutex};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
@@ -335,7 +339,13 @@ struct RuntimeState {
     active_catalog_request_ids: HashSet<String>,
     active_image_request_ids: HashSet<String>,
     active_subtitle: Option<PreparedExternalSubtitle>,
+    active_interpolation: Option<ActiveInterpolation>,
     active_report: Option<ActivePlaybackReport>,
+}
+
+struct ActiveInterpolation {
+    media_id: String,
+    plan: InterpolationPlan,
 }
 
 #[derive(Clone)]
@@ -369,6 +379,7 @@ struct NativeLoadRequest<'a> {
     url: &'a CString,
     options: &'a JfnMpvLoadOptions,
     subtitle: Option<PreparedExternalSubtitle>,
+    interpolation: Option<InterpolationPlan>,
 }
 
 enum TrackSelection {
@@ -536,6 +547,7 @@ impl MediaStationRuntime {
                 active_catalog_request_ids: HashSet::new(),
                 active_image_request_ids: HashSet::new(),
                 active_subtitle: None,
+                active_interpolation: None,
                 active_report: None,
             }),
         })
@@ -559,6 +571,7 @@ impl MediaStationRuntime {
                 state.generation = state.generation.wrapping_add(1);
                 state.session = Some(session);
                 state.active_subtitle = None;
+                state.active_interpolation = None;
                 stopped
             } else {
                 None
@@ -581,14 +594,17 @@ impl MediaStationRuntime {
             state.session = None;
             state.session_profile = None;
             state.active_subtitle = None;
+            state.active_interpolation = None;
             (state.generation, stopped)
         };
         self.enqueue_report(stopped);
         generation
     }
 
-    fn release_active_subtitle(&self) {
-        self.state.lock().active_subtitle = None;
+    fn release_playback_resources(&self) {
+        let mut state = self.state.lock();
+        state.active_subtitle = None;
+        state.active_interpolation = None;
     }
 
     fn handle_playback_event(self: &Arc<Self>, event: &PlaybackEvent) {
@@ -617,6 +633,18 @@ impl MediaStationRuntime {
                     | PlaybackEventKind::Error
             ) {
                 state.active_subtitle = None;
+                state.active_interpolation = None;
+            } else if event.kind == PlaybackEventKind::Started
+                && let Some(active) = state.active_interpolation.as_mut()
+            {
+                active.plan.engine_state = refresh_engine_state(&active.plan);
+                log_debug(&format!(
+                    "RTX frame interpolation started: media_id={} target_fps={} engine_state={} engine_key={}",
+                    active.media_id,
+                    active.plan.target_fps,
+                    active.plan.engine_state.as_str(),
+                    active.plan.engine_key,
+                ));
             }
             let reconcile = if event.kind == PlaybackEventKind::Started {
                 state.active_report.as_mut().and_then(|active| {
@@ -676,6 +704,7 @@ impl MediaStationRuntime {
         let stopped = {
             let mut state = self.state.lock();
             state.active_subtitle = None;
+            state.active_interpolation = None;
             take_stopped_report(&mut state)
         };
         self.enqueue_report(stopped);
@@ -845,6 +874,7 @@ impl MediaStationRuntime {
                 persisted: true,
             });
             state.active_subtitle = None;
+            state.active_interpolation = None;
             (session_status_payload(&state), stopped)
         };
         self.enqueue_report(stopped);
@@ -869,6 +899,7 @@ impl MediaStationRuntime {
             state.session = None;
             state.session_profile = None;
             state.active_subtitle = None;
+            state.active_interpolation = None;
             (deleted, stopped)
         };
         self.enqueue_report(stopped);
@@ -916,6 +947,10 @@ impl MediaStationRuntime {
             ));
         }
         state.active_subtitle = load.subtitle;
+        state.active_interpolation = load.interpolation.map(|plan| ActiveInterpolation {
+            media_id: load.media_id.to_string(),
+            plan,
+        });
         let stopped = activate_playback_report(
             &mut state,
             load.snapshot,
@@ -1253,7 +1288,7 @@ fn install_playback_cleanup(runtime: Weak<MediaStationRuntime>) {
 
 pub(crate) fn release_playback_resources() {
     if let Some(Ok(runtime)) = RUNTIME.get() {
-        runtime.release_active_subtitle();
+        runtime.release_playback_resources();
     }
 }
 
@@ -2417,6 +2452,59 @@ fn valid_text(value: &str, maximum_len: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum_len && !value.chars().any(char::is_control)
 }
 
+fn frame_interpolation_plan(
+    source: &PlaybackSource,
+) -> Result<Option<InterpolationPlan>, LoadFailure> {
+    let configured = jfn_config::frame_interpolation_mode();
+    let mode = InterpolationMode::parse(&configured).ok_or_else(|| {
+        log_error(&format!(
+            "RTX frame interpolation setting is invalid: value={configured}"
+        ));
+        LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The saved frame interpolation mode is invalid",
+        )
+    })?;
+    if mode == InterpolationMode::Off {
+        return Ok(None);
+    }
+    let video = source.video.as_ref().ok_or_else(|| {
+        LoadFailure::new(
+            "frame_interpolation_video_metadata_missing",
+            "Frame interpolation requires a video stream",
+        )
+    })?;
+    let width = video
+        .width
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let height = video
+        .height
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let request = PlanRequest {
+        mode,
+        width,
+        height,
+        source_fps: video.frame_rate.unwrap_or(0.0),
+        display_fps: jfn_playback::ingest_driver::jfn_playback_display_hz(),
+        dynamic_range: video.dynamic_range.clone(),
+        color_space: video.color_space.clone(),
+        color_transfer: video.color_transfer.clone(),
+        color_range: video.color_range.clone(),
+    };
+    prepare_plan(request).map_err(|error| {
+        log_error(&format!(
+            "RTX frame interpolation plan rejected: code={} detail={}",
+            error.code, error.detail
+        ));
+        LoadFailure::new(
+            error.code,
+            "Frame interpolation could not be enabled for this video",
+        )
+    })
+}
+
 pub(crate) fn handle_load_message(layer: Option<Arc<Inner>>, args: Option<&ListValue>) -> bool {
     let Some(layer) = layer else {
         log_error("MediaStation load rejected: web layer unavailable");
@@ -2751,6 +2839,219 @@ pub(crate) fn handle_track_selection_message(
         );
     }
     true
+}
+
+pub(crate) fn handle_frame_interpolation_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("RTX frame interpolation request rejected: web layer unavailable");
+        return true;
+    };
+    let request_id = match parse_request_id(args) {
+        Ok(request_id) => request_id,
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                "frame_interpolation_status",
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let Some(args) = args else {
+        unreachable!("parse_request_id rejects missing arguments")
+    };
+    if args.size() < 2 || args.get_type(1).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        dispatch_response(
+            &layer,
+            &request_id,
+            "frame_interpolation_status",
+            false,
+            LoadFailure::new(
+                "frame_interpolation_request_invalid",
+                "The frame interpolation operation is missing",
+            )
+            .payload(),
+        );
+        return true;
+    }
+    let operation = list_string(args, 1);
+    let result = match operation.as_str() {
+        "frame_interpolation_status" => Ok(frame_interpolation_status_payload()),
+        "frame_interpolation_set_mode" => set_frame_interpolation_mode(args),
+        "frame_interpolation_diagnostics" => {
+            let media_id = (args.size() >= 3
+                && args.get_type(2).as_ref() == &sys::cef_value_type_t::VTYPE_STRING)
+                .then(|| list_string(args, 2));
+            frame_interpolation_diagnostics_payload(media_id.as_deref())
+        }
+        _ => Err(LoadFailure::new(
+            "frame_interpolation_operation_invalid",
+            "The frame interpolation operation is unsupported",
+        )),
+    };
+    match result {
+        Ok(payload) => dispatch_response(&layer, &request_id, &operation, true, payload),
+        Err(failure) => {
+            log_error(&format!(
+                "RTX frame interpolation request failed: operation={operation} code={}",
+                failure.code
+            ));
+            dispatch_response(&layer, &request_id, &operation, false, failure.payload());
+        }
+    }
+    true
+}
+
+fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> {
+    if args.size() < 3 || args.get_type(2).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The requested frame interpolation mode is missing",
+        ));
+    }
+    let requested = list_string(args, 2);
+    let mode = InterpolationMode::parse(&requested).ok_or_else(|| {
+        LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The requested frame interpolation mode is invalid",
+        )
+    })?;
+    if mode != InterpolationMode::Off {
+        let report = jfn_frame_interpolation::capability_report();
+        if !report.ready {
+            return Err(LoadFailure::new(
+                report
+                    .failure
+                    .as_ref()
+                    .map_or("frame_interpolation_runtime_unavailable", |failure| {
+                        failure.code
+                    }),
+                "The RTX frame interpolation components are unavailable",
+            ));
+        }
+    }
+    let previous = jfn_config::frame_interpolation_mode();
+    if !jfn_config::set_frame_interpolation_mode(mode.as_str()) {
+        return Err(LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The requested frame interpolation mode is invalid",
+        ));
+    }
+    if !jfn_config::settings_save() {
+        let _ = jfn_config::set_frame_interpolation_mode(&previous);
+        return Err(LoadFailure::new(
+            "frame_interpolation_setting_save_failed",
+            "The frame interpolation setting could not be saved",
+        ));
+    }
+    log_debug(&format!(
+        "RTX frame interpolation mode saved: mode={}",
+        mode.as_str()
+    ));
+    Ok(frame_interpolation_status_payload())
+}
+
+fn frame_interpolation_status_payload() -> Value {
+    let report = jfn_frame_interpolation::capability_report();
+    json!({
+        "mode": jfn_config::frame_interpolation_mode(),
+        "componentStatus": if report.ready { "ready" } else { "unavailable" },
+        "gpuName": report.gpu_name,
+        "gpuUuid": report.gpu_uuid,
+        "driverVersion": report.driver_version,
+        "runtimePath": report.runtime_path.map(|path| path.display().to_string()),
+        "vapourSynth": report.vapoursynth_version,
+        "vsMlrt": report.vs_mlrt_version,
+        "tensorRt": report.tensorrt_version,
+        "model": report.model_name,
+        "redistributable": report.redistributable,
+        "failureCode": report.failure.as_ref().map(|failure| failure.code),
+        "failureDetail": report.failure.map(|failure| failure.detail),
+    })
+}
+
+fn frame_interpolation_diagnostics_payload(media_id: Option<&str>) -> Result<Value, LoadFailure> {
+    if let Some(media_id) = media_id
+        && !valid_identifier(media_id, MAX_MEDIA_ID_LEN)
+    {
+        return Err(LoadFailure::new(
+            "invalid_media_id",
+            "The media identifier is invalid",
+        ));
+    }
+    let active = RUNTIME
+        .get()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|runtime| {
+            let mut state = runtime.state.lock();
+            let active = state.active_interpolation.as_mut()?;
+            if media_id.is_some_and(|requested| requested != active.media_id) {
+                return None;
+            }
+            active.plan.engine_state = refresh_engine_state(&active.plan);
+            Some(frame_interpolation_payload(&active.plan))
+        });
+    let container_fps = mpv_property_double(c"container-fps");
+    let estimated_vf_fps = mpv_property_double(c"estimated-vf-fps");
+    let display_fps = mpv_property_double(c"display-fps");
+    let frame_drop_count = mpv_property_int(c"frame-drop-count");
+    let decoder_frame_drop_count = mpv_property_int(c"decoder-frame-drop-count");
+    let mistimed_frame_count = mpv_property_int(c"mistimed-frame-count");
+    let vo_delayed_frame_count = mpv_property_int(c"vo-delayed-frame-count");
+    let hwdec_current = mpv_property_string(c"hwdec-current");
+    log_debug(&format!(
+        "RTX frame interpolation diagnostics: active={} container_fps={:?} estimated_vf_fps={:?} display_fps={:?} frame_drop_count={:?} decoder_frame_drop_count={:?} mistimed_frame_count={:?} vo_delayed_frame_count={:?} hwdec_current={:?}",
+        active.is_some(),
+        container_fps,
+        estimated_vf_fps,
+        display_fps,
+        frame_drop_count,
+        decoder_frame_drop_count,
+        mistimed_frame_count,
+        vo_delayed_frame_count,
+        hwdec_current,
+    ));
+    Ok(json!({
+        "status": frame_interpolation_status_payload(),
+        "active": active,
+        "playback": {
+            "containerFps": container_fps,
+            "estimatedVfFps": estimated_vf_fps,
+            "displayFps": display_fps,
+            "frameDropCount": frame_drop_count,
+            "decoderFrameDropCount": decoder_frame_drop_count,
+            "mistimedFrameCount": mistimed_frame_count,
+            "voDelayedFrameCount": vo_delayed_frame_count,
+            "hwdecCurrent": hwdec_current,
+        },
+    }))
+}
+
+fn mpv_property_double(name: &CStr) -> Option<f64> {
+    let mut value = 0.0;
+    (unsafe { jfn_mpv_get_property_double(name.as_ptr(), &mut value) } >= 0).then_some(value)
+}
+
+fn mpv_property_int(name: &CStr) -> Option<i64> {
+    let mut value = 0;
+    (unsafe { jfn_mpv_get_property_int(name.as_ptr(), &mut value) } >= 0).then_some(value)
+}
+
+fn mpv_property_string(name: &CStr) -> Option<String> {
+    let pointer = unsafe { jfn_mpv_get_property_string(name.as_ptr()) };
+    if pointer.is_null() {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { jfn_mpv_free_string(pointer) };
+    Some(value)
 }
 
 enum RequestedTrackKind {
@@ -3301,6 +3602,21 @@ fn execute_load(
         audio_summary,
         source.subtitles.len()
     ));
+    let interpolation = frame_interpolation_plan(&source)?;
+    if let Some(plan) = &interpolation {
+        log_debug(&format!(
+            "RTX frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} scale={} hwdec={} engine_state={} engine_key={}",
+            request.media_id,
+            plan.mode.as_str(),
+            plan.source_fps_num,
+            plan.source_fps_den,
+            plan.target_fps,
+            plan.scale,
+            plan.hwdec,
+            plan.engine_state.as_str(),
+            plan.engine_key,
+        ));
+    }
 
     runtime.ensure_generation(snapshot.generation)?;
     let preference = runtime
@@ -3367,6 +3683,26 @@ fn execute_load(
             "The playback headers contain an invalid byte",
         )
     })?;
+    let video_filter = interpolation
+        .as_ref()
+        .map(|plan| CString::new(plan.video_filter.as_str()))
+        .transpose()
+        .map_err(|_| {
+            LoadFailure::new(
+                "frame_interpolation_filter_invalid",
+                "The generated frame interpolation filter contains an invalid byte",
+            )
+        })?;
+    let interpolation_hwdec = interpolation
+        .as_ref()
+        .map(|plan| CString::new(plan.hwdec))
+        .transpose()
+        .map_err(|_| {
+            LoadFailure::new(
+                "frame_interpolation_hwdec_invalid",
+                "The generated frame interpolation decoder mode is invalid",
+            )
+        })?;
     let options = JfnMpvLoadOptions {
         start_secs: request.start_ms as f64 / 1000.0,
         video_track: plan.video_track,
@@ -3377,6 +3713,12 @@ fn execute_load(
             .as_ref()
             .map_or(c"".as_ptr(), |subtitle| subtitle.path.as_ptr()),
         http_header_fields: header_fields.as_ptr(),
+        video_filter: video_filter
+            .as_ref()
+            .map_or(c"".as_ptr(), |value| value.as_ptr()),
+        hwdec: interpolation_hwdec
+            .as_ref()
+            .map_or(c"".as_ptr(), |value| value.as_ptr()),
         is_infinite_stream: false,
     };
     runtime.load_if_current(NativeLoadRequest {
@@ -3388,6 +3730,7 @@ fn execute_load(
         url: &playback_url,
         options: &options,
         subtitle: prepared_subtitle,
+        interpolation: interpolation.clone(),
     })?;
 
     Ok(json!({
@@ -3423,7 +3766,23 @@ fn execute_load(
         "reportingAvailable": runtime.reporter.is_available(),
         "preferenceCorrection": correction_status,
         "preferenceCorrectionErrorCode": correction_error_code,
+        "frameInterpolation": interpolation.as_ref().map(frame_interpolation_payload),
     }))
+}
+
+fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
+    json!({
+        "enabled": true,
+        "mode": plan.mode.as_str(),
+        "sourceFps": plan.source_fps_num as f64 / plan.source_fps_den as f64,
+        "targetFps": plan.target_fps,
+        "scale": plan.scale,
+        "hwdec": plan.hwdec,
+        "model": plan.model,
+        "backend": plan.backend,
+        "engineKey": plan.engine_key,
+        "engineState": plan.engine_state.as_str(),
+    })
 }
 
 fn audio_tracks_payload(source: &PlaybackSource) -> Value {
@@ -4507,6 +4866,7 @@ mod tests {
             active_catalog_request_ids: HashSet::new(),
             active_image_request_ids: HashSet::new(),
             active_subtitle: None,
+            active_interpolation: None,
             active_report: None,
         };
         let preference = PlaybackTrackPreference {
@@ -4684,7 +5044,7 @@ mod tests {
 
         let runtime = MediaStationRuntime::new().expect("runtime should initialize");
         runtime.state.lock().active_subtitle = Some(prepared);
-        runtime.release_active_subtitle();
+        runtime.release_playback_resources();
 
         assert!(!path.exists());
     }

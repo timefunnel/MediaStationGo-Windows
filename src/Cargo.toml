@@ -4,6 +4,7 @@ members = [
     "color",
     "compositor_core",
     "config",
+    "frame_interpolation",
     "gpu_paint",
     "input",
     "jellyfin",

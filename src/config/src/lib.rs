@@ -55,6 +55,7 @@ struct SettingsData {
     audio_channels: String,
     log_level: String,
     device_name: String,
+    frame_interpolation_mode: String,
     window: JfnWindowGeometry,
     audio_exclusive: bool,
     disable_gpu_compositing: bool,
@@ -73,6 +74,7 @@ impl Default for SettingsData {
             audio_channels: String::new(),
             log_level: String::new(),
             device_name: String::new(),
+            frame_interpolation_mode: "off".to_string(),
             window: JfnWindowGeometry::default(),
             audio_exclusive: false,
             disable_gpu_compositing: false,
@@ -110,6 +112,11 @@ impl SettingsData {
                 s.truncate(DEVICE_NAME_MAX);
             }
             self.device_name = s;
+        }
+        if let Some(s) = v.get("frameInterpolationMode").and_then(Value::as_str)
+            && matches!(s, "off" | "auto" | "60" | "90" | "120")
+        {
+            self.frame_interpolation_mode = s.to_string();
         }
         if let Some(n) = v.get("windowWidth").and_then(Value::as_i64) {
             self.window.width = n as i32;
@@ -226,6 +233,12 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
+        if self.frame_interpolation_mode != "off" {
+            o.insert(
+                "frameInterpolationMode".into(),
+                Value::String(self.frame_interpolation_mode.clone()),
+            );
+        }
         Value::Object(o)
     }
 
@@ -268,6 +281,10 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
+        o.insert(
+            "frameInterpolationMode".into(),
+            Value::String(self.frame_interpolation_mode.clone()),
+        );
         o.insert(
             "deviceNameDefault".into(),
             Value::String(default_device_name()),
@@ -481,6 +498,18 @@ string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
 
+pub fn frame_interpolation_mode() -> String {
+    state().lock().data.frame_interpolation_mode.clone()
+}
+
+pub fn set_frame_interpolation_mode(value: &str) -> bool {
+    if !matches!(value, "off" | "auto" | "60" | "90" | "120") {
+        return false;
+    }
+    state().lock().data.frame_interpolation_mode = value.to_string();
+    true
+}
+
 pub fn device_name() -> String {
     state().lock().data.device_name.clone()
 }
@@ -594,6 +623,7 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{HWDEC_DEFAULT, SettingsData, normalize_device_name};
+    use serde_json::{Value, json};
 
     const PLATFORM: &str = "platform-host";
 
@@ -671,5 +701,29 @@ mod tests {
             settings.to_json().get("hwdec").and_then(|v| v.as_str()),
             Some(explicit)
         );
+    }
+
+    #[test]
+    fn frame_interpolation_mode_defaults_off_and_persists_explicit_choice() {
+        let mut settings = SettingsData::default();
+        assert_eq!(settings.frame_interpolation_mode, "off");
+        assert!(settings.to_json().get("frameInterpolationMode").is_none());
+
+        settings.overlay_json(&json!({ "frameInterpolationMode": "90" }));
+        assert_eq!(settings.frame_interpolation_mode, "90");
+        assert_eq!(
+            settings
+                .to_json()
+                .get("frameInterpolationMode")
+                .and_then(Value::as_str),
+            Some("90")
+        );
+    }
+
+    #[test]
+    fn invalid_frame_interpolation_mode_is_ignored() {
+        let mut settings = SettingsData::default();
+        settings.overlay_json(&json!({ "frameInterpolationMode": "frames" }));
+        assert_eq!(settings.frame_interpolation_mode, "off");
     }
 }

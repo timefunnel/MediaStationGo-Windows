@@ -157,6 +157,8 @@ fn decodes_first_live_video_frame_through_native_load_path() {
             .as_ref()
             .map_or(c"".as_ptr(), |subtitle| subtitle.path.as_ptr()),
         http_header_fields: header_fields.as_ptr(),
+        video_filter: c"".as_ptr(),
+        hwdec: c"".as_ptr(),
         is_infinite_stream: false,
     };
     unsafe { jfn_mpv_load_file(playback_url.as_ptr(), &options) }

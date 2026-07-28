@@ -501,6 +501,15 @@ button:focus-visible, input:focus-visible {
 .setting-toggle-row input::after { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; content: ""; border-radius: 50%; background: #d9dddf; transition: transform 150ms ease; }
 .setting-toggle-row input:checked { border-color: var(--accent); background: var(--accent); }
 .setting-toggle-row input:checked::after { background: #07110f; transform: translateX(20px); }
+.setting-block { display: grid; gap: 10px; }
+.setting-select-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.setting-select-row label { font-size: 15px; font-weight: 620; }
+.setting-select-row select { min-width: 126px; height: 34px; padding: 0 30px 0 10px; border: 1px solid rgba(255,255,255,0.16); border-radius: 4px; outline: 0; color: var(--text); background: #20272a; font: inherit; cursor: pointer; }
+.setting-select-row select:hover { border-color: rgba(255,255,255,0.34); background: #283034; }
+.setting-select-row select:focus-visible { border-color: rgba(255,255,255,0.52); }
+.settings-list .component-status { min-height: 18px; margin: 0; color: var(--muted); line-height: 1.45; }
+.settings-list .component-status[data-state="ready"] { color: #a7d8c5; }
+.settings-list .component-status[data-state="error"] { color: #efb3aa; }
 
 .modal-scrim { position: fixed; z-index: 90; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(0,0,0,0.68); }
 .reading-panel { width: min(720px, 92vw); max-height: min(76vh, 720px); overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: #14191c; box-shadow: 0 26px 76px rgba(0,0,0,0.5); }

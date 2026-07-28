@@ -205,7 +205,13 @@ $Manifest = [ordered]@{
     streams = 1
     redistributable = $false
 }
-$Manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $RuntimeDir "runtime-manifest.json") -Encoding UTF8
+$ManifestJson = $Manifest | ConvertTo-Json
+$ManifestEncoding = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText(
+    (Join-Path $RuntimeDir "runtime-manifest.json"),
+    $ManifestJson,
+    $ManifestEncoding
+)
 
 Write-Host "Frame interpolation PoC runtime prepared at $RuntimeDir" -ForegroundColor Green
 Write-Host "This directory is local-only and must not be published before NVIDIA redistribution review." -ForegroundColor Yellow

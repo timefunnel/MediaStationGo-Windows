@@ -165,6 +165,26 @@ pub unsafe fn jfn_mpv_get_property_int(name: *const c_char, out: *mut i64) -> i3
     }
 }
 
+/// Sync double property read. Writes the value into `*out` and returns
+/// libmpv's error code (0 on success, negative on failure).
+pub unsafe fn jfn_mpv_get_property_double(name: *const c_char, out: *mut f64) -> i32 {
+    let h = raw();
+    if h.is_null() || out.is_null() {
+        return -4;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return -4;
+    };
+    unsafe {
+        sys::mpv_get_property(
+            h,
+            n.as_ptr(),
+            sys::mpv_format::MPV_FORMAT_DOUBLE,
+            out as *mut c_void,
+        )
+    }
+}
+
 /// Sync string property read. Returns a malloc'd UTF-8 C string the
 /// caller must free with [`jfn_mpv_free_string`], or NULL on failure.
 pub unsafe fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
@@ -443,6 +463,10 @@ pub struct JfnMpvLoadOptions {
     pub external_sub_url: *const c_char,
     /// Comma-separated mpv `http-header-fields` string-list value.
     pub http_header_fields: *const c_char,
+    /// Per-file video filter chain. Empty preserves the normal player path.
+    pub video_filter: *const c_char,
+    /// Per-file hardware decoder mode. Empty preserves the configured mode.
+    pub hwdec: *const c_char,
     pub is_infinite_stream: bool,
 }
 
@@ -513,6 +537,8 @@ pub unsafe fn jfn_mpv_load_file(
     let ext_audio = unsafe { cstr_to_string(o.external_audio_url) };
     let ext_sub = unsafe { cstr_to_string(o.external_sub_url) };
     let http_header_fields = unsafe { cstr_to_string(o.http_header_fields) };
+    let video_filter = unsafe { cstr_to_string(o.video_filter) };
+    let hwdec = unsafe { cstr_to_string(o.hwdec) };
     let defer_audio =
         o.is_infinite_stream && o.audio_track == TRACK_DISABLE && ext_audio.is_empty();
 
@@ -528,6 +554,12 @@ pub unsafe fn jfn_mpv_load_file(
     }
     if !http_header_fields.is_empty() {
         load_options.push(("http-header-fields".to_string(), http_header_fields));
+    }
+    if !video_filter.is_empty() {
+        load_options.push(("vf".to_string(), video_filter));
+    }
+    if !hwdec.is_empty() {
+        load_options.push(("hwdec".to_string(), hwdec));
     }
 
     let mut command =

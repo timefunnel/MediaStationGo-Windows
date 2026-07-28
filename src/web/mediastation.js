@@ -56,6 +56,8 @@
     let homeRefreshGeneration = 0;
     let heroRotationTimer = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
+    let frameInterpolationMode = window.jmpInfo?.settings?.playback?.frameInterpolationMode || 'off';
+    let frameInterpolationStatus = null;
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -302,6 +304,48 @@
             playback_unavailable: '当前没有可切换轨道的播放项目',
             authentication_in_progress: '登录请求正在处理中',
             session_changed: '账号状态已变化，请重试',
+            frame_interpolation_runtime_missing: '未找到 RTX 插帧运行组件',
+            frame_interpolation_runtime_incomplete: 'RTX 插帧运行组件不完整',
+            frame_interpolation_runtime_unavailable: 'RTX 插帧运行组件不可用',
+            frame_interpolation_runtime_version_mismatch: 'RTX 插帧组件版本不匹配',
+            frame_interpolation_runtime_path_unsupported: 'RTX 插帧运行目录必须使用纯英文路径',
+            frame_interpolation_manifest_unreadable: 'RTX 插帧组件清单无法读取',
+            frame_interpolation_manifest_invalid: 'RTX 插帧组件清单无效',
+            frame_interpolation_dependency_unreadable: 'RTX 插帧依赖文件无法读取',
+            frame_interpolation_model_hash_mismatch: 'RIFE 模型校验失败',
+            frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
+            frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
+            frame_interpolation_nvidia_output_invalid: 'NVIDIA GPU 信息无效',
+            frame_interpolation_gpu_unsupported: '首版插帧仅支持 NVIDIA GeForce RTX',
+            frame_interpolation_platform_unsupported: '当前系统不支持 RTX 插帧',
+            frame_interpolation_not_initialized: 'RTX 插帧组件尚未初始化',
+            frame_interpolation_script_cache_unavailable: 'RIFE 脚本缓存无法使用',
+            frame_interpolation_engine_cache_unavailable: 'TensorRT Engine 缓存无法使用',
+            frame_interpolation_environment_invalid: 'RTX 插帧运行环境配置失败',
+            frame_interpolation_dll_search_unavailable: 'RTX 插帧 DLL 加载路径配置失败',
+            frame_interpolation_vsscript_load_failed: 'VSScript 加载失败',
+            frame_interpolation_vsscript_api_missing: 'VSScript API 不可用',
+            frame_interpolation_vsscript_initialization_failed: 'VapourSynth 初始化失败',
+            frame_interpolation_mode_invalid: 'RTX 插帧目标设置无效',
+            frame_interpolation_request_invalid: 'RTX 插帧请求无效',
+            frame_interpolation_operation_invalid: 'RTX 插帧操作不受支持',
+            frame_interpolation_video_metadata_missing: '缺少插帧所需的视频信息',
+            frame_interpolation_dimensions_unknown: '无法确认视频分辨率，已拒绝插帧',
+            frame_interpolation_source_fps_invalid: '无法确认视频原始帧率，已拒绝插帧',
+            frame_interpolation_target_not_higher: '插帧目标帧率必须高于原始帧率',
+            frame_interpolation_display_fps_unknown: '无法读取当前显示器刷新率',
+            frame_interpolation_display_refresh_unsupported: '当前显示器刷新率低于 60 Hz',
+            frame_interpolation_display_refresh_insufficient: '目标帧率高于当前显示器刷新率',
+            frame_interpolation_4k_not_validated: '当前版本尚未开放 4K 插帧',
+            frame_interpolation_hlg_not_validated: '当前版本尚未开放 HLG 插帧',
+            frame_interpolation_hdr10_plus_unsupported: '当前版本不支持 HDR10+ 插帧',
+            frame_interpolation_dolby_vision_unsupported: '当前版本不支持 Dolby Vision 插帧',
+            frame_interpolation_dynamic_range_unknown: '无法确认视频动态范围，已拒绝插帧',
+            frame_interpolation_color_space_unsupported: '视频色彩空间不支持插帧',
+            frame_interpolation_color_range_unsupported: '视频色彩范围不支持插帧',
+            frame_interpolation_filter_invalid: 'RIFE 滤镜参数无效',
+            frame_interpolation_hwdec_invalid: 'RTX 插帧硬件解码参数无效',
+            frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -350,6 +394,7 @@
         appShell.classList.remove('hidden');
         byId('login-cancel').classList.add('hidden');
         refreshImageCacheStatus();
+        refreshFrameInterpolationStatus();
         await loadHome(true);
     }
 
@@ -681,6 +726,41 @@
         } catch (error) {
             console.error(`图片缓存统计失败：${friendlyError(error)}`);
             byId('image-cache-status').textContent = '统计失败';
+        }
+    }
+
+    function updateFrameInterpolationStatus(status) {
+        if (!status) return;
+        frameInterpolationStatus = status;
+        frameInterpolationMode = status.mode || 'off';
+        const select = byId('frame-interpolation-mode');
+        const label = byId('frame-interpolation-status');
+        select.value = frameInterpolationMode;
+        if (status.componentStatus === 'ready') {
+            const components = [status.gpuName, status.vsMlrt, status.model].filter(Boolean);
+            label.textContent = components.join(' · ') || 'RTX 插帧组件已就绪';
+            label.dataset.state = 'ready';
+        } else {
+            const error = new Error(status.failureDetail || 'RTX 插帧组件不可用');
+            error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
+            label.textContent = friendlyError(error);
+            label.dataset.state = 'error';
+        }
+    }
+
+    async function refreshFrameInterpolationStatus() {
+        try {
+            const status = await nativeRequest(
+                'mediaStationFrameInterpolation',
+                'frame_interpolation_status',
+                ['frame_interpolation_status'],
+                15000,
+            );
+            updateFrameInterpolationStatus(status);
+        } catch (error) {
+            const label = byId('frame-interpolation-status');
+            label.textContent = friendlyError(error);
+            label.dataset.state = 'error';
         }
     }
 
@@ -1679,6 +1759,9 @@
             const loadInfo = await nativeRequest('mediaStationLoad', 'load', [card.id, Math.max(0, Math.round(startMs || 0))], 60000);
             if (player?.card.id === card.id) {
                 player.loadInfo = loadInfo;
+                if (loadInfo.frameInterpolation?.engineState === 'building') {
+                    setPlayerLoading(true, '正在编译 RTX 插帧引擎');
+                }
                 refreshPlayerTools();
             }
         } catch (error) {
@@ -1970,7 +2053,27 @@
         appendInfoRow(network.list, '解析', Number.isFinite(info.resolveMs) ? `${info.resolveMs} ms` : '-');
         appendInfoRow(network.list, '会话直链', info.reused ? '已复用' : '本次解析');
         appendInfoRow(network.list, '目标主机', infoValue(info.targetHost));
-        playerPanelContent.append(video.section, network.section);
+        const interpolation = createInfoSection('RTX 插帧');
+        const activeInterpolation = info.frameInterpolation;
+        const diagnostics = info.frameInterpolationDiagnostics || {};
+        if (activeInterpolation) {
+            appendInfoRow(interpolation.list, '模式 / 输出', `${activeInterpolation.mode} · ${activeInterpolation.targetFps} fps`);
+            appendInfoRow(interpolation.list, '模型 / 后端', `${activeInterpolation.model} · ${activeInterpolation.backend}`);
+            appendInfoRow(interpolation.list, 'Engine', `${activeInterpolation.engineState} · ${activeInterpolation.engineKey}`);
+            appendInfoRow(interpolation.list, '硬件解码', infoValue(diagnostics.hwdecCurrent || activeInterpolation.hwdec));
+        } else {
+            appendInfoRow(interpolation.list, '状态', '关闭');
+        }
+        appendInfoRow(interpolation.list, '容器 / VF / 显示', [
+            diagnostics.containerFps,
+            diagnostics.estimatedVfFps,
+            diagnostics.displayFps,
+        ].map((value) => Number.isFinite(value) ? `${Number(value).toFixed(3)}` : '-').join(' / '));
+        appendInfoRow(interpolation.list, '输出丢帧', infoValue(diagnostics.frameDropCount));
+        appendInfoRow(interpolation.list, '解码丢帧', infoValue(diagnostics.decoderFrameDropCount));
+        appendInfoRow(interpolation.list, '时序异常', infoValue(diagnostics.mistimedFrameCount));
+        appendInfoRow(interpolation.list, 'VO 延迟', infoValue(diagnostics.voDelayedFrameCount));
+        playerPanelContent.append(video.section, network.section, interpolation.section);
     }
 
     async function openPlayerPanel(kind, trigger) {
@@ -2000,6 +2103,23 @@
                 return;
             } finally {
                 if (player === activePlayer) activePlayer.trackRefreshing = false;
+            }
+        }
+        if (kind === 'info') {
+            try {
+                const diagnostics = await nativeRequest(
+                    'mediaStationFrameInterpolation',
+                    'frame_interpolation_diagnostics',
+                    ['frame_interpolation_diagnostics', activePlayer.card.id],
+                    15000,
+                );
+                if (player !== activePlayer) return;
+                activePlayer.loadInfo.frameInterpolation = diagnostics.active || null;
+                activePlayer.loadInfo.frameInterpolationDiagnostics = diagnostics.playback || {};
+                updateFrameInterpolationStatus(diagnostics.status);
+            } catch (error) {
+                console.error(`RTX frame interpolation diagnostics failed: ${friendlyError(error)}`);
+                showToast(friendlyError(error));
             }
         }
         if (player !== activePlayer) return;
@@ -2158,7 +2278,10 @@
     byId('nav-library').addEventListener('click', () => homeData && setCurrentView({ kind: 'libraries', data: homeData.libraries }));
     byId('search-open').addEventListener('click', openSearch);
     byId('account-open').addEventListener('click', (event) => openDrawer(byId('account-drawer'), event.currentTarget));
-    byId('settings-open').addEventListener('click', (event) => openDrawer(byId('settings-drawer'), event.currentTarget));
+    byId('settings-open').addEventListener('click', (event) => {
+        openDrawer(byId('settings-drawer'), event.currentTarget);
+        refreshFrameInterpolationStatus();
+    });
     byId('drawer-scrim').addEventListener('click', () => closeDrawer());
     document.querySelectorAll('.drawer-close').forEach((button) => button.addEventListener('click', () => closeDrawer()));
     byId('overview-close').addEventListener('click', closeOverview);
@@ -2180,6 +2303,27 @@
             playbackInfoToggle.checked = playbackInfoEnabled;
             console.error(`MediaStation playback info setting could not be saved: ${error}`);
             showToast('播放信息设置保存失败');
+        }
+    });
+    const frameInterpolationSelect = byId('frame-interpolation-mode');
+    frameInterpolationSelect.value = frameInterpolationMode;
+    frameInterpolationSelect.addEventListener('change', async () => {
+        const requested = frameInterpolationSelect.value;
+        frameInterpolationSelect.disabled = true;
+        try {
+            const status = await nativeRequest(
+                'mediaStationFrameInterpolation',
+                'frame_interpolation_set_mode',
+                ['frame_interpolation_set_mode', requested],
+                15000,
+            );
+            updateFrameInterpolationStatus(status);
+        } catch (error) {
+            frameInterpolationSelect.value = frameInterpolationMode;
+            showToast(friendlyError(error));
+            await refreshFrameInterpolationStatus();
+        } finally {
+            frameInterpolationSelect.disabled = false;
         }
     });
     byId('clear-image-cache').addEventListener('click', async (event) => {

@@ -289,6 +289,8 @@ fn handle_player_load(args: &ListValue) {
         external_audio_url: ext_audio_c.as_ptr(),
         external_sub_url: ext_sub_c.as_ptr(),
         http_header_fields: c"".as_ptr(),
+        video_filter: c"".as_ptr(),
+        hwdec: c"".as_ptr(),
         is_infinite_stream,
     };
     if let Err(error) = unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) } {
@@ -344,6 +346,9 @@ fn handle_message(message: BrowserMessage) -> bool {
     }
     if message.name() == "mediaStationSelectTrack" {
         return crate::mediastation_runtime::handle_track_selection_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationFrameInterpolation" {
+        return crate::mediastation_runtime::handle_frame_interpolation_message(web_layer(), args);
     }
 
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.

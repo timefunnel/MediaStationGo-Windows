@@ -91,7 +91,8 @@
         settings: {
             main: { enableMPV: true, fullscreen: false, userWebClient: '__SERVER_URL__' },
             playback: {
-                hwdec: _savedSettings.hwdec || 'auto'
+                hwdec: _savedSettings.hwdec || 'auto',
+                frameInterpolationMode: _savedSettings.frameInterpolationMode || 'off'
             },
             audio: {
                 audioPassthrough: _savedSettings.audioPassthrough || '',

@@ -569,6 +569,32 @@ pub fn jfn_app_main() -> c_int {
     init_logging(opts.log_file, &opts.log_level);
     tracing::info!(target: "Main", "Requested hwdec mode: {}", opts.hwdec);
 
+    #[cfg(target_os = "windows")]
+    {
+        let interpolation_cache = jfn_paths::cache_dir().join("frame-interpolation");
+        let report = jfn_frame_interpolation::initialize(&interpolation_cache);
+        if report.ready {
+            tracing::info!(
+                target: "Main",
+                "RTX frame interpolation ready: gpu={} driver={} runtime={} redistributable={}",
+                report.gpu_name.as_deref().unwrap_or("unknown"),
+                report.driver_version.as_deref().unwrap_or("unknown"),
+                report
+                    .runtime_path
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
+                report.redistributable,
+            );
+        } else if let Some(error) = &report.failure {
+            tracing::warn!(
+                target: "Main",
+                "RTX frame interpolation unavailable: code={} detail={}",
+                error.code,
+                error.detail,
+            );
+        }
+    }
+
     crate::platform_install::install_from_cli(&cli);
 
     let _ = crate::window_geometry::controller();
