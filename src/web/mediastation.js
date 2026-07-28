@@ -304,28 +304,18 @@
             playback_unavailable: '当前没有可切换轨道的播放项目',
             authentication_in_progress: '登录请求正在处理中',
             session_changed: '账号状态已变化，请重试',
-            frame_interpolation_runtime_missing: '未找到 RTX 插帧运行组件',
-            frame_interpolation_runtime_incomplete: 'RTX 插帧运行组件不完整',
-            frame_interpolation_runtime_unavailable: 'RTX 插帧运行组件不可用',
-            frame_interpolation_runtime_version_mismatch: 'RTX 插帧组件版本不匹配',
-            frame_interpolation_runtime_path_unsupported: 'RTX 插帧运行目录必须使用纯英文路径',
-            frame_interpolation_manifest_unreadable: 'RTX 插帧组件清单无法读取',
-            frame_interpolation_manifest_invalid: 'RTX 插帧组件清单无效',
-            frame_interpolation_dependency_unreadable: 'RTX 插帧依赖文件无法读取',
-            frame_interpolation_model_hash_mismatch: 'RIFE 模型校验失败',
+            frame_interpolation_runtime_unavailable: 'NVOFA 插帧组件不可用',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
             frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
             frame_interpolation_nvidia_output_invalid: 'NVIDIA GPU 信息无效',
-            frame_interpolation_gpu_unsupported: '首版插帧仅支持 NVIDIA GeForce RTX',
+            frame_interpolation_gpu_unsupported: '首版插帧仅支持 NVIDIA RTX',
             frame_interpolation_platform_unsupported: '当前系统不支持 RTX 插帧',
-            frame_interpolation_not_initialized: 'RTX 插帧组件尚未初始化',
-            frame_interpolation_script_cache_unavailable: 'RIFE 脚本缓存无法使用',
-            frame_interpolation_engine_cache_unavailable: 'TensorRT Engine 缓存无法使用',
-            frame_interpolation_environment_invalid: 'RTX 插帧运行环境配置失败',
-            frame_interpolation_dll_search_unavailable: 'RTX 插帧 DLL 加载路径配置失败',
-            frame_interpolation_vsscript_load_failed: 'VSScript 加载失败',
-            frame_interpolation_vsscript_api_missing: 'VSScript API 不可用',
-            frame_interpolation_vsscript_initialization_failed: 'VapourSynth 初始化失败',
+            frame_interpolation_not_initialized: 'NVOFA 插帧组件尚未初始化',
+            frame_interpolation_nvofa_library_unavailable: 'NVIDIA Optical Flow 运行库不可用',
+            frame_interpolation_nvofa_api_missing: 'NVIDIA Optical Flow API 不完整',
+            frame_interpolation_nvofa_probe_failed: 'NVIDIA Optical Flow API 探测失败',
+            frame_interpolation_nvofa_api_unsupported: 'NVIDIA Optical Flow API 版本过低',
+            frame_interpolation_d3d_compiler_unavailable: 'D3D11 着色器编译组件不可用',
             frame_interpolation_mode_invalid: 'RTX 插帧目标设置无效',
             frame_interpolation_request_invalid: 'RTX 插帧请求无效',
             frame_interpolation_operation_invalid: 'RTX 插帧操作不受支持',
@@ -336,14 +326,16 @@
             frame_interpolation_display_fps_unknown: '无法读取当前显示器刷新率',
             frame_interpolation_display_refresh_unsupported: '当前显示器刷新率低于 60 Hz',
             frame_interpolation_display_refresh_insufficient: '目标帧率高于当前显示器刷新率',
-            frame_interpolation_4k_not_validated: '当前版本尚未开放 4K 插帧',
+            frame_interpolation_target_not_supported: '当前版本仅支持 60 FPS 插帧',
+            frame_interpolation_dimensions_unsupported: '当前版本最高支持 3840×2160 插帧',
             frame_interpolation_hlg_not_validated: '当前版本尚未开放 HLG 插帧',
             frame_interpolation_hdr10_plus_unsupported: '当前版本不支持 HDR10+ 插帧',
             frame_interpolation_dolby_vision_unsupported: '当前版本不支持 Dolby Vision 插帧',
             frame_interpolation_dynamic_range_unknown: '无法确认视频动态范围，已拒绝插帧',
+            frame_interpolation_hdr10_transfer_invalid: 'HDR10 缺少 PQ/ST2084 色彩元数据',
             frame_interpolation_color_space_unsupported: '视频色彩空间不支持插帧',
             frame_interpolation_color_range_unsupported: '视频色彩范围不支持插帧',
-            frame_interpolation_filter_invalid: 'RIFE 滤镜参数无效',
+            frame_interpolation_filter_invalid: 'NVOFA 滤镜参数无效',
             frame_interpolation_hwdec_invalid: 'RTX 插帧硬件解码参数无效',
             frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
         };
@@ -737,11 +729,12 @@
         const label = byId('frame-interpolation-status');
         select.value = frameInterpolationMode;
         if (status.componentStatus === 'ready') {
-            const components = [status.gpuName, status.vsMlrt, status.model].filter(Boolean);
-            label.textContent = components.join(' · ') || 'RTX 插帧组件已就绪';
+            const api = status.opticalFlowApi ? `Optical Flow API ${status.opticalFlowApi}` : null;
+            const components = [status.gpuName, api, status.backend].filter(Boolean);
+            label.textContent = components.join(' · ') || 'NVOFA 插帧组件已就绪';
             label.dataset.state = 'ready';
         } else {
-            const error = new Error(status.failureDetail || 'RTX 插帧组件不可用');
+            const error = new Error(status.failureDetail || 'NVOFA 插帧组件不可用');
             error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
@@ -1759,9 +1752,6 @@
             const loadInfo = await nativeRequest('mediaStationLoad', 'load', [card.id, Math.max(0, Math.round(startMs || 0))], 60000);
             if (player?.card.id === card.id) {
                 player.loadInfo = loadInfo;
-                if (loadInfo.frameInterpolation?.engineState === 'building') {
-                    setPlayerLoading(true, '正在编译 RTX 插帧引擎');
-                }
                 refreshPlayerTools();
             }
         } catch (error) {
@@ -2058,8 +2048,8 @@
         const diagnostics = info.frameInterpolationDiagnostics || {};
         if (activeInterpolation) {
             appendInfoRow(interpolation.list, '模式 / 输出', `${activeInterpolation.mode} · ${activeInterpolation.targetFps} fps`);
-            appendInfoRow(interpolation.list, '模型 / 后端', `${activeInterpolation.model} · ${activeInterpolation.backend}`);
-            appendInfoRow(interpolation.list, 'Engine', `${activeInterpolation.engineState} · ${activeInterpolation.engineKey}`);
+            appendInfoRow(interpolation.list, '后端 / API', `${activeInterpolation.backend} · ${activeInterpolation.opticalFlowApi}`);
+            appendInfoRow(interpolation.list, '原生滤镜', infoValue(activeInterpolation.videoFilter));
             appendInfoRow(interpolation.list, '硬件解码', infoValue(diagnostics.hwdecCurrent || activeInterpolation.hwdec));
         } else {
             appendInfoRow(interpolation.list, '状态', '关闭');

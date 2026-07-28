@@ -1,8 +1,6 @@
 use base64::Engine as _;
 use cef::{ImplListValue, ListValue, sys};
-use jfn_frame_interpolation::{
-    InterpolationMode, InterpolationPlan, PlanRequest, prepare_plan, refresh_engine_state,
-};
+use jfn_frame_interpolation::{InterpolationMode, InterpolationPlan, PlanRequest, prepare_plan};
 use jfn_mediastation::{
     ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
     MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaStationApiClient,
@@ -635,15 +633,15 @@ impl MediaStationRuntime {
                 state.active_subtitle = None;
                 state.active_interpolation = None;
             } else if event.kind == PlaybackEventKind::Started
-                && let Some(active) = state.active_interpolation.as_mut()
+                && let Some(active) = state.active_interpolation.as_ref()
             {
-                active.plan.engine_state = refresh_engine_state(&active.plan);
                 log_debug(&format!(
-                    "RTX frame interpolation started: media_id={} target_fps={} engine_state={} engine_key={}",
+                    "NVOFA frame interpolation started: media_id={} target_fps={} backend={} optical_flow_api={} hwdec={}",
                     active.media_id,
                     active.plan.target_fps,
-                    active.plan.engine_state.as_str(),
-                    active.plan.engine_key,
+                    active.plan.backend,
+                    active.plan.optical_flow_api,
+                    active.plan.hwdec,
                 ));
             }
             let reconcile = if event.kind == PlaybackEventKind::Started {
@@ -2921,6 +2919,12 @@ fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> 
             "The requested frame interpolation mode is invalid",
         )
     })?;
+    if !mode.supported_by_native_backend() {
+        return Err(LoadFailure::new(
+            "frame_interpolation_target_not_supported",
+            "The native NVOFA backend currently supports only 60 FPS output",
+        ));
+    }
     if mode != InterpolationMode::Off {
         let report = jfn_frame_interpolation::capability_report();
         if !report.ready {
@@ -2931,7 +2935,7 @@ fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> 
                     .map_or("frame_interpolation_runtime_unavailable", |failure| {
                         failure.code
                     }),
-                "The RTX frame interpolation components are unavailable",
+                "The native NVOFA frame interpolation components are unavailable",
             ));
         }
     }
@@ -2964,12 +2968,9 @@ fn frame_interpolation_status_payload() -> Value {
         "gpuName": report.gpu_name,
         "gpuUuid": report.gpu_uuid,
         "driverVersion": report.driver_version,
-        "runtimePath": report.runtime_path.map(|path| path.display().to_string()),
-        "vapourSynth": report.vapoursynth_version,
-        "vsMlrt": report.vs_mlrt_version,
-        "tensorRt": report.tensorrt_version,
-        "model": report.model_name,
-        "redistributable": report.redistributable,
+        "opticalFlowApi": report.optical_flow_api,
+        "backend": report.backend,
+        "filter": report.filter,
         "failureCode": report.failure.as_ref().map(|failure| failure.code),
         "failureDetail": report.failure.map(|failure| failure.detail),
     })
@@ -2988,12 +2989,11 @@ fn frame_interpolation_diagnostics_payload(media_id: Option<&str>) -> Result<Val
         .get()
         .and_then(|result| result.as_ref().ok())
         .and_then(|runtime| {
-            let mut state = runtime.state.lock();
-            let active = state.active_interpolation.as_mut()?;
+            let state = runtime.state.lock();
+            let active = state.active_interpolation.as_ref()?;
             if media_id.is_some_and(|requested| requested != active.media_id) {
                 return None;
             }
-            active.plan.engine_state = refresh_engine_state(&active.plan);
             Some(frame_interpolation_payload(&active.plan))
         });
     let container_fps = mpv_property_double(c"container-fps");
@@ -3605,16 +3605,17 @@ fn execute_load(
     let interpolation = frame_interpolation_plan(&source)?;
     if let Some(plan) = &interpolation {
         log_debug(&format!(
-            "RTX frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} scale={} hwdec={} engine_state={} engine_key={}",
+            "NVOFA frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} backend={} optical_flow_api={} scene_threshold={} hwdec={} filter={}",
             request.media_id,
             plan.mode.as_str(),
             plan.source_fps_num,
             plan.source_fps_den,
             plan.target_fps,
-            plan.scale,
+            plan.backend,
+            plan.optical_flow_api,
+            plan.scene_threshold,
             plan.hwdec,
-            plan.engine_state.as_str(),
-            plan.engine_key,
+            plan.video_filter,
         ));
     }
 
@@ -3776,12 +3777,11 @@ fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
         "mode": plan.mode.as_str(),
         "sourceFps": plan.source_fps_num as f64 / plan.source_fps_den as f64,
         "targetFps": plan.target_fps,
-        "scale": plan.scale,
         "hwdec": plan.hwdec,
-        "model": plan.model,
         "backend": plan.backend,
-        "engineKey": plan.engine_key,
-        "engineState": plan.engine_state.as_str(),
+        "opticalFlowApi": plan.optical_flow_api,
+        "sceneThreshold": plan.scene_threshold,
+        "videoFilter": plan.video_filter,
     })
 }
 

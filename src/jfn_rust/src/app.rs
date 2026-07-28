@@ -576,19 +576,20 @@ pub fn jfn_app_main() -> c_int {
         if report.ready {
             tracing::info!(
                 target: "Main",
-                "RTX frame interpolation ready: gpu={} driver={} runtime={} redistributable={}",
+                "NVOFA frame interpolation ready: gpu={} driver={} optical_flow_api={} backend={} filter={}",
                 report.gpu_name.as_deref().unwrap_or("unknown"),
                 report.driver_version.as_deref().unwrap_or("unknown"),
                 report
-                    .runtime_path
+                    .optical_flow_api
                     .as_deref()
-                    .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
-                report.redistributable,
+                    .unwrap_or("unknown"),
+                report.backend.unwrap_or("unknown"),
+                report.filter.unwrap_or("unknown"),
             );
         } else if let Some(error) = &report.failure {
             tracing::warn!(
                 target: "Main",
-                "RTX frame interpolation unavailable: code={} detail={}",
+                "NVOFA frame interpolation unavailable: code={} detail={}",
                 error.code,
                 error.detail,
             );

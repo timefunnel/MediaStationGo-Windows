@@ -8,12 +8,6 @@ publish.workspace = true
 name = "jfn_frame_interpolation"
 crate-type = ["rlib"]
 
-[dependencies]
-base64.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
-
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
