@@ -113,6 +113,7 @@ pacman -S --needed --noconfirm \
     $PkgPrefix-vulkan-loader \
     $PkgPrefix-shaderc \
     $PkgPrefix-spirv-cross \
+    $PkgPrefix-vapoursynth \
     $PkgPrefix-llvm \
     $PkgPrefix-tools
 "@ -Description "Installing MSYS2 dependencies"
@@ -138,7 +139,7 @@ meson setup build --default-library=shared \
     -Dlibbluray=disabled \
     -Dlibarchive=disabled \
     -Drubberband=disabled \
-    -Dvapoursynth=disabled
+    -Dvapoursynth=enabled
 "@ -Description "Configuring mpv with meson"
 } else {
     Write-Host "Meson already configured (use -Force to reconfigure)" -ForegroundColor Yellow
@@ -274,6 +275,17 @@ $MsysBinDir = Join-Path $MsysPath "$MsysEnv\bin"
 $MsysEnvLower = $MsysEnv.ToLower()
 $MsysLibDir = ConvertTo-MsysPath $LibDir
 
+# mpv loads VSScript dynamically, so it does not appear in libmpv's import
+# table. Stage it explicitly under the Windows name mpv probes, then let the
+# dependency walker collect its Python and C++ runtime dependencies.
+$VsScriptSource = Join-Path $MsysBinDir "libvapoursynth-script-0.dll"
+$VsCoreSource = Join-Path $MsysBinDir "libvapoursynth.dll"
+if (-not (Test-Path $VsScriptSource) -or -not (Test-Path $VsCoreSource)) {
+    throw "VapourSynth R65 runtime DLLs are missing from $MsysBinDir"
+}
+Copy-Item $VsScriptSource (Join-Path $LibDir "VSScript.dll")
+Copy-Item $VsCoreSource (Join-Path $LibDir "libvapoursynth.dll")
+
 # Write a helper script to resolve deps recursively, then run it
 $DepScript = @"
 #!/bin/bash
@@ -295,6 +307,8 @@ resolve_deps() {
 }
 
 resolve_deps libmpv-2.dll `"`$OUT_DIR/libmpv-2.dll`"
+resolve_deps VSScript.dll `"`$OUT_DIR/VSScript.dll`"
+resolve_deps libvapoursynth.dll `"`$OUT_DIR/libvapoursynth.dll`"
 "@
 
 $DepScriptPath = Join-Path $MesonBuildDir "resolve_deps.sh"
