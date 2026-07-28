@@ -162,89 +162,85 @@
             : Math.max(0, node.scrollHeight - node.clientHeight);
     }
 
-    function stopSmoothScroll(node) {
-        const motion = scrollMotions.get(node);
-        if (!motion) return;
-        if (motion.frame) window.cancelAnimationFrame(motion.frame);
-        scrollMotions.delete(node);
+    function cubicBezierEasing(x1, y1, x2, y2) {
+        const sample = (time, first, second) => {
+            const inverse = 1 - time;
+            return 3 * inverse * inverse * time * first
+                + 3 * inverse * time * time * second
+                + time * time * time;
+        };
+        return (progress) => {
+            let lower = 0;
+            let upper = 1;
+            let time = progress;
+            for (let iteration = 0; iteration < 10; iteration += 1) {
+                time = (lower + upper) / 2;
+                if (sample(time, x1, x2) < progress) lower = time;
+                else upper = time;
+            }
+            return sample(time, y1, y2);
+        };
     }
 
-    function smoothScrollTo(node, requested = {}) {
-        if (!node) return;
+    const scrollEasing = cubicBezierEasing(0.2, 0, 0, 1);
+    const horizontalScrollDurationMs = 320;
+
+    function stopSmoothScroll(node) {
+        const motion = scrollMotions.get(node);
+        if (!motion) return false;
+        if (motion.frame) window.cancelAnimationFrame(motion.frame);
+        scrollMotions.delete(node);
+        motion.resolve(false);
+        return true;
+    }
+
+    function smoothScrollTo(node, requested = {}, durationMs = horizontalScrollDurationMs) {
+        if (!node) return Promise.resolve(false);
         const targetX = clamp(requested.left ?? node.scrollLeft, 0, scrollLimit(node, 'x'));
         const targetY = clamp(requested.top ?? node.scrollTop, 0, scrollLimit(node, 'y'));
+        const animateX = requested.left !== undefined && Math.abs(targetX - node.scrollLeft) > 0.01;
+        const animateY = requested.top !== undefined && Math.abs(targetY - node.scrollTop) > 0.01;
+        stopSmoothScroll(node);
         if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-            stopSmoothScroll(node);
-            node.scrollLeft = targetX;
-            node.scrollTop = targetY;
-            return;
+            if (requested.left !== undefined) node.scrollLeft = targetX;
+            if (requested.top !== undefined) node.scrollTop = targetY;
+            return Promise.resolve(true);
         }
+        if (!animateX && !animateY) return Promise.resolve(true);
 
-        let motion = scrollMotions.get(node);
-        if (!motion) {
-            motion = {
-                x: node.scrollLeft,
-                y: node.scrollTop,
-                vx: 0,
-                vy: 0,
+        const startX = node.scrollLeft;
+        const startY = node.scrollTop;
+        return new Promise((resolve) => {
+            const motion = {
                 targetX,
                 targetY,
                 frame: 0,
-                previousTime: 0,
+                startTime: 0,
+                resolve,
             };
             scrollMotions.set(node, motion);
-        } else {
-            motion.targetX = targetX;
-            motion.targetY = targetY;
-        }
-        if (motion.frame) return;
-
-        const advance = (time) => {
-            if (!node.isConnected) {
+            const advance = (time) => {
+                if (scrollMotions.get(node) !== motion) return;
+                if (!node.isConnected) {
+                    scrollMotions.delete(node);
+                    resolve(false);
+                    return;
+                }
+                if (!motion.startTime) motion.startTime = time;
+                const progress = clamp((time - motion.startTime) / durationMs, 0, 1);
+                const eased = scrollEasing(progress);
+                if (animateX) node.scrollLeft = startX + (targetX - startX) * eased;
+                if (animateY) node.scrollTop = startY + (targetY - startY) * eased;
+                if (progress < 1) {
+                    motion.frame = window.requestAnimationFrame(advance);
+                    return;
+                }
+                if (animateX) node.scrollLeft = targetX;
+                if (animateY) node.scrollTop = targetY;
                 scrollMotions.delete(node);
-                return;
-            }
-            const elapsed = motion.previousTime ? (time - motion.previousTime) / 1000 : 1 / 60;
-            const delta = clamp(elapsed, 1 / 240, 1 / 30);
-            motion.previousTime = time;
-            const stiffness = 190;
-            const damping = 27;
-            motion.vx += ((motion.targetX - motion.x) * stiffness - motion.vx * damping) * delta;
-            motion.vy += ((motion.targetY - motion.y) * stiffness - motion.vy * damping) * delta;
-            motion.x += motion.vx * delta;
-            motion.y += motion.vy * delta;
-
-            const settledX = Math.abs(motion.targetX - motion.x) < 0.35 && Math.abs(motion.vx) < 4;
-            const settledY = Math.abs(motion.targetY - motion.y) < 0.35 && Math.abs(motion.vy) < 4;
-            if (settledX) {
-                motion.x = motion.targetX;
-                motion.vx = 0;
-            }
-            if (settledY) {
-                motion.y = motion.targetY;
-                motion.vy = 0;
-            }
-            node.scrollLeft = motion.x;
-            node.scrollTop = motion.y;
-            if (settledX && settledY) {
-                motion.frame = 0;
-                scrollMotions.delete(node);
-                return;
-            }
+                resolve(true);
+            };
             motion.frame = window.requestAnimationFrame(advance);
-        };
-        motion.frame = window.requestAnimationFrame(advance);
-    }
-
-    function nudgeSmoothScroll(node, deltaX, deltaY) {
-        const motion = scrollMotions.get(node);
-        const baseX = motion?.targetX ?? node.scrollLeft;
-        const baseY = motion?.targetY ?? node.scrollTop;
-        const maximumXLead = Math.max(360, node.clientWidth * 1.25);
-        const maximumYLead = Math.max(420, node.clientHeight * 1.1);
-        smoothScrollTo(node, {
-            left: clamp(baseX + deltaX, node.scrollLeft - maximumXLead, node.scrollLeft + maximumXLead),
-            top: clamp(baseY + deltaY, node.scrollTop - maximumYLead, node.scrollTop + maximumYLead),
         });
     }
 
@@ -265,7 +261,8 @@
     function focusAndReveal(node, inline = 'center', block = 'nearest') {
         if (!node) return;
         const row = node.closest('.media-row');
-        if (row) smoothScrollTo(row, { left: revealTarget(row, node, 'x', inline) });
+        if (row?._revealCarouselNode) row._revealCarouselNode(node);
+        else if (row) smoothScrollTo(row, { left: revealTarget(row, node, 'x', inline) });
         smoothScrollTo(content, { top: revealTarget(content, node, 'y', block) });
         focusElement(node);
     }
@@ -775,6 +772,140 @@
         return button;
     }
 
+    function createRowCarousel(row, title) {
+        row.classList.add('carousel-row');
+        const rowShell = element('div', 'media-row-carousel');
+        if (row.classList.contains('episode-row')) rowShell.classList.add('episode-row-carousel');
+        const previous = element('button', 'icon-button hero-carousel-button hero-carousel-previous media-row-carousel-button media-row-carousel-previous');
+        previous.type = 'button';
+        previous.title = '向左滚动';
+        previous.setAttribute('aria-label', `${title}向左滚动`);
+        previous.append(element('span', 'hero-carousel-chevron'));
+        const next = element('button', 'icon-button hero-carousel-button hero-carousel-next media-row-carousel-button media-row-carousel-next');
+        next.type = 'button';
+        next.title = '向右滚动';
+        next.setAttribute('aria-label', `${title}向右滚动`);
+        next.append(element('span', 'hero-carousel-chevron'));
+
+        let pageDistance = 0;
+        let cardStride = 0;
+        let pageIndex = 0;
+        let maximumPage = 0;
+        let active = false;
+        let pendingDirection = 0;
+        let generation = 0;
+        const refreshControls = () => {
+            const atStart = maximumPage < 1 || pageIndex <= 0;
+            const atEnd = maximumPage < 1 || pageIndex >= maximumPage;
+            previous.disabled = atStart;
+            next.disabled = atEnd;
+            previous.classList.toggle('unavailable', atStart);
+            next.classList.toggle('unavailable', atEnd);
+        };
+        const measurePageDistance = () => {
+            const card = row.querySelector('.media-card');
+            if (!card) return row.clientWidth;
+            row.style.removeProperty('--row-card-width');
+            row.style.removeProperty('--row-gap');
+            const rawGap = Number.parseFloat(window.getComputedStyle(row).columnGap) || 0;
+            const rawWidth = card.getBoundingClientRect().width;
+            const pixelRatio = window.devicePixelRatio || 1;
+            const cardWidth = Math.round(rawWidth * pixelRatio) / pixelRatio;
+            const gap = Math.round(rawGap * pixelRatio) / pixelRatio;
+            row.style.setProperty('--row-card-width', `${cardWidth}px`);
+            row.style.setProperty('--row-gap', `${gap}px`);
+            cardStride = cardWidth + gap;
+            return Math.max(
+                cardStride,
+                Math.floor((row.clientWidth * 0.78) / cardStride) * cardStride,
+            );
+        };
+        const alignEndToPage = () => {
+            const previousDistance = pageDistance;
+            const previousIndex = previousDistance > 0
+                ? Math.round(row.scrollLeft / previousDistance)
+                : 0;
+            generation += 1;
+            active = false;
+            pendingDirection = 0;
+            stopSmoothScroll(row);
+            row.style.setProperty('--row-end-alignment', '0px');
+            pageDistance = measurePageDistance();
+            if (pageDistance <= 0) {
+                maximumPage = 0;
+                pageIndex = 0;
+                refreshControls();
+                return;
+            }
+            const limit = scrollLimit(row, 'x');
+            maximumPage = Math.ceil(Math.max(0, limit - 0.5) / pageDistance);
+            const alignment = Math.max(0, maximumPage * pageDistance - limit);
+            row.style.setProperty('--row-end-alignment', `${alignment}px`);
+            const art = row.querySelector('.card-art');
+            if (art) rowShell.style.setProperty('--row-button-center', `${art.getBoundingClientRect().height / 2}px`);
+            pageIndex = clamp(previousIndex, 0, maximumPage);
+            row.scrollLeft = pageIndex * pageDistance;
+            refreshControls();
+        };
+        let refreshFrame = 0;
+        row.addEventListener('scroll', () => {
+            if (refreshFrame) return;
+            refreshFrame = window.requestAnimationFrame(() => {
+                refreshFrame = 0;
+                if (!active && pageDistance > 0) {
+                    pageIndex = clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage);
+                }
+                refreshControls();
+            });
+        }, { passive: true });
+        const moveToPage = (requestedPage) => {
+            if (active) {
+                pendingDirection = requestedPage > pageIndex ? 1 : -1;
+                return;
+            }
+            const targetPage = clamp(requestedPage, 0, maximumPage);
+            if (targetPage === pageIndex || pageDistance <= 0) {
+                refreshControls();
+                return;
+            }
+            const token = ++generation;
+            active = true;
+            pageIndex = targetPage;
+            refreshControls();
+            smoothScrollTo(
+                row,
+                { left: targetPage * pageDistance },
+                horizontalScrollDurationMs,
+            ).then((completed) => {
+                if (token !== generation) return;
+                if (completed) {
+                    row.scrollLeft = targetPage * pageDistance;
+                } else {
+                    pageIndex = clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage);
+                    row.scrollLeft = pageIndex * pageDistance;
+                }
+                active = false;
+                refreshControls();
+                const queuedDirection = pendingDirection;
+                pendingDirection = 0;
+                if (queuedDirection) moveToPage(pageIndex + queuedDirection);
+            });
+        };
+        previous.addEventListener('click', () => moveToPage(pageIndex - 1));
+        next.addEventListener('click', () => moveToPage(pageIndex + 1));
+        row._refreshCarousel = alignEndToPage;
+        row._revealCarouselNode = (node) => {
+            const cards = [...row.querySelectorAll('.media-card')];
+            const cardIndex = cards.indexOf(node.closest('.media-card'));
+            if (cardIndex < 0 || cardStride <= 0) return;
+            const cardsPerPage = Math.max(1, Math.round(pageDistance / cardStride));
+            moveToPage(Math.floor(cardIndex / cardsPerPage));
+        };
+        rowShell.append(row, previous, next);
+        window.requestAnimationFrame(alignEndToPage);
+        return rowShell;
+    }
+
     function createSection(title, cards, options = {}) {
         if (!cards?.length) return null;
         const section = element('section', 'media-section');
@@ -786,11 +917,11 @@
             more.addEventListener('click', options.more);
             heading.append(more);
         }
-        const row = element('div', `media-row${options.landscape ? ' landscape' : ''}`);
+        const row = element('div', `media-row home-media-row${options.landscape ? ' landscape' : ''}`);
         row.dataset.rowKey = options.key || title;
         row.dataset.rowIndex = String(options.rowIndex ?? 0);
         cards.forEach((card, index) => row.append(createMediaCard(card, { ...options, index })));
-        section.append(heading, row);
+        section.append(heading, createRowCarousel(row, title));
         return section;
     }
 
@@ -1358,7 +1489,7 @@
                     index,
                     onClick: (item) => startPlayback(item, item.resumePositionMs),
                 })));
-                rowHost.replaceChildren(row);
+                rowHost.replaceChildren(createRowCarousel(row, '选集'));
             };
 
             if (chunks.length > 1) {
@@ -2226,19 +2357,29 @@
 
     content.addEventListener('wheel', (event) => {
         const row = event.target.closest?.('.media-row');
-        const deltaX = wheelPixels(event.deltaX, event.deltaMode, row?.clientWidth || content.clientWidth);
-        const deltaY = wheelPixels(event.deltaY, event.deltaMode, row?.clientWidth || content.clientHeight);
-        if (row) {
-            const amount = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY;
-            if (!amount) return;
+        if (!row) return;
+        const deltaX = wheelPixels(event.deltaX, event.deltaMode, content.clientWidth);
+        const deltaY = wheelPixels(event.deltaY, event.deltaMode, content.clientHeight);
+        if ((event.shiftKey && deltaY) || (deltaX && Math.abs(deltaX) >= Math.abs(deltaY))) {
             event.preventDefault();
-            nudgeSmoothScroll(row, amount, 0);
-            return;
         }
-        if (!deltaY) return;
-        event.preventDefault();
-        nudgeSmoothScroll(content, 0, deltaY);
     }, { passive: false });
+
+    const rowScrollIdleTimers = new WeakMap();
+    content.addEventListener('scroll', (event) => {
+        const row = event.target;
+        if (!(row instanceof Element) || !row.classList.contains('media-row')) return;
+        row.classList.add('is-scrolling');
+        window.clearTimeout(rowScrollIdleTimers.get(row));
+        rowScrollIdleTimers.set(row, window.setTimeout(() => {
+            row.classList.remove('is-scrolling');
+            rowScrollIdleTimers.delete(row);
+        }, 120));
+    }, { capture: true, passive: true });
+
+    window.addEventListener('resize', () => {
+        content.querySelectorAll('.carousel-row').forEach((row) => row._refreshCarousel?.());
+    }, { passive: true });
 
     content.addEventListener('pointerdown', (event) => {
         stopSmoothScroll(content);
