@@ -16,6 +16,11 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $OutputDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvSourceDir = Join-Path $RepoRoot "third_party\mpv"
+$NvofaSource = Join-Path $PSScriptRoot "mpv\vf_nvofa.c"
+$NvofaPatch = Join-Path $PSScriptRoot "mpv\mpv-nvofa.patch"
+$NvofaDestination = Join-Path $MpvSourceDir "video\filter\vf_nvofa.c"
+$NvofaPatchApplied = $false
+$NvofaSourceCreated = $false
 
 # MSYS2 environment based on target architecture
 if ($Arch -eq "arm64") {
@@ -40,6 +45,12 @@ if ((Test-Path $OutputLib) -and -not $Force) {
 if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
     Write-Host "mpv submodule not found. Run: git submodule update --init --recursive" -ForegroundColor Red
     exit 1
+}
+
+foreach ($RequiredNvofaFile in @($NvofaSource, $NvofaPatch)) {
+    if (-not (Test-Path -LiteralPath $RequiredNvofaFile)) {
+        throw "NVOFA mpv build input is missing: $RequiredNvofaFile"
+    }
 }
 
 # Check for MSYS2, install if missing
@@ -70,6 +81,32 @@ if (-not (Test-Path $MsysBash)) {
     }
     Write-Host "MSYS2 installed" -ForegroundColor Green
 }
+
+try {
+    & git -C $MpvSourceDir apply --check $NvofaPatch 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $MpvSourceDir apply $NvofaPatch
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply the NVOFA mpv patch"
+        }
+        $NvofaPatchApplied = $true
+    } else {
+        & git -C $MpvSourceDir apply --reverse --check $NvofaPatch 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The mpv source does not match the pinned NVOFA patch"
+        }
+    }
+
+    if (Test-Path -LiteralPath $NvofaDestination) {
+        $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofaSource).Hash
+        $DestinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofaDestination).Hash
+        if ($SourceHash -ne $DestinationHash) {
+            throw "Existing mpv NVOFA filter differs from the pinned source: $NvofaDestination"
+        }
+    } else {
+        Copy-Item -LiteralPath $NvofaSource -Destination $NvofaDestination
+        $NvofaSourceCreated = $true
+    }
 
 Write-Host "=== Building mpv from submodule ===" -ForegroundColor Cyan
 Write-Host "MSYS2: $MsysPath ($MsysEnv)"
@@ -365,4 +402,15 @@ Write-Host ""
 Write-Host "Contents:"
 Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
     Write-Host "  $($_.FullName.Substring($OutputDir.Length + 1))"
+}
+} finally {
+    if ($NvofaSourceCreated -and (Test-Path -LiteralPath $NvofaDestination)) {
+        Remove-Item -LiteralPath $NvofaDestination -Force
+    }
+    if ($NvofaPatchApplied) {
+        & git -C $MpvSourceDir apply --reverse $NvofaPatch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to restore the mpv source after the NVOFA build"
+        }
+    }
 }
