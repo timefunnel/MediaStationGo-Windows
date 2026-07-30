@@ -68,7 +68,8 @@ enum output_phase {
 #define ROBUST_SCENE_STATE_COUNT 11
 #define ROBUST_SCENE_METRIC_COUNT 7
 #define ROBUST_SCENE_SUMMARY_COUNT 41
-#define ROBUST_SYNTHESIS_COUNTER_COUNT 12
+#define ROBUST_SYNTHESIS_COUNTER_COUNT 13
+#define ROBUST_TEMPORAL_CACHE_COUNT 2
 #define GPU_PROFILE_RING_SIZE 16
 #define GPU_PROFILE_BUCKET_COUNT 2001
 #define GPU_PROFILE_BUCKET_MS 0.05
@@ -129,6 +130,7 @@ enum robust_synthesis_counter {
     ROBUST_SYNTHESIS_OCCUPANCY1_EMPTY,
     ROBUST_SYNTHESIS_OCCUPANCY0_COLLISION,
     ROBUST_SYNTHESIS_OCCUPANCY1_COLLISION,
+    ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE,
 };
 
 _Static_assert(ROBUST_SCENE_STATE_COUNT ==
@@ -142,7 +144,7 @@ _Static_assert(ROBUST_SCENE_SUMMARY_COUNT ==
                ROBUST_SCENE_CLASS_COUNT * ROBUST_SCENE_METRIC_COUNT,
                "robust scene summary layout changed");
 _Static_assert(ROBUST_SYNTHESIS_COUNTER_COUNT ==
-               ROBUST_SYNTHESIS_OCCUPANCY1_COLLISION + 1,
+               ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE + 1,
                "robust synthesis summary layout changed");
 
 struct gpu_profile_query {
@@ -242,6 +244,38 @@ struct shader_texture_resource {
     ID3D11ShaderResourceView *srv;
 };
 
+struct robust_pair_cache {
+    struct shader_texture_resource flow_forward;
+    struct shader_texture_resource flow_backward;
+    struct shader_texture_resource cost_forward;
+    struct shader_texture_resource cost_backward;
+    ID3D11Buffer *scene_state_buffer;
+    ID3D11ShaderResourceView *scene_state_srv;
+    bool valid;
+};
+
+struct robust_pair_views {
+    ID3D11ShaderResourceView *flow_forward;
+    ID3D11ShaderResourceView *flow_backward;
+    ID3D11ShaderResourceView *cost_forward;
+    ID3D11ShaderResourceView *cost_backward;
+    ID3D11ShaderResourceView *scene_state;
+};
+
+struct robust_synthesis_context {
+    struct robust_pair_views previous;
+    struct robust_pair_views central;
+    struct robust_pair_views next;
+    bool previous_available;
+    bool next_available;
+};
+
+struct robust_temporal_constants {
+    uint32_t previous_available;
+    uint32_t next_available;
+    uint32_t reserved[2];
+};
+
 struct nvof_state {
     HMODULE module;
     HMODULE d3dcompiler_module;
@@ -279,6 +313,7 @@ struct nvof_state {
     ID3D11Buffer *robust_synthesis_summary_buffer;
     ID3D11UnorderedAccessView *robust_synthesis_summary_uav;
     ID3D11Buffer *robust_synthesis_summary_readback;
+    ID3D11Buffer *robust_temporal_constants_buffer;
     ID3D11Texture2D *completion_readback;
     struct nvof_resource gray[2];
     struct nvof_resource flow_forward;
@@ -289,6 +324,7 @@ struct nvof_state {
     struct nvof_resource flow_state_forward[2];
     struct nvof_resource flow_state_backward[2];
     struct shader_texture_resource occupancy[2];
+    struct robust_pair_cache pair_cache[ROBUST_TEMPORAL_CACHE_COUNT];
     int width;
     int height;
     uint32_t driver_api_version;
@@ -324,8 +360,14 @@ struct priv {
     struct mp_image_params input_params;
     struct mp_image *frame0;
     struct mp_image *frame1;
+    struct mp_image *frame2;
+    struct mp_image *pending_frame;
     enum output_phase output_phase;
     double pair_duration;
+    double next_pair_duration;
+    int previous_cache_slot;
+    int central_cache_slot;
+    bool flush_pair_after_midpoint;
     bool input_eof;
     bool output_eof_sent;
     bool robust_scene_history_reset_pending;
@@ -1367,6 +1409,17 @@ static const char synthesize_p010_shader_source[] =
     "StructuredBuffer<uint> robust_scene_state : register(t8);\n"
     "Texture2D<uint> occupancy0 : register(t9);\n"
     "Texture2D<uint> occupancy1 : register(t10);\n"
+    "Texture2D<int2> previous_flow_backward : register(t11);\n"
+    "Texture2D<int2> next_flow_forward : register(t12);\n"
+    "StructuredBuffer<uint> previous_scene_state : register(t13);\n"
+    "StructuredBuffer<uint> next_scene_state : register(t14);\n"
+    "cbuffer RobustTemporalContext : register(b0)\n"
+    "{\n"
+    "    uint temporal_previous_available;\n"
+    "    uint temporal_next_available;\n"
+    "    uint temporal_reserved0;\n"
+    "    uint temporal_reserved1;\n"
+    "};\n"
     "#else\n"
     "StructuredBuffer<uint> scene_counters : register(t8);\n"
     "#endif\n"
@@ -1578,6 +1631,104 @@ static const char synthesize_p010_shader_source[] =
     "                            block_flow(flow1, p, w, h);\n"
     "}\n"
     "\n"
+    "bool temporal_scene_is_normal(StructuredBuffer<uint> state)\n"
+    "{\n"
+    "    return state[ROBUST_STATE_CLASS] == ROBUST_SCENE_NORMAL;\n"
+    "}\n"
+    "\n"
+    "float temporal_vector_support(float2 adjacent, float2 central)\n"
+    "{\n"
+    "    float threshold = 3.0 + 0.30 * length(central);\n"
+    "    return saturate(1.0 - length(adjacent - central) / threshold);\n"
+    "}\n"
+    "\n"
+    "float2 temporal_midpoint_from_frame0(float2 source, uint w, uint h,\n"
+    "                                     out float support)\n"
+    "{\n"
+    "    float2 central = sample_raw_flow(flow0, source, w, h);\n"
+    "    float2 endpoint = source + central;\n"
+    "    float2 tangent0 = central;\n"
+    "    float2 tangent1 = central;\n"
+    "    float support0 = 0.0;\n"
+    "    float support1 = 0.0;\n"
+    "    if (temporal_previous_available != 0 &&\n"
+    "        temporal_scene_is_normal(previous_scene_state)) {\n"
+    "        float2 incoming = -sample_raw_flow(\n"
+    "            previous_flow_backward, source, w, h);\n"
+    "        support0 = temporal_vector_support(incoming, central);\n"
+    "        tangent0 = lerp(central, incoming, support0);\n"
+    "    }\n"
+    "    if (temporal_next_available != 0 &&\n"
+    "        temporal_scene_is_normal(next_scene_state)) {\n"
+    "        float2 outgoing = sample_raw_flow(\n"
+    "            next_flow_forward, endpoint, w, h);\n"
+    "        support1 = temporal_vector_support(outgoing, central);\n"
+    "        tangent1 = lerp(central, outgoing, support1);\n"
+    "    }\n"
+    "    support = max(support0, support1);\n"
+    "    return source + 0.5 * central + 0.125 * (tangent0 - tangent1);\n"
+    "}\n"
+    "\n"
+    "float2 temporal_midpoint_from_frame1(float2 source, uint w, uint h,\n"
+    "                                     out float support)\n"
+    "{\n"
+    "    float2 backward = sample_raw_flow(flow1, source, w, h);\n"
+    "    float2 start = source + backward;\n"
+    "    float2 central = -backward;\n"
+    "    float2 tangent0 = central;\n"
+    "    float2 tangent1 = central;\n"
+    "    float support0 = 0.0;\n"
+    "    float support1 = 0.0;\n"
+    "    if (temporal_previous_available != 0 &&\n"
+    "        temporal_scene_is_normal(previous_scene_state)) {\n"
+    "        float2 incoming = -sample_raw_flow(\n"
+    "            previous_flow_backward, start, w, h);\n"
+    "        support0 = temporal_vector_support(incoming, central);\n"
+    "        tangent0 = lerp(central, incoming, support0);\n"
+    "    }\n"
+    "    if (temporal_next_available != 0 &&\n"
+    "        temporal_scene_is_normal(next_scene_state)) {\n"
+    "        float2 outgoing = sample_raw_flow(\n"
+    "            next_flow_forward, source, w, h);\n"
+    "        support1 = temporal_vector_support(outgoing, central);\n"
+    "        tangent1 = lerp(central, outgoing, support1);\n"
+    "    }\n"
+    "    support = max(support0, support1);\n"
+    "    return start + 0.5 * central + 0.125 * (tangent0 - tangent1);\n"
+    "}\n"
+    "\n"
+    "float2 solve_temporal_candidate0(float2 target, uint w, uint h,\n"
+    "                                 out float support)\n"
+    "{\n"
+    "    float2 source = target - 0.5 *\n"
+    "        sample_raw_flow(flow0, target, w, h);\n"
+    "    float midpoint_support = 0.0;\n"
+    "    float2 midpoint = temporal_midpoint_from_frame0(\n"
+    "        source, w, h, midpoint_support);\n"
+    "    source += target - midpoint;\n"
+    "    midpoint = temporal_midpoint_from_frame0(\n"
+    "        source, w, h, midpoint_support);\n"
+    "    source += target - midpoint;\n"
+    "    support = midpoint_support;\n"
+    "    return source;\n"
+    "}\n"
+    "\n"
+    "float2 solve_temporal_candidate1(float2 target, uint w, uint h,\n"
+    "                                 out float support)\n"
+    "{\n"
+    "    float2 source = target - 0.5 *\n"
+    "        sample_raw_flow(flow1, target, w, h);\n"
+    "    float midpoint_support = 0.0;\n"
+    "    float2 midpoint = temporal_midpoint_from_frame1(\n"
+    "        source, w, h, midpoint_support);\n"
+    "    source += target - midpoint;\n"
+    "    midpoint = temporal_midpoint_from_frame1(\n"
+    "        source, w, h, midpoint_support);\n"
+    "    source += target - midpoint;\n"
+    "    support = midpoint_support;\n"
+    "    return source;\n"
+    "}\n"
+    "\n"
     "float2 solve_candidate0(float2 target, uint candidate, uint w, uint h)\n"
     "{\n"
     "    float2 source = target - 0.5 *\n"
@@ -1688,10 +1839,45 @@ static const char synthesize_p010_shader_source[] =
     "    return result;\n"
     "}\n"
     "\n"
+    "RobustCandidate evaluate_temporal_candidate0(float2 target,\n"
+    "                                             uint w, uint h)\n"
+    "{\n"
+    "    RobustCandidate result;\n"
+    "    float support = 0.0;\n"
+    "    result.source = solve_temporal_candidate0(\n"
+    "        target, w, h, support);\n"
+    "    result.score = robust_candidate_score0(\n"
+    "        target, result.source, w, h) * support;\n"
+    "    result.id = 3;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "RobustCandidate evaluate_temporal_candidate1(float2 target,\n"
+    "                                             uint w, uint h)\n"
+    "{\n"
+    "    RobustCandidate result;\n"
+    "    float support = 0.0;\n"
+    "    result.source = solve_temporal_candidate1(\n"
+    "        target, w, h, support);\n"
+    "    result.score = robust_candidate_score1(\n"
+    "        target, result.source, w, h) * support;\n"
+    "    result.id = 3;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
     "RobustCandidate better_candidate(RobustCandidate current,\n"
     "                                 RobustCandidate candidate)\n"
     "{\n"
     "    if (candidate.score > current.score + 0.00001)\n"
+    "        return candidate;\n"
+    "    return current;\n"
+    "}\n"
+    "\n"
+    "RobustCandidate better_temporal_candidate(RobustCandidate current,\n"
+    "                                          RobustCandidate candidate)\n"
+    "{\n"
+    "    float required = current.score * 1.08 + 0.01;\n"
+    "    if (candidate.score > required)\n"
     "        return candidate;\n"
     "    return current;\n"
     "}\n"
@@ -1711,11 +1897,15 @@ static const char synthesize_p010_shader_source[] =
     "        evaluate_candidate0(target, 1, w, h));\n"
     "    selection.side0 = better_candidate(selection.side0,\n"
     "        evaluate_candidate0(target, 2, w, h));\n"
+    "    selection.side0 = better_temporal_candidate(selection.side0,\n"
+    "        evaluate_temporal_candidate0(target, w, h));\n"
     "    selection.side1 = evaluate_candidate1(target, 0, w, h);\n"
     "    selection.side1 = better_candidate(selection.side1,\n"
     "        evaluate_candidate1(target, 1, w, h));\n"
     "    selection.side1 = better_candidate(selection.side1,\n"
     "        evaluate_candidate1(target, 2, w, h));\n"
+    "    selection.side1 = better_temporal_candidate(selection.side1,\n"
+    "        evaluate_temporal_candidate1(target, w, h));\n"
     "    bool valid0 = selection.side0.score >= 0.002;\n"
     "    bool valid1 = selection.side1.score >= 0.002;\n"
     "    if (!valid0 && !valid1)\n"
@@ -1843,9 +2033,13 @@ static const char synthesize_p010_shader_source[] =
     "                InterlockedAdd(robust_counters[3], 1);\n"
     "            else\n"
     "                InterlockedAdd(robust_counters[4], 1);\n"
-    "            if (!hold_previous && !crossfade && mode != 0)\n"
-    "                InterlockedAdd(robust_counters[\n"
-    "                    5 + selected_candidate], 1);\n"
+    "            if (!hold_previous && !crossfade && mode != 0) {\n"
+    "                if (selected_candidate < 3)\n"
+    "                    InterlockedAdd(robust_counters[\n"
+    "                        5 + selected_candidate], 1);\n"
+    "                else if (selected_candidate == 3)\n"
+    "                    InterlockedAdd(robust_counters[12], 1);\n"
+    "            }\n"
     "            uint occupancy_count0 = occupancy0.Load(int3(id.xy, 0));\n"
     "            uint occupancy_count1 = occupancy1.Load(int3(id.xy, 0));\n"
     "            if (occupancy_count0 == 0)\n"
@@ -2016,6 +2210,21 @@ static void release_shader_texture_resource(
     resource->texture = NULL;
 }
 
+static void release_robust_pair_cache(struct robust_pair_cache *cache)
+{
+    release_shader_texture_resource(&cache->flow_forward);
+    release_shader_texture_resource(&cache->flow_backward);
+    release_shader_texture_resource(&cache->cost_forward);
+    release_shader_texture_resource(&cache->cost_backward);
+    if (cache->scene_state_srv)
+        ID3D11ShaderResourceView_Release(cache->scene_state_srv);
+    cache->scene_state_srv = NULL;
+    if (cache->scene_state_buffer)
+        ID3D11Buffer_Release(cache->scene_state_buffer);
+    cache->scene_state_buffer = NULL;
+    cache->valid = false;
+}
+
 static void release_nvof_session(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -2036,6 +2245,8 @@ static void release_nvof_session(struct mp_filter *f)
         release_nvof_resource(f, resources[n]);
     for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.occupancy); n++)
         release_shader_texture_resource(&p->nvof.occupancy[n]);
+    for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++)
+        release_robust_pair_cache(&p->nvof.pair_cache[n]);
     if (p->nvof.completion_readback)
         ID3D11Texture2D_Release(p->nvof.completion_readback);
     p->nvof.completion_readback = NULL;
@@ -2091,6 +2302,9 @@ static void release_scene_cut_resources(struct priv *p)
 
 static void release_robust_scene_resources(struct priv *p)
 {
+    if (p->nvof.robust_temporal_constants_buffer)
+        ID3D11Buffer_Release(p->nvof.robust_temporal_constants_buffer);
+    p->nvof.robust_temporal_constants_buffer = NULL;
     if (p->nvof.robust_synthesis_summary_readback)
         ID3D11Buffer_Release(p->nvof.robust_synthesis_summary_readback);
     p->nvof.robust_synthesis_summary_readback = NULL;
@@ -2483,7 +2697,8 @@ static bool load_robust_scene_shaders(struct mp_filter *f)
         p->nvof.robust_scene_summary_readback &&
         p->nvof.robust_synthesis_summary_buffer &&
         p->nvof.robust_synthesis_summary_uav &&
-        p->nvof.robust_synthesis_summary_readback)
+        p->nvof.robust_synthesis_summary_readback &&
+        p->nvof.robust_temporal_constants_buffer)
         return true;
     release_robust_scene_resources(p);
     if (!p->nvof.d3d_compile) {
@@ -2737,6 +2952,20 @@ static bool load_robust_scene_shaders(struct mp_filter *f)
             p->device, &readback_desc, NULL,
             &p->nvof.robust_synthesis_summary_readback);
     }
+    const struct robust_temporal_constants zero_temporal_constants = {0};
+    D3D11_SUBRESOURCE_DATA temporal_constants_data = {
+        .pSysMem = &zero_temporal_constants,
+    };
+    D3D11_BUFFER_DESC temporal_constants_desc = {
+        .ByteWidth = sizeof(struct robust_temporal_constants),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &temporal_constants_desc, &temporal_constants_data,
+            &p->nvof.robust_temporal_constants_buffer);
+    }
     if (FAILED(hr)) {
         MP_ERR(f, "NVOF robust scene buffer creation failed hr=0x%08lx\n",
                (unsigned long)hr);
@@ -2747,7 +2976,7 @@ static bool load_robust_scene_shaders(struct mp_filter *f)
     MP_INFO(f, "NVOF robust scene classifier ready regions=3x3 "
                "histogram-bins=%d sample-stride=%d descriptors="
                "luma+chroma+edge history=hysteresis "
-               "synthesis=forward-occupancy+raw-median-block\n",
+               "synthesis=forward-occupancy+raw-median-block-hermite\n",
             ROBUST_SCENE_HISTOGRAM_BINS,
             p->opts->scene_cut_sample_stride);
     return true;
@@ -2989,7 +3218,7 @@ static bool load_synthesize_p010_shader(struct mp_filter *f)
         {"ROBUST_SCENE_FADE_DISSOLVE", "2"},
         {"ROBUST_SCENE_HARD_CUT", "3"},
         {"ROBUST_SCENE_UNCERTAIN", "4"},
-        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "12"},
+        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "13"},
         {NULL, NULL},
     };
     HRESULT hr = p->nvof.d3d_compile(
@@ -3200,7 +3429,7 @@ static bool create_flow_state_resource(struct mp_filter *f,
 
 static bool create_shader_texture_resource(
     struct mp_filter *f, struct shader_texture_resource *resource,
-    UINT width, UINT height, DXGI_FORMAT format)
+    UINT width, UINT height, DXGI_FORMAT format, UINT bind_flags)
 {
     struct priv *p = f->priv;
     D3D11_TEXTURE2D_DESC desc = {
@@ -3211,12 +3440,11 @@ static bool create_shader_texture_resource(
         .Format = format,
         .SampleDesc = { .Count = 1 },
         .Usage = D3D11_USAGE_DEFAULT,
-        .BindFlags = D3D11_BIND_SHADER_RESOURCE |
-                     D3D11_BIND_UNORDERED_ACCESS,
+        .BindFlags = bind_flags,
     };
     HRESULT hr = ID3D11Device_CreateTexture2D(
         p->device, &desc, NULL, &resource->texture);
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(hr) && (bind_flags & D3D11_BIND_UNORDERED_ACCESS)) {
         hr = ID3D11Device_CreateUnorderedAccessView(
             p->device, (ID3D11Resource *)resource->texture,
             NULL, &resource->uav);
@@ -3232,6 +3460,64 @@ static bool create_shader_texture_resource(
                (unsigned)format, width, height, (unsigned long)hr);
         return false;
     }
+    return true;
+}
+
+static bool create_robust_pair_cache(struct mp_filter *f,
+                                     struct robust_pair_cache *cache,
+                                     UINT width, UINT height)
+{
+    struct priv *p = f->priv;
+    bool textures_ok = create_shader_texture_resource(
+        f, &cache->flow_forward, width, height, DXGI_FORMAT_R16G16_SINT,
+        D3D11_BIND_SHADER_RESOURCE) &&
+        create_shader_texture_resource(
+            f, &cache->flow_backward, width, height,
+            DXGI_FORMAT_R16G16_SINT, D3D11_BIND_SHADER_RESOURCE) &&
+        create_shader_texture_resource(
+            f, &cache->cost_forward, width, height, DXGI_FORMAT_R8_UINT,
+            D3D11_BIND_SHADER_RESOURCE) &&
+        create_shader_texture_resource(
+            f, &cache->cost_backward, width, height, DXGI_FORMAT_R8_UINT,
+            D3D11_BIND_SHADER_RESOURCE);
+    if (!textures_ok) {
+        release_robust_pair_cache(cache);
+        return false;
+    }
+
+    const uint32_t zero_state[ROBUST_SCENE_STATE_COUNT] = {0};
+    D3D11_SUBRESOURCE_DATA initial_data = {
+        .pSysMem = zero_state,
+    };
+    D3D11_BUFFER_DESC buffer_desc = {
+        .ByteWidth = ROBUST_SCENE_STATE_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    HRESULT hr = ID3D11Device_CreateBuffer(
+        p->device, &buffer_desc, &initial_data, &cache->scene_state_buffer);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .ViewDimension = D3D11_SRV_DIMENSION_BUFFER,
+        .Buffer = {
+            .FirstElement = 0,
+            .NumElements = ROBUST_SCENE_STATE_COUNT,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device, (ID3D11Resource *)cache->scene_state_buffer,
+            &srv_desc, &cache->scene_state_srv);
+    }
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF robust temporal scene cache creation failed "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        release_robust_pair_cache(cache);
+        return false;
+    }
+    cache->valid = false;
     return true;
 }
 
@@ -3325,10 +3611,17 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
     if (resources_ok && p->opts->stage6_robust_test) {
         resources_ok = create_shader_texture_resource(
             f, &p->nvof.occupancy[0], width, height,
-            DXGI_FORMAT_R32_UINT) &&
+            DXGI_FORMAT_R32_UINT,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS) &&
             create_shader_texture_resource(
                 f, &p->nvof.occupancy[1], width, height,
-                DXGI_FORMAT_R32_UINT);
+                DXGI_FORMAT_R32_UINT,
+                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+        for (int n = 0;
+             resources_ok && n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++) {
+            resources_ok = create_robust_pair_cache(
+                f, &p->nvof.pair_cache[n], width, height);
+        }
     }
     if (resources_ok && p->opts->nvof_completion_diagnostics) {
         D3D11_TEXTURE2D_DESC readback_desc = {
@@ -3697,9 +3990,10 @@ static bool read_robust_scene_summary(struct mp_filter *f)
         p->context,
         (ID3D11Resource *)p->nvof.robust_scene_summary_readback, 0);
     unlock_d3d11_context(p);
-    if (p->nvof.scene_cut_pairs != p->synthesized_frames) {
-        MP_ERR(f, "NVOF robust scene summary mismatch pairs=%llu "
-                  "synthesized=%llu\n",
+    if (p->nvof.scene_cut_pairs < p->synthesized_frames ||
+        p->nvof.scene_cut_pairs > p->synthesized_frames + 1) {
+        MP_ERR(f, "NVOF robust scene summary mismatch analyzed=%llu "
+                  "synthesized=%llu lookahead-limit=1\n",
                (unsigned long long)p->nvof.scene_cut_pairs,
                (unsigned long long)p->synthesized_frames);
         return false;
@@ -4113,11 +4407,13 @@ static bool prepare_and_infill_flows(struct mp_filter *f)
     return true;
 }
 
-static bool prepare_robust_occupancy_masks(struct mp_filter *f)
+static bool prepare_robust_occupancy_masks(
+    struct mp_filter *f, ID3D11ShaderResourceView *flow_forward,
+    ID3D11ShaderResourceView *flow_backward)
 {
     struct priv *p = f->priv;
     if (!p->nvof.robust_occupancy_shader ||
-        !p->nvof.flow_forward.srv || !p->nvof.flow_backward.srv ||
+        !flow_forward || !flow_backward ||
         !p->nvof.occupancy[0].uav || !p->nvof.occupancy[0].srv ||
         !p->nvof.occupancy[1].uav || !p->nvof.occupancy[1].srv) {
         MP_ERR(f, "NVOF robust occupancy resources are incomplete\n");
@@ -4126,8 +4422,8 @@ static bool prepare_robust_occupancy_masks(struct mp_filter *f)
 
     const UINT clear_value[4] = {0};
     ID3D11ShaderResourceView *srvs[] = {
-        p->nvof.flow_forward.srv,
-        p->nvof.flow_backward.srv,
+        flow_forward,
+        flow_backward,
     };
     ID3D11UnorderedAccessView *uavs[] = {
         p->nvof.occupancy[0].uav,
@@ -4266,11 +4562,6 @@ static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
         }
     }
     p->nvof.disable_temporal_hints_next = false;
-    if (p->opts->stage6_robust_test &&
-        !prepare_robust_occupancy_masks(f)) {
-        p->nvof.disable_temporal_hints_next = true;
-        return false;
-    }
     if (p->opts->stage5_flow_infill_test &&
         !prepare_and_infill_flows(f)) {
         p->nvof.disable_temporal_hints_next = true;
@@ -4289,6 +4580,89 @@ static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
                 p->nvof.execute_max_ms,
                 temporal_hints_disabled ? "disabled" : "enabled");
     }
+    return true;
+}
+
+static struct robust_pair_views active_robust_pair_views(struct priv *p)
+{
+    return (struct robust_pair_views) {
+        .flow_forward = p->nvof.flow_forward.srv,
+        .flow_backward = p->nvof.flow_backward.srv,
+        .cost_forward = p->nvof.cost_forward.srv,
+        .cost_backward = p->nvof.cost_backward.srv,
+        .scene_state = p->nvof.robust_scene_state_srv,
+    };
+}
+
+static struct robust_pair_views cached_robust_pair_views(
+    struct priv *p, int slot)
+{
+    if (slot < 0 || slot >= MP_ARRAY_SIZE(p->nvof.pair_cache) ||
+        !p->nvof.pair_cache[slot].valid)
+        return (struct robust_pair_views) {0};
+    struct robust_pair_cache *cache = &p->nvof.pair_cache[slot];
+    return (struct robust_pair_views) {
+        .flow_forward = cache->flow_forward.srv,
+        .flow_backward = cache->flow_backward.srv,
+        .cost_forward = cache->cost_forward.srv,
+        .cost_backward = cache->cost_backward.srv,
+        .scene_state = cache->scene_state_srv,
+    };
+}
+
+static bool robust_pair_views_ready(const struct robust_pair_views *views)
+{
+    return views->flow_forward && views->flow_backward &&
+           views->cost_forward && views->cost_backward &&
+           views->scene_state;
+}
+
+static int select_free_robust_cache_slot(struct priv *p)
+{
+    for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++) {
+        if (n != p->previous_cache_slot && n != p->central_cache_slot)
+            return n;
+    }
+    return -1;
+}
+
+static bool preserve_active_robust_pair(struct mp_filter *f, int slot)
+{
+    struct priv *p = f->priv;
+    if (slot < 0 || slot >= MP_ARRAY_SIZE(p->nvof.pair_cache)) {
+        MP_ERR(f, "NVOF robust temporal cache slot is invalid slot=%d\n",
+               slot);
+        return false;
+    }
+    struct robust_pair_cache *cache = &p->nvof.pair_cache[slot];
+    struct robust_pair_views active = active_robust_pair_views(p);
+    if (!robust_pair_views_ready(&active) ||
+        !cache->flow_forward.texture || !cache->flow_backward.texture ||
+        !cache->cost_forward.texture || !cache->cost_backward.texture ||
+        !cache->scene_state_buffer) {
+        MP_ERR(f, "NVOF robust temporal cache resources are incomplete "
+                  "slot=%d\n", slot);
+        return false;
+    }
+
+    lock_d3d11_context(p);
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)cache->flow_forward.texture,
+        (ID3D11Resource *)p->nvof.flow_forward.texture);
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)cache->flow_backward.texture,
+        (ID3D11Resource *)p->nvof.flow_backward.texture);
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)cache->cost_forward.texture,
+        (ID3D11Resource *)p->nvof.cost_forward.texture);
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)cache->cost_backward.texture,
+        (ID3D11Resource *)p->nvof.cost_backward.texture);
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)cache->scene_state_buffer,
+        (ID3D11Resource *)p->nvof.robust_scene_state_buffer);
+    unlock_d3d11_context(p);
+    cache->valid = true;
     return true;
 }
 
@@ -4804,24 +5178,33 @@ static bool copy_frame(struct mp_filter *f, struct mp_image *out,
 
 static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
                                   struct mp_image *frame0,
-                                  struct mp_image *frame1)
+                                  struct mp_image *frame1,
+                                  const struct robust_synthesis_context *context)
 {
     struct priv *p = f->priv;
+    struct robust_pair_views active = active_robust_pair_views(p);
+    const struct robust_pair_views *central = p->opts->stage6_robust_test
+        ? context ? &context->central : NULL
+        : &active;
     bool flow_resources_ready = p->opts->stage5_flow_infill_test
         ? p->nvof.flow_state_forward[FLOW_INFILL_FINAL_INDEX].srv &&
           p->nvof.flow_state_backward[FLOW_INFILL_FINAL_INDEX].srv
-        : p->nvof.flow_forward.srv && p->nvof.flow_backward.srv &&
-          p->nvof.cost_forward.srv && p->nvof.cost_backward.srv;
+        : central && robust_pair_views_ready(central);
     bool scene_resources_ready = p->opts->stage6_robust_test
-        ? p->nvof.robust_scene_state_srv &&
+        ? context && central && central->scene_state &&
           p->nvof.occupancy[0].srv && p->nvof.occupancy[1].srv &&
-          p->nvof.robust_synthesis_summary_uav
+          p->nvof.robust_synthesis_summary_uav &&
+          p->nvof.robust_temporal_constants_buffer
         : p->nvof.scene_cut_srv && p->nvof.scene_cut_summary_uav;
     if (!p->nvof.synthesize_p010_shader || !flow_resources_ready ||
         !scene_resources_ready) {
         MP_ERR(f, "NVOF P010 synthesis resources are incomplete\n");
         return false;
     }
+    if (p->opts->stage6_robust_test &&
+        !prepare_robust_occupancy_masks(
+            f, central->flow_forward, central->flow_backward))
+        return false;
 
     ID3D11Texture2D *textures[] = {
         (ID3D11Texture2D *)frame0->planes[0],
@@ -4919,7 +5302,7 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         return false;
     }
 
-    ID3D11ShaderResourceView *srvs[11] = {
+    ID3D11ShaderResourceView *srvs[15] = {
         (ID3D11ShaderResourceView *)input_views[0],
         (ID3D11ShaderResourceView *)input_views[1],
         (ID3D11ShaderResourceView *)input_views[2],
@@ -4931,17 +5314,25 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         srvs[5] = p->nvof.flow_state_backward[
             FLOW_INFILL_FINAL_INDEX].srv;
     } else {
-        srvs[4] = p->nvof.flow_forward.srv;
-        srvs[5] = p->nvof.flow_backward.srv;
-        srvs[6] = p->nvof.cost_forward.srv;
-        srvs[7] = p->nvof.cost_backward.srv;
+        srvs[4] = central->flow_forward;
+        srvs[5] = central->flow_backward;
+        srvs[6] = central->cost_forward;
+        srvs[7] = central->cost_backward;
     }
     srvs[8] = p->opts->stage6_robust_test
-        ? p->nvof.robust_scene_state_srv
+        ? central->scene_state
         : p->nvof.scene_cut_srv;
     if (p->opts->stage6_robust_test) {
         srvs[9] = p->nvof.occupancy[0].srv;
         srvs[10] = p->nvof.occupancy[1].srv;
+        const struct robust_pair_views *previous =
+            context->previous_available ? &context->previous : central;
+        const struct robust_pair_views *next =
+            context->next_available ? &context->next : central;
+        srvs[11] = previous->flow_backward;
+        srvs[12] = next->flow_forward;
+        srvs[13] = previous->scene_state;
+        srvs[14] = next->scene_state;
     }
     ID3D11UnorderedAccessView *uavs[] = {
         (ID3D11UnorderedAccessView *)output_views[0],
@@ -4951,6 +5342,20 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
             : p->nvof.scene_cut_summary_uav,
     };
     lock_d3d11_context(p);
+    ID3D11Buffer *temporal_constants_buffer =
+        p->nvof.robust_temporal_constants_buffer;
+    if (p->opts->stage6_robust_test) {
+        const struct robust_temporal_constants temporal_constants = {
+            .previous_available = context->previous_available ? 1 : 0,
+            .next_available = context->next_available ? 1 : 0,
+        };
+        ID3D11DeviceContext_UpdateSubresource(
+            p->context,
+            (ID3D11Resource *)temporal_constants_buffer,
+            0, NULL, &temporal_constants, 0, 0);
+        ID3D11DeviceContext_CSSetConstantBuffers(
+            p->context, 0, 1, &temporal_constants_buffer);
+    }
     struct gpu_profile_token profile = gpu_profile_begin_locked(
         p, GPU_PROFILE_SYNTH);
     ID3D11DeviceContext_CSSetShader(
@@ -4968,6 +5373,11 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         p->context, 0, MP_ARRAY_SIZE(null_srvs), null_srvs);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(
         p->context, 0, MP_ARRAY_SIZE(null_uavs), null_uavs, NULL);
+    if (p->opts->stage6_robust_test) {
+        ID3D11Buffer *null_constant_buffer = NULL;
+        ID3D11DeviceContext_CSSetConstantBuffers(
+            p->context, 0, 1, &null_constant_buffer);
+    }
     ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
     gpu_profile_end_locked(p, profile);
     unlock_d3d11_context(p);
@@ -5018,11 +5428,13 @@ static bool write_copied_frame(struct mp_filter *f, struct mp_image *source,
 static bool write_synthesized_frame(struct mp_filter *f,
                                     struct mp_image *frame0,
                                     struct mp_image *frame1,
-                                    double pts, double duration)
+                                    double pts, double duration,
+                                    const struct robust_synthesis_context *context)
 {
     struct priv *p = f->priv;
     struct mp_image *out = allocate_output(f, frame0);
-    if (!out || !synthesize_p010_frame(f, out, frame0, frame1)) {
+    if (!out || !synthesize_p010_frame(
+                    f, out, frame0, frame1, context)) {
         talloc_free(out);
         fail_filter(f);
         return false;
@@ -5079,12 +5491,20 @@ static void clear_timing_state(struct priv *p)
 {
     mp_image_unrefp(&p->frame0);
     mp_image_unrefp(&p->frame1);
+    mp_image_unrefp(&p->frame2);
+    mp_image_unrefp(&p->pending_frame);
     p->output_phase = OUTPUT_NONE;
     p->pair_duration = 0;
+    p->next_pair_duration = 0;
+    p->previous_cache_slot = -1;
+    p->central_cache_slot = -1;
+    p->flush_pair_after_midpoint = false;
     p->input_eof = false;
     p->output_eof_sent = false;
     p->nvof.disable_temporal_hints_next = true;
     p->robust_scene_history_reset_pending = true;
+    for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++)
+        p->nvof.pair_cache[n].valid = false;
 }
 
 static bool valid_pair(struct mp_filter *f, struct mp_image *frame0,
@@ -5135,7 +5555,7 @@ static bool emit_stage2_frame(struct mp_filter *f)
     bool wrote = phase == OUTPUT_INTERMEDIATE_TEST &&
                   synthesis_enabled(p)
                ? write_synthesized_frame(f, p->frame0, p->frame1,
-                                          pts, duration)
+                                          pts, duration, NULL)
                : write_copied_frame(f, source, pts, duration, true);
     if (!wrote)
         return false;
@@ -5249,10 +5669,242 @@ static void process_stage2(struct mp_filter *f)
     emit_stage2_frame(f);
 }
 
+static void invalidate_robust_temporal_context(struct priv *p)
+{
+    p->previous_cache_slot = -1;
+    p->central_cache_slot = -1;
+    for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++)
+        p->nvof.pair_cache[n].valid = false;
+    p->nvof.disable_temporal_hints_next = true;
+    p->robust_scene_history_reset_pending = true;
+}
+
+static bool build_robust_synthesis_context(
+    struct mp_filter *f, struct robust_synthesis_context *context)
+{
+    struct priv *p = f->priv;
+    *context = (struct robust_synthesis_context) {0};
+    context->previous = cached_robust_pair_views(
+        p, p->previous_cache_slot);
+    context->previous_available = robust_pair_views_ready(
+        &context->previous);
+    if (p->central_cache_slot >= 0) {
+        context->central = cached_robust_pair_views(
+            p, p->central_cache_slot);
+        context->next = active_robust_pair_views(p);
+        context->next_available = p->frame2 &&
+            robust_pair_views_ready(&context->next);
+    } else {
+        context->central = active_robust_pair_views(p);
+    }
+    if (!robust_pair_views_ready(&context->central)) {
+        MP_ERR(f, "NVOF robust temporal central pair is unavailable "
+                  "previous-slot=%d central-slot=%d lookahead=%s\n",
+               p->previous_cache_slot, p->central_cache_slot,
+               p->frame2 ? "yes" : "no");
+        return false;
+    }
+    return true;
+}
+
+static bool emit_stage6_frame(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    struct mp_image *source = p->frame0;
+    mp_assert(source);
+
+    enum output_phase phase = p->output_phase;
+    double pts = source->pts;
+    double duration = source->pkt_duration;
+    if (phase == OUTPUT_ORIGINAL || phase == OUTPUT_INTERMEDIATE_TEST) {
+        duration = p->pair_duration / 2.0;
+        if (phase == OUTPUT_INTERMEDIATE_TEST)
+            pts += duration;
+    }
+
+    bool wrote = false;
+    if (phase == OUTPUT_INTERMEDIATE_TEST) {
+        struct robust_synthesis_context context;
+        if (!p->frame1 || !build_robust_synthesis_context(f, &context)) {
+            fail_filter(f);
+            return false;
+        }
+        wrote = write_synthesized_frame(
+            f, p->frame0, p->frame1, pts, duration, &context);
+    } else {
+        wrote = write_copied_frame(f, source, pts, duration, true);
+    }
+    if (!wrote)
+        return false;
+
+    if (phase == OUTPUT_ORIGINAL) {
+        p->original_frames++;
+        p->output_phase = OUTPUT_INTERMEDIATE_TEST;
+    } else if (phase == OUTPUT_INTERMEDIATE_TEST) {
+        p->intermediate_test_frames++;
+        mp_image_unrefp(&p->frame0);
+        p->frame0 = p->frame1;
+        p->frame1 = NULL;
+        if (p->flush_pair_after_midpoint) {
+            mp_assert(!p->frame2);
+            p->output_phase = OUTPUT_FINAL;
+            p->pair_duration = 0;
+        } else {
+            mp_assert(p->frame2);
+            mp_assert(p->central_cache_slot >= 0);
+            p->frame1 = p->frame2;
+            p->frame2 = NULL;
+            p->previous_cache_slot = p->central_cache_slot;
+            p->central_cache_slot = -1;
+            p->pair_duration = p->next_pair_duration;
+            p->next_pair_duration = 0;
+            p->output_phase = OUTPUT_NONE;
+        }
+        p->flush_pair_after_midpoint = false;
+    } else if (phase == OUTPUT_FINAL) {
+        p->original_frames++;
+        mp_image_unrefp(&p->frame0);
+        p->output_phase = OUTPUT_NONE;
+        p->pair_duration = 0;
+        p->next_pair_duration = 0;
+        invalidate_robust_temporal_context(p);
+        if (p->pending_frame) {
+            p->frame0 = p->pending_frame;
+            p->pending_frame = NULL;
+        }
+    } else {
+        MP_ASSERT_UNREACHABLE();
+    }
+    return true;
+}
+
+static bool copy_stage6_input(struct mp_filter *f, struct mp_image **in)
+{
+    struct mp_image *private_copy = copy_to_private_texture(f, *in);
+    talloc_free(*in);
+    *in = private_copy;
+    if (private_copy)
+        return true;
+    MP_ERR(f, "NVOF could not copy input to a private P010 analysis "
+              "texture mode=stage6-temporal\n");
+    fail_filter(f);
+    return false;
+}
+
+static void start_stage6_flush(struct mp_filter *f,
+                               struct mp_image *pending_frame)
+{
+    struct priv *p = f->priv;
+    p->pending_frame = pending_frame;
+    p->flush_pair_after_midpoint = p->frame1 != NULL;
+    p->output_phase = p->frame1 ? OUTPUT_ORIGINAL : OUTPUT_FINAL;
+    emit_stage6_frame(f);
+}
+
+static void process_stage6(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!mp_pin_in_needs_data(f->ppins[1]))
+        return;
+    if (p->output_phase != OUTPUT_NONE) {
+        emit_stage6_frame(f);
+        return;
+    }
+    if (p->input_eof) {
+        if (p->frame0) {
+            start_stage6_flush(f, NULL);
+        } else if (!p->output_eof_sent) {
+            p->output_eof_sent = true;
+            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_EOF, NULL));
+        }
+        return;
+    }
+    if (!mp_pin_out_request_data(f->ppins[0]))
+        return;
+
+    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+    if (frame.type == MP_FRAME_NONE)
+        return;
+    if (frame.type == MP_FRAME_EOF) {
+        p->input_eof = true;
+        if (p->frame0) {
+            start_stage6_flush(f, NULL);
+        } else {
+            p->output_eof_sent = true;
+            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_EOF, NULL));
+        }
+        return;
+    }
+    if (frame.type != MP_FRAME_VIDEO) {
+        MP_ERR(f, "NVOF MEMC stage 6 received unsupported frame type=%d\n",
+               frame.type);
+        mp_frame_unref(&frame);
+        fail_filter(f);
+        return;
+    }
+
+    struct mp_image *in = frame.data;
+    if (!validate_input(f, in)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->input_frames++;
+    if (!copy_stage6_input(f, &in))
+        return;
+    if (!p->frame0) {
+        p->frame0 = in;
+        mp_pin_out_request_data(f->ppins[0]);
+        return;
+    }
+
+    if (!p->frame1) {
+        double duration = 0;
+        if (!valid_pair(f, p->frame0, in, &duration)) {
+            start_stage6_flush(f, in);
+            return;
+        }
+        if (!execute_nvof_pair(f, p->frame0, in)) {
+            talloc_free(in);
+            fail_filter(f);
+            return;
+        }
+        p->frame1 = in;
+        p->pair_duration = duration;
+        mp_pin_out_request_data(f->ppins[0]);
+        return;
+    }
+
+    double next_duration = 0;
+    if (!valid_pair(f, p->frame1, in, &next_duration)) {
+        start_stage6_flush(f, in);
+        return;
+    }
+    int cache_slot = select_free_robust_cache_slot(p);
+    if (cache_slot < 0 || !preserve_active_robust_pair(f, cache_slot)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->central_cache_slot = cache_slot;
+    if (!execute_nvof_pair(f, p->frame1, in)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->frame2 = in;
+    p->next_pair_duration = next_duration;
+    p->flush_pair_after_midpoint = false;
+    p->output_phase = OUTPUT_ORIGINAL;
+    emit_stage6_frame(f);
+}
+
 static void process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
-    if (p->opts->stage2_timing_test || nvof_analysis_enabled(p))
+    if (p->opts->stage6_robust_test)
+        process_stage6(f);
+    else if (p->opts->stage2_timing_test || nvof_analysis_enabled(p))
         process_stage2(f);
     else
         process_stage1(f);
@@ -5453,7 +6105,9 @@ static void destroy(struct mp_filter *f)
                 p->nvof.robust_synthesis_totals[
                     ROBUST_SYNTHESIS_MEDIAN_CANDIDATE] +
                 p->nvof.robust_synthesis_totals[
-                    ROBUST_SYNTHESIS_BLOCK_CANDIDATE];
+                    ROBUST_SYNTHESIS_BLOCK_CANDIDATE] +
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE];
             if (synthesis_samples > 0) {
                 MP_INFO(f, "NVOF robust synthesis summary samples=%llu "
                            "source0/source1/blend/fallback="
@@ -5484,7 +6138,8 @@ static void destroy(struct mp_filter *f)
             }
             if (candidate_samples) {
                 MP_INFO(f, "NVOF robust candidate summary selected=%llu "
-                           "raw/median/block=%.2f/%.2f/%.2f%%\n",
+                           "raw/median/block/temporal="
+                           "%.2f/%.2f/%.2f/%.2f%%\n",
                         (unsigned long long)candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_RAW_CANDIDATE] /
@@ -5494,6 +6149,9 @@ static void destroy(struct mp_filter *f)
                             candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_BLOCK_CANDIDATE] /
+                            candidate_samples,
+                        100.0 * p->nvof.robust_synthesis_totals[
+                            ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE] /
                             candidate_samples);
             }
         } else {
@@ -5553,6 +6211,8 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
 
     struct priv *p = f->priv;
     p->opts = talloc_steal(p, options);
+    p->previous_cache_slot = -1;
+    p->central_cache_slot = -1;
     int mode_count = p->opts->stage1_passthrough +
                      p->opts->stage2_timing_test +
                      p->opts->stage3_nvof_test +
@@ -5599,7 +6259,8 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
                    "synthesis with native bidirectional OFA and GPU-resident "
                    "3x3 histogram, chroma, edge, exposure, and hysteresis "
                    "scene classification, forward-projected occupancy, "
-                   "fixed raw/median/block motion candidates, and "
+                   "fixed raw/median/block candidates, one-frame source "
+                   "lookahead, four-frame Hermite motion candidates, and "
                    "near-binary source arbitration; flow diffusion is "
                    "disabled and "
                    "unsupported formats or synthesis failures are fatal\n");
