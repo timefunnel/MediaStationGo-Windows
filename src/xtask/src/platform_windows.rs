@@ -1,5 +1,5 @@
 use crate::{BuildArgs, cef, fs as xfs, mpv};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub fn stage_cef(out: &Path, cef: &cef::Cef) -> Result<()> {
@@ -27,7 +27,7 @@ pub fn stage_mpv(out: &Path, mpv_info: &mpv::Mpv, used_external: bool, _bin: &Pa
         }
         let frame_interpolation = lib_dir.join("frame-interpolation");
         if frame_interpolation.exists() {
-            xfs::copy_dir_recursive(&frame_interpolation, &out.join("frame-interpolation"))?;
+            replace_frame_interpolation(&frame_interpolation, &out.join("frame-interpolation"))?;
         }
     }
     Ok(())
@@ -48,8 +48,17 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
         xfs::copy_glob(&dir.join("lib"), prefix, &["*.dll"])?;
         let frame_interpolation = dir.join("lib").join("frame-interpolation");
         if frame_interpolation.exists() {
-            xfs::copy_dir_recursive(&frame_interpolation, &prefix.join("frame-interpolation"))?;
+            replace_frame_interpolation(&frame_interpolation, &prefix.join("frame-interpolation"))?;
         }
     }
     Ok(prefix.to_path_buf())
+}
+
+fn replace_frame_interpolation(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst).with_context(|| {
+            format!("remove stale frame interpolation runtime {}", dst.display())
+        })?;
+    }
+    xfs::copy_dir_recursive(src, dst)
 }
