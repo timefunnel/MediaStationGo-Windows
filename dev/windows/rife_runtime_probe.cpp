@@ -13,6 +13,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -108,6 +114,272 @@ struct OutputValidation {
     bool p010_packed = false;
 };
 
+struct SequenceOutputMetrics {
+    double delta_from_frame0 = 0;
+    double delta_from_frame1 = 0;
+    double temporal_imbalance = 0;
+    double outside_endpoints_ratio = 0;
+};
+
+enum class FrameReadResult {
+    frame,
+    end,
+    partial,
+};
+
+size_t p010_frame_bytes(uint32_t width, uint32_t height)
+{
+    return static_cast<size_t>(width) * height * 3;
+}
+
+FrameReadResult read_p010_frame(std::ifstream &input,
+                                std::vector<uint8_t> &frame)
+{
+    input.read(reinterpret_cast<char *>(frame.data()),
+               static_cast<std::streamsize>(frame.size()));
+    const std::streamsize bytes_read = input.gcount();
+    if (bytes_read == static_cast<std::streamsize>(frame.size()))
+        return FrameReadResult::frame;
+    if (bytes_read == 0 && input.eof())
+        return FrameReadResult::end;
+    return FrameReadResult::partial;
+}
+
+bool upload_p010_frame(ID3D11DeviceContext *context,
+                       ID3D11Texture2D *texture,
+                       const std::vector<uint8_t> &frame,
+                       uint32_t width)
+{
+    context->UpdateSubresource(texture, 0, nullptr, frame.data(), width * 2,
+                               static_cast<UINT>(frame.size()));
+    return true;
+}
+
+bool create_readback_texture(ID3D11Device *device,
+                             ID3D11Texture2D *source,
+                             ComPtr<ID3D11Texture2D> &readback)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    return SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &readback));
+}
+
+bool write_p010_texture(ID3D11DeviceContext *context,
+                        ID3D11Texture2D *source,
+                        ID3D11Texture2D *readback,
+                        const std::vector<uint8_t> &frame0,
+                        const std::vector<uint8_t> &frame1,
+                        uint32_t width,
+                        uint32_t height,
+                        std::ofstream &output,
+                        SequenceOutputMetrics &metrics)
+{
+    context->CopyResource(readback, source);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped)))
+        return false;
+
+    const size_t row_bytes = static_cast<size_t>(width) * 2;
+    const uint32_t rows = height + height / 2;
+    for (uint32_t row = 0; row < rows; ++row) {
+        const auto *mapped_row = static_cast<const uint8_t *>(mapped.pData)
+                               + static_cast<size_t>(mapped.RowPitch) * row;
+        output.write(reinterpret_cast<const char *>(mapped_row),
+                     static_cast<std::streamsize>(row_bytes));
+    }
+
+    double delta0 = 0;
+    double delta1 = 0;
+    uint64_t outside = 0;
+    const uint64_t luma_samples = static_cast<uint64_t>(width) * height;
+    const auto *input0 = reinterpret_cast<const uint16_t *>(frame0.data());
+    const auto *input1 = reinterpret_cast<const uint16_t *>(frame1.data());
+    for (uint32_t y = 0; y < height; ++y) {
+        const auto *output_row = reinterpret_cast<const uint16_t *>(
+            static_cast<const uint8_t *>(mapped.pData)
+            + static_cast<size_t>(mapped.RowPitch) * y);
+        const size_t row_offset = static_cast<size_t>(y) * width;
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint16_t value0 = input0[row_offset + x] >> 6;
+            const uint16_t value1 = input1[row_offset + x] >> 6;
+            const uint16_t value = output_row[x] >> 6;
+            delta0 += std::abs(static_cast<int>(value)
+                               - static_cast<int>(value0));
+            delta1 += std::abs(static_cast<int>(value)
+                               - static_cast<int>(value1));
+            const uint16_t minimum = std::min(value0, value1);
+            const uint16_t maximum = std::max(value0, value1);
+            if (value + 2 < minimum || value > maximum + 2)
+                outside++;
+        }
+    }
+    context->Unmap(readback, 0);
+    if (!output)
+        return false;
+
+    metrics.delta_from_frame0 = delta0 / luma_samples;
+    metrics.delta_from_frame1 = delta1 / luma_samples;
+    const double total_delta = metrics.delta_from_frame0
+                             + metrics.delta_from_frame1;
+    metrics.temporal_imbalance = total_delta > 0
+        ? std::abs(metrics.delta_from_frame0 - metrics.delta_from_frame1)
+          / total_delta
+        : 0;
+    metrics.outside_endpoints_ratio = static_cast<double>(outside)
+                                    / luma_samples;
+    return true;
+}
+
+const char *scene_class_name(uint32_t classification)
+{
+    switch (classification) {
+    case RIFE_SCENE_NORMAL: return "normal";
+    case RIFE_SCENE_FLASH: return "flash";
+    case RIFE_SCENE_FADE_DISSOLVE: return "fade-dissolve";
+    case RIFE_SCENE_HARD_CUT: return "hard-cut";
+    case RIFE_SCENE_UNCERTAIN: return "uncertain";
+    default: return "invalid";
+    }
+}
+
+int run_sequence_probe(rife_runtime *runtime,
+                       ProcessFn process,
+                       GetStatsFn get_stats,
+                       ID3D11Device *device,
+                       ID3D11DeviceContext *context,
+                       ID3D11Texture2D *frame0,
+                       ID3D11Texture2D *frame1,
+                       ID3D11Texture2D *output_texture,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t fps_numerator,
+                       uint32_t fps_denominator,
+                       double start_pts,
+                       const wchar_t *input_path,
+                       const wchar_t *output_path,
+                       const wchar_t *csv_path)
+{
+    std::ifstream input(std::filesystem::path(input_path), std::ios::binary);
+    std::ofstream output(std::filesystem::path(output_path),
+                         std::ios::binary | std::ios::trunc);
+    std::ofstream csv(std::filesystem::path(csv_path), std::ios::trunc);
+    if (!input || !output || !csv) {
+        std::fprintf(stderr, "RIFE_SEQUENCE_FILE_OPEN_FAILED\n");
+        return 11;
+    }
+
+    const size_t frame_bytes = p010_frame_bytes(width, height);
+    std::vector<uint8_t> bytes0(frame_bytes);
+    std::vector<uint8_t> bytes1(frame_bytes);
+    if (read_p010_frame(input, bytes0) != FrameReadResult::frame) {
+        std::fprintf(stderr, "RIFE_SEQUENCE_FIRST_FRAME_MISSING\n");
+        return 12;
+    }
+    ComPtr<ID3D11Texture2D> readback;
+    if (!create_readback_texture(device, output_texture, readback)) {
+        std::fprintf(stderr, "RIFE_SEQUENCE_READBACK_CREATE_FAILED\n");
+        return 13;
+    }
+
+    csv << "pair,source0_pts,source1_pts,midpoint_pts,class,policy,"
+           "average_delta,changed_ratio,average_kl,regional_kl_max,"
+           "chroma_delta,edge_delta,exposure_delta,exposure_spread,"
+           "scene_ms,inference_ms,output_delta_f0,output_delta_f1,"
+           "temporal_imbalance,outside_endpoints_ratio\n";
+    csv << std::fixed << std::setprecision(6);
+
+    char error[1024]{};
+    uint64_t pairs = 0;
+    while (true) {
+        const FrameReadResult read = read_p010_frame(input, bytes1);
+        if (read == FrameReadResult::end)
+            break;
+        if (read == FrameReadResult::partial) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_PARTIAL_FRAME pair=%llu\n",
+                         static_cast<unsigned long long>(pairs));
+            return 14;
+        }
+        upload_p010_frame(context, frame0, bytes0, width);
+        upload_p010_frame(context, frame1, bytes1, width);
+        const double source0_pts = start_pts
+            + static_cast<double>(pairs) * fps_denominator / fps_numerator;
+        const double source1_pts = start_pts
+            + static_cast<double>(pairs + 1) * fps_denominator / fps_numerator;
+        rife_frame_diagnostics diagnostics{};
+        const int status = process(runtime, frame0, 0, frame1, 0,
+                                   output_texture, 0, source0_pts,
+                                   source1_pts, &diagnostics, error,
+                                   sizeof(error));
+        if (status != RIFE_RUNTIME_OK) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_PROCESS_FAILED pair=%llu status=%d "
+                         "detail=%s\n",
+                         static_cast<unsigned long long>(pairs), status,
+                         error);
+            return 15;
+        }
+        SequenceOutputMetrics output_metrics;
+        if (!write_p010_texture(context, output_texture, readback.Get(),
+                                bytes0, bytes1, width, height, output,
+                                output_metrics)) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_READBACK_FAILED pair=%llu\n",
+                         static_cast<unsigned long long>(pairs));
+            return 16;
+        }
+        csv << pairs << ',' << diagnostics.source0_pts << ','
+            << diagnostics.source1_pts << ',' << diagnostics.midpoint_pts
+            << ',' << scene_class_name(diagnostics.classification) << ','
+            << (diagnostics.scene_cut ? "copy-f0-hard-cut"
+                                      : "rife-midpoint")
+            << ',' << diagnostics.average_delta << ','
+            << diagnostics.changed_ratio << ',' << diagnostics.average_kl
+            << ',' << diagnostics.regional_kl_max << ','
+            << diagnostics.chroma_delta << ',' << diagnostics.edge_delta
+            << ',' << diagnostics.exposure_delta << ','
+            << diagnostics.exposure_spread << ',' << diagnostics.scene_ms
+            << ',' << diagnostics.inference_ms << ','
+            << output_metrics.delta_from_frame0 << ','
+            << output_metrics.delta_from_frame1 << ','
+            << output_metrics.temporal_imbalance << ','
+            << output_metrics.outside_endpoints_ratio << '\n';
+        if (!csv) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_CSV_WRITE_FAILED pair=%llu\n",
+                         static_cast<unsigned long long>(pairs));
+            return 17;
+        }
+        pairs++;
+        bytes0.swap(bytes1);
+    }
+    output.flush();
+    csv.flush();
+    if (pairs == 0 || !output || !csv) {
+        std::fprintf(stderr, "RIFE_SEQUENCE_OUTPUT_INCOMPLETE\n");
+        return 19;
+    }
+    rife_runtime_stats stats{};
+    if (get_stats(runtime, &stats) != RIFE_RUNTIME_OK) {
+        std::fprintf(stderr, "RIFE_SEQUENCE_STATS_FAILED\n");
+        return 20;
+    }
+    std::printf(
+        "RIFE_SEQUENCE_OK frames=%llu pairs=%llu inferred=%llu cuts=%llu "
+        "failures=%llu inference-p95=%.3fms scene-max=%.3fms\n",
+        static_cast<unsigned long long>(pairs + 1),
+        static_cast<unsigned long long>(pairs),
+        static_cast<unsigned long long>(stats.inferred_pairs),
+        static_cast<unsigned long long>(stats.scene_cuts),
+        static_cast<unsigned long long>(stats.failures),
+        stats.inference_p95_ms, stats.scene_max_ms);
+    return 0;
+}
+
 bool validate_p010_output(ID3D11Device *device, ID3D11DeviceContext *context,
                           ID3D11Texture2D *texture, uint32_t width,
                           uint32_t height, OutputValidation &validation)
@@ -161,21 +433,43 @@ bool validate_p010_output(ID3D11Device *device, ID3D11DeviceContext *context,
 
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc != 8) {
+    const bool sequence_mode = argc == 13
+        && std::wcscmp(argv[1], L"--sequence") == 0;
+    if (argc != 8 && !sequence_mode) {
         std::fprintf(stderr,
                      "usage: rife_runtime_probe.exe <runtime-dll> <engine> "
-                     "<cudart> <width> <height> <warmup> <iterations>\n");
+                     "<cudart> <width> <height> <warmup> <iterations>\n"
+                     "   or: rife_runtime_probe.exe --sequence "
+                     "<runtime-dll> <engine> <cudart> <width> <height> "
+                     "<fps-num> <fps-den> <start-pts> <input-p010> "
+                     "<midpoints-p010> <diagnostics-csv>\n");
         return 2;
     }
-    const uint32_t width = static_cast<uint32_t>(_wtoi(argv[4]));
-    const uint32_t height = static_cast<uint32_t>(_wtoi(argv[5]));
-    const int warmup = _wtoi(argv[6]);
-    const int iterations = _wtoi(argv[7]);
-    if (!width || !height || warmup < 1 || iterations < 1)
+    const int runtime_argument = sequence_mode ? 2 : 1;
+    const int engine_argument = sequence_mode ? 3 : 2;
+    const int cudart_argument = sequence_mode ? 4 : 3;
+    const int width_argument = sequence_mode ? 5 : 4;
+    const int height_argument = sequence_mode ? 6 : 5;
+    const uint32_t width = static_cast<uint32_t>(
+        _wtoi(argv[width_argument]));
+    const uint32_t height = static_cast<uint32_t>(
+        _wtoi(argv[height_argument]));
+    const int warmup = sequence_mode ? 0 : _wtoi(argv[6]);
+    const int iterations = sequence_mode ? 0 : _wtoi(argv[7]);
+    const uint32_t fps_numerator = sequence_mode
+        ? static_cast<uint32_t>(_wtoi(argv[7])) : 0;
+    const uint32_t fps_denominator = sequence_mode
+        ? static_cast<uint32_t>(_wtoi(argv[8])) : 0;
+    const double start_pts = sequence_mode ? std::wcstod(argv[9], nullptr)
+                                           : 0;
+    if (!width || !height
+        || (sequence_mode
+            ? !fps_numerator || !fps_denominator || start_pts < 0
+            : warmup < 1 || iterations < 1))
         return 2;
 
     HMODULE module = LoadLibraryExW(
-        argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        argv[runtime_argument], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!module) {
         std::fprintf(stderr,
                      "RIFE_RUNTIME_PROBE_LOAD_FAILED win32=%lu\n",
@@ -248,8 +542,8 @@ int wmain(int argc, wchar_t **argv)
         RIFE_RUNTIME_ABI_VERSION,
         device.Get(),
         context.Get(),
-        argv[2],
-        argv[3],
+        argv[engine_argument],
+        argv[cudart_argument],
         width,
         height,
         RIFE_COLOR_MATRIX_BT709,
@@ -266,6 +560,17 @@ int wmain(int argc, wchar_t **argv)
                      error);
         FreeLibrary(module);
         return 9;
+    }
+
+    if (sequence_mode) {
+        const int result = run_sequence_probe(
+            runtime, process, get_stats, device.Get(), context.Get(),
+            frame0.Get(), frame1.Get(), output.Get(), width, height,
+            fps_numerator, fps_denominator, start_pts, argv[10], argv[11],
+            argv[12]);
+        destroy(runtime);
+        FreeLibrary(module);
+        return result;
     }
 
     bool ok = true;

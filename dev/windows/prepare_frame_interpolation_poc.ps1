@@ -53,9 +53,9 @@ $PinnedAssets = @(
         Sha256 = "d07dae0a00cb8dbf4f00358f640f630ff5d933de44d27050e7acce4f31cc3560"
     },
     @{
-        Name = "rife_v4.25_lite.7z"
-        Url = "https://github.com/AmusementClub/vs-mlrt/releases/download/external-models/rife_v4.25_lite.7z"
-        Sha256 = "7d53e29fff5e67345b19f4ce97dfd1e34b490eedc752df2236904fda1a13842c"
+        Name = "rife_v4.26.7z"
+        Url = "https://github.com/AmusementClub/vs-mlrt/releases/download/external-models/rife_v4.26.7z"
+        Sha256 = "dfdabd84a2a3db773f87604b8cc255e94a6a72f13550d910ccd3b4ee2606cd4f"
     },
     @{
         Name = "onnxconverter_common-1.16.0-py2.py3-none-any.whl"
@@ -168,8 +168,8 @@ if ($CudaRuntimeDll) {
 & $SevenZip x -y "-o$PluginDir" (Join-Path $ArchiveDir "VSTRT-RTX-Windows-x64.v15.16.7z") | Out-Null
 & $SevenZip x -y "-o$ScriptDir" (Join-Path $ArchiveDir "scripts.v15.16.7z") | Out-Null
 $ModelExtract = Join-Path $RuntimeDir ".model"
-& $SevenZip x -y "-o$ModelExtract" (Join-Path $ArchiveDir "rife_v4.25_lite.7z") | Out-Null
-Copy-Item (Join-Path $ModelExtract "rife\rife_v4.25_lite.onnx") $ModelDir
+& $SevenZip x -y "-o$ModelExtract" (Join-Path $ArchiveDir "rife_v4.26.7z") | Out-Null
+Copy-Item (Join-Path $ModelExtract "rife\rife_v4.26.onnx") $ModelDir
 & $SevenZip x -y "-o$SitePackagesDir" (Join-Path $ArchiveDir "onnxconverter_common-1.16.0-py2.py3-none-any.whl") | Out-Null
 
 Copy-Item (Join-Path $MsysBin "python.exe") $BinDir
@@ -210,8 +210,8 @@ $Manifest = [ordered]@{
     backend = "TensorRT-RTX 1.4.0.76"
     cudaRuntime = if ($CudaRuntimeDll) { [System.IO.Path]::GetFileName($CudaRuntimeDll) } else { $null }
     cudaRuntimeSha256 = if ($CudaRuntimeDll) { (Get-FileHash -LiteralPath $CudaRuntimeDll -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
-    model = "RIFE v4.25 Lite"
-    modelSha256 = (Get-FileHash (Join-Path $ModelDir "rife_v4.25_lite.onnx") -Algorithm SHA256).Hash.ToLowerInvariant()
+    model = "RIFE v4.26"
+    modelSha256 = (Get-FileHash (Join-Path $ModelDir "rife_v4.26.onnx") -Algorithm SHA256).Hash.ToLowerInvariant()
     fp16 = $true
     cudaGraph = $true
     streams = 1

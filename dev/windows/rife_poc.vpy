@@ -113,7 +113,7 @@ else:
             width=inference_width,
             height=inference_height,
         )
-padding_multiple = 128
+padding_multiple = 64
 padded_width = ((inference_width + padding_multiple - 1) // padding_multiple) * padding_multiple
 padded_height = ((inference_height + padding_multiple - 1) // padding_multiple) * padding_multiple
 source_for_rife = core.std.AddBorders(
@@ -132,7 +132,7 @@ interpolated = RIFE(
     source_for_rife,
     multi=target_fps / source_fps,
     scale=scale,
-    model=RIFEModel.v4_25_lite,
+    model=RIFEModel.v4_26,
     backend=backend,
     video_player=True,
     _implementation=implementation,

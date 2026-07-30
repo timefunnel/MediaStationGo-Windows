@@ -27,7 +27,7 @@ if ($Implementation -eq 2 -and $Precision -ne "fp32") {
 }
 $TensorRtBin = Join-Path $RuntimeDir ".tensorrt\TensorRT-RTX-1.4.0.76\bin"
 $TensorRtExe = Join-Path $TensorRtBin "tensorrt_rtx.exe"
-$EngineDir = Join-Path $RuntimeDir "engines\poc-rife-v4_25-lite-impl${Implementation}-${Width}x${Height}-scale1_0-${Precision}"
+$EngineDir = Join-Path $RuntimeDir "engines\poc-rife-v4_26-impl${Implementation}-${Width}x${Height}-scale1_0-${Precision}"
 $Engines = @(Get-ChildItem -LiteralPath $EngineDir -Filter "*.engine" -File -ErrorAction SilentlyContinue)
 if (-not (Test-Path -LiteralPath $TensorRtExe)) {
     throw "TensorRT-RTX benchmark executable is missing: $TensorRtExe"
@@ -91,4 +91,4 @@ $GpuMemory = if ($GpuMemoryMatch.Success) {
 } else {
     "unknown"
 }
-Write-Host ("FRAME_INTERPOLATION_ENGINE_BENCHMARK_OK input={0}x{1} implementation={2} precision={3} model=RIFE-v4.25-lite backend=TensorRT-RTX cuda_graph=yes throughput={4:N2}qps p95={5:N2}ms required={6:N2}qps budget={7:N2}ms gpu_memory={8}MiB" -f $Width, $Height, $Implementation, $Precision, $Throughput, $P95Milliseconds, $RequiredPairFps, $MaximumP95Milliseconds, $GpuMemory) -ForegroundColor Green
+Write-Host ("FRAME_INTERPOLATION_ENGINE_BENCHMARK_OK input={0}x{1} implementation={2} precision={3} model=RIFE-v4.26 backend=TensorRT-RTX cuda_graph=yes throughput={4:N2}qps p95={5:N2}ms required={6:N2}qps budget={7:N2}ms gpu_memory={8}MiB" -f $Width, $Height, $Implementation, $Precision, $Throughput, $P95Milliseconds, $RequiredPairFps, $MaximumP95Milliseconds, $GpuMemory) -ForegroundColor Green

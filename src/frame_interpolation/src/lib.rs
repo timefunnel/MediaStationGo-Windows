@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 const RIFE_RUNTIME_ABI: u32 = 2;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
 const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
-const RIFE_MODEL: &str = "RIFE v4.25 Lite";
+const RIFE_MODEL: &str = "RIFE v4.26";
 const RIFE_TENSORRT_VERSION: &str = "1.4.0.76";
 const RIFE_SCALE: &str = "1.0";
 const RIFE_PRECISION: &str = "fp16";

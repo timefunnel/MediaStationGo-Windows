@@ -104,10 +104,10 @@ $PluginDir = Join-Path $RuntimeDir "vapoursynth\plugins"
 $ScriptDir = Join-Path $RuntimeDir "scripts"
 $EngineRoot = Join-Path $RuntimeDir "engines"
 $ScaleKey = $Scale.ToString("0.0", [System.Globalization.CultureInfo]::InvariantCulture).Replace(".", "_")
-$EngineDir = Join-Path $EngineRoot "poc-rife-v4_25-lite-impl${Implementation}-${InferenceWidth}x${InferenceHeight}-scale${ScaleKey}-${Precision}"
+$EngineDir = Join-Path $EngineRoot "poc-rife-v4_26-impl${Implementation}-${InferenceWidth}x${InferenceHeight}-scale${ScaleKey}-${Precision}"
 $Vspipe = Join-Path $BinDir "vspipe.exe"
 $PocScript = Join-Path $PSScriptRoot "rife_poc.vpy"
-$ModelPath = Join-Path $PluginDir "models\rife\rife_v4.25_lite.onnx"
+$ModelPath = Join-Path $PluginDir "models\rife\rife_v4.26.onnx"
 foreach ($Required in @($Vspipe, (Join-Path $BinDir "VSScript.dll"), (Join-Path $PluginDir "vstrt_rtx.dll"), (Join-Path $ScriptDir "vsmlrt.py"), $ModelPath)) {
     if (-not (Test-Path $Required)) {
         throw "Frame interpolation dependency is missing: $Required"
@@ -139,7 +139,7 @@ $env:MSGO_RIFE_PIPELINE = $Pipeline
 
 $ExistingEngines = @(Get-ChildItem -LiteralPath $EngineDir -Filter "*.engine" -File -ErrorAction SilentlyContinue)
 if ($ExistingEngines.Count -eq 0) {
-    Write-Host "FRAME_INTERPOLATION_ENGINE_BUILDING input=${Width}x${Height} inference=${InferenceWidth}x${InferenceHeight} scale=$Scale streams=$Streams implementation=$Implementation precision=$Precision pipeline=$Pipeline source=${SourceFps}fps target=${TargetFps}fps backend=TRT_RTX model=RIFE-v4.25-lite" -ForegroundColor Yellow
+    Write-Host "FRAME_INTERPOLATION_ENGINE_BUILDING input=${Width}x${Height} inference=${InferenceWidth}x${InferenceHeight} scale=$Scale streams=$Streams implementation=$Implementation precision=$Precision pipeline=$Pipeline source=${SourceFps}fps target=${TargetFps}fps backend=TRT_RTX model=RIFE-v4.26" -ForegroundColor Yellow
 } else {
     Write-Host "FRAME_INTERPOLATION_ENGINE_CACHE_PRESENT count=$($ExistingEngines.Count)" -ForegroundColor Cyan
 }

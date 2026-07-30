@@ -30,7 +30,7 @@ if (-not $CudaRuntimeDll) {
     $CudaRuntimeDll = $CudaRuntimeCandidates[0].FullName
 }
 if (-not $EnginePath) {
-    $EngineDir = Join-Path $RuntimeDir "engines\poc-rife-v4_25-lite-impl1-${Width}x${Height}-scale1_0-fp16"
+    $EngineDir = Join-Path $RuntimeDir "engines\poc-rife-v4_26-impl1-${Width}x${Height}-scale1_0-fp16"
     $Engines = @(Get-ChildItem -LiteralPath $EngineDir -Filter "*.engine" -File)
     if ($Engines.Count -ne 1) {
         throw "Expected exactly one 4K implementation 1 engine in $EngineDir"

@@ -27,7 +27,7 @@ $FrameInterpolationRuntimeDir = Join-Path $RepoRoot "third_party\frame-interpola
 $RifeRuntimeBuildDir = Join-Path $RepoRoot "build\rife-runtime"
 $NvofApiIncludeDir = Join-Path $RepoRoot "third_party\nvofapi\include"
 $RifeTensorRtVersion = "1.4.0.76"
-$RifeModelPath = Join-Path $FrameInterpolationRuntimeDir "vapoursynth\plugins\models\rife\rife_v4.25_lite.onnx"
+$RifeModelPath = Join-Path $FrameInterpolationRuntimeDir "vapoursynth\plugins\models\rife\rife_v4.26.onnx"
 $RifeEngineSpecs = @(
     @{ Width = 1920; Height = 1080 },
     @{ Width = 2304; Height = 1296 },
@@ -320,7 +320,7 @@ foreach ($Spec in $RifeEngineSpecs) {
     $Width = $Spec.Width
     $Height = $Spec.Height
     $SourceDir = Join-Path $FrameInterpolationRuntimeDir (
-        "engines\poc-rife-v4_25-lite-impl1-${Width}x${Height}-scale1_0-fp16")
+        "engines\poc-rife-v4_26-impl1-${Width}x${Height}-scale1_0-fp16")
     $Candidates = @(Get-ChildItem -LiteralPath $SourceDir -Filter "*.engine" -File -ErrorAction SilentlyContinue)
     if ($Candidates.Count -ne 1) {
         throw "Expected exactly one validated RIFE engine in $SourceDir, found $($Candidates.Count)"
@@ -346,7 +346,7 @@ $EngineManifest = [ordered]@{
     gpuUuid = $GpuUuid
     driverVersion = $DriverVersion
     tensorRtVersion = $RifeTensorRtVersion
-    model = "RIFE v4.25 Lite"
+    model = "RIFE v4.26"
     modelSha256 = $ModelSha256
     runtimeAbi = 2
     runtimeDll = "rife_runtime.dll"

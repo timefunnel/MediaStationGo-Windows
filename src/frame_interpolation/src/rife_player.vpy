@@ -57,7 +57,7 @@ else:
         range_s="full",
     )
 
-padding_multiple = 128
+padding_multiple = 64
 padded_width = ((source.width + padding_multiple - 1) // padding_multiple) * padding_multiple
 padded_height = ((source.height + padding_multiple - 1) // padding_multiple) * padding_multiple
 padded = core.std.AddBorders(
@@ -75,7 +75,7 @@ interpolated = RIFE(
     padded,
     multi=target_fps / source_fps,
     scale=params["scale"],
-    model=RIFEModel.v4_25_lite,
+    model=RIFEModel.v4_26,
     backend=backend,
     video_player=True,
 )

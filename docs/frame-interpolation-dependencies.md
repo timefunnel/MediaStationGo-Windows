@@ -10,7 +10,7 @@ third-party component notices and terms still apply to distributed artifacts.
 | VapourSynth | R65 (`mingw-w64-clang-x86_64-vapoursynth` 65-8) | LGPL-2.1-or-later; MSYS2 package metadata verified locally |
 | vs-mlrt scripts and VSTRT-RTX plugin | v15.16 | Used to prepare and validate engines; GPL-3.0 terms apply when these components are distributed |
 | TensorRT-RTX | 1.4.0.76, CUDA 13.2 build | NVIDIA proprietary SDK |
-| RIFE model | v4.25 Lite, implementation 1 ONNX | Supplied by the vs-mlrt external-models release |
+| RIFE model | v4.26, implementation 1 ONNX | Supplied by the vs-mlrt external-models release |
 | onnxconverter-common | 1.16.0 | Apache-2.0 |
 | CUDA Runtime | `cudart64_12.dll` from the prepared runtime | Required by the native D3D11/CUDA interoperability bridge |
 | Direct3D 11 / D3DCompiler | Windows system components | `d3dcompiler_47.dll` is probed explicitly at startup |
@@ -24,7 +24,8 @@ Development artifact hashes:
 
 - `VSTRT-RTX-Windows-x64.v15.16.7z`: `d2d311b09635d6681285aa4eb30030b953ed243b49c6d842c490d32c338ca303`
 - `scripts.v15.16.7z`: `d07dae0a00cb8dbf4f00358f640f630ff5d933de44d27050e7acce4f31cc3560`
-- `rife_v4.25_lite.7z`: `7d53e29fff5e67345b19f4ce97dfd1e34b490eedc752df2236904fda1a13842c`
+- `rife_v4.26.7z`: `dfdabd84a2a3db773f87604b8cc255e94a6a72f13550d910ccd3b4ee2606cd4f`
+- `rife_v4.26.onnx`: `af8392796b0ed769b8fcaeee0fbf5feee9c647d11a2575e50b620786f2536114`
 - `TensorRT-RTX-1.4.0.76-Windows-amd64-cuda-13.2-Release-external.zip`: `0a050b10158bbe286c90b55b23dffbd3d5096c626b2ee45eccf51322795a3c29`
 - `onnxconverter_common-1.16.0-py2.py3-none-any.whl`: `df39ee96f17fff119dff10dd245467651b60b9e8a96020eb93402239794852f7`
 
@@ -55,38 +56,66 @@ engine key, and engine SHA-256 at startup. The currently staged engines are
 therefore valid only for the GPU and driver that built them; another machine or
 driver requires an explicit engine rebuild.
 
-vs-mlrt v15.16 rejects `scale != 1.0` for RIFE v4.25 Lite in `RIFEMerge`.
+vs-mlrt v15.16 rejects `scale != 1.0` for RIFE v4.26 in `RIFEMerge`.
 The native runtime keeps the same full-resolution constraint and does not tile.
 
 ## Native mpv validation
 
-The native filter has been exercised through the real mpv decode, filter, and
-`gpu-next` D3D11 output chain on the RTX 5070 Ti reference machine. Timings
-below are runtime p95 values after the first engine warm-up outlier.
+The native D3D11 runtime has been exercised on the RTX 5070 Ti reference
+machine. Timings below include P010 conversion, D3D11/CUDA sharing, inference,
+output conversion, and synchronization after the first engine warm-up outlier.
 
 | Source | Midpoints | Result | Inference p95 | Decoded / filter output |
 | --- | ---: | --- | ---: | --- |
-| 1920x1080 SDR 23.976 FPS | 6 | 6 inferred, 0 failed | short warm-up run | D3D11 NV12 promoted to P010 |
-| 2560x1440 SDR 23.976 FPS | 21 | 21 inferred, 0 failed | 13.70 ms | D3D11 NV12 promoted to P010 |
-| 3840x2160 SDR 23.976 FPS | 21 | 21 inferred, 0 failed | 26.85 ms | D3D11 NV12 promoted to P010 |
-| 3840x2160 HDR10 23.976 FPS | 21 | 21 inferred, 0 failed | 26.73 ms | D3D11 P010, BT.2020/PQ/limited preserved |
+| 1920x1080 SDR real film | 58 | 58 inferred, 0 failed | 9.08 ms | 3 hard cuts copied from F0 |
+| 2304x1296 synthetic probe | 170 | 170 inferred, 0 failed | 13.54 ms | P010 packing verified |
+| 2560x1440 synthetic probe | 170 | 170 inferred, 0 failed | 16.38 ms | P010 packing verified |
+| 3840x2160 synthetic probe | 170 | 170 inferred, 0 failed | 40.29 ms | P010 packing verified |
+| 3840x2160 SDR real film, short product playback | 630 | 626 inferred, 0 failed | 37.89 ms | 4 hard cuts copied from F0 |
 
 Additional focused checks:
 
-- A synthetic hard cut produced 23 pairs, detected exactly one cut, copied F0
-  for that midpoint, inferred the other 22 pairs, and reported no failure.
+- The real-film sequence at approximately 31:00 produced 61 pairs, detected
+  exactly three hard cuts, copied F0 for those midpoints, inferred the other 58
+  pairs, and reported no failure.
 - Two exact seeks triggered two filter resets. Playback resumed after each
   reset and completed 80/80 midpoint inferences without failure.
-- The packaged application recognized the RTX 5070 Ti, driver 610.74,
-  TensorRT-RTX 1.4.0.76, RIFE v4.25 Lite, and all four keyed engines.
+- The short 4K product playback initialized the runtime in 7.27 seconds and
+  logged 626 inferred midpoint samples with a 34.35 ms average. This sample is
+  about 26 seconds long and does not replace the required 10-minute test.
+- A repeat after the final product rebuild logged 216 inferred midpoints with
+  no failure, a 34.33 ms average, and a 41.25 ms p95. That p95 leaves only
+  0.42 ms below the 41.67 ms interval of an exact 24 FPS source.
 
-The 4K p95 is below the 41.7 ms source-frame interval required for 23.976 to
-47.952 FPS strict x2 output, so the short PoC has enough steady-state inference
-throughput. First-use engine initialization still produces a visible startup
-cost and the current evidence is based on short synthetic clips. Long-form
-real-film playback, subtitle composition, audio/video drift, display cadence,
-thermal stability, and recovery after repeated seeks still require explicit
-acceptance testing before calling 4K production-stable.
+The 4K p95 is only 1.42 ms below the 41.71 ms source-frame interval required for
+23.976 to 47.952 FPS strict x2 output. It passes the short steady-state probe but
+does not have enough margin to call 4K production-stable. First-use engine
+initialization still produces a visible startup cost. Long-form real-film
+playback, subtitle composition, audio/video drift, display cadence, thermal
+stability, and recovery after repeated seeks still require explicit acceptance
+testing.
+
+## Real-film quality comparison
+
+The active model was changed from v4.25 Lite to v4.26 after comparing both the
+official vs-mlrt graph and the native runtime on 62 consecutive 1920x1080 P010
+frames around 31:00 of a 23.976 FPS SDR film. The Lite result was not a native
+tensor-layout defect: official and native Lite outputs showed the same temporal
+bias toward F0.
+
+| Pair | Model / path | Delta to F0 | Delta to F1 | Temporal imbalance |
+| ---: | --- | ---: | ---: | ---: |
+| 34 | v4.25 Lite native | 6.406 | 15.546 | 0.416 |
+| 34 | v4.26 native | 10.279 | 11.115 | 0.039 |
+| 34 | v4.26 official | 10.408 | 10.374 | 0.002 |
+| 48 | v4.25 Lite native | 6.950 | 16.717 | 0.413 |
+| 48 | v4.26 native | 10.276 | 10.111 | 0.008 |
+| 48 | v4.26 official | 10.394 | 9.694 | 0.035 |
+
+The native v4.26 output differs from the official v4.26 output by an average of
+2.56 luma codes out of 1023 across normal pairs. This remaining difference is
+consistent with the native P010/RGB shader conversion versus the reference
+zimg conversion; it does not reproduce the Lite temporal bias.
 
 ## Earlier isolated probe
 

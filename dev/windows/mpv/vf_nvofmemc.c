@@ -691,7 +691,7 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
         return false;
     }
     MP_INFO(f, "RIFE runtime initialized source=%dx%d format=P010 "
-               "matrix=%d range=%s model=v4.25-lite implementation=1 "
+               "matrix=%d range=%s model=v4.26 implementation=1 "
                "backend=TensorRT-RTX FP16 strict-x2 cache=%s "
                "init-ms=%.3f reuses=%llu\n",
             frame->w, frame->h, matrix,
