@@ -68,7 +68,7 @@ enum output_phase {
 #define ROBUST_SCENE_STATE_COUNT 11
 #define ROBUST_SCENE_METRIC_COUNT 7
 #define ROBUST_SCENE_SUMMARY_COUNT 41
-#define ROBUST_SYNTHESIS_COUNTER_COUNT 14
+#define ROBUST_SYNTHESIS_COUNTER_COUNT 19
 #define ROBUST_TEMPORAL_CACHE_COUNT 2
 #define GPU_PROFILE_RING_SIZE 16
 #define GPU_PROFILE_BUCKET_COUNT 2001
@@ -132,6 +132,11 @@ enum robust_synthesis_counter {
     ROBUST_SYNTHESIS_OCCUPANCY1_COLLISION,
     ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE,
     ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE,
+    ROBUST_SYNTHESIS_OWNER0_MATCH,
+    ROBUST_SYNTHESIS_OWNER1_MATCH,
+    ROBUST_SYNTHESIS_OWNER0_REJECT,
+    ROBUST_SYNTHESIS_OWNER1_REJECT,
+    ROBUST_SYNTHESIS_PROJECTED_OWNER_CANDIDATE,
 };
 
 _Static_assert(ROBUST_SCENE_STATE_COUNT ==
@@ -145,7 +150,7 @@ _Static_assert(ROBUST_SCENE_SUMMARY_COUNT ==
                ROBUST_SCENE_CLASS_COUNT * ROBUST_SCENE_METRIC_COUNT,
                "robust scene summary layout changed");
 _Static_assert(ROBUST_SYNTHESIS_COUNTER_COUNT ==
-               ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE + 1,
+               ROBUST_SYNTHESIS_PROJECTED_OWNER_CANDIDATE + 1,
                "robust synthesis summary layout changed");
 
 struct gpu_profile_query {
@@ -325,6 +330,7 @@ struct nvof_state {
     struct nvof_resource flow_state_forward[2];
     struct nvof_resource flow_state_backward[2];
     struct shader_texture_resource occupancy[2];
+    struct shader_texture_resource projected_owner[2];
     struct robust_pair_cache pair_cache[ROBUST_TEMPORAL_CACHE_COUNT];
     int width;
     int height;
@@ -423,7 +429,7 @@ static const char *gpu_profile_stage_name(enum gpu_profile_stage stage)
     case GPU_PROFILE_P010_COPY: return "p010-copy";
     case GPU_PROFILE_LUMA_EXTRACT: return "luma-extract";
     case GPU_PROFILE_SCENE_CUT: return "scene-cut";
-    case GPU_PROFILE_OCCUPANCY: return "occupancy";
+    case GPU_PROFILE_OCCUPANCY: return "projected-ownership";
     case GPU_PROFILE_FLOW_INFILL: return "flow-infill";
     case GPU_PROFILE_SYNTH: return "p010-synth";
     default: return "unknown";
@@ -1361,13 +1367,71 @@ static const char infill_flow_shader_source[] =
 static const char robust_occupancy_shader_source[] =
     "Texture2D<int2> flow0 : register(t0);\n"
     "Texture2D<int2> flow1 : register(t1);\n"
+    "Texture2D<uint> cost0 : register(t2);\n"
+    "Texture2D<uint> cost1 : register(t3);\n"
+    "Texture2D<float> y0 : register(t4);\n"
+    "Texture2D<float> y1 : register(t5);\n"
     "RWTexture2D<uint> occupancy0 : register(u0);\n"
     "RWTexture2D<uint> occupancy1 : register(u1);\n"
+    "RWTexture2D<uint> projected_owner0 : register(u2);\n"
+    "RWTexture2D<uint> projected_owner1 : register(u3);\n"
     "\n"
     "bool in_frame(float2 p, uint w, uint h)\n"
     "{\n"
     "    return p.x >= 0.0 && p.y >= 0.0 &&\n"
     "           p.x <= (float)w - 1.0 && p.y <= (float)h - 1.0;\n"
+    "}\n"
+    "\n"
+    "float sample_y(Texture2D<float> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp(p, float2(0.0, 0.0),\n"
+    "              float2((float)w - 1.0, (float)h - 1.0));\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = tex.Load(int3(a, 0));\n"
+    "    float v10 = tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float v01 = tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float v11 = tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);\n"
+    "}\n"
+    "\n"
+    "float projected_quality(Texture2D<int2> reverse_flow,\n"
+    "                        Texture2D<uint> primary_cost,\n"
+    "                        Texture2D<uint> reverse_cost,\n"
+    "                        Texture2D<float> primary_y,\n"
+    "                        Texture2D<float> reverse_y,\n"
+    "                        int2 source, float2 motion, uint w, uint h)\n"
+    "{\n"
+    "    float2 endpoint = (float2)source + motion;\n"
+    "    if (!in_frame(endpoint, w, h))\n"
+    "        return 0.0;\n"
+    "    int2 reverse_source = clamp((int2)round(endpoint), int2(0, 0),\n"
+    "        int2((int)w - 1, (int)h - 1));\n"
+    "    float2 reverse = (float2)reverse_flow.Load(\n"
+    "        int3(reverse_source, 0)) / 32.0;\n"
+    "    float threshold = 2.0 + 0.06 * length(motion);\n"
+    "    float consistency = saturate(\n"
+    "        1.0 - length(motion + reverse) / threshold);\n"
+    "    float cost = max(\n"
+    "        (float)(primary_cost.Load(int3(source, 0)) & 255),\n"
+    "        (float)(reverse_cost.Load(int3(reverse_source, 0)) & 255)) /\n"
+    "        255.0;\n"
+    "    float cost_confidence = 1.0 - cost;\n"
+    "    float photo_delta = abs(primary_y.Load(int3(source, 0)) -\n"
+    "        sample_y(reverse_y, endpoint, w, h)) * 255.0;\n"
+    "    float photo = saturate(1.0 - photo_delta / 24.0);\n"
+    "    return cost_confidence * cost_confidence *\n"
+    "        (0.60 * consistency * consistency + 0.40 * photo * photo);\n"
+    "}\n"
+    "\n"
+    "uint pack_projected_owner(int2 source, float quality)\n"
+    "{\n"
+    "    uint quality_code = max(1u,\n"
+    "        (uint)round(saturate(quality) * 255.0));\n"
+    "    return (quality_code << 24) |\n"
+    "           (((uint)source.y & 4095) << 12) |\n"
+    "           ((uint)source.x & 4095);\n"
     "}\n"
     "\n"
     "[numthreads(16, 16, 1)]\n"
@@ -1383,12 +1447,22 @@ static const char robust_occupancy_shader_source[] =
     "    if (in_frame(midpoint0, w, h)) {\n"
     "        int2 target0 = (int2)round(midpoint0);\n"
     "        InterlockedAdd(occupancy0[target0], 1);\n"
+    "        float quality0 = projected_quality(\n"
+    "            flow1, cost0, cost1, y0, y1, (int2)id.xy,\n"
+    "            forward, w, h);\n"
+    "        InterlockedMax(projected_owner0[target0],\n"
+    "            pack_projected_owner((int2)id.xy, quality0));\n"
     "    }\n"
     "    float2 backward = (float2)flow1.Load(int3(id.xy, 0)) / 32.0;\n"
     "    float2 midpoint1 = source + 0.5 * backward;\n"
     "    if (in_frame(midpoint1, w, h)) {\n"
     "        int2 target1 = (int2)round(midpoint1);\n"
     "        InterlockedAdd(occupancy1[target1], 1);\n"
+    "        float quality1 = projected_quality(\n"
+    "            flow0, cost1, cost0, y1, y0, (int2)id.xy,\n"
+    "            backward, w, h);\n"
+    "        InterlockedMax(projected_owner1[target1],\n"
+    "            pack_projected_owner((int2)id.xy, quality1));\n"
     "    }\n"
     "}\n";
 
@@ -1414,6 +1488,8 @@ static const char synthesize_p010_shader_source[] =
     "Texture2D<int2> next_flow_forward : register(t12);\n"
     "StructuredBuffer<uint> previous_scene_state : register(t13);\n"
     "StructuredBuffer<uint> next_scene_state : register(t14);\n"
+    "Texture2D<uint> projected_owner0 : register(t15);\n"
+    "Texture2D<uint> projected_owner1 : register(t16);\n"
     "cbuffer RobustTemporalContext : register(b0)\n"
     "{\n"
     "    uint temporal_previous_available;\n"
@@ -1838,11 +1914,61 @@ static const char synthesize_p010_shader_source[] =
     "    return source;\n"
     "}\n"
     "\n"
-    "float occupancy_confidence(uint count)\n"
+    "float2 unpack_projected_owner_source(uint packed)\n"
+    "{\n"
+    "    return float2((float)(packed & 4095),\n"
+    "                  (float)((packed >> 12) & 4095));\n"
+    "}\n"
+    "\n"
+    "float projected_layer_support(Texture2D<uint> owner_map,\n"
+    "                              Texture2D<int2> owner_flow,\n"
+    "                              float2 target, float2 source,\n"
+    "                              float2 implied, uint w, uint h)\n"
+    "{\n"
+    "    int2 owner_target = clamp((int2)round(target), int2(0, 0),\n"
+    "        int2((int)w - 1, (int)h - 1));\n"
+    "    uint packed = owner_map.Load(int3(owner_target, 0));\n"
+    "    if (packed == 0)\n"
+    "        return 0.0;\n"
+    "    float2 owner_source = unpack_projected_owner_source(packed);\n"
+    "    float owner_quality = (float)((packed >> 24) & 255) / 255.0;\n"
+    "    float spatial_threshold = 2.0 + 0.02 * length(implied);\n"
+    "    float spatial_match = saturate(1.0 -\n"
+    "        length(source - owner_source) / spatial_threshold);\n"
+    "    float2 owner_motion = sample_raw_flow(\n"
+    "        owner_flow, owner_source, w, h);\n"
+    "    float motion_threshold = 2.5 + 0.08 * length(implied);\n"
+    "    float motion_match = saturate(1.0 -\n"
+    "        length(implied - owner_motion) / motion_threshold);\n"
+    "    float layer_match = max(spatial_match, 0.90 * motion_match);\n"
+    "    return layer_match * layer_match *\n"
+    "        (0.65 + 0.35 * owner_quality);\n"
+    "}\n"
+    "\n"
+    "float projected_layer_support0(float2 target, float2 source,\n"
+    "                               uint w, uint h)\n"
+    "{\n"
+    "    float2 implied = 2.0 * (target - source);\n"
+    "    return projected_layer_support(projected_owner0, flow0, target,\n"
+    "                                   source, implied, w, h);\n"
+    "}\n"
+    "\n"
+    "float projected_layer_support1(float2 target, float2 source,\n"
+    "                               uint w, uint h)\n"
+    "{\n"
+    "    float2 implied = 2.0 * (target - source);\n"
+    "    return projected_layer_support(projected_owner1, flow1, target,\n"
+    "                                   source, implied, w, h);\n"
+    "}\n"
+    "\n"
+    "float occupancy_confidence(uint count, float layer_support)\n"
     "{\n"
     "    if (count == 0)\n"
     "        return 0.0;\n"
-    "    return count == 1 ? 1.0 : rsqrt((float)count);\n"
+    "    if (count == 1)\n"
+    "        return 1.0;\n"
+    "    float count_penalty = 0.85 + 0.15 * rsqrt((float)count);\n"
+    "    return (0.22 + 0.78 * layer_support) * count_penalty;\n"
     "}\n"
     "\n"
     "struct RobustCandidate\n"
@@ -1873,12 +1999,14 @@ static const char synthesize_p010_shader_source[] =
     "                            sample_y(y1, correspondent, w, h)) * 255.0;\n"
     "    float photo = saturate(1.0 - photo_delta / 24.0);\n"
     "    uint count = occupancy0.Load(int3((int2)round(target), 0));\n"
+    "    float layer_support = projected_layer_support0(\n"
+    "        target, source, w, h);\n"
     "    float cost_confidence = 1.0 - cost;\n"
     "    float motion_quality = 0.30 * model * model +\n"
     "                           0.45 * consistency * consistency +\n"
     "                           0.25 * photo;\n"
     "    return cost_confidence * cost_confidence * motion_quality *\n"
-    "           occupancy_confidence(count);\n"
+    "           occupancy_confidence(count, layer_support);\n"
     "}\n"
     "\n"
     "float robust_candidate_score1(float2 target, float2 source,\n"
@@ -1902,12 +2030,14 @@ static const char synthesize_p010_shader_source[] =
     "                            sample_y(y0, correspondent, w, h)) * 255.0;\n"
     "    float photo = saturate(1.0 - photo_delta / 24.0);\n"
     "    uint count = occupancy1.Load(int3((int2)round(target), 0));\n"
+    "    float layer_support = projected_layer_support1(\n"
+    "        target, source, w, h);\n"
     "    float cost_confidence = 1.0 - cost;\n"
     "    float motion_quality = 0.30 * model * model +\n"
     "                           0.45 * consistency * consistency +\n"
     "                           0.25 * photo;\n"
     "    return cost_confidence * cost_confidence * motion_quality *\n"
-    "           occupancy_confidence(count);\n"
+    "           occupancy_confidence(count, layer_support);\n"
     "}\n"
     "\n"
     "RobustCandidate evaluate_candidate0(float2 target, uint candidate,\n"
@@ -1927,6 +2057,38 @@ static const char synthesize_p010_shader_source[] =
     "    result.source = solve_candidate1(target, candidate, w, h);\n"
     "    result.score = robust_candidate_score1(target, result.source, w, h);\n"
     "    result.id = candidate;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "RobustCandidate evaluate_projected_owner_candidate0(\n"
+    "    float2 target, uint w, uint h)\n"
+    "{\n"
+    "    RobustCandidate result;\n"
+    "    int2 owner_target = clamp((int2)round(target), int2(0, 0),\n"
+    "        int2((int)w - 1, (int)h - 1));\n"
+    "    uint count = occupancy0.Load(int3(owner_target, 0));\n"
+    "    uint packed = projected_owner0.Load(int3(owner_target, 0));\n"
+    "    result.source = packed != 0\n"
+    "        ? unpack_projected_owner_source(packed) : target;\n"
+    "    result.score = count > 1 && packed != 0\n"
+    "        ? robust_candidate_score0(target, result.source, w, h) : 0.0;\n"
+    "    result.id = 5;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "RobustCandidate evaluate_projected_owner_candidate1(\n"
+    "    float2 target, uint w, uint h)\n"
+    "{\n"
+    "    RobustCandidate result;\n"
+    "    int2 owner_target = clamp((int2)round(target), int2(0, 0),\n"
+    "        int2((int)w - 1, (int)h - 1));\n"
+    "    uint count = occupancy1.Load(int3(owner_target, 0));\n"
+    "    uint packed = projected_owner1.Load(int3(owner_target, 0));\n"
+    "    result.source = packed != 0\n"
+    "        ? unpack_projected_owner_source(packed) : target;\n"
+    "    result.score = count > 1 && packed != 0\n"
+    "        ? robust_candidate_score1(target, result.source, w, h) : 0.0;\n"
+    "    result.id = 5;\n"
     "    return result;\n"
     "}\n"
     "\n"
@@ -1970,6 +2132,15 @@ static const char synthesize_p010_shader_source[] =
     "    return current;\n"
     "}\n"
     "\n"
+    "RobustCandidate better_projected_owner_candidate(\n"
+    "    RobustCandidate current, RobustCandidate candidate)\n"
+    "{\n"
+    "    float required = current.score * 1.03 + 0.004;\n"
+    "    if (candidate.score > required)\n"
+    "        return candidate;\n"
+    "    return current;\n"
+    "}\n"
+    "\n"
     "RobustCandidate better_temporal_candidate(RobustCandidate current,\n"
     "                                          RobustCandidate candidate)\n"
     "{\n"
@@ -1996,6 +2167,9 @@ static const char synthesize_p010_shader_source[] =
     "        evaluate_candidate0(target, 2, w, h), 1.02, 0.002);\n"
     "    selection.side0 = better_spatial_candidate(selection.side0,\n"
     "        evaluate_candidate0(target, 4, w, h), 1.03, 0.004);\n"
+    "    selection.side0 = better_projected_owner_candidate(\n"
+    "        selection.side0,\n"
+    "        evaluate_projected_owner_candidate0(target, w, h));\n"
     "    selection.side0 = better_temporal_candidate(selection.side0,\n"
     "        evaluate_temporal_candidate0(target, w, h));\n"
     "    selection.side1 = evaluate_candidate1(target, 0, w, h);\n"
@@ -2005,6 +2179,9 @@ static const char synthesize_p010_shader_source[] =
     "        evaluate_candidate1(target, 2, w, h), 1.02, 0.002);\n"
     "    selection.side1 = better_spatial_candidate(selection.side1,\n"
     "        evaluate_candidate1(target, 4, w, h), 1.03, 0.004);\n"
+    "    selection.side1 = better_projected_owner_candidate(\n"
+    "        selection.side1,\n"
+    "        evaluate_projected_owner_candidate1(target, w, h));\n"
     "    selection.side1 = better_temporal_candidate(selection.side1,\n"
     "        evaluate_temporal_candidate1(target, w, h));\n"
     "    bool valid0 = selection.side0.score >= 0.002;\n"
@@ -2106,6 +2283,8 @@ static const char synthesize_p010_shader_source[] =
     "        float d = sample_y(y1, target, w, h) * (65535.0 / 64.0);\n"
     "        uint mode = 0;\n"
     "        uint selected_candidate = 0;\n"
+    "        float owner_support0 = 0.0;\n"
+    "        float owner_support1 = 0.0;\n"
     "        float value = c;\n"
     "        if (crossfade) {\n"
     "            mode = 3;\n"
@@ -2113,6 +2292,10 @@ static const char synthesize_p010_shader_source[] =
     "        } else if (!hold_previous) {\n"
     "            RobustSelection selection = robust_selection(target, w, h);\n"
     "            mode = selection.mode;\n"
+    "            owner_support0 = projected_layer_support0(\n"
+    "                target, selection.side0.source, w, h);\n"
+    "            owner_support1 = projected_layer_support1(\n"
+    "                target, selection.side1.source, w, h);\n"
     "            float a = sample_y(y0, selection.side0.source, w, h) *\n"
     "                      (65535.0 / 64.0);\n"
     "            float b = sample_y(y1, selection.side1.source, w, h) *\n"
@@ -2142,6 +2325,8 @@ static const char synthesize_p010_shader_source[] =
     "                    InterlockedAdd(robust_counters[12], 1);\n"
     "                else if (selected_candidate == 4)\n"
     "                    InterlockedAdd(robust_counters[13], 1);\n"
+    "                else if (selected_candidate == 5)\n"
+    "                    InterlockedAdd(robust_counters[18], 1);\n"
     "            }\n"
     "            uint occupancy_count0 = occupancy0.Load(int3(id.xy, 0));\n"
     "            uint occupancy_count1 = occupancy1.Load(int3(id.xy, 0));\n"
@@ -2153,6 +2338,14 @@ static const char synthesize_p010_shader_source[] =
     "                InterlockedAdd(robust_counters[9], 1);\n"
     "            else if (occupancy_count1 > 1)\n"
     "                InterlockedAdd(robust_counters[11], 1);\n"
+    "            if (!hold_previous && !crossfade) {\n"
+    "                if (occupancy_count0 > 1)\n"
+    "                    InterlockedAdd(robust_counters[\n"
+    "                        owner_support0 >= 0.55 ? 14 : 16], 1);\n"
+    "                if (occupancy_count1 > 1)\n"
+    "                    InterlockedAdd(robust_counters[\n"
+    "                        owner_support1 >= 0.55 ? 15 : 17], 1);\n"
+    "            }\n"
     "        }\n"
     "#else\n"
     "        float2 p0, p1;\n"
@@ -2348,6 +2541,8 @@ static void release_nvof_session(struct mp_filter *f)
         release_nvof_resource(f, resources[n]);
     for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.occupancy); n++)
         release_shader_texture_resource(&p->nvof.occupancy[n]);
+    for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.projected_owner); n++)
+        release_shader_texture_resource(&p->nvof.projected_owner[n]);
     for (int n = 0; n < MP_ARRAY_SIZE(p->nvof.pair_cache); n++)
         release_robust_pair_cache(&p->nvof.pair_cache[n]);
     if (p->nvof.completion_readback)
@@ -3079,7 +3274,7 @@ static bool load_robust_scene_shaders(struct mp_filter *f)
     MP_INFO(f, "NVOF robust scene classifier ready regions=3x3 "
                "histogram-bins=%d sample-stride=%d descriptors="
                "luma+chroma+edge history=hysteresis "
-               "synthesis=forward-occupancy+raw-median-block-"
+               "synthesis=projected-ownership+raw-median-block-"
                "edge-vector-hermite\n",
             ROBUST_SCENE_HISTOGRAM_BINS,
             p->opts->scene_cut_sample_stride);
@@ -3322,7 +3517,7 @@ static bool load_synthesize_p010_shader(struct mp_filter *f)
         {"ROBUST_SCENE_FADE_DISSOLVE", "2"},
         {"ROBUST_SCENE_HARD_CUT", "3"},
         {"ROBUST_SCENE_UNCERTAIN", "4"},
-        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "14"},
+        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "19"},
         {NULL, NULL},
     };
     HRESULT hr = p->nvof.d3d_compile(
@@ -3629,6 +3824,11 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
 {
     struct priv *p = f->priv;
     release_nvof_session(f);
+    if (p->opts->stage6_robust_test && (width > 4096 || height > 4096)) {
+        MP_ERR(f, "NVOF projected ownership packing supports at most "
+                  "4096x4096 input, received=%dx%d\n", width, height);
+        return false;
+    }
     if (!check_nvof_status(f, "nvCreateOpticalFlowD3D11",
             p->nvof.api.nvCreateOpticalFlowD3D11(
                 p->device, p->context, &p->nvof.handle)))
@@ -3719,6 +3919,14 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS) &&
             create_shader_texture_resource(
                 f, &p->nvof.occupancy[1], width, height,
+                DXGI_FORMAT_R32_UINT,
+                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS) &&
+            create_shader_texture_resource(
+                f, &p->nvof.projected_owner[0], width, height,
+                DXGI_FORMAT_R32_UINT,
+                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS) &&
+            create_shader_texture_resource(
+                f, &p->nvof.projected_owner[1], width, height,
                 DXGI_FORMAT_R32_UINT,
                 D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
         for (int n = 0;
@@ -4513,13 +4721,22 @@ static bool prepare_and_infill_flows(struct mp_filter *f)
 
 static bool prepare_robust_occupancy_masks(
     struct mp_filter *f, ID3D11ShaderResourceView *flow_forward,
-    ID3D11ShaderResourceView *flow_backward)
+    ID3D11ShaderResourceView *flow_backward,
+    ID3D11ShaderResourceView *cost_forward,
+    ID3D11ShaderResourceView *cost_backward,
+    ID3D11ShaderResourceView *luma0,
+    ID3D11ShaderResourceView *luma1)
 {
     struct priv *p = f->priv;
     if (!p->nvof.robust_occupancy_shader ||
-        !flow_forward || !flow_backward ||
+        !flow_forward || !flow_backward || !cost_forward || !cost_backward ||
+        !luma0 || !luma1 ||
         !p->nvof.occupancy[0].uav || !p->nvof.occupancy[0].srv ||
-        !p->nvof.occupancy[1].uav || !p->nvof.occupancy[1].srv) {
+        !p->nvof.occupancy[1].uav || !p->nvof.occupancy[1].srv ||
+        !p->nvof.projected_owner[0].uav ||
+        !p->nvof.projected_owner[0].srv ||
+        !p->nvof.projected_owner[1].uav ||
+        !p->nvof.projected_owner[1].srv) {
         MP_ERR(f, "NVOF robust occupancy resources are incomplete\n");
         return false;
     }
@@ -4528,10 +4745,16 @@ static bool prepare_robust_occupancy_masks(
     ID3D11ShaderResourceView *srvs[] = {
         flow_forward,
         flow_backward,
+        cost_forward,
+        cost_backward,
+        luma0,
+        luma1,
     };
     ID3D11UnorderedAccessView *uavs[] = {
         p->nvof.occupancy[0].uav,
         p->nvof.occupancy[1].uav,
+        p->nvof.projected_owner[0].uav,
+        p->nvof.projected_owner[1].uav,
     };
     lock_d3d11_context(p);
     struct gpu_profile_token profile = gpu_profile_begin_locked(
@@ -4540,6 +4763,10 @@ static bool prepare_robust_occupancy_masks(
         p->context, uavs[0], clear_value);
     ID3D11DeviceContext_ClearUnorderedAccessViewUint(
         p->context, uavs[1], clear_value);
+    ID3D11DeviceContext_ClearUnorderedAccessViewUint(
+        p->context, uavs[2], clear_value);
+    ID3D11DeviceContext_ClearUnorderedAccessViewUint(
+        p->context, uavs[3], clear_value);
     ID3D11DeviceContext_CSSetShader(
         p->context, p->nvof.robust_occupancy_shader, NULL, 0);
     ID3D11DeviceContext_CSSetShaderResources(
@@ -5297,6 +5524,8 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
     bool scene_resources_ready = p->opts->stage6_robust_test
         ? context && central && central->scene_state &&
           p->nvof.occupancy[0].srv && p->nvof.occupancy[1].srv &&
+          p->nvof.projected_owner[0].srv &&
+          p->nvof.projected_owner[1].srv &&
           p->nvof.robust_synthesis_summary_uav &&
           p->nvof.robust_temporal_constants_buffer
         : p->nvof.scene_cut_srv && p->nvof.scene_cut_summary_uav;
@@ -5305,11 +5534,6 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         MP_ERR(f, "NVOF P010 synthesis resources are incomplete\n");
         return false;
     }
-    if (p->opts->stage6_robust_test &&
-        !prepare_robust_occupancy_masks(
-            f, central->flow_forward, central->flow_backward))
-        return false;
-
     ID3D11Texture2D *textures[] = {
         (ID3D11Texture2D *)frame0->planes[0],
         (ID3D11Texture2D *)frame1->planes[0],
@@ -5406,7 +5630,20 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         return false;
     }
 
-    ID3D11ShaderResourceView *srvs[15] = {
+    if (p->opts->stage6_robust_test &&
+        !prepare_robust_occupancy_masks(
+            f, central->flow_forward, central->flow_backward,
+            central->cost_forward, central->cost_backward,
+            (ID3D11ShaderResourceView *)input_views[0],
+            (ID3D11ShaderResourceView *)input_views[1])) {
+        for (int n = 0; n < MP_ARRAY_SIZE(input_views); n++)
+            ID3D11ShaderResourceView1_Release(input_views[n]);
+        for (int n = 0; n < MP_ARRAY_SIZE(output_views); n++)
+            ID3D11UnorderedAccessView1_Release(output_views[n]);
+        return false;
+    }
+
+    ID3D11ShaderResourceView *srvs[17] = {
         (ID3D11ShaderResourceView *)input_views[0],
         (ID3D11ShaderResourceView *)input_views[1],
         (ID3D11ShaderResourceView *)input_views[2],
@@ -5437,6 +5674,8 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         srvs[12] = next->flow_forward;
         srvs[13] = previous->scene_state;
         srvs[14] = next->scene_state;
+        srvs[15] = p->nvof.projected_owner[0].srv;
+        srvs[16] = p->nvof.projected_owner[1].srv;
     }
     ID3D11UnorderedAccessView *uavs[] = {
         (ID3D11UnorderedAccessView *)output_views[0],
@@ -6213,7 +6452,9 @@ static void destroy(struct mp_filter *f)
                 p->nvof.robust_synthesis_totals[
                     ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE] +
                 p->nvof.robust_synthesis_totals[
-                    ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE];
+                    ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE] +
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_PROJECTED_OWNER_CANDIDATE];
             if (synthesis_samples > 0) {
                 MP_INFO(f, "NVOF robust synthesis summary samples=%llu "
                            "source0/source1/blend/fallback="
@@ -6242,10 +6483,40 @@ static void destroy(struct mp_filter *f)
                             ROBUST_SYNTHESIS_OCCUPANCY1_COLLISION] /
                             synthesis_samples);
             }
+            uint64_t owner0_samples =
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_OWNER0_MATCH] +
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_OWNER0_REJECT];
+            uint64_t owner1_samples =
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_OWNER1_MATCH] +
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_OWNER1_REJECT];
+            if (owner0_samples || owner1_samples) {
+                MP_INFO(f, "NVOF projected ownership collision "
+                           "match/reject=%.2f/%.2f%% %.2f/%.2f%%\n",
+                        owner0_samples ? 100.0 *
+                            p->nvof.robust_synthesis_totals[
+                                ROBUST_SYNTHESIS_OWNER0_MATCH] /
+                            owner0_samples : 0.0,
+                        owner0_samples ? 100.0 *
+                            p->nvof.robust_synthesis_totals[
+                                ROBUST_SYNTHESIS_OWNER0_REJECT] /
+                            owner0_samples : 0.0,
+                        owner1_samples ? 100.0 *
+                            p->nvof.robust_synthesis_totals[
+                                ROBUST_SYNTHESIS_OWNER1_MATCH] /
+                            owner1_samples : 0.0,
+                        owner1_samples ? 100.0 *
+                            p->nvof.robust_synthesis_totals[
+                                ROBUST_SYNTHESIS_OWNER1_REJECT] /
+                            owner1_samples : 0.0);
+            }
             if (candidate_samples) {
                 MP_INFO(f, "NVOF robust candidate summary selected=%llu "
-                           "raw/median/block/temporal/edge-vector="
-                           "%.2f/%.2f/%.2f/%.2f/%.2f%%\n",
+                           "raw/median/block/temporal/edge-vector/owner="
+                           "%.2f/%.2f/%.2f/%.2f/%.2f/%.2f%%\n",
                         (unsigned long long)candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_RAW_CANDIDATE] /
@@ -6261,6 +6532,9 @@ static void destroy(struct mp_filter *f)
                             candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE] /
+                            candidate_samples,
+                        100.0 * p->nvof.robust_synthesis_totals[
+                            ROBUST_SYNTHESIS_PROJECTED_OWNER_CANDIDATE] /
                             candidate_samples);
             }
         } else {
@@ -6367,7 +6641,8 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         MP_WARN(f, "NVOF MEMC stage 6 enables strict x2 P010 midpoint "
                    "synthesis with native bidirectional OFA and GPU-resident "
                    "3x3 histogram, chroma, edge, exposure, and hysteresis "
-                   "scene classification, forward-projected occupancy, "
+                   "scene classification, luma- and consistency-scored "
+                   "projected ownership, "
                    "raw/median/block and luma-guided vector-median "
                    "candidates, one-frame source lookahead, four-frame "
                    "Hermite motion candidates, and "
