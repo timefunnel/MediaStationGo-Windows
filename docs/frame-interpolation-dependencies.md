@@ -27,6 +27,7 @@ default playback backend.
 | TensorRT-RTX | 1.4.0.76, CUDA 13.2 build | NVIDIA proprietary SDK |
 | RIFE model | v4.25 Lite, implementation 1 ONNX | Supplied by the vs-mlrt external-models release |
 | onnxconverter-common | 1.16.0 | Apache-2.0 |
+| CUDA Runtime | Caller-supplied `cudart64_<version>.dll` | Required only by the native D3D11/CUDA interoperability probe; copied into the isolated runtime and recorded by filename and SHA-256 |
 
 Development artifact hashes:
 
@@ -45,3 +46,31 @@ ignored `third_party/`.
 
 vs-mlrt v15.16 explicitly rejects `scale != 1.0` for RIFE v4.25 Lite in
 `RIFEMerge`. This constraint does not apply to the production NVOFA backend.
+
+## Native D3D11/TensorRT validation
+
+The VapourSynth path is not suitable for full-resolution 4K P010 playback. On
+the RTX 5070 Ti reference machine, implementation 1 reached 28.63 output FPS
+for strict 24 to 48 interpolation because CPU color conversion dominated the
+filter graph. Implementation 2 was also rejected as a 4K baseline: its FP32
+engine reached only 26.89 pair FPS with a 37.90 ms p95 before conversion.
+
+`run_rife_d3d11_trt_probe.ps1` validates the replacement data path without
+altering the player: two P010 D3D11 textures are converted into the exact
+11-channel FP16 RIFE tensor by a compute shader, shared with CUDA, inferred by
+TensorRT-RTX, converted back to P010, synchronized, and read back once for
+packing validation. No frame crosses system memory during the timed loop.
+
+Reference results for RIFE v4.25 Lite implementation 1, strict x2:
+
+| Source | Iterations | Throughput | p95 | P010 validation |
+| --- | ---: | ---: | ---: | --- |
+| 1920x1080 | 300 | 157.54 pair FPS | 6.62 ms | 877 luma codes; 1,553,080 non-8-bit luma samples |
+| 2560x1440 | 300 | 87.45 pair FPS | 11.82 ms | 877 luma codes; 2,764,057 non-8-bit luma samples |
+| 3840x2160 | 600 | 41.87 pair FPS | 24.33 ms | 877 luma codes; 6,216,617 non-8-bit luma samples |
+
+These measurements prove the conversion, interop, inference, and P010 packing
+budget only. They do not yet prove scene-cut quality, mpv scheduling, decoded
+frame ownership, HDR metadata propagation, subtitles, seek/reset behavior, or
+long-form playback stability. The native path must remain outside production
+playback until those items pass explicit validation.

@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$TensorRtRtxArchive,
+    [string]$CudaRuntimeDll,
     [switch]$AcceptNvidiaLicense,
     [string]$MsysPath = "C:\msys64",
     [string]$RuntimeDir,
@@ -23,6 +24,12 @@ if (-not $AcceptNvidiaLicense) {
 }
 
 $TensorRtRtxArchive = (Resolve-Path -LiteralPath $TensorRtRtxArchive).Path
+if ($CudaRuntimeDll) {
+    $CudaRuntimeDll = (Resolve-Path -LiteralPath $CudaRuntimeDll).Path
+    if ([System.IO.Path]::GetFileName($CudaRuntimeDll) -notmatch '^cudart64_[0-9]+\.dll$') {
+        throw "CudaRuntimeDll must be an NVIDIA CUDA Runtime DLL named cudart64_<version>.dll"
+    }
+}
 $SevenZip = "C:\Program Files\7-Zip\7z.exe"
 if (-not (Test-Path $SevenZip)) {
     throw "7-Zip is required at $SevenZip"
@@ -154,6 +161,9 @@ if (-not $TensorRtRoot) {
 }
 Copy-Item (Join-Path $TensorRtRoot.FullName "bin\*") $BinDir -Force
 Copy-Item (Join-Path $TensorRtRoot.FullName "bin\*") $VsMlrtCudaDir -Force
+if ($CudaRuntimeDll) {
+    Copy-Item -LiteralPath $CudaRuntimeDll -Destination $BinDir -Force
+}
 
 & $SevenZip x -y "-o$PluginDir" (Join-Path $ArchiveDir "VSTRT-RTX-Windows-x64.v15.16.7z") | Out-Null
 & $SevenZip x -y "-o$ScriptDir" (Join-Path $ArchiveDir "scripts.v15.16.7z") | Out-Null
@@ -198,6 +208,8 @@ $Manifest = [ordered]@{
     python = "3.14"
     vsMlrt = "v15.16"
     backend = "TensorRT-RTX 1.4.0.76"
+    cudaRuntime = if ($CudaRuntimeDll) { [System.IO.Path]::GetFileName($CudaRuntimeDll) } else { $null }
+    cudaRuntimeSha256 = if ($CudaRuntimeDll) { (Get-FileHash -LiteralPath $CudaRuntimeDll -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
     model = "RIFE v4.25 Lite"
     modelSha256 = (Get-FileHash (Join-Path $ModelDir "rife_v4.25_lite.onnx") -Algorithm SHA256).Hash.ToLowerInvariant()
     fp16 = $true

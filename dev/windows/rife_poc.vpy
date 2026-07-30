@@ -16,6 +16,7 @@ vs.YUV = vs.ColorFamily.YUV
 vs.GRAYH = core.query_video_format(vs.GRAY, vs.FLOAT, 16, 0, 0).id
 vs.GRAYS = core.query_video_format(vs.GRAY, vs.FLOAT, 32, 0, 0).id
 vs.RGBH = core.query_video_format(vs.RGB, vs.FLOAT, 16, 0, 0).id
+vs.RGBS = core.query_video_format(vs.RGB, vs.FLOAT, 32, 0, 0).id
 
 from vsmlrt import Backend, RIFE, RIFEModel
 
@@ -30,6 +31,8 @@ frame_count = int(os.environ.get("MSGO_RIFE_SOURCE_FRAMES", "48"))
 engine_folder = os.environ["MSGO_RIFE_ENGINE_DIR"]
 scale = float(os.environ.get("MSGO_RIFE_SCALE", "1.0"))
 streams = int(os.environ.get("MSGO_RIFE_STREAMS", "1"))
+implementation = int(os.environ.get("MSGO_RIFE_IMPLEMENTATION", "1"))
+precision = os.environ.get("MSGO_RIFE_PRECISION", "fp16")
 pipeline = os.environ.get("MSGO_RIFE_PIPELINE", "rgb")
 
 if target_fps <= source_fps:
@@ -38,12 +41,18 @@ if scale not in (0.5, 1.0):
     raise ValueError("Scale must be 0.5 or 1.0")
 if streams not in (1, 2):
     raise ValueError("Streams must be 1 or 2")
+if implementation not in (1, 2):
+    raise ValueError("Implementation must be 1 or 2")
+if precision not in ("fp16", "fp32"):
+    raise ValueError("Precision must be fp16 or fp32")
+if implementation == 2 and precision != "fp32":
+    raise ValueError("Implementation 2 requires its original FP32 graph")
 if pipeline not in ("rgb", "yuv10"):
     raise ValueError("Pipeline must be rgb or yuv10")
 if not (0 < inference_width <= width and 0 < inference_height <= height):
     raise ValueError("Inference dimensions must be positive and cannot exceed source dimensions")
 
-working_format = vs.RGBH
+working_format = vs.RGBH if precision == "fp16" else vs.RGBS
 
 base = core.std.BlankClip(
     width=width,
@@ -114,7 +123,7 @@ source_for_rife = core.std.AddBorders(
     color=[0.025, 0.035, 0.045],
 )
 backend = Backend.TRT_RTX(
-    fp16=True,
+    fp16=precision == "fp16",
     use_cuda_graph=True,
     num_streams=streams,
     engine_folder=engine_folder,
@@ -126,6 +135,7 @@ interpolated = RIFE(
     model=RIFEModel.v4_25_lite,
     backend=backend,
     video_player=True,
+    _implementation=implementation,
 )
 output = core.std.CropAbs(interpolated, width=inference_width, height=inference_height)
 if pipeline == "yuv10":
