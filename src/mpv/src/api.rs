@@ -47,47 +47,6 @@ fn checked_raw() -> crate::Result<*mut sys::mpv_handle> {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub struct D3d11DeviceLease {
-    device: *mut c_void,
-    context: *mut c_void,
-}
-
-#[cfg(target_os = "windows")]
-impl D3d11DeviceLease {
-    pub fn device(&self) -> *mut c_void {
-        self.device
-    }
-
-    pub fn context(&self) -> *mut c_void {
-        self.context
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for D3d11DeviceLease {
-    fn drop(&mut self) {
-        unsafe { sys::mpv_release_d3d11_device(self.device, self.context) };
-    }
-}
-
-/// Borrow the D3D11 device used by mpv's current VO. The returned COM
-/// interfaces remain valid until the lease is dropped.
-#[cfg(target_os = "windows")]
-pub fn jfn_mpv_get_d3d11_device() -> crate::Result<D3d11DeviceLease> {
-    let handle = checked_raw()?;
-    let mut device: *mut c_void = std::ptr::null_mut();
-    let mut context: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { sys::mpv_get_d3d11_device(handle, &mut device, &mut context) };
-    crate::error::check(status)?;
-    if device.is_null() || context.is_null() {
-        return Err(crate::Error::new(
-            sys::mpv_error::MPV_ERROR_NOT_IMPLEMENTED.0,
-        ));
-    }
-    Ok(D3d11DeviceLease { device, context })
-}
-
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
     if p.is_null() {
         None
