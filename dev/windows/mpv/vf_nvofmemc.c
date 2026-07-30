@@ -371,7 +371,7 @@ typedef struct rife_runtime *(__cdecl *rife_create_fn)(
 typedef int (__cdecl *rife_process_fn)(
     struct rife_runtime *, ID3D11Texture2D *, uint32_t,
     ID3D11Texture2D *, uint32_t, ID3D11Texture2D *, uint32_t,
-    int *, char *, size_t);
+    double, double, struct rife_frame_diagnostics *, char *, size_t);
 typedef void (__cdecl *rife_reset_fn)(struct rife_runtime *);
 typedef int (__cdecl *rife_get_stats_fn)(
     const struct rife_runtime *, struct rife_runtime_stats *);
@@ -424,6 +424,8 @@ struct priv {
     uint64_t scene_cut_midpoints;
     uint64_t discontinuities;
     uint64_t resets;
+    uint32_t rife_last_scene_class;
+    bool rife_scene_class_initialized;
     bool pool_logged;
 };
 
@@ -493,7 +495,10 @@ static void destroy_rife_session(struct mp_filter *f)
         MP_INFO(f, "RIFE runtime summary pairs=%llu inferred=%llu "
                    "scene-cuts=%llu failures=%llu inference-average-ms=%.3f "
                    "inference-p95-ms=%.3f inference-max-ms=%.3f "
-                   "scene-average-ms=%.3f scene-max-ms=%.3f\n",
+                   "scene-average-ms=%.3f scene-max-ms=%.3f "
+                   "cache=%s init-ms=%.3f reuses=%llu "
+                   "scene-classes=normal:%llu,flash:%llu,fade:%llu,"
+                   "hard-cut:%llu,uncertain:%llu\n",
                 (unsigned long long)stats.pairs,
                 (unsigned long long)stats.inferred_pairs,
                 (unsigned long long)stats.scene_cuts,
@@ -502,7 +507,17 @@ static void destroy_rife_session(struct mp_filter *f)
                     ? stats.inference_total_ms / stats.inferred_pairs : 0,
                 stats.inference_p95_ms, stats.inference_max_ms,
                 stats.pairs ? stats.scene_total_ms / stats.pairs : 0,
-                stats.scene_max_ms);
+                stats.scene_max_ms,
+                stats.runtime_cache_hit ? "hit" : "cold",
+                stats.runtime_initialization_ms,
+                (unsigned long long)stats.runtime_reuses,
+                (unsigned long long)stats.scene_classes[RIFE_SCENE_NORMAL],
+                (unsigned long long)stats.scene_classes[RIFE_SCENE_FLASH],
+                (unsigned long long)stats.scene_classes[
+                    RIFE_SCENE_FADE_DISSOLVE],
+                (unsigned long long)stats.scene_classes[RIFE_SCENE_HARD_CUT],
+                (unsigned long long)stats.scene_classes[
+                    RIFE_SCENE_UNCERTAIN]);
     }
     p->rife.destroy(p->rife.runtime);
     p->rife.runtime = NULL;
@@ -669,11 +684,21 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
     p->rife.height = frame->h;
     p->rife.color_matrix = matrix;
     p->rife.limited_range = limited_range;
+    struct rife_runtime_stats stats = {0};
+    if (p->rife.get_stats(p->rife.runtime, &stats) != RIFE_RUNTIME_OK) {
+        MP_ERR(f, "RIFE runtime initialization diagnostics unavailable\n");
+        destroy_rife_session(f);
+        return false;
+    }
     MP_INFO(f, "RIFE runtime initialized source=%dx%d format=P010 "
                "matrix=%d range=%s model=v4.25-lite implementation=1 "
-               "backend=TensorRT-RTX FP16 strict-x2\n",
+               "backend=TensorRT-RTX FP16 strict-x2 cache=%s "
+               "init-ms=%.3f reuses=%llu\n",
             frame->w, frame->h, matrix,
-            limited_range ? "limited" : "full");
+            limited_range ? "limited" : "full",
+            stats.runtime_cache_hit ? "hit" : "cold",
+            stats.runtime_initialization_ms,
+            (unsigned long long)stats.runtime_reuses);
     return true;
 }
 
@@ -6150,7 +6175,7 @@ static bool write_rife_frame(struct mp_filter *f,
         return false;
     }
     char error[1024] = {0};
-    int scene_cut = 0;
+    struct rife_frame_diagnostics diagnostics = {0};
     lock_d3d11_context(p);
     int status = p->rife.process(
         p->rife.runtime,
@@ -6160,7 +6185,7 @@ static bool write_rife_frame(struct mp_filter *f,
         (uint32_t)(uintptr_t)frame1->planes[1],
         (ID3D11Texture2D *)out->planes[0],
         (uint32_t)(uintptr_t)out->planes[1],
-        &scene_cut, error, sizeof(error));
+        frame0->pts, frame1->pts, &diagnostics, error, sizeof(error));
     unlock_d3d11_context(p);
     if (status != RIFE_RUNTIME_OK) {
         MP_ERR(f, "RIFE midpoint inference failed status=%d detail=%s\n",
@@ -6175,9 +6200,39 @@ static bool write_rife_frame(struct mp_filter *f,
     if (out->nominal_fps > 0)
         out->nominal_fps *= 2;
     p->synthesized_frames++;
-    if (scene_cut) {
+    if (diagnostics.scene_cut) {
         p->scene_cut_midpoints++;
-        MP_VERBOSE(f, "RIFE hard cut detected midpoint-policy=copy-f0\n");
+    }
+    bool classification_changed = !p->rife_scene_class_initialized ||
+        p->rife_last_scene_class != diagnostics.classification;
+    p->rife_scene_class_initialized = true;
+    p->rife_last_scene_class = diagnostics.classification;
+    bool scene_event = diagnostics.scene_cut || classification_changed ||
+        (diagnostics.classification != RIFE_SCENE_NORMAL &&
+         p->synthesized_frames % 30 == 0);
+    double pair_interval_ms =
+        isfinite(frame0->pts) && isfinite(frame1->pts)
+            ? fabs(frame1->pts - frame0->pts) * 1000.0 : 0;
+    bool timing_outlier = pair_interval_ms > 0 &&
+        diagnostics.inference_ms > pair_interval_ms * 0.8;
+    if (scene_event || timing_outlier || p->synthesized_frames % 240 == 0) {
+        int level = diagnostics.scene_cut || timing_outlier ? MSGL_WARN
+                                                          : MSGL_INFO;
+        MP_MSG(f, level, "RIFE frame evidence source0-pts=%.6f "
+               "source1-pts=%.6f midpoint-pts=%.6f class=%s policy=%s "
+               "average-delta=%.3f changed-ratio=%.4f average-kl=%.5f "
+               "regional-kl-max=%.5f chroma-delta=%.3f "
+               "edge-delta=%.3f exposure-delta=%.3f "
+               "exposure-spread=%.3f scene-ms=%.3f inference-ms=%.3f\n",
+               diagnostics.source0_pts, diagnostics.source1_pts,
+               diagnostics.midpoint_pts,
+               robust_scene_class_name(diagnostics.classification),
+               diagnostics.scene_cut ? "copy-f0-hard-cut" : "rife-midpoint",
+               diagnostics.average_delta, diagnostics.changed_ratio,
+               diagnostics.average_kl, diagnostics.regional_kl_max,
+               diagnostics.chroma_delta, diagnostics.edge_delta,
+               diagnostics.exposure_delta, diagnostics.exposure_spread,
+               diagnostics.scene_ms, diagnostics.inference_ms);
     }
     mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
     return true;
@@ -6666,6 +6721,7 @@ static void reset_filter(struct mp_filter *f)
     clear_timing_state(p);
     if (p->rife.runtime)
         p->rife.reset(p->rife.runtime);
+    p->rife_scene_class_initialized = false;
     p->resets++;
     MP_VERBOSE(f, "Frame interpolation reset backend=%s count=%llu\n",
                p->opts->rife ? "rife" : "nvof",
@@ -7148,7 +7204,7 @@ static const m_option_t option_fields[] = {
     {"rife-scene-sample-stride", OPT_INT(rife_scene_sample_stride),
         M_RANGE(2, 64)},
     {"rife-scene-pixel-threshold", OPT_INT(rife_scene_pixel_threshold),
-        M_RANGE(1, 1023)},
+        M_RANGE(1, 255)},
     {"rife-scene-average-threshold", OPT_DOUBLE(rife_scene_average_threshold),
         M_RANGE(0.001, 1023.0)},
     {"rife-scene-changed-ratio", OPT_DOUBLE(rife_scene_changed_ratio),
@@ -7189,9 +7245,9 @@ const struct mp_user_filter_entry vf_nvofmemc = {
         .priv_defaults = &(const OPT_BASE_STRUCT) {
             .rife = false,
             .rife_scene_sample_stride = 8,
-            .rife_scene_pixel_threshold = 160,
-            .rife_scene_average_threshold = 180.0,
-            .rife_scene_changed_ratio = 0.75,
+            .rife_scene_pixel_threshold = 32,
+            .rife_scene_average_threshold = 24.0,
+            .rife_scene_changed_ratio = 0.42,
             .stage1_passthrough = false,
             .stage2_timing_test = false,
             .stage3_nvof_test = false,

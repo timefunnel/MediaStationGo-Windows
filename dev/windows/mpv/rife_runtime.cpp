@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,16 @@ constexpr CudaError kCudaSuccess = 0;
 constexpr unsigned int kCudaStreamNonBlocking = 1;
 constexpr size_t kInferenceHistogramBuckets = 4001;
 constexpr double kInferenceHistogramBucketMs = 0.025;
+constexpr uint32_t kSceneRegionColumns = 3;
+constexpr uint32_t kSceneRegionRows = 3;
+constexpr uint32_t kSceneRegionCount =
+    kSceneRegionColumns * kSceneRegionRows;
+constexpr uint32_t kSceneHistogramBins = 16;
+constexpr uint32_t kSceneHistogramCount =
+    kSceneRegionCount * kSceneHistogramBins;
+constexpr uint32_t kSceneMetricCount = 6;
+constexpr uint32_t kSceneDescriptorCount =
+    kSceneHistogramCount * 2 + kSceneMetricCount;
 
 const char kShaderSource[] = R"hlsl(
 cbuffer RifeConstants : register(b0)
@@ -52,8 +63,8 @@ cbuffer SceneConstants : register(b1)
 {
     uint scene_sample_stride;
     uint scene_pixel_threshold;
-    uint scene_reserved0;
-    uint scene_reserved1;
+    uint scene_histogram_bins;
+    uint scene_histogram_count;
 };
 
 Texture2D<float> input_y0 : register(t0);
@@ -166,16 +177,56 @@ void prepare_input(uint3 dispatch_id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void detect_scene(uint3 dispatch_id : SV_DispatchThreadID)
 {
-    uint2 position = dispatch_id.xy * scene_sample_stride;
+    uint2 position = dispatch_id.xy * scene_sample_stride
+                   + scene_sample_stride / 2;
     if (position.x >= source_width || position.y >= source_height)
         return;
-    float y0 = input_y0.Load(int3(position, 0));
-    float y1 = input_y1.Load(int3(position, 0));
-    uint delta = (uint)round(abs(code10(y1) - code10(y0)));
-    InterlockedAdd(scene_stats[0], delta);
+    float y_code0 = code10(input_y0.Load(int3(position, 0)));
+    float y_code1 = code10(input_y1.Load(int3(position, 0)));
+    float y0 = saturate(limited_range != 0
+        ? (y_code0 - 64.0) / 876.0 : y_code0 / 1023.0);
+    float y1 = saturate(limited_range != 0
+        ? (y_code1 - 64.0) / 876.0 : y_code1 / 1023.0);
+    uint region_x = min(position.x * 3 / max(source_width, 1), 2);
+    uint region_y = min(position.y * 3 / max(source_height, 1), 2);
+    uint region = region_y * 3 + region_x;
+    uint bin0 = min((uint)(y0 * scene_histogram_bins),
+                    scene_histogram_bins - 1);
+    uint bin1 = min((uint)(y1 * scene_histogram_bins),
+                    scene_histogram_bins - 1);
+    InterlockedAdd(scene_stats[region * scene_histogram_bins + bin0], 1);
+    InterlockedAdd(scene_stats[scene_histogram_count
+                               + region * scene_histogram_bins + bin1], 1);
+
+    uint delta = (uint)round(abs(y1 - y0) * 255.0);
+    uint2 uv_position = position / 2;
+    float2 uv0 = input_uv0.Load(int3(uv_position, 0));
+    float2 uv1 = input_uv1.Load(int3(uv_position, 0));
+    uint chroma_delta = (uint)round(
+        (abs(uv0.x - uv1.x) + abs(uv0.y - uv1.y)) * 127.5);
+    int2 left = int2(max((int)position.x - 1, 0), position.y);
+    int2 right = int2(min(position.x + 1, source_width - 1), position.y);
+    int2 top = int2(position.x, max((int)position.y - 1, 0));
+    int2 bottom = int2(position.x, min(position.y + 1, source_height - 1));
+    float edge0 = abs(input_y0.Load(int3(right, 0))
+                    - input_y0.Load(int3(left, 0)))
+                + abs(input_y0.Load(int3(bottom, 0))
+                    - input_y0.Load(int3(top, 0)));
+    float edge1 = abs(input_y1.Load(int3(right, 0))
+                    - input_y1.Load(int3(left, 0)))
+                + abs(input_y1.Load(int3(bottom, 0))
+                    - input_y1.Load(int3(top, 0)));
+    uint edge_delta = (uint)round(saturate(abs(edge1 - edge0) * 0.5)
+                                       * 255.0);
+    uint metric_base = scene_histogram_count * 2;
+    InterlockedAdd(scene_stats[metric_base + 0], delta);
+    InterlockedAdd(scene_stats[metric_base + 1], chroma_delta);
+    InterlockedAdd(scene_stats[metric_base + 2], edge_delta);
     if (delta >= scene_pixel_threshold)
-        InterlockedAdd(scene_stats[1], 1);
-    InterlockedAdd(scene_stats[2], 1);
+        InterlockedAdd(scene_stats[metric_base + 3], 1);
+    if (delta >= min(255, scene_pixel_threshold * 2))
+        InterlockedAdd(scene_stats[metric_base + 4], 1);
+    InterlockedAdd(scene_stats[metric_base + 5], 1);
 }
 
 float load_output_channel(uint channel, uint2 position)
@@ -457,7 +508,7 @@ bool create_scene_buffers(ID3D11Device *device,
                           ComPtr<ID3D11Buffer> &readback)
 {
     D3D11_BUFFER_DESC desc{};
-    desc.ByteWidth = 3 * sizeof(uint32_t);
+    desc.ByteWidth = kSceneDescriptorCount * sizeof(uint32_t);
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
@@ -467,7 +518,7 @@ bool create_scene_buffers(ID3D11Device *device,
     D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
     uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    uav_desc.Buffer.NumElements = 3;
+    uav_desc.Buffer.NumElements = kSceneDescriptorCount;
     if (FAILED(device->CreateUnorderedAccessView(buffer.Get(), &uav_desc, &uav)))
         return false;
     desc.Usage = D3D11_USAGE_STAGING;
@@ -598,8 +649,27 @@ struct RifeConstants {
 struct SceneConstants {
     uint32_t sample_stride;
     uint32_t pixel_threshold;
-    uint32_t reserved[2];
+    uint32_t histogram_bins;
+    uint32_t histogram_count;
 };
+
+struct SceneMetrics {
+    double average_delta = 0;
+    double changed_ratio = 0;
+    double average_kl = 0;
+    double regional_kl_max = 0;
+    double chroma_delta = 0;
+    double edge_delta = 0;
+    double exposure_delta = 0;
+    double exposure_spread = 0;
+    uint32_t classification = RIFE_SCENE_NORMAL;
+};
+
+double symmetric_kl(double left, double right)
+{
+    return 0.5 * (left * std::log2(left / right)
+                + right * std::log2(right / left));
+}
 
 class Runtime {
 public:
@@ -618,7 +688,11 @@ public:
     bool initialize(const rife_runtime_config &config,
                     char *error, size_t error_capacity)
     {
+        engine_path_ = config.engine_path;
+        cuda_runtime_path_ = config.cuda_runtime_path;
         config_ = config;
+        config_.engine_path = engine_path_.c_str();
+        config_.cuda_runtime_path = cuda_runtime_path_.c_str();
         device_ = config.device;
         context_ = config.context;
         if (FAILED(device_.As(&device3_))) {
@@ -664,11 +738,55 @@ public:
         return true;
     }
 
+    bool matches(const rife_runtime_config &config) const
+    {
+        return device_.Get() == config.device
+            && context_.Get() == config.context
+            && engine_path_ == config.engine_path
+            && cuda_runtime_path_ == config.cuda_runtime_path
+            && config_.source_width == config.source_width
+            && config_.source_height == config.source_height
+            && config_.color_matrix == config.color_matrix
+            && config_.limited_range == config.limited_range
+            && config_.scene_sample_stride == config.scene_sample_stride
+            && config_.scene_pixel_threshold == config.scene_pixel_threshold
+            && config_.scene_average_threshold == config.scene_average_threshold
+            && config_.scene_changed_ratio == config.scene_changed_ratio;
+    }
+
+    bool device_available() const
+    {
+        return device_ && SUCCEEDED(device_->GetDeviceRemovedReason());
+    }
+
+    void begin_session(bool cache_hit, double initialization_ms)
+    {
+        stats_ = {};
+        inference_histogram_.fill(0);
+        previous_scene_ = {};
+        previous_scene_class_ = RIFE_SCENE_NORMAL;
+        previous_scene_streak_ = 0;
+        if (cache_hit)
+            reuse_count_++;
+        stats_.runtime_cache_hit = cache_hit ? 1u : 0u;
+        stats_.runtime_reuses = reuse_count_;
+        stats_.runtime_initialization_ms = initialization_ms;
+    }
+
     int process(ID3D11Texture2D *frame0, uint32_t frame0_slice,
                 ID3D11Texture2D *frame1, uint32_t frame1_slice,
                 ID3D11Texture2D *output, uint32_t output_slice,
-                int *scene_cut, char *error, size_t error_capacity)
+                double source0_pts, double source1_pts,
+                rife_frame_diagnostics *diagnostics,
+                char *error, size_t error_capacity)
     {
+        *diagnostics = {};
+        diagnostics->source0_pts = source0_pts;
+        diagnostics->source1_pts = source1_pts;
+        diagnostics->midpoint_pts =
+            std::isfinite(source0_pts) && std::isfinite(source1_pts)
+                ? source0_pts + (source1_pts - source0_pts) * 0.5
+                : source0_pts;
         if (!validate_texture(frame0, frame0_slice, false, "frame0", error,
                               error_capacity)
             || !validate_texture(frame1, frame1_slice, false, "frame1", error,
@@ -701,8 +819,8 @@ public:
             input_y0.Get(), input_y1.Get(), input_uv0.Get(), input_uv1.Get(),
         };
         const auto scene_started = std::chrono::steady_clock::now();
-        bool cut = false;
-        if (!detect_scene(input_srvs, cut, error, error_capacity)) {
+        SceneMetrics scene;
+        if (!detect_scene(input_srvs, scene, error, error_capacity)) {
             stats_.failures++;
             return RIFE_RUNTIME_D3D11_FAILED;
         }
@@ -712,8 +830,19 @@ public:
         stats_.scene_total_ms += scene_ms;
         stats_.scene_max_ms = std::max(stats_.scene_max_ms, scene_ms);
         stats_.pairs++;
+        stats_.scene_classes[scene.classification]++;
+        diagnostics->scene_ms = scene_ms;
+        diagnostics->average_delta = scene.average_delta;
+        diagnostics->changed_ratio = scene.changed_ratio;
+        diagnostics->average_kl = scene.average_kl;
+        diagnostics->regional_kl_max = scene.regional_kl_max;
+        diagnostics->chroma_delta = scene.chroma_delta;
+        diagnostics->edge_delta = scene.edge_delta;
+        diagnostics->exposure_delta = scene.exposure_delta;
+        diagnostics->exposure_spread = scene.exposure_spread;
+        diagnostics->classification = scene.classification;
 
-        if (cut) {
+        if (scene.classification == RIFE_SCENE_HARD_CUT) {
             D3D11_TEXTURE2D_DESC source_desc{};
             frame0->GetDesc(&source_desc);
             D3D11_BOX box{};
@@ -723,7 +852,7 @@ public:
             context_->CopySubresourceRegion(
                 output, output_slice, 0, 0, 0, frame0, frame0_slice, &box);
             stats_.scene_cuts++;
-            *scene_cut = 1;
+            diagnostics->scene_cut = 1;
             return RIFE_RUNTIME_OK;
         }
 
@@ -738,13 +867,15 @@ public:
             inference_ended - inference_started).count();
         record_inference(inference_ms);
         stats_.inferred_pairs++;
-        *scene_cut = 0;
+        diagnostics->inference_ms = inference_ms;
         return RIFE_RUNTIME_OK;
     }
 
     void reset()
     {
-        // RIFE inference is pair-local. The mpv filter owns temporal history.
+        previous_scene_ = {};
+        previous_scene_class_ = RIFE_SCENE_NORMAL;
+        previous_scene_streak_ = 0;
     }
 
     rife_runtime_stats stats() const
@@ -857,7 +988,8 @@ private:
         const SceneConstants scene_constants{
             config_.scene_sample_stride,
             config_.scene_pixel_threshold,
-            {0, 0},
+            kSceneHistogramBins,
+            kSceneHistogramCount,
         };
         if (!create_constant_buffer(device_.Get(), constants, constants_buffer_)
             || !create_constant_buffer(device_.Get(), scene_constants,
@@ -918,7 +1050,8 @@ private:
         return true;
     }
 
-    bool detect_scene(ID3D11ShaderResourceView **input_srvs, bool &cut,
+    bool detect_scene(ID3D11ShaderResourceView **input_srvs,
+                      SceneMetrics &metrics,
                       char *error, size_t error_capacity)
     {
         const UINT clear[4] = {0, 0, 0, 0};
@@ -956,19 +1089,136 @@ private:
             return false;
         }
         const auto *values = static_cast<const uint32_t *>(mapped.pData);
-        const uint32_t delta_sum = values[0];
-        const uint32_t changed = values[1];
-        const uint32_t samples = values[2];
+        std::array<uint32_t, kSceneDescriptorCount> descriptor{};
+        std::copy_n(values, descriptor.size(), descriptor.begin());
         context_->Unmap(scene_readback_.Get(), 0);
+        const size_t metric_base = kSceneHistogramCount * 2;
+        const uint32_t samples = descriptor[metric_base + 5];
         if (!samples) {
             set_error(error, error_capacity,
                       "Scene detector produced no samples");
             return false;
         }
-        const double average = static_cast<double>(delta_sum) / samples;
-        const double changed_ratio = static_cast<double>(changed) / samples;
-        cut = average >= config_.scene_average_threshold
-           && changed_ratio >= config_.scene_changed_ratio;
+        metrics.average_delta =
+            static_cast<double>(descriptor[metric_base + 0]) / samples;
+        metrics.chroma_delta =
+            static_cast<double>(descriptor[metric_base + 1]) / samples;
+        metrics.edge_delta =
+            static_cast<double>(descriptor[metric_base + 2]) / samples;
+        metrics.changed_ratio =
+            static_cast<double>(descriptor[metric_base + 3]) / samples;
+
+        double kl_sum = 0;
+        double exposure_sum = 0;
+        double exposure_min = 255;
+        double exposure_max = -255;
+        for (uint32_t region = 0; region < kSceneRegionCount; ++region) {
+            double samples0 = 0;
+            double samples1 = 0;
+            double mean0 = 0;
+            double mean1 = 0;
+            for (uint32_t bin = 0; bin < kSceneHistogramBins; ++bin) {
+                const size_t index = region * kSceneHistogramBins + bin;
+                const double count0 = descriptor[index];
+                const double count1 = descriptor[kSceneHistogramCount + index];
+                const double center = (bin + 0.5) *
+                                      (255.0 / kSceneHistogramBins);
+                samples0 += count0;
+                samples1 += count1;
+                mean0 += count0 * center;
+                mean1 += count1 * center;
+            }
+            const double denominator0 = samples0 +
+                                        0.5 * kSceneHistogramBins;
+            const double denominator1 = samples1 +
+                                        0.5 * kSceneHistogramBins;
+            double regional_kl = 0;
+            for (uint32_t bin = 0; bin < kSceneHistogramBins; ++bin) {
+                const size_t index = region * kSceneHistogramBins + bin;
+                const double probability0 = (descriptor[index] + 0.5)
+                                          / denominator0;
+                const double probability1 =
+                    (descriptor[kSceneHistogramCount + index] + 0.5)
+                    / denominator1;
+                regional_kl += symmetric_kl(probability0, probability1);
+            }
+            const double shift = samples0 > 0 && samples1 > 0
+                ? mean1 / samples1 - mean0 / samples0 : 0;
+            kl_sum += regional_kl;
+            metrics.regional_kl_max = std::max(metrics.regional_kl_max,
+                                               regional_kl);
+            exposure_sum += std::abs(shift);
+            exposure_min = std::min(exposure_min, shift);
+            exposure_max = std::max(exposure_max, shift);
+        }
+        metrics.average_kl = kl_sum / kSceneRegionCount;
+        metrics.exposure_delta = exposure_sum / kSceneRegionCount;
+        metrics.exposure_spread = exposure_max - exposure_min;
+
+        const bool flash = metrics.exposure_delta >= 18.0
+            && metrics.exposure_spread <= 12.0
+            && metrics.changed_ratio >= 0.25
+            && metrics.average_kl < 0.14
+            && metrics.edge_delta < 12.0
+            && metrics.chroma_delta < 12.0;
+        const bool hard_cut =
+            metrics.average_delta >= config_.scene_average_threshold
+            && metrics.changed_ratio >= config_.scene_changed_ratio
+            && metrics.average_kl >= 0.11
+            && (metrics.regional_kl_max >= 0.22
+                || metrics.chroma_delta >= 10.0
+                || metrics.edge_delta >= 10.0);
+        const bool exposure_fade = metrics.exposure_delta >= 6.0
+            && metrics.exposure_spread <= 20.0
+            && metrics.changed_ratio >= 0.12
+            && metrics.average_kl >= 0.025
+            && metrics.average_kl < 0.18
+            && metrics.edge_delta < 18.0;
+        const bool sustained_dissolve =
+            (previous_scene_class_ == RIFE_SCENE_UNCERTAIN
+             || previous_scene_class_ == RIFE_SCENE_FADE_DISSOLVE)
+            && previous_scene_.average_kl >= 0.30
+            && metrics.average_kl >= 0.30
+            && previous_scene_.average_delta >= 3.0
+            && previous_scene_.average_delta <= 16.0
+            && metrics.average_delta >= 3.0
+            && metrics.average_delta <= 16.0
+            && std::abs(previous_scene_.average_delta
+                        - metrics.average_delta) <= 8.0
+            && previous_scene_.changed_ratio <= 0.08
+            && metrics.changed_ratio <= 0.08
+            && metrics.edge_delta < 4.0;
+        const bool fade = exposure_fade || sustained_dissolve;
+        const bool uncertain =
+            (metrics.average_delta >= 12.0
+             && metrics.changed_ratio >= 0.18)
+            || metrics.average_kl >= 0.08;
+
+        uint32_t candidate = RIFE_SCENE_NORMAL;
+        if (flash)
+            candidate = RIFE_SCENE_FLASH;
+        else if (hard_cut)
+            candidate = RIFE_SCENE_HARD_CUT;
+        else if (fade)
+            candidate = RIFE_SCENE_FADE_DISSOLVE;
+        else if (uncertain)
+            candidate = RIFE_SCENE_UNCERTAIN;
+        metrics.classification = candidate;
+        if (candidate == RIFE_SCENE_UNCERTAIN
+            && (previous_scene_class_ == RIFE_SCENE_FLASH
+                || previous_scene_class_ == RIFE_SCENE_FADE_DISSOLVE)
+            && previous_scene_streak_ < 3) {
+            metrics.classification = previous_scene_class_;
+        } else if (candidate == RIFE_SCENE_NORMAL
+                   && previous_scene_class_ == RIFE_SCENE_FADE_DISSOLVE
+                   && metrics.exposure_delta >= 3.0
+                   && metrics.average_kl >= 0.012) {
+            metrics.classification = previous_scene_class_;
+        }
+        previous_scene_streak_ = metrics.classification == previous_scene_class_
+            ? std::min(previous_scene_streak_ + 1, 255u) : 1u;
+        previous_scene_class_ = metrics.classification;
+        previous_scene_ = metrics;
         return true;
     }
 
@@ -1081,6 +1331,8 @@ private:
     }
 
     rife_runtime_config config_{};
+    std::wstring engine_path_;
+    std::wstring cuda_runtime_path_;
     CudaApi cuda_{};
     CudaStream stream_ = nullptr;
     CudaGraphicsResource input_resource_ = nullptr;
@@ -1113,12 +1365,42 @@ private:
     ComPtr<ID3D11Query> completion_query_;
     rife_runtime_stats stats_{};
     std::array<uint64_t, kInferenceHistogramBuckets> inference_histogram_{};
+    SceneMetrics previous_scene_{};
+    uint32_t previous_scene_class_ = RIFE_SCENE_NORMAL;
+    uint32_t previous_scene_streak_ = 0;
+    uint64_t reuse_count_ = 0;
 };
+
+struct RuntimeCache {
+    std::mutex mutex;
+    std::shared_ptr<Runtime> runtime;
+};
+
+RuntimeCache &runtime_cache()
+{
+    // The DLL is pinned for process-wide reuse. Let Windows reclaim the final
+    // cached D3D/CUDA objects so they are not destructed after the D3D device.
+    static RuntimeCache *cache = new RuntimeCache();
+    return *cache;
+}
+
+bool pin_runtime_module(char *error, size_t error_capacity)
+{
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCSTR>(&rife_runtime_create), &module))
+        return true;
+    set_error(error, error_capacity,
+              "RIFE runtime module pinning failed: Win32 %lu", GetLastError());
+    return false;
+}
 
 } // namespace
 
 struct rife_runtime {
-    std::unique_ptr<Runtime> implementation;
+    std::shared_ptr<Runtime> implementation;
 };
 
 extern "C" uint32_t __cdecl rife_runtime_abi_version(void)
@@ -1148,10 +1430,35 @@ extern "C" struct rife_runtime *__cdecl rife_runtime_create(
         set_error(error, error_capacity, "RIFE runtime configuration is invalid");
         return nullptr;
     }
-    auto runtime = std::make_unique<rife_runtime>();
-    runtime->implementation = std::make_unique<Runtime>();
-    if (!runtime->implementation->initialize(*config, error, error_capacity))
+    if (!pin_runtime_module(error, error_capacity))
         return nullptr;
+    const auto started = std::chrono::steady_clock::now();
+    auto runtime = std::make_unique<rife_runtime>();
+    {
+        RuntimeCache &cache = runtime_cache();
+        std::scoped_lock lock(cache.mutex);
+        if (cache.runtime && cache.runtime.use_count() == 1
+            && cache.runtime->device_available()
+            && cache.runtime->matches(*config)) {
+            runtime->implementation = cache.runtime;
+            const auto ended = std::chrono::steady_clock::now();
+            runtime->implementation->begin_session(
+                true, std::chrono::duration<double, std::milli>(
+                          ended - started).count());
+        } else {
+            if (cache.runtime && cache.runtime.use_count() == 1)
+                cache.runtime.reset();
+            auto implementation = std::make_shared<Runtime>();
+            if (!implementation->initialize(*config, error, error_capacity))
+                return nullptr;
+            const auto ended = std::chrono::steady_clock::now();
+            implementation->begin_session(
+                false, std::chrono::duration<double, std::milli>(
+                           ended - started).count());
+            cache.runtime = implementation;
+            runtime->implementation = std::move(implementation);
+        }
+    }
     return runtime.release();
 }
 
@@ -1163,19 +1470,21 @@ extern "C" int __cdecl rife_runtime_process(
     uint32_t frame1_slice,
     ID3D11Texture2D *output,
     uint32_t output_slice,
-    int *scene_cut,
+    double source0_pts,
+    double source1_pts,
+    struct rife_frame_diagnostics *diagnostics,
     char *error,
     size_t error_capacity)
 {
     if (error && error_capacity)
         error[0] = '\0';
-    if (!runtime || !runtime->implementation || !scene_cut) {
+    if (!runtime || !runtime->implementation || !diagnostics) {
         set_error(error, error_capacity, "RIFE process arguments are invalid");
         return RIFE_RUNTIME_INVALID_ARGUMENT;
     }
     return runtime->implementation->process(
         frame0, frame0_slice, frame1, frame1_slice, output, output_slice,
-        scene_cut, error, error_capacity);
+        source0_pts, source1_pts, diagnostics, error, error_capacity);
 }
 
 extern "C" void __cdecl rife_runtime_reset(struct rife_runtime *runtime)

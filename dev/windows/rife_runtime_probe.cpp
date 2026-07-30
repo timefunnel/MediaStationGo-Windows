@@ -24,7 +24,8 @@ using CreateFn = rife_runtime *(__cdecl *)(
     const rife_runtime_config *, char *, size_t);
 using ProcessFn = int(__cdecl *)(
     rife_runtime *, ID3D11Texture2D *, uint32_t, ID3D11Texture2D *, uint32_t,
-    ID3D11Texture2D *, uint32_t, int *, char *, size_t);
+    ID3D11Texture2D *, uint32_t, double, double,
+    rife_frame_diagnostics *, char *, size_t);
 using GetStatsFn = int(__cdecl *)(const rife_runtime *, rife_runtime_stats *);
 using DestroyFn = void(__cdecl *)(rife_runtime *);
 
@@ -254,9 +255,9 @@ int wmain(int argc, wchar_t **argv)
         RIFE_COLOR_MATRIX_BT709,
         1,
         8,
-        160,
-        180.0f,
-        0.75f,
+        32,
+        24.0f,
+        0.42f,
     };
     char error[1024]{};
     rife_runtime *runtime = create(&config, error, sizeof(error));
@@ -268,19 +269,21 @@ int wmain(int argc, wchar_t **argv)
     }
 
     bool ok = true;
-    int scene_cut = 0;
+    rife_frame_diagnostics diagnostics{};
     for (int index = 0; index < warmup && ok; ++index) {
         ok = process(runtime, frame0.Get(), 0, frame1.Get(), 0,
-                     output.Get(), 0, &scene_cut, error, sizeof(error))
-             == RIFE_RUNTIME_OK && !scene_cut;
+                     output.Get(), 0, index / 24.0, (index + 1) / 24.0,
+                     &diagnostics, error, sizeof(error))
+             == RIFE_RUNTIME_OK && !diagnostics.scene_cut;
     }
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(iterations));
     for (int index = 0; index < iterations && ok; ++index) {
         const auto started = std::chrono::steady_clock::now();
         ok = process(runtime, frame0.Get(), 0, frame1.Get(), 0,
-                     output.Get(), 0, &scene_cut, error, sizeof(error))
-             == RIFE_RUNTIME_OK && !scene_cut;
+                     output.Get(), 0, index / 24.0, (index + 1) / 24.0,
+                     &diagnostics, error, sizeof(error))
+             == RIFE_RUNTIME_OK && !diagnostics.scene_cut;
         const auto ended = std::chrono::steady_clock::now();
         samples.push_back(std::chrono::duration<double, std::milli>(
             ended - started).count());
@@ -291,11 +294,18 @@ int wmain(int argc, wchar_t **argv)
     ok = ok && validate_p010_output(device.Get(), context.Get(), output.Get(),
                                     width, height, validation);
     destroy(runtime);
+    runtime = create(&config, error, sizeof(error));
+    rife_runtime_stats cached_stats{};
+    ok = ok && runtime
+        && get_stats(runtime, &cached_stats) == RIFE_RUNTIME_OK
+        && cached_stats.runtime_cache_hit == 1;
+    if (runtime)
+        destroy(runtime);
     FreeLibrary(module);
     if (!ok || samples.size() != static_cast<size_t>(iterations)) {
         std::fprintf(stderr,
-                     "RIFE_RUNTIME_PROBE_FAILED detail=%s scene-cut=%d\n",
-                     error, scene_cut);
+                     "RIFE_RUNTIME_PROBE_FAILED detail=%s scene-cut=%u\n",
+                     error, diagnostics.scene_cut);
         return 10;
     }
 
@@ -310,12 +320,20 @@ int wmain(int argc, wchar_t **argv)
         "RIFE_RUNTIME_PROBE_OK adapter=%ls source=%ux%u warmup=%d "
         "iterations=%d throughput=%.2fqps mean=%.2fms p95=%.2fms "
         "runtime-p95=%.2fms scene-mean=%.3fms inferred=%llu cuts=%llu "
+        "cache-reopen=%s cold-init=%.2fms cached-init=%.2fms "
+        "scene-class=%u average-delta=%.3f changed-ratio=%.4f "
+        "average-kl=%.5f "
         "unique-luma=%u non-8bit-luma=%llu p010-packed=%s\n",
         adapter_name.c_str(), width, height, warmup, iterations, 1000.0 / mean,
         mean, p95, stats.inference_p95_ms,
         stats.pairs ? stats.scene_total_ms / stats.pairs : 0,
         static_cast<unsigned long long>(stats.inferred_pairs),
         static_cast<unsigned long long>(stats.scene_cuts),
+        cached_stats.runtime_cache_hit ? "hit" : "miss",
+        stats.runtime_initialization_ms,
+        cached_stats.runtime_initialization_ms,
+        diagnostics.classification, diagnostics.average_delta,
+        diagnostics.changed_ratio, diagnostics.average_kl,
         validation.unique_luma_codes,
         static_cast<unsigned long long>(validation.non_8bit_luma_samples),
         validation.p010_packed ? "yes" : "no");
