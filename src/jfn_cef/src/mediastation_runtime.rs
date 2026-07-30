@@ -636,7 +636,7 @@ impl MediaStationRuntime {
                 && let Some(active) = state.active_interpolation.as_ref()
             {
                 log_debug(&format!(
-                    "NVOFA frame interpolation started: media_id={} target_fps={} backend={} optical_flow_api={} hwdec={}",
+                    "NVOF MEMC frame interpolation started: media_id={} target_fps={} backend={} optical_flow_api={} hwdec={}",
                     active.media_id,
                     active.plan.target_fps,
                     active.plan.backend,
@@ -2919,12 +2919,6 @@ fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> 
             "The requested frame interpolation mode is invalid",
         )
     })?;
-    if !mode.supported_by_native_backend() {
-        return Err(LoadFailure::new(
-            "frame_interpolation_target_not_supported",
-            "The native NVOFA backend currently supports only 60 FPS output",
-        ));
-    }
     if mode != InterpolationMode::Off {
         let report = jfn_frame_interpolation::capability_report();
         if !report.ready {
@@ -2935,7 +2929,7 @@ fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> 
                     .map_or("frame_interpolation_runtime_unavailable", |failure| {
                         failure.code
                     }),
-                "The native NVOFA frame interpolation components are unavailable",
+                "The native NVOF MEMC frame interpolation components are unavailable",
             ));
         }
     }
@@ -3604,19 +3598,29 @@ fn execute_load(
     ));
     let interpolation = frame_interpolation_plan(&source)?;
     if let Some(plan) = &interpolation {
+        let display_fps = jfn_playback::ingest_driver::jfn_playback_display_hz();
         log_debug(&format!(
-            "NVOFA frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} backend={} optical_flow_api={} scene_threshold={} hwdec={} filter={}",
+            "NVOF MEMC frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} display_fps={} backend={} optical_flow_api={} hwdec={} filter={}",
             request.media_id,
             plan.mode.as_str(),
             plan.source_fps_num,
             plan.source_fps_den,
             plan.target_fps,
+            display_fps,
             plan.backend,
             plan.optical_flow_api,
-            plan.scene_threshold,
             plan.hwdec,
             plan.video_filter,
         ));
+        let cadence_multiple = (display_fps / plan.target_fps).round().max(1.0);
+        let cadence_target = plan.target_fps * cadence_multiple;
+        let cadence_error = (display_fps - cadence_target).abs();
+        if cadence_error > 0.5 {
+            log_warn(&format!(
+                "NVOF MEMC display cadence mismatch: display_fps={display_fps:.3} target_fps={:.3} nearest_multiple={cadence_multiple:.0} expected_display_fps={cadence_target:.3} error_hz={cadence_error:.3}; fixed-refresh presentation can judder when VRR is inactive",
+                plan.target_fps,
+            ));
+        }
     }
 
     runtime.ensure_generation(snapshot.generation)?;
@@ -3780,7 +3784,6 @@ fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
         "hwdec": plan.hwdec,
         "backend": plan.backend,
         "opticalFlowApi": plan.optical_flow_api,
-        "sceneThreshold": plan.scene_threshold,
         "videoFilter": plan.video_filter,
     })
 }
@@ -4344,6 +4347,10 @@ fn dispatch_response(
 
 fn log_error(message: &str) {
     jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_ERROR, message);
+}
+
+fn log_warn(message: &str) {
+    jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_WARN, message);
 }
 
 fn log_debug(message: &str) {

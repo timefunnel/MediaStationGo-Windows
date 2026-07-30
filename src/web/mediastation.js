@@ -304,13 +304,13 @@
             playback_unavailable: '当前没有可切换轨道的播放项目',
             authentication_in_progress: '登录请求正在处理中',
             session_changed: '账号状态已变化，请重试',
-            frame_interpolation_runtime_unavailable: 'NVOFA 插帧组件不可用',
+            frame_interpolation_runtime_unavailable: 'NVOF MEMC 插帧组件不可用',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
             frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
             frame_interpolation_nvidia_output_invalid: 'NVIDIA GPU 信息无效',
             frame_interpolation_gpu_unsupported: '首版插帧仅支持 NVIDIA RTX',
             frame_interpolation_platform_unsupported: '当前系统不支持 RTX 插帧',
-            frame_interpolation_not_initialized: 'NVOFA 插帧组件尚未初始化',
+            frame_interpolation_not_initialized: 'NVOF MEMC 插帧组件尚未初始化',
             frame_interpolation_nvofa_library_unavailable: 'NVIDIA Optical Flow 运行库不可用',
             frame_interpolation_nvofa_api_missing: 'NVIDIA Optical Flow API 不完整',
             frame_interpolation_nvofa_probe_failed: 'NVIDIA Optical Flow API 探测失败',
@@ -324,10 +324,9 @@
             frame_interpolation_source_fps_invalid: '无法确认视频原始帧率，已拒绝插帧',
             frame_interpolation_target_not_higher: '插帧目标帧率必须高于原始帧率',
             frame_interpolation_display_fps_unknown: '无法读取当前显示器刷新率',
-            frame_interpolation_display_refresh_unsupported: '当前显示器刷新率低于 60 Hz',
             frame_interpolation_display_refresh_insufficient: '目标帧率高于当前显示器刷新率',
-            frame_interpolation_target_not_supported: '当前版本仅支持 60 FPS 插帧',
             frame_interpolation_dimensions_unsupported: '当前版本最高支持 3840×2160 插帧',
+            frame_interpolation_source_fps_unsupported: '当前仅支持 20 至 30 FPS 片源进行严格 2 倍插帧',
             frame_interpolation_hlg_not_validated: '当前版本尚未开放 HLG 插帧',
             frame_interpolation_hdr10_plus_unsupported: '当前版本不支持 HDR10+ 插帧',
             frame_interpolation_dolby_vision_unsupported: '当前版本不支持 Dolby Vision 插帧',
@@ -335,7 +334,7 @@
             frame_interpolation_hdr10_transfer_invalid: 'HDR10 缺少 PQ/ST2084 色彩元数据',
             frame_interpolation_color_space_unsupported: '视频色彩空间不支持插帧',
             frame_interpolation_color_range_unsupported: '视频色彩范围不支持插帧',
-            frame_interpolation_filter_invalid: 'NVOFA 滤镜参数无效',
+            frame_interpolation_filter_invalid: 'NVOF MEMC 滤镜参数无效',
             frame_interpolation_hwdec_invalid: 'RTX 插帧硬件解码参数无效',
             frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
         };
@@ -731,10 +730,10 @@
         if (status.componentStatus === 'ready') {
             const api = status.opticalFlowApi ? `Optical Flow API ${status.opticalFlowApi}` : null;
             const components = [status.gpuName, api, status.backend].filter(Boolean);
-            label.textContent = components.join(' · ') || 'NVOFA 插帧组件已就绪';
+            label.textContent = components.join(' · ') || 'NVOF MEMC 插帧组件已就绪';
             label.dataset.state = 'ready';
         } else {
-            const error = new Error(status.failureDetail || 'NVOFA 插帧组件不可用');
+            const error = new Error(status.failureDetail || 'NVOF MEMC 插帧组件不可用');
             error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';

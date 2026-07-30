@@ -1,0 +1,4122 @@
+/*
+ * MediaStationGo NVIDIA Optical Flow MEMC filter.
+ *
+ * Stage 1 is intentionally limited to a D3D11/P010 GPU passthrough. It
+ * validates the private UAV-capable P010 frame pool and HDR metadata path
+ * before any motion analysis or synthesized frames are introduced.
+ */
+
+#include <windows.h>
+#include <d3d11.h>
+#include <d3d11_3.h>
+#include <d3dcompiler.h>
+#include <dxgi1_2.h>
+#include <math.h>
+#include <stdio.h>
+
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+
+#include "filters/filter.h"
+#include "filters/filter_internal.h"
+#include "filters/user_filters.h"
+#include "video/hwdec.h"
+#include "video/mp_image.h"
+
+#include "nvOpticalFlowD3D11.h"
+
+struct opts {
+    bool stage1_passthrough;
+    bool stage2_timing_test;
+    bool stage3_nvof_test;
+    bool stage4_synthesis_test;
+    bool stage5_flow_infill_test;
+    bool flow_diagnostics;
+    double flow_fb_abs;
+    double flow_fb_rel;
+    double flow_cost_max;
+    double flow_confidence_min;
+    double infill_luma_threshold;
+    int scene_cut_sample_stride;
+    int scene_cut_pixel_threshold;
+    double scene_cut_average_threshold;
+    double scene_cut_changed_ratio;
+    bool gpu_timing;
+    bool nvof_completion_diagnostics;
+};
+
+enum output_phase {
+    OUTPUT_NONE,
+    OUTPUT_ORIGINAL,
+    OUTPUT_INTERMEDIATE_TEST,
+    OUTPUT_FINAL,
+};
+
+#define OUTPUT_POOL_CAPACITY 16
+#define FLOW_INFILL_PASS_COUNT 2
+#define FLOW_INFILL_FINAL_INDEX (FLOW_INFILL_PASS_COUNT % 2)
+#define SCENE_CUT_COUNTER_COUNT 4
+#define SCENE_CUT_SUMMARY_COUNTER_COUNT 2
+#define GPU_PROFILE_RING_SIZE 16
+#define GPU_PROFILE_BUCKET_COUNT 2001
+#define GPU_PROFILE_BUCKET_MS 0.05
+
+enum gpu_profile_stage {
+    GPU_PROFILE_P010_COPY,
+    GPU_PROFILE_LUMA_EXTRACT,
+    GPU_PROFILE_SCENE_CUT,
+    GPU_PROFILE_FLOW_INFILL,
+    GPU_PROFILE_SYNTH,
+    GPU_PROFILE_STAGE_COUNT,
+};
+
+struct gpu_profile_query {
+    ID3D11Query *disjoint;
+    ID3D11Query *start;
+    ID3D11Query *end;
+    bool pending;
+};
+
+struct gpu_profile_stats {
+    struct gpu_profile_query queries[GPU_PROFILE_RING_SIZE];
+    int cursor;
+    uint64_t samples;
+    uint64_t skipped;
+    uint64_t invalid;
+    double total_ms;
+    double max_ms;
+    uint64_t buckets[GPU_PROFILE_BUCKET_COUNT];
+};
+
+struct gpu_profile_token {
+    struct gpu_profile_query *query;
+};
+
+enum flow_diagnostic_counter {
+    FLOW_DIAG_PIXELS,
+    FLOW_DIAG_BOTH_VALID,
+    FLOW_DIAG_FORWARD_ONLY,
+    FLOW_DIAG_BACKWARD_ONLY,
+    FLOW_DIAG_HOLES,
+    FLOW_DIAG_FORWARD_OOB,
+    FLOW_DIAG_BACKWARD_OOB,
+    FLOW_DIAG_FORWARD_INCONSISTENT,
+    FLOW_DIAG_BACKWARD_INCONSISTENT,
+    FLOW_DIAG_FORWARD_HIGH_COST,
+    FLOW_DIAG_BACKWARD_HIGH_COST,
+    FLOW_DIAG_FORWARD_COST_SUM,
+    FLOW_DIAG_BACKWARD_COST_SUM,
+    FLOW_DIAG_LUMA_ABS_SUM,
+    FLOW_DIAG_LUMA_LARGE_CHANGE,
+    FLOW_DIAG_LARGE_FLOW,
+    FLOW_DIAG_FORWARD_RESIDUAL_LE_3,
+    FLOW_DIAG_FORWARD_RESIDUAL_LE_6,
+    FLOW_DIAG_FORWARD_RESIDUAL_LE_12,
+    FLOW_DIAG_BACKWARD_RESIDUAL_LE_3,
+    FLOW_DIAG_BACKWARD_RESIDUAL_LE_6,
+    FLOW_DIAG_BACKWARD_RESIDUAL_LE_12,
+    FLOW_DIAG_FORWARD_RESIDUAL_SUM,
+    FLOW_DIAG_BACKWARD_RESIDUAL_SUM,
+    FLOW_DIAG_FINAL_FORWARD_SEED,
+    FLOW_DIAG_FINAL_FORWARD_PROPAGATED,
+    FLOW_DIAG_FINAL_FORWARD_HOLE,
+    FLOW_DIAG_FINAL_BACKWARD_SEED,
+    FLOW_DIAG_FINAL_BACKWARD_PROPAGATED,
+    FLOW_DIAG_FINAL_BACKWARD_HOLE,
+    FLOW_DIAG_INVERSE_RESIDUAL_REJECT,
+    FLOW_DIAG_PHOTOMETRIC_REJECT,
+    FLOW_DIAG_INVERSE_OOB_REJECT,
+    FLOW_DIAG_COST_REJECT,
+    FLOW_DIAG_COUNTER_COUNT,
+};
+
+_Static_assert(FLOW_DIAG_COUNTER_COUNT == 34,
+               "flow diagnostics shader counter layout changed");
+
+struct texture_slot {
+    ID3D11Texture2D *texture;
+    bool in_use;
+};
+
+struct texture_pool {
+    volatile LONG refs;
+    SRWLOCK lock;
+    ID3D11Device *device;
+    int width;
+    int height;
+    int created;
+    bool views_verified;
+    struct texture_slot slots[OUTPUT_POOL_CAPACITY];
+};
+
+struct output_ref {
+    struct texture_pool *pool;
+    int slot;
+};
+
+struct nvof_resource {
+    ID3D11Texture2D *texture;
+    ID3D11UnorderedAccessView *uav;
+    ID3D11ShaderResourceView *srv;
+    NvOFGPUBufferHandle handle;
+};
+
+struct nvof_state {
+    HMODULE module;
+    HMODULE d3dcompiler_module;
+    pD3DCompile d3d_compile;
+    NV_OF_D3D11_API_FUNCTION_LIST api;
+    NvOFHandle handle;
+    ID3D11ComputeShader *promote_nv12_shader;
+    ID3D11ComputeShader *extract_luma_shader;
+    ID3D11ComputeShader *scene_cut_shader;
+    ID3D11ComputeShader *flow_diagnostics_shader;
+    ID3D11ComputeShader *prepare_flow_shader;
+    ID3D11ComputeShader *infill_flow_shader;
+    ID3D11ComputeShader *synthesize_p010_shader;
+    ID3D11Buffer *flow_diagnostics_buffer;
+    ID3D11Buffer *flow_diagnostics_readback;
+    ID3D11UnorderedAccessView *flow_diagnostics_uav;
+    ID3D11Buffer *scene_cut_buffer;
+    ID3D11UnorderedAccessView *scene_cut_uav;
+    ID3D11ShaderResourceView *scene_cut_srv;
+    ID3D11Buffer *scene_cut_summary_buffer;
+    ID3D11Buffer *scene_cut_summary_readback;
+    ID3D11UnorderedAccessView *scene_cut_summary_uav;
+    ID3D11Texture2D *completion_readback;
+    struct nvof_resource gray[2];
+    struct nvof_resource flow_forward;
+    struct nvof_resource flow_backward;
+    struct nvof_resource cost_forward;
+    struct nvof_resource cost_backward;
+    struct nvof_resource global_flow;
+    struct nvof_resource flow_state_forward[2];
+    struct nvof_resource flow_state_backward[2];
+    int width;
+    int height;
+    uint32_t driver_api_version;
+    bool disable_temporal_hints_next;
+    uint64_t executes;
+    double execute_total_ms;
+    double execute_max_ms;
+    uint64_t completion_samples;
+    double completion_total_ms;
+    double completion_max_ms;
+    uint64_t diagnostic_pairs;
+    uint64_t diagnostic_totals[FLOW_DIAG_COUNTER_COUNT];
+    double diagnostic_total_ms;
+    double diagnostic_max_ms;
+    uint64_t flow_infill_pairs;
+    uint64_t scene_cut_pairs;
+    uint64_t scene_cuts;
+    struct gpu_profile_stats gpu_profile[GPU_PROFILE_STAGE_COUNT];
+};
+
+struct priv {
+    struct opts *opts;
+    AVBufferRef *av_device_ref;
+    ID3D11Device *device;
+    ID3D11DeviceContext *context;
+    ID3D10Multithread *multithread;
+    struct texture_pool *pool;
+    struct nvof_state nvof;
+    struct mp_image_params input_params;
+    struct mp_image *frame0;
+    struct mp_image *frame1;
+    enum output_phase output_phase;
+    double pair_duration;
+    bool input_eof;
+    bool output_eof_sent;
+    uint64_t input_frames;
+    uint64_t copied_frames;
+    uint64_t promoted_frames;
+    uint64_t original_frames;
+    uint64_t intermediate_test_frames;
+    uint64_t synthesized_frames;
+    uint64_t scene_cut_midpoints;
+    uint64_t discontinuities;
+    uint64_t resets;
+    bool pool_logged;
+};
+
+static bool synthesis_enabled(const struct priv *p)
+{
+    return p->opts->stage4_synthesis_test ||
+           p->opts->stage5_flow_infill_test;
+}
+
+static bool nvof_analysis_enabled(const struct priv *p)
+{
+    return p->opts->stage3_nvof_test || synthesis_enabled(p);
+}
+
+static void lock_d3d11_context(struct priv *p)
+{
+    mp_assert(p->multithread);
+    ID3D10Multithread_Enter(p->multithread);
+}
+
+static void unlock_d3d11_context(struct priv *p)
+{
+    mp_assert(p->multithread);
+    ID3D10Multithread_Leave(p->multithread);
+}
+
+static void format_shader_number(char *buffer, size_t size, double value)
+{
+    snprintf(buffer, size, "%.9g", value);
+    for (char *cursor = buffer; *cursor; cursor++) {
+        if (*cursor == ',')
+            *cursor = '.';
+    }
+}
+
+static const char *gpu_profile_stage_name(enum gpu_profile_stage stage)
+{
+    switch (stage) {
+    case GPU_PROFILE_P010_COPY: return "p010-copy";
+    case GPU_PROFILE_LUMA_EXTRACT: return "luma-extract";
+    case GPU_PROFILE_SCENE_CUT: return "scene-cut";
+    case GPU_PROFILE_FLOW_INFILL: return "flow-infill";
+    case GPU_PROFILE_SYNTH: return "p010-synth";
+    default: return "unknown";
+    }
+}
+
+static void release_gpu_profile_queries(struct priv *p)
+{
+    for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++) {
+        struct gpu_profile_stats *stats = &p->nvof.gpu_profile[stage];
+        for (int index = 0; index < GPU_PROFILE_RING_SIZE; index++) {
+            struct gpu_profile_query *query = &stats->queries[index];
+            if (query->disjoint)
+                ID3D11Query_Release(query->disjoint);
+            if (query->start)
+                ID3D11Query_Release(query->start);
+            if (query->end)
+                ID3D11Query_Release(query->end);
+            query->disjoint = NULL;
+            query->start = NULL;
+            query->end = NULL;
+            query->pending = false;
+        }
+    }
+}
+
+static bool create_gpu_profile_queries(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->opts->gpu_timing)
+        return true;
+    D3D11_QUERY_DESC disjoint_desc = {
+        .Query = D3D11_QUERY_TIMESTAMP_DISJOINT,
+    };
+    D3D11_QUERY_DESC timestamp_desc = {
+        .Query = D3D11_QUERY_TIMESTAMP,
+    };
+    for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++) {
+        struct gpu_profile_stats *stats = &p->nvof.gpu_profile[stage];
+        for (int index = 0; index < GPU_PROFILE_RING_SIZE; index++) {
+            struct gpu_profile_query *query = &stats->queries[index];
+            HRESULT hr = ID3D11Device_CreateQuery(
+                p->device, &disjoint_desc, &query->disjoint);
+            if (SUCCEEDED(hr)) {
+                hr = ID3D11Device_CreateQuery(
+                    p->device, &timestamp_desc, &query->start);
+            }
+            if (SUCCEEDED(hr)) {
+                hr = ID3D11Device_CreateQuery(
+                    p->device, &timestamp_desc, &query->end);
+            }
+            if (FAILED(hr)) {
+                MP_ERR(f, "NVOF GPU timestamp query creation failed "
+                          "stage=%s slot=%d hr=0x%08lx\n",
+                       gpu_profile_stage_name(stage), index,
+                       (unsigned long)hr);
+                release_gpu_profile_queries(p);
+                return false;
+            }
+        }
+    }
+    MP_INFO(f, "NVOF asynchronous GPU timestamp queries ready "
+               "stages=%d ring-size=%d bucket-ms=%.2f\n",
+            GPU_PROFILE_STAGE_COUNT, GPU_PROFILE_RING_SIZE,
+            GPU_PROFILE_BUCKET_MS);
+    return true;
+}
+
+static bool collect_gpu_profile_query_locked(
+    struct priv *p, struct gpu_profile_stats *stats,
+    struct gpu_profile_query *query)
+{
+    if (!query->pending)
+        return true;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {0};
+    UINT64 start = 0;
+    UINT64 end = 0;
+    HRESULT disjoint_hr = ID3D11DeviceContext_GetData(
+        p->context, (ID3D11Asynchronous *)query->disjoint,
+        &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    HRESULT start_hr = ID3D11DeviceContext_GetData(
+        p->context, (ID3D11Asynchronous *)query->start,
+        &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    HRESULT end_hr = ID3D11DeviceContext_GetData(
+        p->context, (ID3D11Asynchronous *)query->end,
+        &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (disjoint_hr == S_FALSE || start_hr == S_FALSE || end_hr == S_FALSE)
+        return false;
+    query->pending = false;
+    if (FAILED(disjoint_hr) || FAILED(start_hr) || FAILED(end_hr) ||
+        disjoint.Disjoint || !disjoint.Frequency || end < start) {
+        stats->invalid++;
+        return true;
+    }
+    double elapsed_ms = (end - start) * 1000.0 / disjoint.Frequency;
+    stats->samples++;
+    stats->total_ms += elapsed_ms;
+    stats->max_ms = MPMAX(stats->max_ms, elapsed_ms);
+    int bucket = (int)(elapsed_ms / GPU_PROFILE_BUCKET_MS);
+    bucket = MPCLAMP(bucket, 0, GPU_PROFILE_BUCKET_COUNT - 1);
+    stats->buckets[bucket]++;
+    return true;
+}
+
+static int collect_gpu_profile_stage_locked(struct priv *p,
+                                             enum gpu_profile_stage stage)
+{
+    struct gpu_profile_stats *stats = &p->nvof.gpu_profile[stage];
+    int pending = 0;
+    for (int index = 0; index < GPU_PROFILE_RING_SIZE; index++) {
+        struct gpu_profile_query *query = &stats->queries[index];
+        if (!collect_gpu_profile_query_locked(p, stats, query))
+            pending++;
+    }
+    return pending;
+}
+
+static struct gpu_profile_token gpu_profile_begin_locked(
+    struct priv *p, enum gpu_profile_stage stage)
+{
+    struct gpu_profile_token token = {0};
+    if (!p->opts->gpu_timing)
+        return token;
+    struct gpu_profile_stats *stats = &p->nvof.gpu_profile[stage];
+    collect_gpu_profile_stage_locked(p, stage);
+    struct gpu_profile_query *query = &stats->queries[stats->cursor];
+    stats->cursor = (stats->cursor + 1) % GPU_PROFILE_RING_SIZE;
+    if (query->pending) {
+        stats->skipped++;
+        return token;
+    }
+    ID3D11DeviceContext_Begin(
+        p->context, (ID3D11Asynchronous *)query->disjoint);
+    ID3D11DeviceContext_End(
+        p->context, (ID3D11Asynchronous *)query->start);
+    token.query = query;
+    return token;
+}
+
+static void gpu_profile_end_locked(struct priv *p,
+                                   struct gpu_profile_token token)
+{
+    if (!token.query)
+        return;
+    ID3D11DeviceContext_End(
+        p->context, (ID3D11Asynchronous *)token.query->end);
+    ID3D11DeviceContext_End(
+        p->context, (ID3D11Asynchronous *)token.query->disjoint);
+    token.query->pending = true;
+}
+
+static int drain_gpu_profile_queries(struct priv *p)
+{
+    if (!p->opts->gpu_timing || !p->context)
+        return 0;
+    lock_d3d11_context(p);
+    ID3D11DeviceContext_Flush(p->context);
+    unlock_d3d11_context(p);
+    int pending = 0;
+    for (int attempt = 0; attempt < 2000; attempt++) {
+        pending = 0;
+        lock_d3d11_context(p);
+        for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++)
+            pending += collect_gpu_profile_stage_locked(p, stage);
+        unlock_d3d11_context(p);
+        if (!pending)
+            break;
+        Sleep(1);
+    }
+    return pending;
+}
+
+static double gpu_profile_percentile(const struct gpu_profile_stats *stats,
+                                     double percentile)
+{
+    if (!stats->samples)
+        return 0;
+    uint64_t target = (uint64_t)ceil(stats->samples * percentile);
+    target = MPMAX(target, 1);
+    uint64_t accumulated = 0;
+    for (int bucket = 0; bucket < GPU_PROFILE_BUCKET_COUNT; bucket++) {
+        accumulated += stats->buckets[bucket];
+        if (accumulated >= target)
+            return (bucket + 1) * GPU_PROFILE_BUCKET_MS;
+    }
+    return stats->max_ms;
+}
+
+typedef NV_OF_STATUS(NVOFAPI *nvof_get_max_version_fn)(uint32_t *version);
+typedef NV_OF_STATUS(NVOFAPI *nvof_create_instance_d3d11_fn)(
+    uint32_t api_version, NV_OF_D3D11_API_FUNCTION_LIST *functions);
+
+static const char extract_luma_shader_source[] =
+    "Texture2D<float> source_y : register(t0);\n"
+    "RWTexture2D<float> output_gray : register(u0);\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint width, height;\n"
+    "    output_gray.GetDimensions(width, height);\n"
+    "    if (id.x >= width || id.y >= height)\n"
+    "        return;\n"
+    "    float stored = source_y.Load(int3(id.xy, 0));\n"
+    "    float y10 = round(stored * (65535.0 / 64.0));\n"
+    "    float gray8 = round(y10 * (255.0 / 1023.0));\n"
+    "    output_gray[id.xy] = gray8 / 255.0;\n"
+    "}\n";
+
+static const char promote_nv12_shader_source[] =
+    "Texture2D<float> source_y : register(t0);\n"
+    "Texture2D<float2> source_uv : register(t1);\n"
+    "RWTexture2D<float> output_y : register(u0);\n"
+    "RWTexture2D<float2> output_uv : register(u1);\n"
+    "float promote_code(float value)\n"
+    "{\n"
+    "    float code8 = round(saturate(value) * 255.0);\n"
+    "    return code8 * 256.0 / 65535.0;\n"
+    "}\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    output_y.GetDimensions(w, h);\n"
+    "    if (id.x < w && id.y < h)\n"
+    "        output_y[id.xy] = promote_code(source_y.Load(int3(id.xy, 0)));\n"
+    "    uint uvw, uvh;\n"
+    "    output_uv.GetDimensions(uvw, uvh);\n"
+    "    if (id.x < uvw && id.y < uvh) {\n"
+    "        float2 value = source_uv.Load(int3(id.xy, 0));\n"
+    "        output_uv[id.xy] = float2(promote_code(value.x),\n"
+    "                                      promote_code(value.y));\n"
+    "    }\n"
+    "}\n";
+
+static const char scene_cut_shader_source[] =
+    "Texture2D<float> gray0 : register(t0);\n"
+    "Texture2D<float> gray1 : register(t1);\n"
+    "RWStructuredBuffer<uint> output_counters : register(u0);\n"
+    "groupshared uint counters[4];\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID,\n"
+    "          uint group_index : SV_GroupIndex)\n"
+    "{\n"
+    "    if (group_index < 4)\n"
+    "        counters[group_index] = 0;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    uint w, h;\n"
+    "    gray0.GetDimensions(w, h);\n"
+    "    uint sampled_w = (w + SCENE_SAMPLE_STRIDE - 1) /\n"
+    "                     SCENE_SAMPLE_STRIDE;\n"
+    "    uint sampled_h = (h + SCENE_SAMPLE_STRIDE - 1) /\n"
+    "                     SCENE_SAMPLE_STRIDE;\n"
+    "    if (id.x < sampled_w && id.y < sampled_h) {\n"
+    "        uint2 p = min(id.xy * SCENE_SAMPLE_STRIDE +\n"
+    "                      SCENE_SAMPLE_STRIDE / 2, uint2(w - 1, h - 1));\n"
+    "        uint delta = (uint)round(abs(gray0.Load(int3(p, 0)) -\n"
+    "                                    gray1.Load(int3(p, 0))) * 255.0);\n"
+    "        InterlockedAdd(counters[0], 1);\n"
+    "        InterlockedAdd(counters[1], delta);\n"
+    "        if (delta >= SCENE_PIXEL_THRESHOLD)\n"
+    "            InterlockedAdd(counters[2], 1);\n"
+    "        if (delta >= min(255, SCENE_PIXEL_THRESHOLD * 2))\n"
+    "            InterlockedAdd(counters[3], 1);\n"
+    "    }\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    if (group_index < 4)\n"
+    "        InterlockedAdd(output_counters[group_index],\n"
+    "                       counters[group_index]);\n"
+    "}\n";
+
+static const char flow_diagnostics_shader_source[] =
+    "Texture2D<int2> flow0 : register(t0);\n"
+    "Texture2D<int2> flow1 : register(t1);\n"
+    "Texture2D<uint> cost0 : register(t2);\n"
+    "Texture2D<uint> cost1 : register(t3);\n"
+    "Texture2D<float> gray0 : register(t4);\n"
+    "Texture2D<float> gray1 : register(t5);\n"
+    "#if USE_FILLED_FLOW\n"
+    "Texture2D<float4> final_state0 : register(t6);\n"
+    "Texture2D<float4> final_state1 : register(t7);\n"
+    "#endif\n"
+    "RWStructuredBuffer<uint> output_counters : register(u0);\n"
+    "groupshared uint counters[34];\n"
+    "\n"
+    "float2 clamp_coord(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return clamp(p, float2(0.0, 0.0),\n"
+    "                  float2((float)w - 1.0, (float)h - 1.0));\n"
+    "}\n"
+    "\n"
+    "bool in_frame(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return p.x >= 0.0 && p.y >= 0.0 && p.x <= (float)w - 1.0 &&\n"
+    "           p.y <= (float)h - 1.0;\n"
+    "}\n"
+    "\n"
+    "float2 sample_flow(Texture2D<int2> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_coord(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float2 v00 = (float2)tex.Load(int3(a, 0));\n"
+    "    float2 v10 = (float2)tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float2 v01 = (float2)tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float2 v11 = (float2)tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x),\n"
+    "                lerp(v01, v11, f.x), f.y) / 32.0;\n"
+    "}\n"
+    "\n"
+    "float sample_cost(Texture2D<uint> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_coord(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = (float)(tex.Load(int3(a, 0)) & 255);\n"
+    "    float v10 = (float)(tex.Load(int3(int2(b.x, a.y), 0)) & 255);\n"
+    "    float v01 = (float)(tex.Load(int3(int2(a.x, b.y), 0)) & 255);\n"
+    "    float v11 = (float)(tex.Load(int3(b, 0)) & 255);\n"
+    "    return lerp(lerp(v00, v10, f.x),\n"
+    "                lerp(v01, v11, f.x), f.y) / 255.0;\n"
+    "}\n"
+    "\n"
+    "void solve_sources(float2 target, uint w, uint h, out float2 p0,\n"
+    "                   out float2 p1)\n"
+    "{\n"
+    "    p0 = target;\n"
+    "    p1 = target;\n"
+    "    [unroll]\n"
+    "    for (uint n = 0; n < 2; n++) {\n"
+    "        p0 = target - 0.5 * sample_flow(flow0, p0, w, h);\n"
+    "        p1 = target - 0.5 * sample_flow(flow1, p1, w, h);\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "float4 analyze_forward(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    float cost = sample_cost(cost0, p, w, h);\n"
+    "    float2 f = sample_flow(flow0, p, w, h);\n"
+    "    float2 q = p + f;\n"
+    "    if (!in_frame(q, w, h))\n"
+    "        return float4(0.0, 1.0, 0.0, cost);\n"
+    "    float2 b = sample_flow(flow1, q, w, h);\n"
+    "    float residual = length(f + b);\n"
+    "    float threshold = 1.5 + 0.05 * length(f);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    return float4(consistency * (1.0 - cost), 0.0, residual, cost);\n"
+    "}\n"
+    "\n"
+    "float4 analyze_backward(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    float cost = sample_cost(cost1, p, w, h);\n"
+    "    float2 b = sample_flow(flow1, p, w, h);\n"
+    "    float2 q = p + b;\n"
+    "    if (!in_frame(q, w, h))\n"
+    "        return float4(0.0, 1.0, 0.0, cost);\n"
+    "    float2 f = sample_flow(flow0, q, w, h);\n"
+    "    float residual = length(b + f);\n"
+    "    float threshold = 1.5 + 0.05 * length(b);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    return float4(consistency * (1.0 - cost), 0.0, residual, cost);\n"
+    "}\n"
+    "\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID,\n"
+    "          uint group_index : SV_GroupIndex)\n"
+    "{\n"
+    "    if (group_index < 34)\n"
+    "        counters[group_index] = 0;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    uint w, h;\n"
+    "    gray0.GetDimensions(w, h);\n"
+    "    bool active = id.x < w && id.y < h;\n"
+    "    if (active) {\n"
+    "\n"
+    "    float2 target = (float2)id.xy;\n"
+    "#if USE_FILLED_FLOW\n"
+    "    float4 final0 = final_state0.Load(int3(id.xy, 0));\n"
+    "    float4 final1 = final_state1.Load(int3(id.xy, 0));\n"
+    "    bool valid0 = final0.z > FLOW_CONFIDENCE_MIN;\n"
+    "    bool valid1 = final1.z > FLOW_CONFIDENCE_MIN;\n"
+    "    float flow0_length = length(final0.xy);\n"
+    "    float flow1_length = length(final1.xy);\n"
+    "    float2 q0 = target + final0.xy;\n"
+    "    float2 q1 = target + final1.xy;\n"
+    "    bool oob0 = !in_frame(q0, w, h);\n"
+    "    bool oob1 = !in_frame(q1, w, h);\n"
+    "    float residual0 = oob0 ? 0.0 : length(final0.xy +\n"
+    "        final_state1.Load(int3((int2)round(q0), 0)).xy);\n"
+    "    float residual1 = oob1 ? 0.0 : length(final1.xy +\n"
+    "        final_state0.Load(int3((int2)round(q1), 0)).xy);\n"
+    "    float cost_fwd = sample_cost(cost0, target, w, h);\n"
+    "    float cost_bwd = sample_cost(cost1, target, w, h);\n"
+    "    float4 fwd = float4(final0.z, oob0 ? 1.0 : 0.0,\n"
+    "                        residual0, cost_fwd);\n"
+    "    float4 bwd = float4(final1.z, oob1 ? 1.0 : 0.0,\n"
+    "                        residual1, cost_bwd);\n"
+    "#else\n"
+    "    float2 p0, p1;\n"
+    "    solve_sources(target, w, h, p0, p1);\n"
+    "    float4 fwd = analyze_forward(p0, w, h);\n"
+    "    float4 bwd = analyze_backward(p1, w, h);\n"
+    "    bool valid0 = fwd.x > FLOW_CONFIDENCE_MIN;\n"
+    "    bool valid1 = bwd.x > FLOW_CONFIDENCE_MIN;\n"
+    "    float flow0_length = length(sample_flow(flow0, p0, w, h));\n"
+    "    float flow1_length = length(sample_flow(flow1, p1, w, h));\n"
+    "#endif\n"
+    "\n"
+    "    InterlockedAdd(counters[0], 1);\n"
+    "    if (valid0 && valid1)\n"
+    "        InterlockedAdd(counters[1], 1);\n"
+    "    else if (valid0)\n"
+    "        InterlockedAdd(counters[2], 1);\n"
+    "    else if (valid1)\n"
+    "        InterlockedAdd(counters[3], 1);\n"
+    "    else\n"
+    "        InterlockedAdd(counters[4], 1);\n"
+    "    if (fwd.y > 0.5) InterlockedAdd(counters[5], 1);\n"
+    "    if (bwd.y > 0.5) InterlockedAdd(counters[6], 1);\n"
+    "    if (fwd.y < 0.5 && fwd.z >= 0.95 * (1.5 + 0.05 * flow0_length))\n"
+    "        InterlockedAdd(counters[7], 1);\n"
+    "    if (bwd.y < 0.5 && bwd.z >= 0.95 * (1.5 + 0.05 * flow1_length))\n"
+    "        InterlockedAdd(counters[8], 1);\n"
+    "    if (fwd.w >= 0.95) InterlockedAdd(counters[9], 1);\n"
+    "    if (bwd.w >= 0.95) InterlockedAdd(counters[10], 1);\n"
+    "    InterlockedAdd(counters[11], (uint)round(fwd.w * 255.0));\n"
+    "    InterlockedAdd(counters[12], (uint)round(bwd.w * 255.0));\n"
+    "\n"
+    "    uint luma_diff = (uint)round(abs(\n"
+    "        gray0.Load(int3(id.xy, 0)) - gray1.Load(int3(id.xy, 0))) * 255.0);\n"
+    "    InterlockedAdd(counters[13], luma_diff);\n"
+    "    if (luma_diff >= 32) InterlockedAdd(counters[14], 1);\n"
+    "    float flow_length = max(flow0_length, flow1_length);\n"
+    "    if (flow_length >= 64.0) InterlockedAdd(counters[15], 1);\n"
+    "    if (fwd.y < 0.5) {\n"
+    "        if (fwd.z <= 3.0) InterlockedAdd(counters[16], 1);\n"
+    "        if (fwd.z <= 6.0) InterlockedAdd(counters[17], 1);\n"
+    "        if (fwd.z <= 12.0) InterlockedAdd(counters[18], 1);\n"
+    "        InterlockedAdd(counters[22], (uint)round(min(fwd.z, 255.0)));\n"
+    "    }\n"
+    "    if (bwd.y < 0.5) {\n"
+    "        if (bwd.z <= 3.0) InterlockedAdd(counters[19], 1);\n"
+    "        if (bwd.z <= 6.0) InterlockedAdd(counters[20], 1);\n"
+    "        if (bwd.z <= 12.0) InterlockedAdd(counters[21], 1);\n"
+    "        InterlockedAdd(counters[23], (uint)round(min(bwd.z, 255.0)));\n"
+    "    }\n"
+    "#if USE_FILLED_FLOW\n"
+    "    if (final0.z <= FLOW_CONFIDENCE_MIN)\n"
+    "        InterlockedAdd(counters[26], 1);\n"
+    "    else if (final0.w > 0.5)\n"
+    "        InterlockedAdd(counters[25], 1);\n"
+    "    else\n"
+    "        InterlockedAdd(counters[24], 1);\n"
+    "    if (final1.z <= FLOW_CONFIDENCE_MIN)\n"
+    "        InterlockedAdd(counters[29], 1);\n"
+    "    else if (final1.w > 0.5)\n"
+    "        InterlockedAdd(counters[28], 1);\n"
+    "    else\n"
+    "        InterlockedAdd(counters[27], 1);\n"
+    "    if (final1.z <= FLOW_CONFIDENCE_MIN &&\n"
+    "        final1.w < -1.5 && final1.w > -2.5)\n"
+    "        InterlockedAdd(counters[30], 1);\n"
+    "    if ((final0.z <= FLOW_CONFIDENCE_MIN &&\n"
+    "         final0.w < -2.5 && final0.w > -3.5) ||\n"
+    "        (final1.z <= FLOW_CONFIDENCE_MIN &&\n"
+    "         final1.w < -2.5 && final1.w > -3.5))\n"
+    "        InterlockedAdd(counters[31], 1);\n"
+    "    if ((final0.z <= FLOW_CONFIDENCE_MIN &&\n"
+    "         final0.w < -0.5 && final0.w > -1.5) ||\n"
+    "        (final1.z <= FLOW_CONFIDENCE_MIN &&\n"
+    "         final1.w < -0.5 && final1.w > -1.5))\n"
+    "        InterlockedAdd(counters[32], 1);\n"
+    "    if ((final0.z <= FLOW_CONFIDENCE_MIN && final0.w < -3.5) ||\n"
+    "        (final1.z <= FLOW_CONFIDENCE_MIN && final1.w < -3.5))\n"
+    "        InterlockedAdd(counters[33], 1);\n"
+    "#endif\n"
+    "    }\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    if (group_index < 34)\n"
+    "        InterlockedAdd(output_counters[group_index],\n"
+    "                       counters[group_index]);\n"
+    "}\n";
+
+static const char prepare_flow_shader_source[] =
+    "Texture2D<int2> flow0 : register(t0);\n"
+    "Texture2D<uint> cost0 : register(t1);\n"
+    "Texture2D<int2> flow1 : register(t2);\n"
+    "Texture2D<uint> cost1 : register(t3);\n"
+    "Texture2D<float> gray0 : register(t4);\n"
+    "Texture2D<float> gray1 : register(t5);\n"
+    "RWTexture2D<float4> state0 : register(u0);\n"
+    "RWTexture2D<float4> state1 : register(u1);\n"
+    "\n"
+    "float2 clamp_coord(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return clamp(p, float2(0.0, 0.0),\n"
+    "                  float2((float)w - 1.0, (float)h - 1.0));\n"
+    "}\n"
+    "\n"
+    "bool in_frame(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return p.x >= 0.0 && p.y >= 0.0 && p.x <= (float)w - 1.0 &&\n"
+    "           p.y <= (float)h - 1.0;\n"
+    "}\n"
+    "\n"
+    "float2 sample_flow(Texture2D<int2> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_coord(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float2 v00 = (float2)tex.Load(int3(a, 0));\n"
+    "    float2 v10 = (float2)tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float2 v01 = (float2)tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float2 v11 = (float2)tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x),\n"
+    "                lerp(v01, v11, f.x), f.y) / 32.0;\n"
+    "}\n"
+    "\n"
+    "float sample_cost(Texture2D<uint> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_coord(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = (float)(tex.Load(int3(a, 0)) & 255);\n"
+    "    float v10 = (float)(tex.Load(int3(int2(b.x, a.y), 0)) & 255);\n"
+    "    float v01 = (float)(tex.Load(int3(int2(a.x, b.y), 0)) & 255);\n"
+    "    float v11 = (float)(tex.Load(int3(b, 0)) & 255);\n"
+    "    return lerp(lerp(v00, v10, f.x),\n"
+    "                lerp(v01, v11, f.x), f.y) / 255.0;\n"
+    "}\n"
+    "\n"
+    "float sample_gray(Texture2D<float> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_coord(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = tex.Load(int3(a, 0));\n"
+    "    float v10 = tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float v01 = tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float v11 = tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x),\n"
+    "                lerp(v01, v11, f.x), f.y);\n"
+    "}\n"
+    "\n"
+    "float photometric_confidence(float luma_delta)\n"
+    "{\n"
+    "    return saturate(1.0 - luma_delta /\n"
+    "                    max(INFILL_LUMA_THRESHOLD, 0.001));\n"
+    "}\n"
+    "\n"
+    "float4 prepare_forward(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    float2 f = sample_flow(flow0, p, w, h);\n"
+    "    float2 q = p + f;\n"
+    "    if (!in_frame(q, w, h))\n"
+    "        return float4(f, 0.0, -1.0);\n"
+    "    float2 b = sample_flow(flow1, q, w, h);\n"
+    "    float residual = length(f + b);\n"
+    "    float threshold = FLOW_FB_ABS + FLOW_FB_REL * length(f);\n"
+    "    if (residual >= threshold)\n"
+    "        return float4(f, 0.0, -2.0);\n"
+    "    float cost = max(sample_cost(cost0, p, w, h),\n"
+    "                     sample_cost(cost1, q, w, h));\n"
+    "    if (cost > FLOW_COST_MAX)\n"
+    "        return float4(f, 0.0, -4.0);\n"
+    "    float luma_delta = abs(sample_gray(gray0, p, w, h) -\n"
+    "                           sample_gray(gray1, q, w, h)) * 255.0;\n"
+    "    if (luma_delta >= INFILL_LUMA_THRESHOLD)\n"
+    "        return float4(f, 0.0, -3.0);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    float confidence = consistency * (1.0 - cost) *\n"
+    "                       photometric_confidence(luma_delta);\n"
+    "    return float4(f, confidence, 0.0);\n"
+    "}\n"
+    "\n"
+    "float4 prepare_backward(float2 q, uint w, uint h)\n"
+    "{\n"
+    "    float2 b = sample_flow(flow1, q, w, h);\n"
+    "    float2 p = q + b;\n"
+    "    if (!in_frame(p, w, h))\n"
+    "        return float4(b, 0.0, -1.0);\n"
+    "    float2 f = sample_flow(flow0, p, w, h);\n"
+    "    float residual = length(b + f);\n"
+    "    float threshold = FLOW_FB_ABS + FLOW_FB_REL * length(b);\n"
+    "    if (residual >= threshold)\n"
+    "        return float4(b, 0.0, -2.0);\n"
+    "    float cost = max(sample_cost(cost1, q, w, h),\n"
+    "                     sample_cost(cost0, p, w, h));\n"
+    "    if (cost > FLOW_COST_MAX)\n"
+    "        return float4(b, 0.0, -4.0);\n"
+    "    float luma_delta = abs(sample_gray(gray0, p, w, h) -\n"
+    "                           sample_gray(gray1, q, w, h)) * 255.0;\n"
+    "    if (luma_delta >= INFILL_LUMA_THRESHOLD)\n"
+    "        return float4(b, 0.0, -3.0);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    float confidence = consistency * (1.0 - cost) *\n"
+    "                       photometric_confidence(luma_delta);\n"
+    "    return float4(b, confidence, 0.0);\n"
+    "}\n"
+    "\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    state0.GetDimensions(w, h);\n"
+    "    if (id.x >= w || id.y >= h)\n"
+    "        return;\n"
+    "    float2 p = (float2)id.xy;\n"
+    "    state0[id.xy] = prepare_forward(p, w, h);\n"
+    "    state1[id.xy] = prepare_backward(p, w, h);\n"
+    "}\n";
+
+static const char infill_flow_shader_source[] =
+    "Texture2D<float4> source0 : register(t0);\n"
+    "Texture2D<float4> source1 : register(t1);\n"
+    "Texture2D<float> gray0 : register(t2);\n"
+    "Texture2D<float> gray1 : register(t3);\n"
+    "RWTexture2D<float4> output0 : register(u0);\n"
+    "RWTexture2D<float4> output1 : register(u1);\n"
+    "\n"
+    "float4 fill_state(Texture2D<float4> source, Texture2D<float> gray,\n"
+    "                  int2 p, uint w, uint h)\n"
+    "{\n"
+    "    float4 base = source.Load(int3(p, 0));\n"
+    "    if (base.z > FLOW_CONFIDENCE_MIN)\n"
+    "        return base;\n"
+    "    float center = gray.Load(int3(p, 0));\n"
+    "    float4 best = base;\n"
+    "    float best_score = 0.0;\n"
+    "    [unroll]\n"
+    "    for (int step = 0; step < 3; step++) {\n"
+    "        int radius = 1 << step;\n"
+    "        [unroll]\n"
+    "        for (int oy = -1; oy <= 1; oy++) {\n"
+    "            [unroll]\n"
+    "            for (int ox = -1; ox <= 1; ox++) {\n"
+    "                if (ox == 0 && oy == 0)\n"
+    "                    continue;\n"
+    "                int2 q = p + int2(ox, oy) * radius;\n"
+    "                if (q.x < 0 || q.y < 0 || q.x >= (int)w || q.y >= (int)h)\n"
+    "                    continue;\n"
+    "                float4 candidate = source.Load(int3(q, 0));\n"
+    "                if (candidate.z <= FLOW_CONFIDENCE_MIN)\n"
+    "                    continue;\n"
+    "                float luma_delta = abs(center - gray.Load(int3(q, 0))) * 255.0;\n"
+    "                if (luma_delta > INFILL_LUMA_THRESHOLD)\n"
+    "                    continue;\n"
+    "                float axial = abs(ox) + abs(oy) == 1 ? 1.0 : 0.85;\n"
+    "                float score = candidate.z * axial *\n"
+    "                              exp2(-0.25 * luma_delta) / radius;\n"
+    "                if (score > best_score) {\n"
+    "                    best_score = score;\n"
+    "                    best = candidate;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    if (best_score > 0.0)\n"
+    "        return float4(best.xy, max(best.z * 0.9,\n"
+    "                                      FLOW_CONFIDENCE_MIN + 0.001), 1.0);\n"
+    "    return base;\n"
+    "}\n"
+    "\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    output0.GetDimensions(w, h);\n"
+    "    if (id.x >= w || id.y >= h)\n"
+    "        return;\n"
+    "    output0[id.xy] = fill_state(source0, gray0, (int2)id.xy, w, h);\n"
+    "    output1[id.xy] = fill_state(source1, gray1, (int2)id.xy, w, h);\n"
+    "}\n";
+
+static const char synthesize_p010_shader_source[] =
+    "Texture2D<float> y0 : register(t0);\n"
+    "Texture2D<float> y1 : register(t1);\n"
+    "Texture2D<float2> uv0 : register(t2);\n"
+    "Texture2D<float2> uv1 : register(t3);\n"
+    "#if USE_FILLED_FLOW\n"
+    "Texture2D<float4> flow_state0 : register(t4);\n"
+    "Texture2D<float4> flow_state1 : register(t5);\n"
+    "#else\n"
+    "Texture2D<int2> flow0 : register(t4);\n"
+    "Texture2D<int2> flow1 : register(t5);\n"
+    "Texture2D<uint> cost0 : register(t6);\n"
+    "Texture2D<uint> cost1 : register(t7);\n"
+    "#endif\n"
+    "StructuredBuffer<uint> scene_counters : register(t8);\n"
+    "RWTexture2D<float> out_y : register(u0);\n"
+    "RWTexture2D<float2> out_uv : register(u1);\n"
+    "RWStructuredBuffer<uint> scene_summary : register(u2);\n"
+    "\n"
+    "float2 clamp_luma(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return clamp(p, float2(0.0, 0.0),\n"
+    "                  float2((float)w - 1.0, (float)h - 1.0));\n"
+    "}\n"
+    "\n"
+    "float sample_y(Texture2D<float> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_luma(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = tex.Load(int3(a, 0));\n"
+    "    float v10 = tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float v01 = tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float v11 = tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);\n"
+    "}\n"
+    "\n"
+    "float2 sample_uv(Texture2D<float2> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp(p, float2(0.0, 0.0),\n"
+    "               float2((float)w - 1.0, (float)h - 1.0));\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float2 v00 = tex.Load(int3(a, 0));\n"
+    "    float2 v10 = tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float2 v01 = tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float2 v11 = tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);\n"
+    "}\n"
+    "\n"
+    "float2 sample_raw_flow(Texture2D<int2> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_luma(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float2 v00 = (float2)tex.Load(int3(a, 0));\n"
+    "    float2 v10 = (float2)tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float2 v01 = (float2)tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float2 v11 = (float2)tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y) / 32.0;\n"
+    "}\n"
+    "\n"
+    "float sample_cost(Texture2D<uint> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_luma(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float v00 = (float)(tex.Load(int3(a, 0)) & 255);\n"
+    "    float v10 = (float)(tex.Load(int3(int2(b.x, a.y), 0)) & 255);\n"
+    "    float v01 = (float)(tex.Load(int3(int2(a.x, b.y), 0)) & 255);\n"
+    "    float v11 = (float)(tex.Load(int3(b, 0)) & 255);\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y) / 255.0;\n"
+    "}\n"
+    "\n"
+    "#if USE_FILLED_FLOW\n"
+    "float4 sample_flow_state(Texture2D<float4> tex, float2 p, uint w, uint h)\n"
+    "{\n"
+    "    p = clamp_luma(p, w, h);\n"
+    "    int2 a = (int2)floor(p);\n"
+    "    int2 b = min(a + 1, int2((int)w - 1, (int)h - 1));\n"
+    "    float2 f = p - a;\n"
+    "    float4 v00 = tex.Load(int3(a, 0));\n"
+    "    float4 v10 = tex.Load(int3(int2(b.x, a.y), 0));\n"
+    "    float4 v01 = tex.Load(int3(int2(a.x, b.y), 0));\n"
+    "    float4 v11 = tex.Load(int3(b, 0));\n"
+    "    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);\n"
+    "}\n"
+    "#endif\n"
+    "\n"
+    "float2 active_flow0(float2 p, uint w, uint h)\n"
+    "{\n"
+    "#if USE_FILLED_FLOW\n"
+    "    return sample_flow_state(flow_state0, p, w, h).xy;\n"
+    "#else\n"
+    "    return sample_raw_flow(flow0, p, w, h);\n"
+    "#endif\n"
+    "}\n"
+    "\n"
+    "float2 active_flow1(float2 p, uint w, uint h)\n"
+    "{\n"
+    "#if USE_FILLED_FLOW\n"
+    "    return sample_flow_state(flow_state1, p, w, h).xy;\n"
+    "#else\n"
+    "    return sample_raw_flow(flow1, p, w, h);\n"
+    "#endif\n"
+    "}\n"
+    "\n"
+    "bool in_luma(float2 p, uint w, uint h)\n"
+    "{\n"
+    "    return p.x >= 0.0 && p.y >= 0.0 && p.x <= (float)w - 1.0 &&\n"
+    "           p.y <= (float)h - 1.0;\n"
+    "}\n"
+    "\n"
+    "float confidence_forward(float2 p, uint w, uint h)\n"
+    "{\n"
+    "#if USE_FILLED_FLOW\n"
+    "    return sample_flow_state(flow_state0, p, w, h).z;\n"
+    "#else\n"
+    "    float2 f = active_flow0(p, w, h);\n"
+    "    float2 q = p + f;\n"
+    "    if (!in_luma(q, w, h))\n"
+    "        return 0.0;\n"
+    "    float2 b = active_flow1(q, w, h);\n"
+    "    float residual = length(f + b);\n"
+    "    float threshold = 1.5 + 0.05 * length(f);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    return consistency * (1.0 - sample_cost(cost0, p, w, h));\n"
+    "#endif\n"
+    "}\n"
+    "\n"
+    "float confidence_backward(float2 p, uint w, uint h)\n"
+    "{\n"
+    "#if USE_FILLED_FLOW\n"
+    "    return sample_flow_state(flow_state1, p, w, h).z;\n"
+    "#else\n"
+    "    float2 b = active_flow1(p, w, h);\n"
+    "    float2 q = p + b;\n"
+    "    if (!in_luma(q, w, h))\n"
+    "        return 0.0;\n"
+    "    float2 f = active_flow0(q, w, h);\n"
+    "    float residual = length(b + f);\n"
+    "    float threshold = 1.5 + 0.05 * length(b);\n"
+    "    float consistency = saturate(1.0 - residual / threshold);\n"
+    "    return consistency * (1.0 - sample_cost(cost1, p, w, h));\n"
+    "#endif\n"
+    "}\n"
+    "\n"
+    "void solve_sources(float2 target, uint w, uint h, out float2 p0,\n"
+    "                   out float2 p1)\n"
+    "{\n"
+    "    p0 = target;\n"
+    "    p1 = target;\n"
+    "    [unroll]\n"
+    "    for (uint n = 0; n < 2; n++) {\n"
+    "        p0 = target - 0.5 * active_flow0(p0, w, h);\n"
+    "        p1 = target - 0.5 * active_flow1(p1, w, h);\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "float encode_p010_code(float value)\n"
+    "{\n"
+    "    float code = clamp(round(value), 0.0, 1023.0);\n"
+    "    return code * 64.0 / 65535.0;\n"
+    "}\n"
+    "\n"
+    "float2 encode_p010_code_uv(float2 value)\n"
+    "{\n"
+    "    float2 code = clamp(round(value),\n"
+    "                        float2(0.0, 0.0), float2(1023.0, 1023.0));\n"
+    "    return code * 64.0 / 65535.0;\n"
+    "}\n"
+    "\n"
+    "bool is_scene_cut()\n"
+    "{\n"
+    "    float samples = (float)scene_counters[0];\n"
+    "    if (samples <= 0.0)\n"
+    "        return false;\n"
+    "    float average_delta = (float)scene_counters[1] / samples;\n"
+    "    float changed_ratio = (float)scene_counters[2] / samples;\n"
+    "    return average_delta >= SCENE_AVERAGE_THRESHOLD &&\n"
+    "           changed_ratio >= SCENE_CHANGED_RATIO;\n"
+    "}\n"
+    "\n"
+    "float interpolate_code(float a, float b, float fallback,\n"
+    "                       float2 p0, float2 p1, uint w, uint h)\n"
+    "{\n"
+    "    float v0 = confidence_forward(p0, w, h);\n"
+    "    float v1 = confidence_backward(p1, w, h);\n"
+    "    if (v0 > FLOW_CONFIDENCE_MIN && v1 > FLOW_CONFIDENCE_MIN)\n"
+    "        return (a * v0 + b * v1) / (v0 + v1);\n"
+    "    if (v0 > FLOW_CONFIDENCE_MIN)\n"
+    "        return a;\n"
+    "    if (v1 > FLOW_CONFIDENCE_MIN)\n"
+    "        return b;\n"
+    "    return fallback;\n"
+    "}\n"
+    "\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    out_y.GetDimensions(w, h);\n"
+    "    uint uvw, uvh;\n"
+    "    out_uv.GetDimensions(uvw, uvh);\n"
+    "    bool hard_cut = is_scene_cut();\n"
+    "    if (id.x < w && id.y < h) {\n"
+    "        float2 target = (float2)id.xy;\n"
+    "        float2 p0, p1;\n"
+    "        solve_sources(target, w, h, p0, p1);\n"
+    "        float a = sample_y(y0, p0, w, h) * (65535.0 / 64.0);\n"
+    "        float b = sample_y(y1, p1, w, h) * (65535.0 / 64.0);\n"
+    "        float c = sample_y(y0, target, w, h) * (65535.0 / 64.0);\n"
+    "        out_y[id.xy] = encode_p010_code(hard_cut ? c :\n"
+    "            interpolate_code(a, b, c, p0, p1, w, h));\n"
+    "    }\n"
+    "    if (id.x < uvw && id.y < uvh) {\n"
+    "        float2 target = float2(id.x * 2.0, id.y * 2.0 + 0.5);\n"
+    "        float2 p0, p1;\n"
+    "        solve_sources(target, w, h, p0, p1);\n"
+    "        float2 uvp0 = (p0 - float2(0.0, 0.5)) * 0.5;\n"
+    "        float2 uvp1 = (p1 - float2(0.0, 0.5)) * 0.5;\n"
+    "        float2 uva = sample_uv(uv0, uvp0, uvw, uvh) * (65535.0 / 64.0);\n"
+    "        float2 uvb = sample_uv(uv1, uvp1, uvw, uvh) * (65535.0 / 64.0);\n"
+    "        float2 uvc = sample_uv(uv0, (target - float2(0.0, 0.5)) * 0.5,\n"
+    "                               uvw, uvh) * (65535.0 / 64.0);\n"
+    "        float v0 = confidence_forward(p0, w, h);\n"
+    "        float v1 = confidence_backward(p1, w, h);\n"
+    "        float2 value = v0 > FLOW_CONFIDENCE_MIN &&\n"
+    "                       v1 > FLOW_CONFIDENCE_MIN\n"
+    "            ? (uva * v0 + uvb * v1) / (v0 + v1)\n"
+    "            : v0 > FLOW_CONFIDENCE_MIN ? uva\n"
+    "            : v1 > FLOW_CONFIDENCE_MIN ? uvb : uvc;\n"
+    "        out_uv[id.xy] = encode_p010_code_uv(hard_cut ? uvc : value);\n"
+    "    }\n"
+    "    if (id.x == 0 && id.y == 0) {\n"
+    "        InterlockedAdd(scene_summary[0], 1);\n"
+    "        if (hard_cut)\n"
+    "            InterlockedAdd(scene_summary[1], 1);\n"
+    "    }\n"
+    "}\n";
+
+static const char *nvof_status_name(NV_OF_STATUS status)
+{
+    switch (status) {
+    case NV_OF_SUCCESS: return "success";
+    case NV_OF_ERR_OF_NOT_AVAILABLE: return "not_available";
+    case NV_OF_ERR_UNSUPPORTED_DEVICE: return "unsupported_device";
+    case NV_OF_ERR_DEVICE_DOES_NOT_EXIST: return "device_missing";
+    case NV_OF_ERR_INVALID_PTR: return "invalid_pointer";
+    case NV_OF_ERR_INVALID_PARAM: return "invalid_parameter";
+    case NV_OF_ERR_INVALID_CALL: return "invalid_call";
+    case NV_OF_ERR_INVALID_VERSION: return "invalid_version";
+    case NV_OF_ERR_OUT_OF_MEMORY: return "out_of_memory";
+    case NV_OF_ERR_NOT_INITIALIZED: return "not_initialized";
+    case NV_OF_ERR_UNSUPPORTED_FEATURE: return "unsupported_feature";
+    default: return "generic_error";
+    }
+}
+
+static bool check_nvof_status(struct mp_filter *f, const char *operation,
+                              NV_OF_STATUS status)
+{
+    if (status == NV_OF_SUCCESS)
+        return true;
+
+    struct priv *p = f->priv;
+    char detail[512] = {0};
+    uint32_t detail_size = sizeof(detail);
+    if (p->nvof.handle && p->nvof.api.nvOFGetLastError) {
+        p->nvof.api.nvOFGetLastError(p->nvof.handle, detail, &detail_size);
+        detail[sizeof(detail) - 1] = '\0';
+    }
+    MP_ERR(f, "NVOF operation failed operation=%s status=%u name=%s "
+              "detail=%s\n",
+           operation, (unsigned)status, nvof_status_name(status),
+           detail[0] ? detail : "none");
+    return false;
+}
+
+static void release_nvof_resource(struct mp_filter *f,
+                                  struct nvof_resource *resource)
+{
+    struct priv *p = f->priv;
+    if (resource->handle && p->nvof.api.nvOFUnregisterResourceD3D11) {
+        check_nvof_status(f, "nvOFUnregisterResourceD3D11",
+            p->nvof.api.nvOFUnregisterResourceD3D11(resource->handle));
+    }
+    resource->handle = NULL;
+    if (resource->srv)
+        ID3D11ShaderResourceView_Release(resource->srv);
+    resource->srv = NULL;
+    if (resource->uav)
+        ID3D11UnorderedAccessView_Release(resource->uav);
+    resource->uav = NULL;
+    if (resource->texture)
+        ID3D11Texture2D_Release(resource->texture);
+    resource->texture = NULL;
+}
+
+static void release_nvof_session(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    struct nvof_resource *resources[] = {
+        &p->nvof.gray[0],
+        &p->nvof.gray[1],
+        &p->nvof.flow_forward,
+        &p->nvof.flow_backward,
+        &p->nvof.cost_forward,
+        &p->nvof.cost_backward,
+        &p->nvof.global_flow,
+        &p->nvof.flow_state_forward[0],
+        &p->nvof.flow_state_forward[1],
+        &p->nvof.flow_state_backward[0],
+        &p->nvof.flow_state_backward[1],
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(resources); n++)
+        release_nvof_resource(f, resources[n]);
+    if (p->nvof.completion_readback)
+        ID3D11Texture2D_Release(p->nvof.completion_readback);
+    p->nvof.completion_readback = NULL;
+    if (p->nvof.handle && p->nvof.api.nvOFDestroy) {
+        check_nvof_status(f, "nvOFDestroy",
+                          p->nvof.api.nvOFDestroy(p->nvof.handle));
+    }
+    p->nvof.handle = NULL;
+    p->nvof.width = 0;
+    p->nvof.height = 0;
+}
+
+static void release_flow_diagnostics(struct priv *p)
+{
+    if (p->nvof.flow_diagnostics_uav)
+        ID3D11UnorderedAccessView_Release(p->nvof.flow_diagnostics_uav);
+    p->nvof.flow_diagnostics_uav = NULL;
+    if (p->nvof.flow_diagnostics_readback)
+        ID3D11Buffer_Release(p->nvof.flow_diagnostics_readback);
+    p->nvof.flow_diagnostics_readback = NULL;
+    if (p->nvof.flow_diagnostics_buffer)
+        ID3D11Buffer_Release(p->nvof.flow_diagnostics_buffer);
+    p->nvof.flow_diagnostics_buffer = NULL;
+    if (p->nvof.flow_diagnostics_shader)
+        ID3D11ComputeShader_Release(p->nvof.flow_diagnostics_shader);
+    p->nvof.flow_diagnostics_shader = NULL;
+}
+
+static void release_scene_cut_resources(struct priv *p)
+{
+    if (p->nvof.scene_cut_summary_uav)
+        ID3D11UnorderedAccessView_Release(p->nvof.scene_cut_summary_uav);
+    p->nvof.scene_cut_summary_uav = NULL;
+    if (p->nvof.scene_cut_summary_readback)
+        ID3D11Buffer_Release(p->nvof.scene_cut_summary_readback);
+    p->nvof.scene_cut_summary_readback = NULL;
+    if (p->nvof.scene_cut_summary_buffer)
+        ID3D11Buffer_Release(p->nvof.scene_cut_summary_buffer);
+    p->nvof.scene_cut_summary_buffer = NULL;
+    if (p->nvof.scene_cut_srv)
+        ID3D11ShaderResourceView_Release(p->nvof.scene_cut_srv);
+    p->nvof.scene_cut_srv = NULL;
+    if (p->nvof.scene_cut_uav)
+        ID3D11UnorderedAccessView_Release(p->nvof.scene_cut_uav);
+    p->nvof.scene_cut_uav = NULL;
+    if (p->nvof.scene_cut_buffer)
+        ID3D11Buffer_Release(p->nvof.scene_cut_buffer);
+    p->nvof.scene_cut_buffer = NULL;
+    if (p->nvof.scene_cut_shader)
+        ID3D11ComputeShader_Release(p->nvof.scene_cut_shader);
+    p->nvof.scene_cut_shader = NULL;
+}
+
+static void destroy_nvof(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    release_nvof_session(f);
+    if (p->nvof.promote_nv12_shader)
+        ID3D11ComputeShader_Release(p->nvof.promote_nv12_shader);
+    p->nvof.promote_nv12_shader = NULL;
+    if (p->nvof.extract_luma_shader)
+        ID3D11ComputeShader_Release(p->nvof.extract_luma_shader);
+    p->nvof.extract_luma_shader = NULL;
+    if (p->nvof.synthesize_p010_shader)
+        ID3D11ComputeShader_Release(p->nvof.synthesize_p010_shader);
+    p->nvof.synthesize_p010_shader = NULL;
+    if (p->nvof.prepare_flow_shader)
+        ID3D11ComputeShader_Release(p->nvof.prepare_flow_shader);
+    p->nvof.prepare_flow_shader = NULL;
+    if (p->nvof.infill_flow_shader)
+        ID3D11ComputeShader_Release(p->nvof.infill_flow_shader);
+    p->nvof.infill_flow_shader = NULL;
+    release_flow_diagnostics(p);
+    release_scene_cut_resources(p);
+    release_gpu_profile_queries(p);
+    if (p->nvof.d3dcompiler_module)
+        FreeLibrary(p->nvof.d3dcompiler_module);
+    p->nvof.d3dcompiler_module = NULL;
+    p->nvof.d3d_compile = NULL;
+    if (p->nvof.module)
+        FreeLibrary(p->nvof.module);
+    p->nvof.module = NULL;
+}
+
+static bool load_nvof_api(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    p->nvof.module = LoadLibraryW(L"nvofapi64.dll");
+    if (!p->nvof.module) {
+        MP_ERR(f, "NVOF could not load nvofapi64.dll win32-error=%lu\n",
+               (unsigned long)GetLastError());
+        return false;
+    }
+    nvof_get_max_version_fn get_max_version =
+        (nvof_get_max_version_fn)GetProcAddress(
+            p->nvof.module, "NvOFGetMaxSupportedApiVersion");
+    nvof_create_instance_d3d11_fn create_instance =
+        (nvof_create_instance_d3d11_fn)GetProcAddress(
+            p->nvof.module, "NvOFAPICreateInstanceD3D11");
+    if (!get_max_version || !create_instance) {
+        MP_ERR(f, "NVOF required D3D11 entry points are missing\n");
+        return false;
+    }
+    if (!check_nvof_status(f, "NvOFGetMaxSupportedApiVersion",
+                           get_max_version(&p->nvof.driver_api_version)))
+        return false;
+    if (p->nvof.driver_api_version < NV_OF_API_VERSION) {
+        MP_ERR(f, "NVOF driver API is too old driver=%u.%u required=%u.%u\n",
+               p->nvof.driver_api_version >> 4,
+               p->nvof.driver_api_version & 0xf,
+               NV_OF_API_VERSION >> 4, NV_OF_API_VERSION & 0xf);
+        return false;
+    }
+    if (!check_nvof_status(f, "NvOFAPICreateInstanceD3D11",
+                           create_instance(NV_OF_API_VERSION, &p->nvof.api)))
+        return false;
+    p->nvof.disable_temporal_hints_next = true;
+    MP_INFO(f, "NVOF API loaded driver-api=%u.%u client-api=%u.%u\n",
+            p->nvof.driver_api_version >> 4,
+            p->nvof.driver_api_version & 0xf,
+            NV_OF_API_VERSION >> 4, NV_OF_API_VERSION & 0xf);
+    return true;
+}
+
+static bool load_extract_luma_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.extract_luma_shader)
+        return true;
+
+    static const wchar_t *compiler_names[] = {
+        L"d3dcompiler_47.dll",
+        L"d3dcompiler_46.dll",
+        L"d3dcompiler_43.dll",
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(compiler_names); n++) {
+        p->nvof.d3dcompiler_module = LoadLibraryW(compiler_names[n]);
+        if (p->nvof.d3dcompiler_module)
+            break;
+    }
+    if (!p->nvof.d3dcompiler_module) {
+        MP_ERR(f, "NVOF could not load a D3DCompiler runtime\n");
+        return false;
+    }
+    p->nvof.d3d_compile = (pD3DCompile)GetProcAddress(
+        p->nvof.d3dcompiler_module, "D3DCompile");
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF D3DCompile entry point is missing\n");
+        return false;
+    }
+
+    ID3DBlob *bytecode = NULL;
+    ID3DBlob *errors = NULL;
+    HRESULT hr = p->nvof.d3d_compile(
+        extract_luma_shader_source, sizeof(extract_luma_shader_source) - 1,
+        "extract_luma.hlsl", NULL, NULL, "main", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+        0, &bytecode, &errors);
+    if (FAILED(hr)) {
+        const char *message = errors
+            ? ID3D10Blob_GetBufferPointer(errors) : "no compiler diagnostics";
+        MP_ERR(f, "NVOF extract-luma shader compilation failed hr=0x%08lx "
+                  "detail=%s\n", (unsigned long)hr, message);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (bytecode)
+            ID3D10Blob_Release(bytecode);
+        return false;
+    }
+    if (errors)
+        ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreateComputeShader(
+        p->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL,
+        &p->nvof.extract_luma_shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create extract-luma compute shader "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    MP_INFO(f, "NVOF extract-luma shader ready input=P010-R16_UNORM "
+               "output=GRAY8\n");
+    return true;
+}
+
+static bool load_promote_nv12_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.promote_nv12_shader)
+        return true;
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF NV12 promotion requires the D3DCompiler runtime\n");
+        return false;
+    }
+
+    ID3DBlob *bytecode = NULL;
+    ID3DBlob *errors = NULL;
+    HRESULT hr = p->nvof.d3d_compile(
+        promote_nv12_shader_source, sizeof(promote_nv12_shader_source) - 1,
+        "promote_nv12.hlsl", NULL, NULL, "main", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+        0, &bytecode, &errors);
+    if (FAILED(hr)) {
+        const char *message = errors
+            ? ID3D10Blob_GetBufferPointer(errors) : "no compiler diagnostics";
+        MP_ERR(f, "NVOF NV12 promotion shader compilation failed "
+                  "hr=0x%08lx detail=%s\n", (unsigned long)hr, message);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (bytecode)
+            ID3D10Blob_Release(bytecode);
+        return false;
+    }
+    if (errors)
+        ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreateComputeShader(
+        p->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL,
+        &p->nvof.promote_nv12_shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create NV12 promotion compute shader "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    MP_INFO(f, "NVOF NV12 promotion shader ready input=NV12 "
+               "output=P010 mapping=code8<<2\n");
+    return true;
+}
+
+static bool load_scene_cut_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.scene_cut_shader && p->nvof.scene_cut_buffer &&
+        p->nvof.scene_cut_uav && p->nvof.scene_cut_srv &&
+        p->nvof.scene_cut_summary_buffer &&
+        p->nvof.scene_cut_summary_readback &&
+        p->nvof.scene_cut_summary_uav)
+        return true;
+    release_scene_cut_resources(p);
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF scene-cut detection requires the D3DCompiler "
+                  "runtime\n");
+        return false;
+    }
+
+    char sample_stride[16];
+    char pixel_threshold[16];
+    snprintf(sample_stride, sizeof(sample_stride), "%d",
+             p->opts->scene_cut_sample_stride);
+    snprintf(pixel_threshold, sizeof(pixel_threshold), "%d",
+             p->opts->scene_cut_pixel_threshold);
+    D3D_SHADER_MACRO macros[] = {
+        {"SCENE_SAMPLE_STRIDE", sample_stride},
+        {"SCENE_PIXEL_THRESHOLD", pixel_threshold},
+        {NULL, NULL},
+    };
+    ID3DBlob *bytecode = NULL;
+    ID3DBlob *errors = NULL;
+    HRESULT hr = p->nvof.d3d_compile(
+        scene_cut_shader_source, sizeof(scene_cut_shader_source) - 1,
+        "scene_cut.hlsl", macros, NULL, "main", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+        0, &bytecode, &errors);
+    if (FAILED(hr)) {
+        const char *message = errors
+            ? ID3D10Blob_GetBufferPointer(errors) : "no compiler diagnostics";
+        MP_ERR(f, "NVOF scene-cut shader compilation failed hr=0x%08lx "
+                  "detail=%s\n", (unsigned long)hr, message);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (bytecode)
+            ID3D10Blob_Release(bytecode);
+        return false;
+    }
+    if (errors)
+        ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreateComputeShader(
+        p->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL,
+        &p->nvof.scene_cut_shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create scene-cut compute shader "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        release_scene_cut_resources(p);
+        return false;
+    }
+
+    D3D11_BUFFER_DESC counter_desc = {
+        .ByteWidth = SCENE_CUT_COUNTER_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS |
+                     D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    hr = ID3D11Device_CreateBuffer(
+        p->device, &counter_desc, NULL, &p->nvof.scene_cut_buffer);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .ViewDimension = D3D11_UAV_DIMENSION_BUFFER,
+        .Buffer = {
+            .FirstElement = 0,
+            .NumElements = SCENE_CUT_COUNTER_COUNT,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device, (ID3D11Resource *)p->nvof.scene_cut_buffer,
+            &uav_desc, &p->nvof.scene_cut_uav);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+            .Format = DXGI_FORMAT_UNKNOWN,
+            .ViewDimension = D3D11_SRV_DIMENSION_BUFFER,
+            .Buffer = {
+                .FirstElement = 0,
+                .NumElements = SCENE_CUT_COUNTER_COUNT,
+            },
+        };
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device, (ID3D11Resource *)p->nvof.scene_cut_buffer,
+            &srv_desc, &p->nvof.scene_cut_srv);
+    }
+    D3D11_BUFFER_DESC summary_desc = {
+        .ByteWidth = SCENE_CUT_SUMMARY_COUNTER_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    const uint32_t zero_summary[SCENE_CUT_SUMMARY_COUNTER_COUNT] = {0};
+    D3D11_SUBRESOURCE_DATA summary_data = {
+        .pSysMem = zero_summary,
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &summary_desc, &summary_data,
+            &p->nvof.scene_cut_summary_buffer);
+    }
+    uav_desc.Buffer.NumElements = SCENE_CUT_SUMMARY_COUNTER_COUNT;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device,
+            (ID3D11Resource *)p->nvof.scene_cut_summary_buffer,
+            &uav_desc, &p->nvof.scene_cut_summary_uav);
+    }
+    D3D11_BUFFER_DESC readback_desc = {
+        .ByteWidth = summary_desc.ByteWidth,
+        .Usage = D3D11_USAGE_STAGING,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &readback_desc, NULL,
+            &p->nvof.scene_cut_summary_readback);
+    }
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF scene-cut buffer creation failed hr=0x%08lx\n",
+               (unsigned long)hr);
+        release_scene_cut_resources(p);
+        return false;
+    }
+    MP_INFO(f, "NVOF GPU-resident scene-cut detector ready sample-stride=%d "
+               "pixel-threshold=%d average-threshold=%.2f "
+               "changed-ratio=%.3f\n",
+            p->opts->scene_cut_sample_stride,
+            p->opts->scene_cut_pixel_threshold,
+            p->opts->scene_cut_average_threshold,
+            p->opts->scene_cut_changed_ratio);
+    return true;
+}
+
+static bool load_flow_diagnostics_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.flow_diagnostics_shader &&
+        p->nvof.flow_diagnostics_buffer &&
+        p->nvof.flow_diagnostics_readback &&
+        p->nvof.flow_diagnostics_uav)
+        return true;
+    release_flow_diagnostics(p);
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF flow diagnostics require the D3DCompiler runtime\n");
+        return false;
+    }
+
+    ID3DBlob *bytecode = NULL;
+    ID3DBlob *errors = NULL;
+    char confidence_min[32];
+    format_shader_number(confidence_min, sizeof(confidence_min),
+                         p->opts->flow_confidence_min);
+    D3D_SHADER_MACRO macros[] = {
+        {"USE_FILLED_FLOW",
+         p->opts->stage5_flow_infill_test ? "1" : "0"},
+        {"FLOW_CONFIDENCE_MIN", confidence_min},
+        {NULL, NULL},
+    };
+    HRESULT hr = p->nvof.d3d_compile(
+        flow_diagnostics_shader_source,
+        sizeof(flow_diagnostics_shader_source) - 1,
+        "flow_diagnostics.hlsl", macros, NULL, "main", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+        0, &bytecode, &errors);
+    if (FAILED(hr)) {
+        const char *message = errors
+            ? ID3D10Blob_GetBufferPointer(errors) : "no compiler diagnostics";
+        MP_ERR(f, "NVOF flow diagnostics shader compilation failed "
+                  "hr=0x%08lx detail=%s\n", (unsigned long)hr, message);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (bytecode)
+            ID3D10Blob_Release(bytecode);
+        return false;
+    }
+    if (errors)
+        ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreateComputeShader(
+        p->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL,
+        &p->nvof.flow_diagnostics_shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create flow diagnostics compute shader "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        release_flow_diagnostics(p);
+        return false;
+    }
+
+    D3D11_BUFFER_DESC counter_desc = {
+        .ByteWidth = FLOW_DIAG_COUNTER_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    hr = ID3D11Device_CreateBuffer(
+        p->device, &counter_desc, NULL, &p->nvof.flow_diagnostics_buffer);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .ViewDimension = D3D11_UAV_DIMENSION_BUFFER,
+        .Buffer = {
+            .FirstElement = 0,
+            .NumElements = FLOW_DIAG_COUNTER_COUNT,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device,
+            (ID3D11Resource *)p->nvof.flow_diagnostics_buffer,
+            &uav_desc, &p->nvof.flow_diagnostics_uav);
+    }
+    D3D11_BUFFER_DESC readback_desc = {
+        .ByteWidth = counter_desc.ByteWidth,
+        .Usage = D3D11_USAGE_STAGING,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &readback_desc, NULL,
+            &p->nvof.flow_diagnostics_readback);
+    }
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF flow diagnostics buffer creation failed "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        release_flow_diagnostics(p);
+        return false;
+    }
+    MP_WARN(f, "NVOF flow diagnostics ready counters=%d readback-bytes=%u "
+               "final-flow-state=%s; this development mode introduces a "
+               "per-pair GPU sync\n",
+            FLOW_DIAG_COUNTER_COUNT, counter_desc.ByteWidth,
+            p->opts->stage5_flow_infill_test ? "yes" : "no");
+    return true;
+}
+
+static bool load_flow_infill_shaders(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.prepare_flow_shader && p->nvof.infill_flow_shader)
+        return true;
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF flow infill requires the D3DCompiler runtime\n");
+        return false;
+    }
+    if (p->nvof.prepare_flow_shader)
+        ID3D11ComputeShader_Release(p->nvof.prepare_flow_shader);
+    p->nvof.prepare_flow_shader = NULL;
+    if (p->nvof.infill_flow_shader)
+        ID3D11ComputeShader_Release(p->nvof.infill_flow_shader);
+    p->nvof.infill_flow_shader = NULL;
+
+    const char *sources[] = {
+        prepare_flow_shader_source,
+        infill_flow_shader_source,
+    };
+    const SIZE_T source_sizes[] = {
+        sizeof(prepare_flow_shader_source) - 1,
+        sizeof(infill_flow_shader_source) - 1,
+    };
+    const char *names[] = {
+        "prepare_flow.hlsl",
+        "infill_flow.hlsl",
+    };
+    ID3D11ComputeShader **outputs[] = {
+        &p->nvof.prepare_flow_shader,
+        &p->nvof.infill_flow_shader,
+    };
+    char fb_abs[32];
+    char fb_rel[32];
+    char cost_max[32];
+    char confidence_min[32];
+    char infill_luma_threshold[32];
+    format_shader_number(fb_abs, sizeof(fb_abs), p->opts->flow_fb_abs);
+    format_shader_number(fb_rel, sizeof(fb_rel), p->opts->flow_fb_rel);
+    format_shader_number(cost_max, sizeof(cost_max), p->opts->flow_cost_max);
+    format_shader_number(confidence_min, sizeof(confidence_min),
+                         p->opts->flow_confidence_min);
+    format_shader_number(infill_luma_threshold,
+                         sizeof(infill_luma_threshold),
+                         p->opts->infill_luma_threshold);
+    D3D_SHADER_MACRO macros[] = {
+        {"FLOW_FB_ABS", fb_abs},
+        {"FLOW_FB_REL", fb_rel},
+        {"FLOW_COST_MAX", cost_max},
+        {"FLOW_CONFIDENCE_MIN", confidence_min},
+        {"INFILL_LUMA_THRESHOLD", infill_luma_threshold},
+        {NULL, NULL},
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(sources); n++) {
+        ID3DBlob *bytecode = NULL;
+        ID3DBlob *errors = NULL;
+        HRESULT hr = p->nvof.d3d_compile(
+            sources[n], source_sizes[n], names[n], macros, NULL,
+            "main", "cs_5_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3 |
+            D3DCOMPILE_WARNINGS_ARE_ERRORS,
+            0, &bytecode, &errors);
+        if (FAILED(hr)) {
+            const char *message = errors
+                ? ID3D10Blob_GetBufferPointer(errors)
+                : "no compiler diagnostics";
+            MP_ERR(f, "NVOF flow infill shader compilation failed "
+                      "shader=%s hr=0x%08lx detail=%s\n",
+                   names[n], (unsigned long)hr, message);
+            if (errors)
+                ID3D10Blob_Release(errors);
+            if (bytecode)
+                ID3D10Blob_Release(bytecode);
+            return false;
+        }
+        if (errors)
+            ID3D10Blob_Release(errors);
+        hr = ID3D11Device_CreateComputeShader(
+            p->device, ID3D10Blob_GetBufferPointer(bytecode),
+            ID3D10Blob_GetBufferSize(bytecode), NULL, outputs[n]);
+        ID3D10Blob_Release(bytecode);
+        if (FAILED(hr)) {
+            MP_ERR(f, "NVOF could not create flow infill compute shader "
+                      "shader=%s hr=0x%08lx\n",
+                   names[n], (unsigned long)hr);
+            return false;
+        }
+    }
+    MP_INFO(f, "NVOF flow-domain infill shaders ready fb-threshold="
+               "%.3f+%.3f*flow cost-max=%.3f confidence-min=%.3f "
+               "luma-delta-max=%.2f passes=%d\n",
+            p->opts->flow_fb_abs, p->opts->flow_fb_rel,
+            p->opts->flow_cost_max, p->opts->flow_confidence_min,
+            p->opts->infill_luma_threshold, FLOW_INFILL_PASS_COUNT);
+    return true;
+}
+
+static bool load_synthesize_p010_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.synthesize_p010_shader)
+        return true;
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF P010 synthesis requires the D3DCompiler runtime\n");
+        return false;
+    }
+
+    ID3DBlob *bytecode = NULL;
+    ID3DBlob *errors = NULL;
+    char confidence_min[32];
+    char scene_average_threshold[32];
+    char scene_changed_ratio[32];
+    format_shader_number(confidence_min, sizeof(confidence_min),
+                         p->opts->flow_confidence_min);
+    format_shader_number(scene_average_threshold,
+                         sizeof(scene_average_threshold),
+                         p->opts->scene_cut_average_threshold);
+    format_shader_number(scene_changed_ratio, sizeof(scene_changed_ratio),
+                         p->opts->scene_cut_changed_ratio);
+    D3D_SHADER_MACRO macros[] = {
+        {"USE_FILLED_FLOW",
+         p->opts->stage5_flow_infill_test ? "1" : "0"},
+        {"FLOW_CONFIDENCE_MIN", confidence_min},
+        {"SCENE_AVERAGE_THRESHOLD", scene_average_threshold},
+        {"SCENE_CHANGED_RATIO", scene_changed_ratio},
+        {NULL, NULL},
+    };
+    HRESULT hr = p->nvof.d3d_compile(
+        synthesize_p010_shader_source,
+        sizeof(synthesize_p010_shader_source) - 1,
+        "synthesize_p010.hlsl", macros, NULL, "main", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+        0, &bytecode, &errors);
+    if (FAILED(hr)) {
+        const char *message = errors
+            ? ID3D10Blob_GetBufferPointer(errors) : "no compiler diagnostics";
+        MP_ERR(f, "NVOF P010 synthesis shader compilation failed "
+                  "hr=0x%08lx detail=%s\n", (unsigned long)hr, message);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (bytecode)
+            ID3D10Blob_Release(bytecode);
+        return false;
+    }
+    if (errors)
+        ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreateComputeShader(
+        p->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL,
+        &p->nvof.synthesize_p010_shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create P010 synthesis compute shader "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    MP_INFO(f, "NVOF P010 synthesis shader ready inputs=Y/UV+%s "
+               "output=P010 midpoint=0.5\n",
+            p->opts->stage5_flow_infill_test
+                ? "filled-flow-confidence" : "flow+cost");
+    return true;
+}
+
+static bool nvof_cap_contains(struct mp_filter *f, NV_OF_CAPS capability,
+                              uint32_t expected)
+{
+    struct priv *p = f->priv;
+    uint32_t count = 0;
+    if (!check_nvof_status(f, "nvOFGetCaps(count)",
+                           p->nvof.api.nvOFGetCaps(
+                               p->nvof.handle, capability, NULL, &count)))
+        return false;
+    uint32_t *values = count ? talloc_array(NULL, uint32_t, count) : NULL;
+    if (count && !values) {
+        MP_ERR(f, "NVOF capability allocation failed count=%u\n", count);
+        return false;
+    }
+    bool found = false;
+    if (!count || check_nvof_status(f, "nvOFGetCaps(values)",
+            p->nvof.api.nvOFGetCaps(
+                p->nvof.handle, capability, values, &count))) {
+        for (uint32_t n = 0; n < count; n++)
+            found |= values[n] == expected;
+    }
+    talloc_free(values);
+    return found;
+}
+
+static bool nvof_cap_at_least(struct mp_filter *f, NV_OF_CAPS capability,
+                              uint32_t required)
+{
+    struct priv *p = f->priv;
+    uint32_t count = 0;
+    if (!check_nvof_status(f, "nvOFGetCaps(limit-count)",
+                           p->nvof.api.nvOFGetCaps(
+                               p->nvof.handle, capability, NULL, &count)))
+        return false;
+    uint32_t *values = count ? talloc_array(NULL, uint32_t, count) : NULL;
+    if (count && !values) {
+        MP_ERR(f, "NVOF limit allocation failed count=%u\n", count);
+        return false;
+    }
+    uint32_t maximum = 0;
+    if (!count || check_nvof_status(f, "nvOFGetCaps(limit-values)",
+            p->nvof.api.nvOFGetCaps(
+                p->nvof.handle, capability, values, &count))) {
+        for (uint32_t n = 0; n < count; n++)
+            maximum = MPMAX(maximum, values[n]);
+    }
+    talloc_free(values);
+    return maximum >= required;
+}
+
+static bool nvof_format_supported(struct mp_filter *f,
+                                  NV_OF_BUFFER_USAGE usage,
+                                  DXGI_FORMAT expected)
+{
+    struct priv *p = f->priv;
+    uint32_t count = 0;
+    if (!check_nvof_status(f, "nvOFGetSurfaceFormatCountD3D11",
+            p->nvof.api.nvOFGetSurfaceFormatCountD3D11(
+                p->nvof.handle, usage, NV_OF_MODE_OPTICALFLOW, &count)))
+        return false;
+    DXGI_FORMAT *formats = count
+        ? talloc_array(NULL, DXGI_FORMAT, count) : NULL;
+    if (count && !formats) {
+        MP_ERR(f, "NVOF format allocation failed count=%u\n", count);
+        return false;
+    }
+    bool found = false;
+    if (!count || check_nvof_status(f, "nvOFGetSurfaceFormatD3D11",
+            p->nvof.api.nvOFGetSurfaceFormatD3D11(
+                p->nvof.handle, usage, NV_OF_MODE_OPTICALFLOW, formats))) {
+        for (uint32_t n = 0; n < count; n++)
+            found |= formats[n] == expected;
+    }
+    talloc_free(formats);
+    return found;
+}
+
+static bool create_nvof_resource(struct mp_filter *f,
+                                 struct nvof_resource *resource,
+                                 UINT width, UINT height, DXGI_FORMAT format,
+                                 UINT bind_flags, bool create_uav,
+                                 bool create_srv)
+{
+    struct priv *p = f->priv;
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = format,
+        .SampleDesc = { .Count = 1 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = bind_flags,
+    };
+    HRESULT hr = ID3D11Device_CreateTexture2D(
+        p->device, &desc, NULL, &resource->texture);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF resource creation failed format=%u size=%ux%u "
+                  "bind-flags=0x%x hr=0x%08lx\n",
+               (unsigned)format, width, height, bind_flags,
+               (unsigned long)hr);
+        return false;
+    }
+    if (create_uav) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device, (ID3D11Resource *)resource->texture, NULL,
+            &resource->uav);
+        if (FAILED(hr)) {
+            MP_ERR(f, "NVOF resource UAV creation failed format=%u "
+                      "hr=0x%08lx\n", (unsigned)format, (unsigned long)hr);
+            return false;
+        }
+    }
+    if (create_srv) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device, (ID3D11Resource *)resource->texture, NULL,
+            &resource->srv);
+        if (FAILED(hr)) {
+            MP_ERR(f, "NVOF resource SRV creation failed format=%u "
+                      "hr=0x%08lx\n", (unsigned)format, (unsigned long)hr);
+            return false;
+        }
+    }
+    if (!check_nvof_status(f, "nvOFRegisterResourceD3D11",
+            p->nvof.api.nvOFRegisterResourceD3D11(
+                p->nvof.handle, (ID3D11Resource *)resource->texture,
+                &resource->handle)))
+        return false;
+    return true;
+}
+
+static bool create_flow_state_resource(struct mp_filter *f,
+                                       struct nvof_resource *resource,
+                                       UINT width, UINT height)
+{
+    struct priv *p = f->priv;
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+        .SampleDesc = { .Count = 1 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS,
+    };
+    HRESULT hr = ID3D11Device_CreateTexture2D(
+        p->device, &desc, NULL, &resource->texture);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device, (ID3D11Resource *)resource->texture,
+            NULL, &resource->uav);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device, (ID3D11Resource *)resource->texture,
+            NULL, &resource->srv);
+    }
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF flow-state resource creation failed "
+                  "format=R16G16B16A16_FLOAT size=%ux%u hr=0x%08lx\n",
+               width, height, (unsigned long)hr);
+        return false;
+    }
+    return true;
+}
+
+static bool create_nvof_session(struct mp_filter *f, int width, int height)
+{
+    struct priv *p = f->priv;
+    release_nvof_session(f);
+    if (!check_nvof_status(f, "nvCreateOpticalFlowD3D11",
+            p->nvof.api.nvCreateOpticalFlowD3D11(
+                p->device, p->context, &p->nvof.handle)))
+        return false;
+
+    bool capabilities_ok =
+        nvof_cap_contains(f, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, 1) &&
+        nvof_cap_at_least(f, NV_OF_CAPS_WIDTH_MAX, width) &&
+        nvof_cap_at_least(f, NV_OF_CAPS_HEIGHT_MAX, height) &&
+        nvof_format_supported(f, NV_OF_BUFFER_USAGE_INPUT,
+                              DXGI_FORMAT_R8_UNORM) &&
+        nvof_format_supported(f, NV_OF_BUFFER_USAGE_OUTPUT,
+                              DXGI_FORMAT_R16G16_SINT) &&
+        nvof_format_supported(f, NV_OF_BUFFER_USAGE_COST,
+                              DXGI_FORMAT_R8_UINT);
+    if (!capabilities_ok) {
+        MP_ERR(f, "NVOF strict MEMC capabilities are unavailable "
+                  "resolution=%dx%d grid=1 gray8=yes flow=s16x2 "
+                  "cost=u8\n", width, height);
+        release_nvof_session(f);
+        return false;
+    }
+
+    NV_OF_INIT_PARAMS init = {
+        .width = width,
+        .height = height,
+        .outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_1,
+        .hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED,
+        .mode = NV_OF_MODE_OPTICALFLOW,
+        .perfLevel = NV_OF_PERF_LEVEL_SLOW,
+        .enableExternalHints = NV_OF_FALSE,
+        .enableOutputCost = NV_OF_TRUE,
+        .disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED,
+        .enableRoi = NV_OF_FALSE,
+        .predDirection = NV_OF_PRED_DIRECTION_BOTH,
+        .enableGlobalFlow = NV_OF_FALSE,
+        .inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8,
+    };
+    if (!check_nvof_status(f, "nvOFInit(strict-memc)",
+                           p->nvof.api.nvOFInit(p->nvof.handle, &init))) {
+        release_nvof_session(f);
+        return false;
+    }
+
+    UINT gray_bind = D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS |
+                     D3D11_BIND_RENDER_TARGET;
+    bool resources_ok =
+        create_nvof_resource(f, &p->nvof.gray[0], width, height,
+                             DXGI_FORMAT_R8_UNORM, gray_bind,
+                             true, p->opts->flow_diagnostics ||
+                                   synthesis_enabled(p)) &&
+        create_nvof_resource(f, &p->nvof.gray[1], width, height,
+                             DXGI_FORMAT_R8_UNORM, gray_bind,
+                             true, p->opts->flow_diagnostics ||
+                                   synthesis_enabled(p)) &&
+        create_nvof_resource(f, &p->nvof.flow_forward, width, height,
+                             DXGI_FORMAT_R16G16_SINT,
+                             D3D11_BIND_SHADER_RESOURCE,
+                             false, true) &&
+        create_nvof_resource(f, &p->nvof.cost_forward, width, height,
+                             DXGI_FORMAT_R8_UINT,
+                             D3D11_BIND_SHADER_RESOURCE,
+                             false, true) &&
+        create_nvof_resource(f, &p->nvof.flow_backward, width, height,
+                             DXGI_FORMAT_R16G16_SINT,
+                             D3D11_BIND_SHADER_RESOURCE,
+                             false, true) &&
+        create_nvof_resource(f, &p->nvof.cost_backward, width, height,
+                             DXGI_FORMAT_R8_UINT,
+                             D3D11_BIND_SHADER_RESOURCE,
+                             false, true);
+    if (resources_ok && p->opts->stage5_flow_infill_test) {
+        resources_ok =
+            create_flow_state_resource(
+                f, &p->nvof.flow_state_forward[0], width, height) &&
+            create_flow_state_resource(
+                f, &p->nvof.flow_state_forward[1], width, height) &&
+            create_flow_state_resource(
+                f, &p->nvof.flow_state_backward[0], width, height) &&
+            create_flow_state_resource(
+                f, &p->nvof.flow_state_backward[1], width, height);
+    }
+    if (resources_ok && p->opts->nvof_completion_diagnostics) {
+        D3D11_TEXTURE2D_DESC readback_desc = {
+            .Width = width,
+            .Height = height,
+            .MipLevels = 1,
+            .ArraySize = 1,
+            .Format = DXGI_FORMAT_R16G16_SINT,
+            .SampleDesc = { .Count = 1 },
+            .Usage = D3D11_USAGE_STAGING,
+            .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+        };
+        HRESULT hr = ID3D11Device_CreateTexture2D(
+            p->device, &readback_desc, NULL,
+            &p->nvof.completion_readback);
+        if (FAILED(hr)) {
+            MP_ERR(f, "NVOF completion diagnostic staging texture creation "
+                       "failed "
+                       "hr=0x%08lx\n", (unsigned long)hr);
+            resources_ok = false;
+        }
+    }
+    bool shaders_ok = resources_ok && load_extract_luma_shader(f) &&
+        (!synthesis_enabled(p) || load_scene_cut_shader(f)) &&
+        (!p->opts->flow_diagnostics ||
+         load_flow_diagnostics_shader(f)) &&
+        (!p->opts->stage5_flow_infill_test ||
+         load_flow_infill_shaders(f)) &&
+        (!(p->opts->stage4_synthesis_test ||
+           p->opts->stage5_flow_infill_test) ||
+         load_synthesize_p010_shader(f));
+    if (!shaders_ok) {
+        release_nvof_session(f);
+        return false;
+    }
+
+    p->nvof.width = width;
+    p->nvof.height = height;
+    p->nvof.disable_temporal_hints_next = true;
+    MP_INFO(f, "NVOF session initialized resolution=%dx%d grid=1 "
+               "preset=slow direction=both cost=uint8 global-flow=no\n",
+            width, height);
+    return true;
+}
+
+static bool ensure_nvof_session(struct mp_filter *f, int width, int height)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.handle && p->nvof.width == width &&
+        p->nvof.height == height)
+        return true;
+    return create_nvof_session(f, width, height);
+}
+
+static bool extract_luma(struct mp_filter *f, struct mp_image *frame,
+                          int gray_index)
+{
+    struct priv *p = f->priv;
+    ID3D11Texture2D *texture = (ID3D11Texture2D *)frame->planes[0];
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Texture2D_GetDesc(texture, &texture_desc);
+    if (texture_desc.Format != DXGI_FORMAT_P010 ||
+        texture_desc.ArraySize != 1 ||
+        texture_desc.Width < (UINT)frame->w ||
+        texture_desc.Height < (UINT)frame->h) {
+        MP_ERR(f, "NVOF luma extraction requires a private single-layer P010 "
+                  "texture received-format=%u array-size=%u size=%ux%u\n",
+               (unsigned)texture_desc.Format, texture_desc.ArraySize,
+               texture_desc.Width, texture_desc.Height);
+        return false;
+    }
+
+    ID3D11Device3 *device3 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device3, (void **)&device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF luma extraction requires ID3D11Device3 "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 srv_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 0,
+        },
+    };
+    ID3D11ShaderResourceView1 *source_srv1 = NULL;
+    hr = ID3D11Device3_CreateShaderResourceView1(
+        device3, (ID3D11Resource *)texture, &srv_desc, &source_srv1);
+    ID3D11Device3_Release(device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF could not create P010 Y SRV hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+
+    ID3D11ShaderResourceView *source_srv =
+        (ID3D11ShaderResourceView *)source_srv1;
+    ID3D11UnorderedAccessView *gray_uav = p->nvof.gray[gray_index].uav;
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_LUMA_EXTRACT);
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.extract_luma_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, 1, &source_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &gray_uav, NULL);
+    ID3D11DeviceContext_Dispatch(
+        p->context, (frame->w + 15) / 16, (frame->h + 15) / 16, 1);
+
+    ID3D11ShaderResourceView *null_srv = NULL;
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, 1, &null_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &null_uav, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+    ID3D11ShaderResourceView1_Release(source_srv1);
+    return true;
+}
+
+static bool dispatch_scene_cut_analysis(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->nvof.scene_cut_shader || !p->nvof.scene_cut_buffer ||
+        !p->nvof.scene_cut_uav || !p->nvof.scene_cut_srv ||
+        !p->nvof.gray[0].srv || !p->nvof.gray[1].srv) {
+        MP_ERR(f, "NVOF scene-cut detection resources are incomplete\n");
+        return false;
+    }
+
+    uint32_t counters[SCENE_CUT_COUNTER_COUNT] = {0};
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_SCENE_CUT);
+    ID3D11DeviceContext_UpdateSubresource(
+        p->context, (ID3D11Resource *)p->nvof.scene_cut_buffer,
+        0, NULL, counters, 0, 0);
+    ID3D11ShaderResourceView *srvs[] = {
+        p->nvof.gray[0].srv,
+        p->nvof.gray[1].srv,
+    };
+    ID3D11UnorderedAccessView *uav = p->nvof.scene_cut_uav;
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.scene_cut_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(srvs), srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &uav, NULL);
+    UINT sampled_width = (p->nvof.width +
+        p->opts->scene_cut_sample_stride - 1) /
+        p->opts->scene_cut_sample_stride;
+    UINT sampled_height = (p->nvof.height +
+        p->opts->scene_cut_sample_stride - 1) /
+        p->opts->scene_cut_sample_stride;
+    ID3D11DeviceContext_Dispatch(
+        p->context, (sampled_width + 15) / 16,
+        (sampled_height + 15) / 16, 1);
+
+    ID3D11ShaderResourceView *null_srvs[MP_ARRAY_SIZE(srvs)] = {0};
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_srvs), null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &null_uav, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+    return true;
+}
+
+static bool read_scene_cut_summary(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!synthesis_enabled(p))
+        return true;
+    if (!p->nvof.scene_cut_summary_buffer ||
+        !p->nvof.scene_cut_summary_readback) {
+        MP_ERR(f, "NVOF scene-cut summary resources are incomplete\n");
+        return false;
+    }
+    lock_d3d11_context(p);
+    ID3D11DeviceContext_CopyResource(
+        p->context,
+        (ID3D11Resource *)p->nvof.scene_cut_summary_readback,
+        (ID3D11Resource *)p->nvof.scene_cut_summary_buffer);
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+    HRESULT hr = ID3D11DeviceContext_Map(
+        p->context,
+        (ID3D11Resource *)p->nvof.scene_cut_summary_readback,
+        0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        unlock_d3d11_context(p);
+        MP_ERR(f, "NVOF scene-cut summary readback failed hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+    const uint32_t *values = mapped.pData;
+    p->nvof.scene_cut_pairs = values[0];
+    p->nvof.scene_cuts = values[1];
+    p->scene_cut_midpoints = values[1];
+    ID3D11DeviceContext_Unmap(
+        p->context,
+        (ID3D11Resource *)p->nvof.scene_cut_summary_readback, 0);
+    unlock_d3d11_context(p);
+    if (p->nvof.scene_cut_pairs != p->synthesized_frames ||
+        p->nvof.scene_cuts > p->nvof.scene_cut_pairs) {
+        MP_ERR(f, "NVOF scene-cut summary mismatch pairs=%llu cuts=%llu "
+                  "synthesized=%llu\n",
+               (unsigned long long)p->nvof.scene_cut_pairs,
+               (unsigned long long)p->nvof.scene_cuts,
+               (unsigned long long)p->synthesized_frames);
+        return false;
+    }
+    return true;
+}
+
+static bool run_flow_diagnostics(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    bool final_state_ready = !p->opts->stage5_flow_infill_test ||
+        (p->nvof.flow_state_forward[FLOW_INFILL_FINAL_INDEX].srv &&
+         p->nvof.flow_state_backward[FLOW_INFILL_FINAL_INDEX].srv);
+    bool raw_flow_ready = p->nvof.flow_forward.srv &&
+                          p->nvof.cost_forward.srv &&
+                          p->nvof.flow_backward.srv &&
+                          p->nvof.cost_backward.srv;
+    if (!p->nvof.flow_diagnostics_shader ||
+        !p->nvof.flow_diagnostics_buffer ||
+        !p->nvof.flow_diagnostics_readback ||
+        !p->nvof.flow_diagnostics_uav ||
+        !raw_flow_ready ||
+        !p->nvof.gray[0].srv || !p->nvof.gray[1].srv ||
+        !final_state_ready) {
+        MP_ERR(f, "NVOF flow diagnostics resources are incomplete\n");
+        return false;
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    lock_d3d11_context(p);
+    const uint32_t zero_counters[FLOW_DIAG_COUNTER_COUNT] = {0};
+    ID3D11DeviceContext_UpdateSubresource(
+        p->context,
+        (ID3D11Resource *)p->nvof.flow_diagnostics_buffer,
+        0, NULL, zero_counters, 0, 0);
+    ID3D11ShaderResourceView *srvs[8] = {
+        p->nvof.flow_forward.srv,
+        p->nvof.flow_backward.srv,
+        p->nvof.cost_forward.srv,
+        p->nvof.cost_backward.srv,
+        p->nvof.gray[0].srv,
+        p->nvof.gray[1].srv,
+    };
+    if (p->opts->stage5_flow_infill_test) {
+        srvs[6] = p->nvof.flow_state_forward[
+            FLOW_INFILL_FINAL_INDEX].srv;
+        srvs[7] = p->nvof.flow_state_backward[
+            FLOW_INFILL_FINAL_INDEX].srv;
+    }
+    ID3D11UnorderedAccessView *uav = p->nvof.flow_diagnostics_uav;
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.flow_diagnostics_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(srvs), srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &uav, NULL);
+    ID3D11DeviceContext_Dispatch(
+        p->context, (p->nvof.width + 15) / 16,
+        (p->nvof.height + 15) / 16, 1);
+
+    ID3D11ShaderResourceView *null_srvs[MP_ARRAY_SIZE(srvs)] = {0};
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_srvs), null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &null_uav, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+
+    ID3D11DeviceContext_CopyResource(
+        p->context, (ID3D11Resource *)p->nvof.flow_diagnostics_readback,
+        (ID3D11Resource *)p->nvof.flow_diagnostics_buffer);
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+    HRESULT hr = ID3D11DeviceContext_Map(
+        p->context,
+        (ID3D11Resource *)p->nvof.flow_diagnostics_readback,
+        0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        unlock_d3d11_context(p);
+        MP_ERR(f, "NVOF flow diagnostics readback failed hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+    uint32_t counters[FLOW_DIAG_COUNTER_COUNT];
+    const uint32_t *mapped_values = mapped.pData;
+    for (int n = 0; n < FLOW_DIAG_COUNTER_COUNT; n++)
+        counters[n] = mapped_values[n];
+    ID3D11DeviceContext_Unmap(
+        p->context,
+        (ID3D11Resource *)p->nvof.flow_diagnostics_readback, 0);
+    unlock_d3d11_context(p);
+    QueryPerformanceCounter(&end);
+
+    uint32_t expected_pixels = p->nvof.width * p->nvof.height;
+    uint64_t classified_pixels =
+        (uint64_t)counters[FLOW_DIAG_BOTH_VALID] +
+        counters[FLOW_DIAG_FORWARD_ONLY] +
+        counters[FLOW_DIAG_BACKWARD_ONLY] +
+        counters[FLOW_DIAG_HOLES];
+    if (counters[FLOW_DIAG_PIXELS] != expected_pixels ||
+        classified_pixels != expected_pixels) {
+        MP_ERR(f, "NVOF flow diagnostics returned incomplete counters "
+                  "analyzed=%u classified=%llu expected=%u\n",
+               counters[FLOW_DIAG_PIXELS],
+               (unsigned long long)classified_pixels, expected_pixels);
+        return false;
+    }
+    if (p->opts->stage5_flow_infill_test) {
+        uint64_t final_forward_pixels =
+            (uint64_t)counters[FLOW_DIAG_FINAL_FORWARD_SEED] +
+            counters[FLOW_DIAG_FINAL_FORWARD_PROPAGATED] +
+            counters[FLOW_DIAG_FINAL_FORWARD_HOLE];
+        uint64_t final_backward_pixels =
+            (uint64_t)counters[FLOW_DIAG_FINAL_BACKWARD_SEED] +
+            counters[FLOW_DIAG_FINAL_BACKWARD_PROPAGATED] +
+            counters[FLOW_DIAG_FINAL_BACKWARD_HOLE];
+        if (final_forward_pixels != expected_pixels ||
+            final_backward_pixels != expected_pixels) {
+            MP_ERR(f, "NVOF final flow-state diagnostics are incomplete "
+                      "forward=%llu backward=%llu expected=%u\n",
+                   (unsigned long long)final_forward_pixels,
+                   (unsigned long long)final_backward_pixels,
+                   expected_pixels);
+            return false;
+        }
+    }
+    double elapsed_ms = (end.QuadPart - start.QuadPart) * 1000.0 /
+                        frequency.QuadPart;
+    p->nvof.diagnostic_pairs++;
+    p->nvof.diagnostic_total_ms += elapsed_ms;
+    p->nvof.diagnostic_max_ms =
+        MPMAX(p->nvof.diagnostic_max_ms, elapsed_ms);
+    for (int n = 0; n < FLOW_DIAG_COUNTER_COUNT; n++)
+        p->nvof.diagnostic_totals[n] += counters[n];
+
+    if (p->nvof.diagnostic_pairs <= 4 ||
+        p->nvof.diagnostic_pairs % 30 == 0) {
+        double pixels = counters[FLOW_DIAG_PIXELS];
+        MP_INFO(f, "NVOF flow diagnostics pair=%llu pixels=%u "
+                   "valid=%.2f/%.2f/%.2f holes=%.2f "
+                   "oob=%.2f/%.2f inconsistent=%.2f/%.2f "
+                   "high-cost=%.2f/%.2f avg-cost=%.2f/%.2f "
+                   "luma-diff=%.2f luma-large=%.2f large-flow=%.2f "
+                   "residual=%.2f/%.2f "
+                   "residual-le3/6/12=%.2f/%.2f/%.2f|%.2f/%.2f/%.2f "
+                   "sync-ms=%.3f\n",
+                (unsigned long long)p->nvof.diagnostic_pairs,
+                counters[FLOW_DIAG_PIXELS],
+                100.0 * counters[FLOW_DIAG_BOTH_VALID] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_ONLY] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_ONLY] / pixels,
+                100.0 * counters[FLOW_DIAG_HOLES] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_OOB] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_OOB] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_INCONSISTENT] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_INCONSISTENT] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_HIGH_COST] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_HIGH_COST] / pixels,
+                counters[FLOW_DIAG_FORWARD_COST_SUM] / pixels,
+                counters[FLOW_DIAG_BACKWARD_COST_SUM] / pixels,
+                counters[FLOW_DIAG_LUMA_ABS_SUM] / pixels,
+                100.0 * counters[FLOW_DIAG_LUMA_LARGE_CHANGE] / pixels,
+                100.0 * counters[FLOW_DIAG_LARGE_FLOW] / pixels,
+                counters[FLOW_DIAG_FORWARD_RESIDUAL_SUM] / pixels,
+                counters[FLOW_DIAG_BACKWARD_RESIDUAL_SUM] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_RESIDUAL_LE_3] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_RESIDUAL_LE_6] / pixels,
+                100.0 * counters[FLOW_DIAG_FORWARD_RESIDUAL_LE_12] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_RESIDUAL_LE_3] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_RESIDUAL_LE_6] / pixels,
+                100.0 * counters[FLOW_DIAG_BACKWARD_RESIDUAL_LE_12] / pixels,
+                elapsed_ms);
+        if (p->opts->stage5_flow_infill_test) {
+            MP_INFO(f, "NVOF final flow-state pair=%llu "
+                       "forward-seed/fill/hole=%.2f/%.2f/%.2f "
+                       "backward-seed/fill/hole=%.2f/%.2f/%.2f "
+                       "unresolved-reject="
+                       "consistency/photometric/oob/cost="
+                       "%.2f/%.2f/%.2f/%.2f\n",
+                    (unsigned long long)p->nvof.diagnostic_pairs,
+                    100.0 * counters[FLOW_DIAG_FINAL_FORWARD_SEED] / pixels,
+                    100.0 * counters[
+                        FLOW_DIAG_FINAL_FORWARD_PROPAGATED] / pixels,
+                    100.0 * counters[FLOW_DIAG_FINAL_FORWARD_HOLE] / pixels,
+                    100.0 * counters[FLOW_DIAG_FINAL_BACKWARD_SEED] / pixels,
+                    100.0 * counters[
+                        FLOW_DIAG_FINAL_BACKWARD_PROPAGATED] / pixels,
+                    100.0 * counters[FLOW_DIAG_FINAL_BACKWARD_HOLE] / pixels,
+                    100.0 * counters[
+                        FLOW_DIAG_INVERSE_RESIDUAL_REJECT] / pixels,
+                    100.0 * counters[FLOW_DIAG_PHOTOMETRIC_REJECT] / pixels,
+                    100.0 * counters[FLOW_DIAG_INVERSE_OOB_REJECT] / pixels,
+                    100.0 * counters[FLOW_DIAG_COST_REJECT] / pixels);
+        }
+    }
+    return true;
+}
+
+static bool prepare_and_infill_flows(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->nvof.prepare_flow_shader || !p->nvof.infill_flow_shader ||
+        !p->nvof.flow_forward.srv || !p->nvof.cost_forward.srv ||
+        !p->nvof.flow_backward.srv || !p->nvof.cost_backward.srv ||
+        !p->nvof.gray[0].srv || !p->nvof.gray[1].srv) {
+        MP_ERR(f, "NVOF flow infill source resources are incomplete\n");
+        return false;
+    }
+    for (int direction = 0; direction < 2; direction++) {
+        struct nvof_resource *states = direction == 0
+            ? p->nvof.flow_state_forward : p->nvof.flow_state_backward;
+        for (int index = 0; index < 2; index++) {
+            if (!states[index].srv || !states[index].uav) {
+                MP_ERR(f, "NVOF flow infill state resource is incomplete "
+                          "direction=%s index=%d\n",
+                       direction == 0 ? "forward" : "backward", index);
+                return false;
+            }
+        }
+    }
+
+    UINT groups_x = (p->nvof.width + 15) / 16;
+    UINT groups_y = (p->nvof.height + 15) / 16;
+    ID3D11ShaderResourceView *prepare_srvs[] = {
+        p->nvof.flow_forward.srv,
+        p->nvof.cost_forward.srv,
+        p->nvof.flow_backward.srv,
+        p->nvof.cost_backward.srv,
+        p->nvof.gray[0].srv,
+        p->nvof.gray[1].srv,
+    };
+    ID3D11UnorderedAccessView *prepare_uavs[] = {
+        p->nvof.flow_state_forward[0].uav,
+        p->nvof.flow_state_backward[0].uav,
+    };
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_FLOW_INFILL);
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.prepare_flow_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(prepare_srvs), prepare_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(prepare_uavs), prepare_uavs, NULL);
+    ID3D11DeviceContext_Dispatch(p->context, groups_x, groups_y, 1);
+
+    ID3D11ShaderResourceView *null_prepare_srvs[
+        MP_ARRAY_SIZE(prepare_srvs)] = {0};
+    ID3D11UnorderedAccessView *null_prepare_uavs[
+        MP_ARRAY_SIZE(prepare_uavs)] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_prepare_srvs), null_prepare_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(null_prepare_uavs), null_prepare_uavs,
+        NULL);
+
+    int source_index = 0;
+    for (int pass = 0; pass < FLOW_INFILL_PASS_COUNT; pass++) {
+        int output_index = 1 - source_index;
+        ID3D11ShaderResourceView *infill_srvs[] = {
+            p->nvof.flow_state_forward[source_index].srv,
+            p->nvof.flow_state_backward[source_index].srv,
+            p->nvof.gray[0].srv,
+            p->nvof.gray[1].srv,
+        };
+        ID3D11UnorderedAccessView *infill_uavs[] = {
+            p->nvof.flow_state_forward[output_index].uav,
+            p->nvof.flow_state_backward[output_index].uav,
+        };
+        ID3D11DeviceContext_CSSetShader(
+            p->context, p->nvof.infill_flow_shader, NULL, 0);
+        ID3D11DeviceContext_CSSetShaderResources(
+            p->context, 0, MP_ARRAY_SIZE(infill_srvs), infill_srvs);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(
+            p->context, 0, MP_ARRAY_SIZE(infill_uavs), infill_uavs, NULL);
+        ID3D11DeviceContext_Dispatch(p->context, groups_x, groups_y, 1);
+
+        ID3D11ShaderResourceView *null_infill_srvs[
+            MP_ARRAY_SIZE(infill_srvs)] = {0};
+        ID3D11UnorderedAccessView *null_infill_uavs[
+            MP_ARRAY_SIZE(infill_uavs)] = {0};
+        ID3D11DeviceContext_CSSetShaderResources(
+            p->context, 0, MP_ARRAY_SIZE(null_infill_srvs),
+            null_infill_srvs);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(
+            p->context, 0, MP_ARRAY_SIZE(null_infill_uavs),
+            null_infill_uavs, NULL);
+        source_index = output_index;
+    }
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+
+    if (source_index != FLOW_INFILL_FINAL_INDEX) {
+        MP_ERR(f, "NVOF flow infill final state mismatch actual=%d expected=%d\n",
+               source_index, FLOW_INFILL_FINAL_INDEX);
+        return false;
+    }
+    p->nvof.flow_infill_pairs++;
+    if (p->nvof.flow_infill_pairs == 1 ||
+        p->nvof.flow_infill_pairs % 120 == 0) {
+        MP_INFO(f, "NVOF flow infill dispatched pairs=%llu passes=%d "
+                   "state-index=%d\n",
+                (unsigned long long)p->nvof.flow_infill_pairs,
+                FLOW_INFILL_PASS_COUNT, FLOW_INFILL_FINAL_INDEX);
+    }
+    return true;
+}
+
+static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
+                               struct mp_image *frame1)
+{
+    struct priv *p = f->priv;
+    if (!ensure_nvof_session(f, frame0->w, frame0->h) ||
+        !extract_luma(f, frame0, 0) || !extract_luma(f, frame1, 1))
+        return false;
+
+    if (synthesis_enabled(p) && !dispatch_scene_cut_analysis(f))
+        return false;
+
+    bool temporal_hints_reset = p->nvof.disable_temporal_hints_next;
+    bool temporal_hints_disabled = temporal_hints_reset ||
+                                   synthesis_enabled(p);
+    NV_OF_EXECUTE_INPUT_PARAMS input = {
+        .inputFrame = p->nvof.gray[0].handle,
+        .referenceFrame = p->nvof.gray[1].handle,
+        .disableTemporalHints = temporal_hints_disabled
+                              ? NV_OF_TRUE : NV_OF_FALSE,
+    };
+    NV_OF_EXECUTE_OUTPUT_PARAMS output = {
+        .outputBuffer = p->nvof.flow_forward.handle,
+        .outputCostBuffer = p->nvof.cost_forward.handle,
+        .bwdOutputBuffer = p->nvof.flow_backward.handle,
+        .bwdOutputCostBuffer = p->nvof.cost_backward.handle,
+        .globalFlowBuffer = NULL,
+    };
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER submit_end;
+    LARGE_INTEGER completion_end;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    HRESULT completion_hr = S_OK;
+    lock_d3d11_context(p);
+    NV_OF_STATUS status = p->nvof.api.nvOFExecute(
+        p->nvof.handle, &input, &output);
+    QueryPerformanceCounter(&submit_end);
+    if (status == NV_OF_SUCCESS &&
+        p->opts->nvof_completion_diagnostics) {
+        ID3D11DeviceContext_CopyResource(
+            p->context,
+            (ID3D11Resource *)p->nvof.completion_readback,
+            (ID3D11Resource *)p->nvof.flow_forward.texture);
+        ID3D11DeviceContext_CopyResource(
+            p->context,
+            (ID3D11Resource *)p->nvof.completion_readback,
+            (ID3D11Resource *)p->nvof.flow_backward.texture);
+        D3D11_MAPPED_SUBRESOURCE mapped = {0};
+        completion_hr = ID3D11DeviceContext_Map(
+            p->context,
+            (ID3D11Resource *)p->nvof.completion_readback,
+            0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(completion_hr)) {
+            volatile uint32_t marker = *(const uint32_t *)mapped.pData;
+            (void)marker;
+            ID3D11DeviceContext_Unmap(
+                p->context,
+                (ID3D11Resource *)p->nvof.completion_readback, 0);
+        }
+    }
+    unlock_d3d11_context(p);
+    QueryPerformanceCounter(&completion_end);
+    if (!check_nvof_status(f, "nvOFExecute(strict-memc)", status)) {
+        p->nvof.disable_temporal_hints_next = true;
+        return false;
+    }
+    if (FAILED(completion_hr)) {
+        MP_ERR(f, "NVOF completion diagnostic full-flow readback failed "
+                   "hr=0x%08lx\n",
+               (unsigned long)completion_hr);
+        p->nvof.disable_temporal_hints_next = true;
+        return false;
+    }
+
+    double elapsed_ms = (submit_end.QuadPart - start.QuadPart) * 1000.0 /
+                        frequency.QuadPart;
+    p->nvof.execute_total_ms += elapsed_ms;
+    p->nvof.execute_max_ms = MPMAX(p->nvof.execute_max_ms, elapsed_ms);
+    p->nvof.executes++;
+    if (p->opts->nvof_completion_diagnostics) {
+        double completion_ms =
+            (completion_end.QuadPart - start.QuadPart) * 1000.0 /
+            frequency.QuadPart;
+        p->nvof.completion_samples++;
+        p->nvof.completion_total_ms += completion_ms;
+        p->nvof.completion_max_ms =
+            MPMAX(p->nvof.completion_max_ms, completion_ms);
+        if (p->nvof.completion_samples <= 4 ||
+            p->nvof.completion_samples % 30 == 0) {
+            MP_INFO(f, "NVOF completion diagnostic sample=%llu "
+                       "completion-ms=%.3f average-ms=%.3f max-ms=%.3f\n",
+                    (unsigned long long)p->nvof.completion_samples,
+                    completion_ms,
+                    p->nvof.completion_total_ms /
+                        p->nvof.completion_samples,
+                    p->nvof.completion_max_ms);
+        }
+    }
+    p->nvof.disable_temporal_hints_next = false;
+    if (p->opts->stage5_flow_infill_test &&
+        !prepare_and_infill_flows(f)) {
+        p->nvof.disable_temporal_hints_next = true;
+        return false;
+    }
+    if (p->opts->flow_diagnostics && !run_flow_diagnostics(f)) {
+        p->nvof.disable_temporal_hints_next = true;
+        return false;
+    }
+    if (p->nvof.executes == 1 || temporal_hints_reset ||
+        p->nvof.executes % 120 == 0) {
+        MP_INFO(f, "NVOF API execute count=%llu latest-ms=%.3f "
+                   "average-ms=%.3f max-ms=%.3f temporal-hints=%s\n",
+                (unsigned long long)p->nvof.executes, elapsed_ms,
+                p->nvof.execute_total_ms / p->nvof.executes,
+                p->nvof.execute_max_ms,
+                temporal_hints_disabled ? "disabled" : "enabled");
+    }
+    return true;
+}
+
+static bool has_dynamic_hdr10_plus(const struct mp_image *img)
+{
+    if (img->params.color.hdr.scene_avg > 0 ||
+        img->params.color.hdr.ootf.num_anchors > 0)
+        return true;
+    for (int n = 0; n < img->num_ff_side_data; n++) {
+        if (img->ff_side_data[n].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS)
+            return true;
+    }
+    return false;
+}
+
+static bool validate_input(struct mp_filter *f, struct mp_image *img)
+{
+    struct priv *p = f->priv;
+    if (!img || img->imgfmt != IMGFMT_D3D11 || !img->hwctx) {
+        MP_ERR(f, "NVOF MEMC requires D3D11 hardware frames\n");
+        return false;
+    }
+    if (img->params.hw_subfmt != IMGFMT_P010 &&
+        img->params.hw_subfmt != IMGFMT_NV12) {
+        MP_ERR(f, "NVOF MEMC requires P010 or NV12, received %s\n",
+               mp_imgfmt_to_name(img->params.hw_subfmt));
+        return false;
+    }
+    if (img->dovi || img->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION) {
+        MP_ERR(f, "NVOF MEMC does not support Dolby Vision\n");
+        return false;
+    }
+    if (has_dynamic_hdr10_plus(img)) {
+        MP_ERR(f, "NVOF MEMC does not support HDR10+ metadata\n");
+        return false;
+    }
+    if (img->params.color.transfer == PL_COLOR_TRC_HLG) {
+        MP_ERR(f, "NVOF MEMC does not support HLG before output "
+                  "validation\n");
+        return false;
+    }
+    if (img->params.color.transfer == PL_COLOR_TRC_PQ &&
+        (img->params.hw_subfmt != IMGFMT_P010 ||
+         img->params.color.primaries != PL_COLOR_PRIM_BT_2020)) {
+        MP_ERR(f, "NVOF MEMC HDR10 requires P010 BT.2020/PQ input "
+               "format=%s primaries=%d transfer=%d\n",
+               mp_imgfmt_to_name(img->params.hw_subfmt),
+               img->params.color.primaries, img->params.color.transfer);
+        return false;
+    }
+    if (synthesis_enabled(p) &&
+        img->params.chroma_location != PL_CHROMA_LEFT) {
+        MP_ERR(f, "NVOF MEMC synthesis supports only MPEG2/4/H.264 left "
+                   "chroma siting mode=%s received=%d\n",
+               p->opts->stage5_flow_infill_test ? "stage5" : "stage4",
+               img->params.chroma_location);
+        return false;
+    }
+    if (img->pts == MP_NOPTS_VALUE || !isfinite(img->pts)) {
+        MP_ERR(f, "NVOF MEMC requires finite timestamps\n");
+        return false;
+    }
+    return true;
+}
+
+static void pool_ref(struct texture_pool *pool)
+{
+    InterlockedIncrement(&pool->refs);
+}
+
+static void pool_unref(struct texture_pool *pool)
+{
+    if (!pool || InterlockedDecrement(&pool->refs) != 0)
+        return;
+    for (int n = 0; n < OUTPUT_POOL_CAPACITY; n++) {
+        if (pool->slots[n].texture)
+            ID3D11Texture2D_Release(pool->slots[n].texture);
+    }
+    if (pool->device)
+        ID3D11Device_Release(pool->device);
+    talloc_free(pool);
+}
+
+static bool verify_p010_views(struct mp_filter *f, ID3D11Texture2D *texture)
+{
+    struct priv *p = f->priv;
+    ID3D11Device3 *device3 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device3, (void **)&device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF MEMC requires ID3D11Device3 for planar P010 views "
+               "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    ID3D11ShaderResourceView1 *y_srv = NULL;
+    ID3D11ShaderResourceView1 *uv_srv = NULL;
+    ID3D11UnorderedAccessView1 *y_uav = NULL;
+    ID3D11UnorderedAccessView1 *uv_uav = NULL;
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 srv_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 0,
+        },
+    };
+    hr = ID3D11Device3_CreateShaderResourceView1(
+        device3, (ID3D11Resource *)texture, &srv_desc, &y_srv);
+    if (SUCCEEDED(hr)) {
+        srv_desc.Format = DXGI_FORMAT_R16G16_UNORM;
+        srv_desc.Texture2D.PlaneSlice = 1;
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)texture, &srv_desc, &uv_srv);
+    }
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 uav_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MipSlice = 0,
+            .PlaneSlice = 0,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)texture, &uav_desc, &y_uav);
+    }
+    if (SUCCEEDED(hr)) {
+        uav_desc.Format = DXGI_FORMAT_R16G16_UNORM;
+        uav_desc.Texture2D.PlaneSlice = 1;
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)texture, &uav_desc, &uv_uav);
+    }
+    if (y_srv)
+        ID3D11ShaderResourceView1_Release(y_srv);
+    if (uv_srv)
+        ID3D11ShaderResourceView1_Release(uv_srv);
+    if (y_uav)
+        ID3D11UnorderedAccessView1_Release(y_uav);
+    if (uv_uav)
+        ID3D11UnorderedAccessView1_Release(uv_uav);
+    ID3D11Device3_Release(device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF MEMC could not create planar P010 SRV/UAV views "
+               "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    return true;
+}
+
+static struct texture_pool *create_texture_pool(struct mp_filter *f,
+                                                struct mp_image *in)
+{
+    struct priv *p = f->priv;
+    struct texture_pool *pool = talloc_zero(NULL, struct texture_pool);
+    if (!pool)
+        return NULL;
+    pool->refs = 1;
+    InitializeSRWLock(&pool->lock);
+    pool->device = p->device;
+    ID3D11Device_AddRef(pool->device);
+    pool->width = MP_ALIGN_UP(in->w, 2);
+    pool->height = MP_ALIGN_UP(in->h, 2);
+    const char *mode = p->opts->stage5_flow_infill_test
+                     ? "flow-infill-test" :
+                       p->opts->stage4_synthesis_test ? "synthesis-test" :
+                       p->opts->stage3_nvof_test ? "nvof-test" :
+                       p->opts->stage2_timing_test ? "timing-test" :
+                       "passthrough";
+    MP_INFO(f, "NVOF MEMC initialized resolution=%dx%d "
+            "format=P010 private-pool=%d bind-flags=SRV|UAV|RT "
+            "mode=%s\n",
+            in->w, in->h, OUTPUT_POOL_CAPACITY, mode);
+    return pool;
+}
+
+static bool create_pool_texture(struct mp_filter *f,
+                                struct texture_pool *pool,
+                                ID3D11Texture2D **texture)
+{
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = pool->width,
+        .Height = pool->height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_P010,
+        .SampleDesc = { .Count = 1 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE |
+                     D3D11_BIND_UNORDERED_ACCESS |
+                     D3D11_BIND_RENDER_TARGET,
+    };
+    HRESULT hr = ID3D11Device_CreateTexture2D(
+        pool->device, &desc, NULL, texture);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF MEMC could not create a private P010 texture "
+               "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    if (!pool->views_verified && !verify_p010_views(f, *texture)) {
+        ID3D11Texture2D_Release(*texture);
+        *texture = NULL;
+        return false;
+    }
+    pool->views_verified = true;
+    return true;
+}
+
+static int acquire_pool_slot(struct mp_filter *f, struct texture_pool *pool)
+{
+    int slot = -1;
+    AcquireSRWLockExclusive(&pool->lock);
+    for (int n = 0; n < OUTPUT_POOL_CAPACITY; n++) {
+        if (!pool->slots[n].in_use) {
+            if (!pool->slots[n].texture &&
+                !create_pool_texture(f, pool, &pool->slots[n].texture))
+                break;
+            pool->slots[n].in_use = true;
+            pool->created = MPMAX(pool->created, n + 1);
+            slot = n;
+            pool_ref(pool);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&pool->lock);
+    if (slot < 0) {
+        MP_ERR(f, "NVOF MEMC private P010 pool exhausted capacity=%d\n",
+               OUTPUT_POOL_CAPACITY);
+    }
+    return slot;
+}
+
+static void release_pool_slot(struct texture_pool *pool, int slot)
+{
+    AcquireSRWLockExclusive(&pool->lock);
+    mp_assert(slot >= 0 && slot < OUTPUT_POOL_CAPACITY);
+    mp_assert(pool->slots[slot].in_use);
+    pool->slots[slot].in_use = false;
+    ReleaseSRWLockExclusive(&pool->lock);
+    pool_unref(pool);
+}
+
+static void release_output(void *arg)
+{
+    struct output_ref *ref = arg;
+    release_pool_slot(ref->pool, ref->slot);
+    talloc_free(ref);
+}
+
+static struct mp_image_params p010_output_params(const struct mp_image *in)
+{
+    struct mp_image_params params = in->params;
+    params.hw_subfmt = IMGFMT_P010;
+    return params;
+}
+
+static struct mp_image *allocate_output(struct mp_filter *f,
+                                        struct mp_image *in)
+{
+    struct priv *p = f->priv;
+    struct mp_image_params output_params = p010_output_params(in);
+    if (!p->pool ||
+        !mp_image_params_static_equal(&p->input_params, &output_params)) {
+        pool_unref(p->pool);
+        p->pool = create_texture_pool(f, in);
+        if (!p->pool)
+            return NULL;
+        p->input_params = output_params;
+        p->pool_logged = false;
+    }
+
+    int slot = acquire_pool_slot(f, p->pool);
+    if (slot < 0)
+        return NULL;
+    struct output_ref *ref = talloc(NULL, struct output_ref);
+    if (!ref) {
+        release_pool_slot(p->pool, slot);
+        return NULL;
+    }
+    *ref = (struct output_ref){ .pool = p->pool, .slot = slot };
+    struct mp_image *out = mp_image_new_custom_ref(in, ref, release_output);
+    if (!out) {
+        release_output(ref);
+        return NULL;
+    }
+    mp_image_copy_attributes(out, in);
+    out->params = output_params;
+    out->hwctx = av_buffer_ref(in->hwctx);
+    MP_HANDLE_OOM(out->hwctx);
+    out->planes[0] = (uint8_t *)p->pool->slots[slot].texture;
+    out->planes[1] = 0;
+    for (int n = 2; n < MP_MAX_PLANES; n++)
+        out->planes[n] = NULL;
+    if (!p->pool_logged) {
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D_GetDesc(p->pool->slots[slot].texture, &desc);
+        MP_INFO(f, "NVOF MEMC output pool verified format=P010 "
+                "texture=%ux%u array-size=%u bind-flags=0x%x "
+                "views=R16_UNORM/R16G16_UNORM\n",
+                desc.Width, desc.Height, desc.ArraySize, desc.BindFlags);
+        p->pool_logged = true;
+    }
+    return out;
+}
+
+static bool promote_nv12_frame(struct mp_filter *f, struct mp_image *out,
+                               struct mp_image *in)
+{
+    struct priv *p = f->priv;
+    if (!load_promote_nv12_shader(f))
+        return false;
+
+    ID3D11Texture2D *source = (ID3D11Texture2D *)in->planes[0];
+    ID3D11Texture2D *destination = (ID3D11Texture2D *)out->planes[0];
+    D3D11_TEXTURE2D_DESC source_desc;
+    D3D11_TEXTURE2D_DESC destination_desc;
+    ID3D11Texture2D_GetDesc(source, &source_desc);
+    ID3D11Texture2D_GetDesc(destination, &destination_desc);
+    UINT required_width = MP_ALIGN_UP(in->w, 2);
+    UINT required_height = MP_ALIGN_UP(in->h, 2);
+    UINT source_slice = (UINT)(uintptr_t)in->planes[1];
+    if (source_desc.Format != DXGI_FORMAT_NV12 ||
+        destination_desc.Format != DXGI_FORMAT_P010 ||
+        source_desc.Width < required_width ||
+        source_desc.Height < required_height ||
+        destination_desc.Width < required_width ||
+        destination_desc.Height < required_height ||
+        source_slice >= source_desc.ArraySize) {
+        MP_ERR(f, "NVOF NV12 promotion dimensions or formats are invalid "
+                  "source=%ux%u/%d array=%u slice=%u "
+                  "destination=%ux%u/%d visible=%dx%d\n",
+               source_desc.Width, source_desc.Height, source_desc.Format,
+               source_desc.ArraySize, source_slice,
+               destination_desc.Width, destination_desc.Height,
+               destination_desc.Format, in->w, in->h);
+        return false;
+    }
+
+    ID3D11Device3 *device3 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device3, (void **)&device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF NV12 promotion requires ID3D11Device3 "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    ID3D11ShaderResourceView1 *source_views[2] = {0};
+    ID3D11UnorderedAccessView1 *output_views[2] = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 srv_desc = {0};
+    srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+    if (source_desc.ArraySize > 1) {
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv_desc.Texture2DArray.MostDetailedMip = 0;
+        srv_desc.Texture2DArray.MipLevels = 1;
+        srv_desc.Texture2DArray.FirstArraySlice = source_slice;
+        srv_desc.Texture2DArray.ArraySize = 1;
+        srv_desc.Texture2DArray.PlaneSlice = 0;
+    } else {
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        srv_desc.Texture2D.MipLevels = 1;
+        srv_desc.Texture2D.PlaneSlice = 0;
+    }
+    hr = ID3D11Device3_CreateShaderResourceView1(
+        device3, (ID3D11Resource *)source, &srv_desc, &source_views[0]);
+    srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+    if (source_desc.ArraySize > 1)
+        srv_desc.Texture2DArray.PlaneSlice = 1;
+    else
+        srv_desc.Texture2D.PlaneSlice = 1;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)source, &srv_desc,
+            &source_views[1]);
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 uav_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MipSlice = 0,
+            .PlaneSlice = 0,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)destination, &uav_desc,
+            &output_views[0]);
+    }
+    uav_desc.Format = DXGI_FORMAT_R16G16_UNORM;
+    uav_desc.Texture2D.PlaneSlice = 1;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)destination, &uav_desc,
+            &output_views[1]);
+    }
+    ID3D11Device3_Release(device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF NV12 promotion view creation failed "
+                  "hr=0x%08lx bind-flags=0x%x\n",
+               (unsigned long)hr, source_desc.BindFlags);
+        for (int n = 0; n < MP_ARRAY_SIZE(source_views); n++) {
+            if (source_views[n])
+                ID3D11ShaderResourceView1_Release(source_views[n]);
+        }
+        for (int n = 0; n < MP_ARRAY_SIZE(output_views); n++) {
+            if (output_views[n])
+                ID3D11UnorderedAccessView1_Release(output_views[n]);
+        }
+        return false;
+    }
+
+    ID3D11ShaderResourceView *srvs[] = {
+        (ID3D11ShaderResourceView *)source_views[0],
+        (ID3D11ShaderResourceView *)source_views[1],
+    };
+    ID3D11UnorderedAccessView *uavs[] = {
+        (ID3D11UnorderedAccessView *)output_views[0],
+        (ID3D11UnorderedAccessView *)output_views[1],
+    };
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_P010_COPY);
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.promote_nv12_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(srvs), srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(uavs), uavs, NULL);
+    ID3D11DeviceContext_Dispatch(
+        p->context, (required_width + 7) / 8,
+        (required_height + 7) / 8, 1);
+    ID3D11ShaderResourceView *null_srvs[MP_ARRAY_SIZE(srvs)] = {0};
+    ID3D11UnorderedAccessView *null_uavs[MP_ARRAY_SIZE(uavs)] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_srvs), null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(null_uavs), null_uavs, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+
+    for (int n = 0; n < MP_ARRAY_SIZE(source_views); n++)
+        ID3D11ShaderResourceView1_Release(source_views[n]);
+    for (int n = 0; n < MP_ARRAY_SIZE(output_views); n++)
+        ID3D11UnorderedAccessView1_Release(output_views[n]);
+    p->promoted_frames++;
+    return true;
+}
+
+static bool copy_frame(struct mp_filter *f, struct mp_image *out,
+                       struct mp_image *in)
+{
+    struct priv *p = f->priv;
+    ID3D11Texture2D *source = (ID3D11Texture2D *)in->planes[0];
+    ID3D11Texture2D *destination = (ID3D11Texture2D *)out->planes[0];
+    ID3D11Device *source_device = NULL;
+    ID3D11Texture2D_GetDevice(source, &source_device);
+    bool same_device = source_device == p->device;
+    if (source_device)
+        ID3D11Device_Release(source_device);
+    if (!same_device) {
+        MP_ERR(f, "NVOF MEMC cannot copy between different D3D11 devices\n");
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC source_desc;
+    D3D11_TEXTURE2D_DESC destination_desc;
+    ID3D11Texture2D_GetDesc(source, &source_desc);
+    ID3D11Texture2D_GetDesc(destination, &destination_desc);
+    if (source_desc.Format == DXGI_FORMAT_NV12)
+        return promote_nv12_frame(f, out, in);
+    UINT copy_width = MP_ALIGN_UP(in->w, 2);
+    UINT copy_height = MP_ALIGN_UP(in->h, 2);
+    if (source_desc.Format != DXGI_FORMAT_P010 ||
+        destination_desc.Format != DXGI_FORMAT_P010 ||
+        source_desc.Width < copy_width ||
+        source_desc.Height < copy_height ||
+        destination_desc.Width < copy_width ||
+        destination_desc.Height < copy_height) {
+        MP_ERR(f, "NVOF MEMC P010 copy dimensions or formats are invalid "
+               "source=%ux%u/%d destination=%ux%u/%d visible=%dx%d\n",
+               source_desc.Width, source_desc.Height, source_desc.Format,
+               destination_desc.Width, destination_desc.Height,
+               destination_desc.Format, in->w, in->h);
+        return false;
+    }
+
+    D3D11_BOX box = {
+        .left = 0,
+        .top = 0,
+        .front = 0,
+        .right = copy_width,
+        .bottom = copy_height,
+        .back = 1,
+    };
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_P010_COPY);
+    ID3D11DeviceContext_CopySubresourceRegion(
+        p->context, (ID3D11Resource *)destination,
+        (UINT)(uintptr_t)out->planes[1], 0, 0, 0,
+        (ID3D11Resource *)source, (UINT)(uintptr_t)in->planes[1], &box);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+    return true;
+}
+
+static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
+                                  struct mp_image *frame0,
+                                  struct mp_image *frame1)
+{
+    struct priv *p = f->priv;
+    bool flow_resources_ready = p->opts->stage5_flow_infill_test
+        ? p->nvof.flow_state_forward[FLOW_INFILL_FINAL_INDEX].srv &&
+          p->nvof.flow_state_backward[FLOW_INFILL_FINAL_INDEX].srv
+        : p->nvof.flow_forward.srv && p->nvof.flow_backward.srv &&
+          p->nvof.cost_forward.srv && p->nvof.cost_backward.srv;
+    if (!p->nvof.synthesize_p010_shader || !flow_resources_ready ||
+        !p->nvof.scene_cut_srv || !p->nvof.scene_cut_summary_uav) {
+        MP_ERR(f, "NVOF P010 synthesis resources are incomplete\n");
+        return false;
+    }
+
+    ID3D11Texture2D *textures[] = {
+        (ID3D11Texture2D *)frame0->planes[0],
+        (ID3D11Texture2D *)frame1->planes[0],
+        (ID3D11Texture2D *)out->planes[0],
+    };
+    UINT required_width = MP_ALIGN_UP(frame0->w, 2);
+    UINT required_height = MP_ALIGN_UP(frame0->h, 2);
+    for (int n = 0; n < MP_ARRAY_SIZE(textures); n++) {
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D_GetDesc(textures[n], &desc);
+        if (desc.Format != DXGI_FORMAT_P010 || desc.ArraySize != 1 ||
+            desc.Width < required_width || desc.Height < required_height) {
+            MP_ERR(f, "NVOF P010 synthesis requires private single-layer "
+                      "textures index=%d format=%u array-size=%u size=%ux%u "
+                      "required=%ux%u\n",
+                   n, (unsigned)desc.Format, desc.ArraySize,
+                   desc.Width, desc.Height, required_width, required_height);
+            return false;
+        }
+    }
+
+    ID3D11Device3 *device3 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device3, (void **)&device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF P010 synthesis requires ID3D11Device3 "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    ID3D11ShaderResourceView1 *input_views[4] = {0};
+    ID3D11UnorderedAccessView1 *output_views[2] = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 srv_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 0,
+        },
+    };
+    hr = ID3D11Device3_CreateShaderResourceView1(
+        device3, (ID3D11Resource *)textures[0], &srv_desc, &input_views[0]);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)textures[1], &srv_desc,
+            &input_views[1]);
+    }
+    srv_desc.Format = DXGI_FORMAT_R16G16_UNORM;
+    srv_desc.Texture2D.PlaneSlice = 1;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)textures[0], &srv_desc,
+            &input_views[2]);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)textures[1], &srv_desc,
+            &input_views[3]);
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 uav_desc = {
+        .Format = DXGI_FORMAT_R16_UNORM,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MipSlice = 0,
+            .PlaneSlice = 0,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)textures[2], &uav_desc,
+            &output_views[0]);
+    }
+    uav_desc.Format = DXGI_FORMAT_R16G16_UNORM;
+    uav_desc.Texture2D.PlaneSlice = 1;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateUnorderedAccessView1(
+            device3, (ID3D11Resource *)textures[2], &uav_desc,
+            &output_views[1]);
+    }
+    ID3D11Device3_Release(device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF P010 synthesis view creation failed "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        for (int n = 0; n < MP_ARRAY_SIZE(input_views); n++) {
+            if (input_views[n])
+                ID3D11ShaderResourceView1_Release(input_views[n]);
+        }
+        for (int n = 0; n < MP_ARRAY_SIZE(output_views); n++) {
+            if (output_views[n])
+                ID3D11UnorderedAccessView1_Release(output_views[n]);
+        }
+        return false;
+    }
+
+    ID3D11ShaderResourceView *srvs[9] = {
+        (ID3D11ShaderResourceView *)input_views[0],
+        (ID3D11ShaderResourceView *)input_views[1],
+        (ID3D11ShaderResourceView *)input_views[2],
+        (ID3D11ShaderResourceView *)input_views[3],
+    };
+    if (p->opts->stage5_flow_infill_test) {
+        srvs[4] = p->nvof.flow_state_forward[
+            FLOW_INFILL_FINAL_INDEX].srv;
+        srvs[5] = p->nvof.flow_state_backward[
+            FLOW_INFILL_FINAL_INDEX].srv;
+    } else {
+        srvs[4] = p->nvof.flow_forward.srv;
+        srvs[5] = p->nvof.flow_backward.srv;
+        srvs[6] = p->nvof.cost_forward.srv;
+        srvs[7] = p->nvof.cost_backward.srv;
+    }
+    srvs[8] = p->nvof.scene_cut_srv;
+    ID3D11UnorderedAccessView *uavs[] = {
+        (ID3D11UnorderedAccessView *)output_views[0],
+        (ID3D11UnorderedAccessView *)output_views[1],
+        p->nvof.scene_cut_summary_uav,
+    };
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_SYNTH);
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.synthesize_p010_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(srvs), srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(uavs), uavs, NULL);
+    ID3D11DeviceContext_Dispatch(
+        p->context, (required_width + 7) / 8, (required_height + 7) / 8, 1);
+
+    ID3D11ShaderResourceView *null_srvs[MP_ARRAY_SIZE(srvs)] = {0};
+    ID3D11UnorderedAccessView *null_uavs[MP_ARRAY_SIZE(uavs)] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_srvs), null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(null_uavs), null_uavs, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+
+    for (int n = 0; n < MP_ARRAY_SIZE(input_views); n++)
+        ID3D11ShaderResourceView1_Release(input_views[n]);
+    for (int n = 0; n < MP_ARRAY_SIZE(output_views); n++)
+        ID3D11UnorderedAccessView1_Release(output_views[n]);
+    return true;
+}
+
+static struct mp_image *copy_to_private_texture(struct mp_filter *f,
+                                                struct mp_image *in)
+{
+    struct mp_image *copy = allocate_output(f, in);
+    if (!copy || !copy_frame(f, copy, in)) {
+        talloc_free(copy);
+        return NULL;
+    }
+    return copy;
+}
+
+static void fail_filter(struct mp_filter *f)
+{
+    mp_filter_internal_mark_failed(f);
+}
+
+static bool write_copied_frame(struct mp_filter *f, struct mp_image *source,
+                               double pts, double duration, bool stage2)
+{
+    struct priv *p = f->priv;
+    struct mp_image *out = allocate_output(f, source);
+    if (!out || !copy_frame(f, out, source)) {
+        talloc_free(out);
+        fail_filter(f);
+        return false;
+    }
+    out->pts = pts;
+    out->dts = MP_NOPTS_VALUE;
+    out->pkt_duration = duration;
+    if (stage2 && out->nominal_fps > 0)
+        out->nominal_fps *= 2;
+    p->copied_frames++;
+    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
+    return true;
+}
+
+static bool write_synthesized_frame(struct mp_filter *f,
+                                    struct mp_image *frame0,
+                                    struct mp_image *frame1,
+                                    double pts, double duration)
+{
+    struct priv *p = f->priv;
+    struct mp_image *out = allocate_output(f, frame0);
+    if (!out || !synthesize_p010_frame(f, out, frame0, frame1)) {
+        talloc_free(out);
+        fail_filter(f);
+        return false;
+    }
+    out->pts = pts;
+    out->dts = MP_NOPTS_VALUE;
+    out->pkt_duration = duration;
+    if (out->nominal_fps > 0)
+        out->nominal_fps *= 2;
+    p->synthesized_frames++;
+    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
+    return true;
+}
+
+static void process_stage1(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!mp_pin_in_needs_data(f->ppins[1]))
+        return;
+    if (!mp_pin_out_request_data(f->ppins[0]))
+        return;
+
+    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+    if (frame.type == MP_FRAME_NONE)
+        return;
+    if (frame.type == MP_FRAME_EOF) {
+        mp_pin_in_write(f->ppins[1], frame);
+        return;
+    }
+    if (frame.type != MP_FRAME_VIDEO) {
+        MP_ERR(f, "NVOF MEMC stage 1 received unsupported frame type=%d\n",
+               frame.type);
+        mp_frame_unref(&frame);
+        fail_filter(f);
+        return;
+    }
+
+    struct mp_image *in = frame.data;
+    if (!validate_input(f, in)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->input_frames++;
+    if (!write_copied_frame(f, in, in->pts, in->pkt_duration, false)) {
+        talloc_free(in);
+        return;
+    }
+    p->original_frames++;
+    talloc_free(in);
+}
+
+static void clear_timing_state(struct priv *p)
+{
+    mp_image_unrefp(&p->frame0);
+    mp_image_unrefp(&p->frame1);
+    p->output_phase = OUTPUT_NONE;
+    p->pair_duration = 0;
+    p->input_eof = false;
+    p->output_eof_sent = false;
+    p->nvof.disable_temporal_hints_next = true;
+}
+
+static bool valid_pair(struct mp_filter *f, struct mp_image *frame0,
+                       struct mp_image *frame1, double *duration)
+{
+    struct priv *p = f->priv;
+    if (!!frame0->hwctx != !!frame1->hwctx ||
+        (frame0->hwctx && frame0->hwctx->data != frame1->hwctx->data) ||
+        !mp_image_params_static_equal(&frame0->params, &frame1->params)) {
+        MP_WARN(f, "NVOF MEMC stage 2 reset history because input format "
+                   "or D3D11 context changed\n");
+        p->discontinuities++;
+        return false;
+    }
+
+    double delta = frame1->pts - frame0->pts;
+    double nominal_duration = frame0->nominal_fps > 0
+                            ? 1.0 / frame0->nominal_fps : 0;
+    double maximum_duration = nominal_duration > 0
+                            ? nominal_duration * 4.0 : 1.0;
+    if (!isfinite(delta) || delta <= 0 || delta > maximum_duration) {
+        MP_WARN(f, "NVOF MEMC stage 2 reset history because PTS interval "
+                   "is invalid delta=%.6f maximum=%.6f\n",
+                delta, maximum_duration);
+        p->discontinuities++;
+        return false;
+    }
+    *duration = delta;
+    return true;
+}
+
+static bool emit_stage2_frame(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    struct mp_image *source = p->frame0;
+    mp_assert(source);
+
+    double pts = source->pts;
+    double duration = source->pkt_duration;
+    enum output_phase phase = p->output_phase;
+    if (phase == OUTPUT_ORIGINAL || phase == OUTPUT_INTERMEDIATE_TEST) {
+        duration = p->pair_duration / 2.0;
+        if (phase == OUTPUT_INTERMEDIATE_TEST)
+            pts += duration;
+    }
+    bool wrote = phase == OUTPUT_INTERMEDIATE_TEST &&
+                  synthesis_enabled(p)
+               ? write_synthesized_frame(f, p->frame0, p->frame1,
+                                          pts, duration)
+               : write_copied_frame(f, source, pts, duration, true);
+    if (!wrote)
+        return false;
+
+    if (phase == OUTPUT_ORIGINAL) {
+        p->original_frames++;
+        p->output_phase = OUTPUT_INTERMEDIATE_TEST;
+    } else if (phase == OUTPUT_INTERMEDIATE_TEST) {
+        p->intermediate_test_frames++;
+        mp_image_unrefp(&p->frame0);
+        p->frame0 = p->frame1;
+        p->frame1 = NULL;
+        p->output_phase = OUTPUT_NONE;
+        p->pair_duration = 0;
+    } else if (phase == OUTPUT_FINAL) {
+        p->original_frames++;
+        mp_image_unrefp(&p->frame0);
+        p->output_phase = OUTPUT_NONE;
+    } else {
+        MP_ASSERT_UNREACHABLE();
+    }
+    return true;
+}
+
+static void process_stage2(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!mp_pin_in_needs_data(f->ppins[1]))
+        return;
+
+    if (p->output_phase != OUTPUT_NONE) {
+        emit_stage2_frame(f);
+        return;
+    }
+    if (p->input_eof) {
+        if (!p->output_eof_sent) {
+            p->output_eof_sent = true;
+            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_EOF, NULL));
+        }
+        return;
+    }
+    if (!mp_pin_out_request_data(f->ppins[0]))
+        return;
+
+    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+    if (frame.type == MP_FRAME_NONE)
+        return;
+    if (frame.type == MP_FRAME_EOF) {
+        p->input_eof = true;
+        if (p->frame0) {
+            p->output_phase = OUTPUT_FINAL;
+            emit_stage2_frame(f);
+        } else {
+            p->output_eof_sent = true;
+            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_EOF, NULL));
+        }
+        return;
+    }
+    if (frame.type != MP_FRAME_VIDEO) {
+        MP_ERR(f, "NVOF MEMC stage 2 received unsupported frame type=%d\n",
+               frame.type);
+        mp_frame_unref(&frame);
+        fail_filter(f);
+        return;
+    }
+
+    struct mp_image *in = frame.data;
+    if (!validate_input(f, in)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->input_frames++;
+    if (nvof_analysis_enabled(p)) {
+        struct mp_image *private_copy = copy_to_private_texture(f, in);
+        talloc_free(in);
+        if (!private_copy) {
+            MP_ERR(f, "NVOF could not copy input to a private P010 "
+                      "analysis texture mode=%s\n",
+                   p->opts->stage5_flow_infill_test ? "stage5" :
+                   p->opts->stage4_synthesis_test ? "stage4" : "stage3");
+            fail_filter(f);
+            return;
+        }
+        in = private_copy;
+    }
+    if (!p->frame0) {
+        p->frame0 = in;
+        mp_pin_out_request_data(f->ppins[0]);
+        return;
+    }
+
+    double duration = 0;
+    if (!valid_pair(f, p->frame0, in, &duration)) {
+        p->nvof.disable_temporal_hints_next = true;
+        mp_image_unrefp(&p->frame0);
+        p->frame0 = in;
+        mp_pin_out_request_data(f->ppins[0]);
+        return;
+    }
+    if (nvof_analysis_enabled(p) &&
+        !execute_nvof_pair(f, p->frame0, in)) {
+        talloc_free(in);
+        fail_filter(f);
+        return;
+    }
+    p->frame1 = in;
+    p->pair_duration = duration;
+    p->output_phase = OUTPUT_ORIGINAL;
+    emit_stage2_frame(f);
+}
+
+static void process(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->opts->stage2_timing_test || nvof_analysis_enabled(p))
+        process_stage2(f);
+    else
+        process_stage1(f);
+}
+
+static void reset_filter(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    clear_timing_state(p);
+    p->resets++;
+    MP_VERBOSE(f, "NVOF MEMC reset count=%llu\n",
+               (unsigned long long)p->resets);
+}
+
+static void destroy(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    int pending_gpu_queries = drain_gpu_profile_queries(p);
+    if (pending_gpu_queries) {
+        MP_WARN(f, "NVOF GPU timing drain left unresolved queries=%d\n",
+                pending_gpu_queries);
+    }
+    read_scene_cut_summary(f);
+    MP_INFO(f, "NVOF MEMC shutdown input-frames=%llu copied-frames=%llu "
+            "promoted-frames=%llu "
+            "original-frames=%llu intermediate-test-frames=%llu "
+            "synthesized-frames=%llu scene-cut-midpoints=%llu "
+            "discontinuities=%llu resets=%llu\n",
+            (unsigned long long)p->input_frames,
+            (unsigned long long)p->copied_frames,
+            (unsigned long long)p->promoted_frames,
+            (unsigned long long)p->original_frames,
+            (unsigned long long)p->intermediate_test_frames,
+            (unsigned long long)p->synthesized_frames,
+            (unsigned long long)p->scene_cut_midpoints,
+            (unsigned long long)p->discontinuities,
+            (unsigned long long)p->resets);
+    if (p->nvof.executes) {
+        MP_INFO(f, "NVOF API timing executes=%llu average-ms=%.3f "
+                   "max-ms=%.3f note=fixed-function-engine-not-covered-by-"
+                   "d3d11-timestamps\n",
+                (unsigned long long)p->nvof.executes,
+                p->nvof.execute_total_ms / p->nvof.executes,
+                p->nvof.execute_max_ms);
+    }
+    if (p->nvof.completion_samples) {
+        MP_INFO(f, "NVOF completion diagnostic samples=%llu "
+                   "average-ms=%.3f max-ms=%.3f "
+                   "sync=full-%s-flow-copy-map\n",
+                (unsigned long long)p->nvof.completion_samples,
+                p->nvof.completion_total_ms / p->nvof.completion_samples,
+                p->nvof.completion_max_ms,
+                "bidirectional");
+    }
+    if (p->nvof.diagnostic_pairs &&
+        p->nvof.diagnostic_totals[FLOW_DIAG_PIXELS]) {
+        double pixels = p->nvof.diagnostic_totals[FLOW_DIAG_PIXELS];
+        MP_INFO(f, "NVOF flow diagnostics summary pairs=%llu pixels=%llu "
+                   "valid=%.2f/%.2f/%.2f holes=%.2f "
+                   "oob=%.2f/%.2f inconsistent=%.2f/%.2f "
+                   "high-cost=%.2f/%.2f avg-cost=%.2f/%.2f "
+                   "luma-diff=%.2f luma-large=%.2f large-flow=%.2f "
+                   "residual=%.2f/%.2f "
+                   "residual-le3/6/12=%.2f/%.2f/%.2f|%.2f/%.2f/%.2f "
+                   "sync-average-ms=%.3f sync-max-ms=%.3f\n",
+                (unsigned long long)p->nvof.diagnostic_pairs,
+                (unsigned long long)p->nvof.diagnostic_totals[
+                    FLOW_DIAG_PIXELS],
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BOTH_VALID] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_ONLY] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_ONLY] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_HOLES] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_OOB] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_OOB] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_INCONSISTENT] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_INCONSISTENT] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_HIGH_COST] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_HIGH_COST] / pixels,
+                p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_COST_SUM] / pixels,
+                p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_COST_SUM] / pixels,
+                p->nvof.diagnostic_totals[
+                    FLOW_DIAG_LUMA_ABS_SUM] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_LUMA_LARGE_CHANGE] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_LARGE_FLOW] / pixels,
+                p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_RESIDUAL_SUM] / pixels,
+                p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_RESIDUAL_SUM] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_RESIDUAL_LE_3] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_RESIDUAL_LE_6] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_FORWARD_RESIDUAL_LE_12] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_RESIDUAL_LE_3] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_RESIDUAL_LE_6] / pixels,
+                100.0 * p->nvof.diagnostic_totals[
+                    FLOW_DIAG_BACKWARD_RESIDUAL_LE_12] / pixels,
+                p->nvof.diagnostic_total_ms / p->nvof.diagnostic_pairs,
+                p->nvof.diagnostic_max_ms);
+        if (p->opts->stage5_flow_infill_test) {
+            MP_INFO(f, "NVOF final flow-state summary pairs=%llu "
+                       "forward-seed/fill/hole=%.2f/%.2f/%.2f "
+                       "backward-seed/fill/hole=%.2f/%.2f/%.2f "
+                       "unresolved-reject="
+                       "consistency/photometric/oob/cost="
+                       "%.2f/%.2f/%.2f/%.2f\n",
+                    (unsigned long long)p->nvof.diagnostic_pairs,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_FORWARD_SEED] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_FORWARD_PROPAGATED] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_FORWARD_HOLE] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_BACKWARD_SEED] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_BACKWARD_PROPAGATED] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_FINAL_BACKWARD_HOLE] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_INVERSE_RESIDUAL_REJECT] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_PHOTOMETRIC_REJECT] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_INVERSE_OOB_REJECT] / pixels,
+                    100.0 * p->nvof.diagnostic_totals[
+                        FLOW_DIAG_COST_REJECT] / pixels);
+        }
+    }
+    if (p->nvof.scene_cut_pairs) {
+        MP_INFO(f, "NVOF GPU scene-cut summary pairs=%llu cuts=%llu "
+                   "midpoint-policy=copy-f0\n",
+                (unsigned long long)p->nvof.scene_cut_pairs,
+                (unsigned long long)p->nvof.scene_cuts);
+    }
+    if (p->opts->gpu_timing) {
+        for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++) {
+            const struct gpu_profile_stats *stats =
+                &p->nvof.gpu_profile[stage];
+            MP_INFO(f, "NVOF GPU timing stage=%s samples=%llu skipped=%llu "
+                       "invalid=%llu average-ms=%.3f p95-ms=%.3f "
+                       "p99-ms=%.3f max-ms=%.3f\n",
+                    gpu_profile_stage_name(stage),
+                    (unsigned long long)stats->samples,
+                    (unsigned long long)stats->skipped,
+                    (unsigned long long)stats->invalid,
+                    stats->samples ? stats->total_ms / stats->samples : 0,
+                    gpu_profile_percentile(stats, 0.95),
+                    gpu_profile_percentile(stats, 0.99), stats->max_ms);
+        }
+    }
+    clear_timing_state(p);
+    pool_unref(p->pool);
+    p->pool = NULL;
+    destroy_nvof(f);
+    av_buffer_unref(&p->av_device_ref);
+    if (p->multithread)
+        ID3D10Multithread_Release(p->multithread);
+    p->multithread = NULL;
+    if (p->context)
+        ID3D11DeviceContext_Release(p->context);
+    if (p->device)
+        ID3D11Device_Release(p->device);
+}
+
+static const struct mp_filter_info nvofmemc_filter = {
+    .name = "nvofmemc",
+    .process = process,
+    .reset = reset_filter,
+    .destroy = destroy,
+    .priv_size = sizeof(struct priv),
+};
+
+static struct mp_filter *create(struct mp_filter *parent, void *options)
+{
+    struct mp_filter *f = mp_filter_create(parent, &nvofmemc_filter);
+    if (!f) {
+        talloc_free(options);
+        return NULL;
+    }
+    mp_filter_add_pin(f, MP_PIN_IN, "in");
+    mp_filter_add_pin(f, MP_PIN_OUT, "out");
+
+    struct priv *p = f->priv;
+    p->opts = talloc_steal(p, options);
+    int mode_count = p->opts->stage1_passthrough +
+                     p->opts->stage2_timing_test +
+                     p->opts->stage3_nvof_test +
+                     p->opts->stage4_synthesis_test +
+                     p->opts->stage5_flow_infill_test;
+    if (mode_count != 1) {
+        MP_ERR(f, "NVOF MEMC requires exactly one validation mode: "
+                "stage1-passthrough=yes, stage2-timing-test=yes, or "
+                "stage3-nvof-test=yes, stage4-synthesis-test=yes, or "
+                "stage5-flow-infill-test=yes\n");
+        goto fail;
+    }
+    if (p->opts->flow_diagnostics &&
+        !nvof_analysis_enabled(p)) {
+        MP_ERR(f, "NVOF flow diagnostics require stage 3, 4, or 5 mode\n");
+        goto fail;
+    }
+    if (p->opts->stage2_timing_test) {
+        MP_WARN(f, "NVOF MEMC stage 2 timing test repeats F0 for midpoint "
+                   "frames; motion compensation is not active\n");
+    }
+    if (p->opts->stage3_nvof_test) {
+        MP_WARN(f, "NVOF MEMC stage 3 generates bidirectional flow and cost "
+                   "but still repeats F0 for midpoint frames; motion "
+                   "compensation is not active\n");
+    }
+    if (p->opts->stage4_synthesis_test) {
+        MP_WARN(f, "NVOF MEMC stage 4 enables strict x2 P010 midpoint "
+                   "synthesis; unsupported formats or synthesis failures "
+                   "are fatal\n");
+    }
+    if (p->opts->stage5_flow_infill_test) {
+        MP_WARN(f, "NVOF MEMC stage 5 enables strict x2 P010 midpoint "
+                   "synthesis with native bidirectional OFA, "
+                   "forward-backward consistency rejection, and two-pass "
+                   "luma-guided flow infill; "
+                   "unsupported formats or synthesis failures are fatal\n");
+    }
+    if (p->opts->flow_diagnostics) {
+        MP_WARN(f, "NVOF flow diagnostics are enabled for development "
+                   "measurement and add a synchronous GPU counter readback "
+                   "for every analyzed pair\n");
+    }
+    if (p->opts->nvof_completion_diagnostics) {
+        MP_WARN(f, "NVOF completion diagnostics are enabled and force a "
+                   "full OFA flow staging copy and Map after "
+                   "every pair; this mode is "
+                   "measurement-only and intentionally synchronous\n");
+    }
+
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    if (!info || !info->hwdec_devs)
+        goto fail;
+    struct hwdec_imgfmt_request request = {
+        .imgfmt = IMGFMT_D3D11,
+        .probing = false,
+    };
+    hwdec_devices_request_for_img_fmt(info->hwdec_devs, &request);
+    struct mp_hwdec_ctx *hwctx = hwdec_devices_get_by_imgfmt_and_type(
+        info->hwdec_devs, IMGFMT_D3D11, AV_HWDEVICE_TYPE_D3D11VA);
+    if (!hwctx || !hwctx->av_device_ref) {
+        MP_ERR(f, "NVOF MEMC could not obtain mpv's D3D11 device\n");
+        goto fail;
+    }
+
+    p->av_device_ref = av_buffer_ref(hwctx->av_device_ref);
+    MP_HANDLE_OOM(p->av_device_ref);
+    AVHWDeviceContext *device = (AVHWDeviceContext *)p->av_device_ref->data;
+    AVD3D11VADeviceContext *d3d = device->hwctx;
+    p->device = d3d->device;
+    ID3D11Device_AddRef(p->device);
+    ID3D11Device_GetImmediateContext(p->device, &p->context);
+    if (!p->context) {
+        MP_ERR(f, "NVOF MEMC could not obtain the D3D11 immediate context\n");
+        goto fail;
+    }
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D10Multithread, (void **)&p->multithread);
+    if (FAILED(hr) || !p->multithread) {
+        MP_ERR(f, "NVOF MEMC requires ID3D10Multithread for atomic D3D11 "
+                  "context command blocks hr=0x%08lx\n",
+               (unsigned long)hr);
+        goto fail;
+    }
+    ID3D10Multithread_SetMultithreadProtected(p->multithread, TRUE);
+    MP_INFO(f, "NVOF MEMC D3D11 context block locking enabled\n");
+    if (nvof_analysis_enabled(p) && !create_gpu_profile_queries(f))
+        goto fail;
+    if (nvof_analysis_enabled(p) &&
+        (!load_nvof_api(f) || !load_extract_luma_shader(f)))
+        goto fail;
+    return f;
+
+fail:
+    talloc_free(f);
+    return NULL;
+}
+
+#define OPT_BASE_STRUCT struct opts
+static const m_option_t option_fields[] = {
+    {"memc", OPT_BOOL(stage5_flow_infill_test)},
+    {"stage1-passthrough", OPT_BOOL(stage1_passthrough)},
+    {"stage2-timing-test", OPT_BOOL(stage2_timing_test)},
+    {"stage3-nvof-test", OPT_BOOL(stage3_nvof_test)},
+    {"stage4-synthesis-test", OPT_BOOL(stage4_synthesis_test)},
+    {"stage5-flow-infill-test", OPT_BOOL(stage5_flow_infill_test)},
+    {"flow-diagnostics", OPT_BOOL(flow_diagnostics)},
+    {"flow-fb-abs", OPT_DOUBLE(flow_fb_abs), M_RANGE(0.001, 255.0)},
+    {"flow-fb-rel", OPT_DOUBLE(flow_fb_rel), M_RANGE(0.0, 10.0)},
+    {"flow-cost-max", OPT_DOUBLE(flow_cost_max), M_RANGE(0.0, 1.0)},
+    {"flow-confidence-min", OPT_DOUBLE(flow_confidence_min),
+        M_RANGE(0.001, 0.5)},
+    {"infill-luma-threshold", OPT_DOUBLE(infill_luma_threshold),
+        M_RANGE(0.0, 255.0)},
+    {"scene-cut-sample-stride", OPT_INT(scene_cut_sample_stride),
+        M_RANGE(2, 64)},
+    {"scene-cut-pixel-threshold", OPT_INT(scene_cut_pixel_threshold),
+        M_RANGE(1, 127)},
+    {"scene-cut-average-threshold", OPT_DOUBLE(scene_cut_average_threshold),
+        M_RANGE(0.0, 255.0)},
+    {"scene-cut-changed-ratio", OPT_DOUBLE(scene_cut_changed_ratio),
+        M_RANGE(0.0, 1.0)},
+    {"gpu-timing", OPT_BOOL(gpu_timing)},
+    {"nvof-completion-diagnostics", OPT_BOOL(nvof_completion_diagnostics)},
+    {0}
+};
+
+const struct mp_user_filter_entry vf_nvofmemc = {
+    .desc = {
+        .description = "NVIDIA NVOF D3D11 P010 MEMC frame interpolation",
+        .name = "nvofmemc",
+        .priv_size = sizeof(OPT_BASE_STRUCT),
+        .priv_defaults = &(const OPT_BASE_STRUCT) {
+            .stage1_passthrough = false,
+            .stage2_timing_test = false,
+            .stage3_nvof_test = false,
+            .stage4_synthesis_test = false,
+            .stage5_flow_infill_test = false,
+            .flow_diagnostics = false,
+            .flow_fb_abs = 6.0,
+            .flow_fb_rel = 0.05,
+            .flow_cost_max = 0.95,
+            .flow_confidence_min = 0.05,
+            .infill_luma_threshold = 12.0,
+            .scene_cut_sample_stride = 8,
+            .scene_cut_pixel_threshold = 32,
+            .scene_cut_average_threshold = 24.0,
+            .scene_cut_changed_ratio = 0.35,
+            .gpu_timing = true,
+            .nvof_completion_diagnostics = false,
+        },
+        .options = option_fields,
+    },
+    .create = create,
+};

@@ -113,10 +113,12 @@ impl SettingsData {
             }
             self.device_name = s;
         }
-        if let Some(s) = v.get("frameInterpolationMode").and_then(Value::as_str)
-            && matches!(s, "off" | "auto" | "60" | "90" | "120")
-        {
-            self.frame_interpolation_mode = s.to_string();
+        if let Some(s) = v.get("frameInterpolationMode").and_then(Value::as_str) {
+            self.frame_interpolation_mode = match s {
+                "off" | "auto" | "2x" => s.to_string(),
+                "60" => "2x".to_string(),
+                _ => self.frame_interpolation_mode.clone(),
+            };
         }
         if let Some(n) = v.get("windowWidth").and_then(Value::as_i64) {
             self.window.width = n as i32;
@@ -503,7 +505,7 @@ pub fn frame_interpolation_mode() -> String {
 }
 
 pub fn set_frame_interpolation_mode(value: &str) -> bool {
-    if !matches!(value, "off" | "auto" | "60" | "90" | "120") {
+    if !matches!(value, "off" | "auto" | "2x") {
         return false;
     }
     state().lock().data.frame_interpolation_mode = value.to_string();
@@ -709,14 +711,28 @@ mod tests {
         assert_eq!(settings.frame_interpolation_mode, "off");
         assert!(settings.to_json().get("frameInterpolationMode").is_none());
 
-        settings.overlay_json(&json!({ "frameInterpolationMode": "90" }));
-        assert_eq!(settings.frame_interpolation_mode, "90");
+        settings.overlay_json(&json!({ "frameInterpolationMode": "2x" }));
+        assert_eq!(settings.frame_interpolation_mode, "2x");
         assert_eq!(
             settings
                 .to_json()
                 .get("frameInterpolationMode")
                 .and_then(Value::as_str),
-            Some("90")
+            Some("2x")
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_60_fps_interpolation_mode_to_x2() {
+        let mut settings = SettingsData::default();
+        settings.overlay_json(&json!({ "frameInterpolationMode": "60" }));
+        assert_eq!(settings.frame_interpolation_mode, "2x");
+        assert_eq!(
+            settings
+                .to_json()
+                .get("frameInterpolationMode")
+                .and_then(Value::as_str),
+            Some("2x")
         );
     }
 

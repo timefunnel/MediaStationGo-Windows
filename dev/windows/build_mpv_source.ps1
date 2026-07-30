@@ -16,11 +16,12 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $OutputDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvSourceDir = Join-Path $RepoRoot "third_party\mpv"
-$NvofaSource = Join-Path $PSScriptRoot "mpv\vf_nvofa.c"
-$NvofaPatch = Join-Path $PSScriptRoot "mpv\mpv-nvofa.patch"
-$NvofaDestination = Join-Path $MpvSourceDir "video\filter\vf_nvofa.c"
-$NvofaPatchApplied = $false
-$NvofaSourceCreated = $false
+$NvofMemcSource = Join-Path $PSScriptRoot "mpv\vf_nvofmemc.c"
+$NvofMemcPatch = Join-Path $PSScriptRoot "mpv\mpv-nvofmemc.patch"
+$NvofMemcDestination = Join-Path $MpvSourceDir "video\filter\vf_nvofmemc.c"
+$NvofApiIncludeDir = Join-Path $RepoRoot "third_party\nvofapi\include"
+$NvofMemcPatchApplied = $false
+$NvofMemcSourceCreated = $false
 
 # MSYS2 environment based on target architecture
 if ($Arch -eq "arm64") {
@@ -47,9 +48,14 @@ if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
     exit 1
 }
 
-foreach ($RequiredNvofaFile in @($NvofaSource, $NvofaPatch)) {
-    if (-not (Test-Path -LiteralPath $RequiredNvofaFile)) {
-        throw "NVOFA mpv build input is missing: $RequiredNvofaFile"
+foreach ($RequiredNvofFile in @(
+    $NvofMemcSource,
+    $NvofMemcPatch,
+    (Join-Path $NvofApiIncludeDir "nvOpticalFlowCommon.h"),
+    (Join-Path $NvofApiIncludeDir "nvOpticalFlowD3D11.h")
+)) {
+    if (-not (Test-Path -LiteralPath $RequiredNvofFile)) {
+        throw "NVOF MEMC mpv build input is missing: $RequiredNvofFile"
     }
 }
 
@@ -83,29 +89,29 @@ if (-not (Test-Path $MsysBash)) {
 }
 
 try {
-    & git -C $MpvSourceDir apply --check $NvofaPatch 2>$null
+    & git -C $MpvSourceDir apply --check $NvofMemcPatch 2>$null
     if ($LASTEXITCODE -eq 0) {
-        & git -C $MpvSourceDir apply $NvofaPatch
+        & git -C $MpvSourceDir apply $NvofMemcPatch
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to apply the NVOFA mpv patch"
+            throw "Failed to apply the NVOF MEMC mpv patch"
         }
-        $NvofaPatchApplied = $true
+        $NvofMemcPatchApplied = $true
     } else {
-        & git -C $MpvSourceDir apply --reverse --check $NvofaPatch 2>$null
+        & git -C $MpvSourceDir apply --reverse --check $NvofMemcPatch 2>$null
         if ($LASTEXITCODE -ne 0) {
-            throw "The mpv source does not match the pinned NVOFA patch"
+            throw "The mpv source does not match the pinned NVOF MEMC patch"
         }
     }
 
-    if (Test-Path -LiteralPath $NvofaDestination) {
-        $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofaSource).Hash
-        $DestinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofaDestination).Hash
+    if (Test-Path -LiteralPath $NvofMemcDestination) {
+        $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofMemcSource).Hash
+        $DestinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofMemcDestination).Hash
         if ($SourceHash -ne $DestinationHash) {
-            throw "Existing mpv NVOFA filter differs from the pinned source: $NvofaDestination"
+            throw "Existing mpv NVOF MEMC filter differs from the pinned source: $NvofMemcDestination"
         }
     } else {
-        Copy-Item -LiteralPath $NvofaSource -Destination $NvofaDestination
-        $NvofaSourceCreated = $true
+        Copy-Item -LiteralPath $NvofMemcSource -Destination $NvofMemcDestination
+        $NvofMemcSourceCreated = $true
     }
 
 Write-Host "=== Building mpv from submodule ===" -ForegroundColor Cyan
@@ -124,6 +130,7 @@ function ConvertTo-MsysPath($WinPath) {
 }
 
 $MsysMpvSource = ConvertTo-MsysPath $MpvSourceDir
+$MsysNvofApiInclude = ConvertTo-MsysPath $NvofApiIncludeDir
 
 # Run a command in MSYS2
 function Invoke-Msys2 {
@@ -166,6 +173,7 @@ if ($Force -and (Test-Path $MesonBuildDir)) {
 if (-not (Test-Path (Join-Path $MesonBuildDir "build.ninja"))) {
     Invoke-Msys2 @"
 cd '$MsysMpvSource' && \
+CFLAGS="-I$MsysNvofApiInclude" \
 meson setup build --default-library=shared \
     -Dlibmpv=true \
     -Dcplayer=true \
@@ -404,13 +412,13 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
     Write-Host "  $($_.FullName.Substring($OutputDir.Length + 1))"
 }
 } finally {
-    if ($NvofaSourceCreated -and (Test-Path -LiteralPath $NvofaDestination)) {
-        Remove-Item -LiteralPath $NvofaDestination -Force
+    if ($NvofMemcSourceCreated -and (Test-Path -LiteralPath $NvofMemcDestination)) {
+        Remove-Item -LiteralPath $NvofMemcDestination -Force
     }
-    if ($NvofaPatchApplied) {
-        & git -C $MpvSourceDir apply --reverse $NvofaPatch
+    if ($NvofMemcPatchApplied) {
+        & git -C $MpvSourceDir apply --reverse $NvofMemcPatch
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to restore the mpv source after the NVOFA build"
+            Write-Error "Failed to restore the mpv source after the NVOF MEMC build"
         }
     }
 }

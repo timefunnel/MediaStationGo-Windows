@@ -576,7 +576,7 @@ pub fn jfn_app_main() -> c_int {
         if report.ready {
             tracing::info!(
                 target: "Main",
-                "NVOFA frame interpolation ready: gpu={} driver={} optical_flow_api={} backend={} filter={}",
+                "NVOF MEMC frame interpolation ready: gpu={} driver={} optical_flow_api={} backend={} filter={}",
                 report.gpu_name.as_deref().unwrap_or("unknown"),
                 report.driver_version.as_deref().unwrap_or("unknown"),
                 report
@@ -589,7 +589,7 @@ pub fn jfn_app_main() -> c_int {
         } else if let Some(error) = &report.failure {
             tracing::warn!(
                 target: "Main",
-                "NVOFA frame interpolation unavailable: code={} detail={}",
+                "NVOF MEMC frame interpolation unavailable: code={} detail={}",
                 error.code,
                 error.detail,
             );

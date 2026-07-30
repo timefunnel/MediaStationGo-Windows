@@ -1,0 +1,34 @@
+diff --git a/filters/user_filters.c b/filters/user_filters.c
+index 7bdda69..b5f57f3 100644
+--- a/filters/user_filters.c
++++ b/filters/user_filters.c
+@@ -99,5 +99,6 @@ const struct mp_user_filter_entry *vf_list[] = {
+ #if HAVE_D3D_HWACCEL
+     &vf_d3d11vpp,
++    &vf_nvofmemc,
+ #endif
+ #if HAVE_AMF
+     &vf_amf_frc,
+diff --git a/filters/user_filters.h b/filters/user_filters.h
+index aa88649..69244ba 100644
+--- a/filters/user_filters.h
++++ b/filters/user_filters.h
+@@ -35,5 +35,6 @@ extern const struct mp_user_filter_entry vf_format;
+ extern const struct mp_user_filter_entry vf_vavpp;
+ extern const struct mp_user_filter_entry vf_d3d11vpp;
++extern const struct mp_user_filter_entry vf_nvofmemc;
+ extern const struct mp_user_filter_entry vf_amf_frc;
+ extern const struct mp_user_filter_entry vf_fingerprint;
+ extern const struct mp_user_filter_entry vf_gpu;
+diff --git a/meson.build b/meson.build
+index 1cd2570..f15b0af 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1408,5 +1408,6 @@ d3d_hwaccel = get_option('d3d-hwaccel').require(
+ features += {'d3d-hwaccel': d3d_hwaccel.allowed()}
+ if features['d3d-hwaccel']
+     sources += files('video/d3d.c',
+-                     'video/filter/vf_d3d11vpp.c')
++                     'video/filter/vf_d3d11vpp.c',
++                     'video/filter/vf_nvofmemc.c')
+ endif

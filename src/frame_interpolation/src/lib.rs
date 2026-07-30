@@ -2,19 +2,16 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-const NVOFA_REQUIRED_API: u32 = 0x50;
-const NVOFA_BACKEND: &str = "NVOFA D3D11";
-const NVOFA_FILTER: &str = "vf_nvofa";
-const DEFAULT_SCENE_THRESHOLD: f64 = 0.35;
+const NVOF_REQUIRED_API: u32 = 0x50;
+const NVOF_BACKEND: &str = "NVIDIA NVOF D3D11 P010 MEMC";
+const NVOF_FILTER: &str = "vf_nvofmemc";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InterpolationMode {
     #[default]
     Off,
     Auto,
-    Fps60,
-    Fps90,
-    Fps120,
+    X2,
 }
 
 impl InterpolationMode {
@@ -22,9 +19,7 @@ impl InterpolationMode {
         match value {
             "off" => Some(Self::Off),
             "auto" => Some(Self::Auto),
-            "60" => Some(Self::Fps60),
-            "90" => Some(Self::Fps90),
-            "120" => Some(Self::Fps120),
+            "2x" | "60" => Some(Self::X2),
             _ => None,
         }
     }
@@ -33,14 +28,12 @@ impl InterpolationMode {
         match self {
             Self::Off => "off",
             Self::Auto => "auto",
-            Self::Fps60 => "60",
-            Self::Fps90 => "90",
-            Self::Fps120 => "120",
+            Self::X2 => "2x",
         }
     }
 
     pub const fn supported_by_native_backend(self) -> bool {
-        matches!(self, Self::Off | Self::Auto | Self::Fps60)
+        true
     }
 }
 
@@ -110,8 +103,8 @@ fn build_capability_report() -> CapabilityReport {
             gpu_uuid: Some(gpu.uuid),
             driver_version: Some(gpu.driver),
             optical_flow_api: Some(format_api_version(api_version)),
-            backend: Some(NVOFA_BACKEND),
-            filter: Some(NVOFA_FILTER),
+            backend: Some(NVOF_BACKEND),
+            filter: Some(NVOF_FILTER),
             failure: None,
         },
         Err(error) => CapabilityReport {
@@ -125,16 +118,16 @@ fn probe_capability() -> Result<(GpuInfo, u32), InterpolationError> {
     if !cfg!(target_os = "windows") {
         return Err(InterpolationError::new(
             "frame_interpolation_platform_unsupported",
-            "NVOFA frame interpolation is supported only on Windows",
+            "NVOF MEMC frame interpolation is supported only on Windows",
         ));
     }
     let gpu = probe_gpu()?;
-    let api_version = probe_nvofa_api()?;
-    if api_version < NVOFA_REQUIRED_API {
+    let api_version = probe_nvof_api()?;
+    if api_version < NVOF_REQUIRED_API {
         return Err(InterpolationError::new(
             "frame_interpolation_nvofa_api_unsupported",
             format!(
-                "NVOFA API {} is below required 5.0",
+                "NVOF API {} is below required 5.0",
                 format_api_version(api_version)
             ),
         ));
@@ -189,7 +182,7 @@ fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
 }
 
 #[cfg(target_os = "windows")]
-fn probe_nvofa_api() -> Result<u32, InterpolationError> {
+fn probe_nvof_api() -> Result<u32, InterpolationError> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::FreeLibrary;
@@ -235,10 +228,10 @@ fn probe_nvofa_api() -> Result<u32, InterpolationError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn probe_nvofa_api() -> Result<u32, InterpolationError> {
+fn probe_nvof_api() -> Result<u32, InterpolationError> {
     Err(InterpolationError::new(
         "frame_interpolation_platform_unsupported",
-        "NVOFA frame interpolation is supported only on Windows",
+        "NVOF MEMC frame interpolation is supported only on Windows",
     ))
 }
 
@@ -271,7 +264,7 @@ fn probe_d3d_compiler() -> Result<(), InterpolationError> {
 fn probe_d3d_compiler() -> Result<(), InterpolationError> {
     Err(InterpolationError::new(
         "frame_interpolation_platform_unsupported",
-        "NVOFA frame interpolation is supported only on Windows",
+        "NVOF MEMC frame interpolation is supported only on Windows",
     ))
 }
 
@@ -304,7 +297,6 @@ pub struct InterpolationPlan {
     pub hwdec: &'static str,
     pub backend: &'static str,
     pub optical_flow_api: String,
-    pub scene_threshold: f64,
 }
 
 pub fn prepare_plan(request: PlanRequest) -> Result<Option<InterpolationPlan>, InterpolationError> {
@@ -330,7 +322,7 @@ fn build_plan(
     if !report.ready {
         return Err(InterpolationError::new(
             "frame_interpolation_runtime_unavailable",
-            "The NVOFA capability probe did not report a usable runtime",
+            "The NVOF MEMC capability probe did not report a usable runtime",
         ));
     }
     validate_dimensions(request.width, request.height)?;
@@ -358,8 +350,7 @@ fn build_plan(
             ),
         ));
     }
-    let video_filter =
-        format!("nvofa=target-fps={target_fps:.6}:scene-threshold={DEFAULT_SCENE_THRESHOLD:.2}");
+    let video_filter = "nvofmemc=memc=yes".to_string();
     Ok(InterpolationPlan {
         mode: request.mode,
         target_fps,
@@ -369,12 +360,11 @@ fn build_plan(
         source_fps_den,
         video_filter,
         hwdec: "d3d11va",
-        backend: NVOFA_BACKEND,
+        backend: NVOF_BACKEND,
         optical_flow_api: report
             .optical_flow_api
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
-        scene_threshold: DEFAULT_SCENE_THRESHOLD,
     })
 }
 
@@ -388,7 +378,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), InterpolationError
     if width > 3840 || height > 2160 {
         return Err(InterpolationError::new(
             "frame_interpolation_dimensions_unsupported",
-            format!("NVOFA first release supports at most 3840x2160, received {width}x{height}"),
+            format!("NVOF MEMC supports at most 3840x2160, received {width}x{height}"),
         ));
     }
     Ok(())
@@ -417,6 +407,40 @@ fn validate_dynamic_range(value: Option<&str>) -> Result<(), InterpolationError>
     }
 }
 
+fn target_frame_rate(
+    mode: InterpolationMode,
+    display_fps: f64,
+    source_num: u32,
+    source_den: u32,
+) -> Result<(u32, u32), InterpolationError> {
+    if !display_fps.is_finite() || display_fps <= 0.0 {
+        return Err(InterpolationError::new(
+            "frame_interpolation_display_fps_unknown",
+            "The active display refresh rate is unavailable",
+        ));
+    }
+    match mode {
+        InterpolationMode::Off => unreachable!("off mode exits before target selection"),
+        InterpolationMode::Auto | InterpolationMode::X2 => {}
+    }
+    let doubled = source_num.checked_mul(2).ok_or_else(|| {
+        InterpolationError::new(
+            "frame_interpolation_source_fps_invalid",
+            "The doubled source frame rate overflows its rational representation",
+        )
+    })?;
+    let divisor = greatest_common_divisor(doubled, source_den);
+    let target = (doubled / divisor, source_den / divisor);
+    let target_value = f64::from(target.0) / f64::from(target.1);
+    if display_fps + 1.0 < target_value {
+        return Err(InterpolationError::new(
+            "frame_interpolation_display_refresh_insufficient",
+            format!("Target {target_value:.3} FPS exceeds display refresh {display_fps:.3} Hz"),
+        ));
+    }
+    Ok(target)
+}
+
 fn validate_transfer(
     dynamic_range: Option<&str>,
     transfer: Option<&str>,
@@ -438,58 +462,17 @@ fn validate_transfer(
     Ok(())
 }
 
-fn target_frame_rate(
-    mode: InterpolationMode,
-    display_fps: f64,
-    source_num: u32,
-    source_den: u32,
-) -> Result<(u32, u32), InterpolationError> {
-    if !display_fps.is_finite() || display_fps <= 0.0 {
-        return Err(InterpolationError::new(
-            "frame_interpolation_display_fps_unknown",
-            "The active display refresh rate is unavailable",
-        ));
-    }
-    match mode {
-        InterpolationMode::Fps90 | InterpolationMode::Fps120 => {
-            return Err(InterpolationError::new(
-                "frame_interpolation_target_not_supported",
-                format!(
-                    "NVOFA first release supports only 60 FPS output, requested {} FPS",
-                    mode.as_str()
-                ),
-            ));
-        }
-        InterpolationMode::Off => unreachable!("off mode exits before target selection"),
-        InterpolationMode::Auto | InterpolationMode::Fps60 => {}
-    }
-    if display_fps < 58.0 {
-        return Err(InterpolationError::new(
-            "frame_interpolation_display_refresh_unsupported",
-            format!("Display refresh {display_fps:.3} Hz is below 60 Hz"),
-        ));
-    }
-    let fractional_source = source_den == 1_001 && matches!(source_num, 24_000 | 30_000 | 48_000);
-    let target = if fractional_source && display_fps < 60.5 {
-        (60_000, 1_001)
-    } else {
-        (60, 1)
-    };
-    let target_value = f64::from(target.0) / f64::from(target.1);
-    if display_fps + 1.0 < target_value {
-        return Err(InterpolationError::new(
-            "frame_interpolation_display_refresh_insufficient",
-            format!("Target {target_value:.3} FPS exceeds display refresh {display_fps:.3} Hz"),
-        ));
-    }
-    Ok(target)
-}
-
 fn rational_frame_rate(value: f64) -> Result<(u32, u32), InterpolationError> {
     if !value.is_finite() || value <= 0.0 || value > 240.0 {
         return Err(InterpolationError::new(
             "frame_interpolation_source_fps_invalid",
             format!("Invalid source FPS: {value}"),
+        ));
+    }
+    if !(20.0..=30.001).contains(&value) {
+        return Err(InterpolationError::new(
+            "frame_interpolation_source_fps_unsupported",
+            format!("Strict x2 NVOF MEMC supports 20-30 FPS sources, received {value:.3}"),
         ));
     }
     for (known, numerator, denominator) in [
@@ -549,8 +532,8 @@ mod tests {
         CapabilityReport {
             ready: true,
             optical_flow_api: Some("5.0".to_string()),
-            backend: Some(NVOFA_BACKEND),
-            filter: Some(NVOFA_FILTER),
+            backend: Some(NVOF_BACKEND),
+            filter: Some(NVOF_FILTER),
             ..CapabilityReport::default()
         }
     }
@@ -574,48 +557,46 @@ mod tests {
         for mode in [
             InterpolationMode::Off,
             InterpolationMode::Auto,
-            InterpolationMode::Fps60,
-            InterpolationMode::Fps90,
-            InterpolationMode::Fps120,
+            InterpolationMode::X2,
         ] {
             assert_eq!(InterpolationMode::parse(mode.as_str()), Some(mode));
+            assert!(mode.supported_by_native_backend());
         }
+        assert_eq!(InterpolationMode::parse("60"), Some(InterpolationMode::X2));
         assert_eq!(InterpolationMode::parse("59"), None);
-        assert!(InterpolationMode::Fps60.supported_by_native_backend());
-        assert!(!InterpolationMode::Fps90.supported_by_native_backend());
-        assert!(!InterpolationMode::Fps120.supported_by_native_backend());
     }
 
     #[test]
-    fn auto_and_explicit_60_use_native_filter() {
-        for mode in [InterpolationMode::Auto, InterpolationMode::Fps60] {
+    fn auto_and_explicit_x2_use_native_filter() {
+        for mode in [InterpolationMode::Auto, InterpolationMode::X2] {
             let plan = build_plan(&ready_report(), request(mode, 3840, 2160, 24.0))
-                .expect("4K 24 to 60 plan");
-            assert_eq!(plan.target_fps, 60.0);
+                .expect("4K 24 to 48 plan");
+            assert_eq!(plan.target_fps, 48.0);
+            assert_eq!((plan.target_fps_num, plan.target_fps_den), (48, 1));
             assert_eq!(plan.hwdec, "d3d11va");
-            assert_eq!(plan.backend, NVOFA_BACKEND);
-            assert_eq!(
-                plan.video_filter,
-                "nvofa=target-fps=60.000000:scene-threshold=0.35"
-            );
+            assert_eq!(plan.backend, NVOF_BACKEND);
+            assert_eq!(plan.video_filter, "nvofmemc=memc=yes");
         }
     }
 
     #[test]
-    fn fractional_sources_target_5994_on_5994_display() {
-        let mut input = request(InterpolationMode::Fps60, 1920, 1080, 23.976);
-        input.display_fps = 59.94;
+    fn fractional_sources_are_doubled_exactly() {
+        let mut input = request(InterpolationMode::X2, 1920, 1080, 23.976);
+        input.display_fps = 48.0;
         let plan = build_plan(&ready_report(), input).expect("fractional plan");
-        assert_eq!((plan.target_fps_num, plan.target_fps_den), (60_000, 1_001));
+        assert_eq!((plan.source_fps_num, plan.source_fps_den), (24_000, 1_001));
+        assert_eq!((plan.target_fps_num, plan.target_fps_den), (48_000, 1_001));
+        assert!((plan.target_fps - 47.952).abs() < 0.001);
     }
 
     #[test]
-    fn first_release_rejects_90_and_120() {
-        for mode in [InterpolationMode::Fps90, InterpolationMode::Fps120] {
-            let error = build_plan(&ready_report(), request(mode, 1920, 1080, 24.0))
-                .expect_err("unsupported target must fail");
-            assert_eq!(error.code, "frame_interpolation_target_not_supported");
-        }
+    fn thirty_fps_targets_sixty() {
+        let plan = build_plan(
+            &ready_report(),
+            request(InterpolationMode::X2, 2560, 1440, 30.0),
+        )
+        .expect("30 to 60 plan");
+        assert_eq!((plan.target_fps_num, plan.target_fps_den), (60, 1));
     }
 
     #[test]
@@ -630,9 +611,15 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_metadata_formats_remain_explicitly_rejected() {
+    fn sdr_and_hdr10_are_accepted_while_dynamic_metadata_formats_are_rejected() {
         assert!(validate_dynamic_range(Some("SDR")).is_ok());
         assert!(validate_dynamic_range(Some("HDR10")).is_ok());
+        assert_eq!(
+            validate_dynamic_range(Some("HLG"))
+                .expect_err("HLG must fail until validated")
+                .code,
+            "frame_interpolation_hlg_not_validated"
+        );
         assert_eq!(
             validate_dynamic_range(Some("HDR10+"))
                 .expect_err("HDR10+ must fail")
@@ -648,19 +635,8 @@ mod tests {
     }
 
     #[test]
-    fn hdr10_requires_pq_transfer_metadata() {
-        assert!(validate_transfer(Some("HDR10"), Some("smpte2084")).is_ok());
-        assert_eq!(
-            validate_transfer(Some("HDR10"), Some("bt1886"))
-                .expect_err("invalid HDR10 transfer must fail")
-                .code,
-            "frame_interpolation_hdr10_transfer_invalid"
-        );
-    }
-
-    #[test]
     fn missing_server_color_metadata_is_deferred_to_native_frames() {
-        let mut input = request(InterpolationMode::Fps60, 1920, 1080, 24.0);
+        let mut input = request(InterpolationMode::X2, 1920, 1080, 24.0);
         input.dynamic_range = None;
         input.color_space = None;
         input.color_transfer = None;
@@ -671,20 +647,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_hdr10_transfer_is_deferred_to_native_frames() {
-        let mut input = request(InterpolationMode::Fps60, 3840, 2160, 24.0);
+    fn hdr10_requires_pq_when_transfer_metadata_is_present() {
+        let mut input = request(InterpolationMode::X2, 3840, 2160, 24.0);
         input.dynamic_range = Some("HDR10".to_string());
         input.color_space = Some("bt2020nc".to_string());
-        input.color_transfer = None;
-        let plan =
-            build_plan(&ready_report(), input).expect("native filter validates decoded frames");
-        assert_eq!(plan.hwdec, "d3d11va");
+        input.color_transfer = Some("pq".to_string());
+        assert!(build_plan(&ready_report(), input.clone()).is_ok());
+
+        input.color_transfer = Some("hlg".to_string());
+        assert_eq!(
+            build_plan(&ready_report(), input)
+                .expect_err("HDR10 with HLG transfer must fail")
+                .code,
+            "frame_interpolation_hdr10_transfer_invalid"
+        );
     }
 
     #[test]
-    fn known_fractional_rates_are_exact() {
+    fn supported_source_rate_bounds_are_explicit() {
         assert_eq!(rational_frame_rate(23.976), Ok((24_000, 1_001)));
-        assert_eq!(rational_frame_rate(59.94), Ok((60_000, 1_001)));
         assert_eq!(rational_frame_rate(24.0), Ok((24, 1)));
+        assert_eq!(rational_frame_rate(30.0), Ok((30, 1)));
+        assert_eq!(
+            rational_frame_rate(19.0)
+                .expect_err("below supported range")
+                .code,
+            "frame_interpolation_source_fps_unsupported"
+        );
+        assert_eq!(
+            rational_frame_rate(30.1)
+                .expect_err("above supported range")
+                .code,
+            "frame_interpolation_source_fps_unsupported"
+        );
+    }
+
+    #[test]
+    fn display_refresh_must_fit_the_doubled_rate() {
+        let mut input = request(InterpolationMode::X2, 1920, 1080, 30.0);
+        input.display_fps = 50.0;
+        assert_eq!(
+            build_plan(&ready_report(), input)
+                .expect_err("50 Hz display cannot present 60 fps")
+                .code,
+            "frame_interpolation_display_refresh_insufficient"
+        );
     }
 }
