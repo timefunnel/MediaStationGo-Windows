@@ -32,6 +32,7 @@ struct opts {
     bool stage3_nvof_test;
     bool stage4_synthesis_test;
     bool stage5_flow_infill_test;
+    bool stage6_robust_test;
     bool flow_diagnostics;
     double flow_fb_abs;
     double flow_fb_rel;
@@ -58,6 +59,15 @@ enum output_phase {
 #define FLOW_INFILL_FINAL_INDEX (FLOW_INFILL_PASS_COUNT % 2)
 #define SCENE_CUT_COUNTER_COUNT 4
 #define SCENE_CUT_SUMMARY_COUNTER_COUNT 2
+#define ROBUST_SCENE_REGION_COUNT 9
+#define ROBUST_SCENE_HISTOGRAM_BINS 16
+#define ROBUST_SCENE_HISTOGRAM_COUNT \
+    (ROBUST_SCENE_REGION_COUNT * ROBUST_SCENE_HISTOGRAM_BINS)
+#define ROBUST_SCENE_DESCRIPTOR_COUNT \
+    (ROBUST_SCENE_HISTOGRAM_COUNT * 2 + 6)
+#define ROBUST_SCENE_STATE_COUNT 11
+#define ROBUST_SCENE_METRIC_COUNT 7
+#define ROBUST_SCENE_SUMMARY_COUNT 41
 #define GPU_PROFILE_RING_SIZE 16
 #define GPU_PROFILE_BUCKET_COUNT 2001
 #define GPU_PROFILE_BUCKET_MS 0.05
@@ -70,6 +80,50 @@ enum gpu_profile_stage {
     GPU_PROFILE_SYNTH,
     GPU_PROFILE_STAGE_COUNT,
 };
+
+enum robust_scene_class {
+    ROBUST_SCENE_NORMAL,
+    ROBUST_SCENE_FLASH,
+    ROBUST_SCENE_FADE_DISSOLVE,
+    ROBUST_SCENE_HARD_CUT,
+    ROBUST_SCENE_UNCERTAIN,
+    ROBUST_SCENE_CLASS_COUNT,
+};
+
+enum robust_scene_state_index {
+    ROBUST_SCENE_STATE_CLASS,
+    ROBUST_SCENE_STATE_PREVIOUS_CLASS,
+    ROBUST_SCENE_STATE_STREAK,
+    ROBUST_SCENE_STATE_KL_MILLI,
+    ROBUST_SCENE_STATE_AVERAGE_DELTA_MILLI,
+    ROBUST_SCENE_STATE_CHANGED_RATIO_MILLI,
+    ROBUST_SCENE_STATE_CHROMA_DELTA_MILLI,
+    ROBUST_SCENE_STATE_EDGE_DELTA_MILLI,
+    ROBUST_SCENE_STATE_EXPOSURE_DELTA_MILLI,
+    ROBUST_SCENE_STATE_REGIONAL_KL_MAX_MILLI,
+    ROBUST_SCENE_STATE_EXPOSURE_SPREAD_MILLI,
+};
+
+enum robust_scene_metric {
+    ROBUST_SCENE_METRIC_KL_MILLI,
+    ROBUST_SCENE_METRIC_AVERAGE_DELTA,
+    ROBUST_SCENE_METRIC_CHANGED_RATIO_MILLI,
+    ROBUST_SCENE_METRIC_CHROMA_DELTA,
+    ROBUST_SCENE_METRIC_EDGE_DELTA,
+    ROBUST_SCENE_METRIC_EXPOSURE_DELTA,
+    ROBUST_SCENE_METRIC_REGIONAL_KL_MAX_MILLI,
+};
+
+_Static_assert(ROBUST_SCENE_STATE_COUNT ==
+               ROBUST_SCENE_STATE_EXPOSURE_SPREAD_MILLI + 1,
+               "robust scene state layout changed");
+_Static_assert(ROBUST_SCENE_METRIC_COUNT ==
+               ROBUST_SCENE_METRIC_REGIONAL_KL_MAX_MILLI + 1,
+               "robust scene metric layout changed");
+_Static_assert(ROBUST_SCENE_SUMMARY_COUNT ==
+               1 + ROBUST_SCENE_CLASS_COUNT +
+               ROBUST_SCENE_CLASS_COUNT * ROBUST_SCENE_METRIC_COUNT,
+               "robust scene summary layout changed");
 
 struct gpu_profile_query {
     ID3D11Query *disjoint;
@@ -171,6 +225,8 @@ struct nvof_state {
     ID3D11ComputeShader *promote_nv12_shader;
     ID3D11ComputeShader *extract_luma_shader;
     ID3D11ComputeShader *scene_cut_shader;
+    ID3D11ComputeShader *robust_scene_descriptor_shader;
+    ID3D11ComputeShader *robust_scene_classify_shader;
     ID3D11ComputeShader *flow_diagnostics_shader;
     ID3D11ComputeShader *prepare_flow_shader;
     ID3D11ComputeShader *infill_flow_shader;
@@ -184,6 +240,15 @@ struct nvof_state {
     ID3D11Buffer *scene_cut_summary_buffer;
     ID3D11Buffer *scene_cut_summary_readback;
     ID3D11UnorderedAccessView *scene_cut_summary_uav;
+    ID3D11Buffer *robust_scene_descriptor_buffer;
+    ID3D11UnorderedAccessView *robust_scene_descriptor_uav;
+    ID3D11ShaderResourceView *robust_scene_descriptor_srv;
+    ID3D11Buffer *robust_scene_state_buffer;
+    ID3D11UnorderedAccessView *robust_scene_state_uav;
+    ID3D11ShaderResourceView *robust_scene_state_srv;
+    ID3D11Buffer *robust_scene_summary_buffer;
+    ID3D11UnorderedAccessView *robust_scene_summary_uav;
+    ID3D11Buffer *robust_scene_summary_readback;
     ID3D11Texture2D *completion_readback;
     struct nvof_resource gray[2];
     struct nvof_resource flow_forward;
@@ -210,6 +275,9 @@ struct nvof_state {
     uint64_t flow_infill_pairs;
     uint64_t scene_cut_pairs;
     uint64_t scene_cuts;
+    uint64_t robust_scene_classes[ROBUST_SCENE_CLASS_COUNT];
+    uint64_t robust_scene_metric_totals[ROBUST_SCENE_CLASS_COUNT]
+                                       [ROBUST_SCENE_METRIC_COUNT];
     struct gpu_profile_stats gpu_profile[GPU_PROFILE_STAGE_COUNT];
 };
 
@@ -228,6 +296,7 @@ struct priv {
     double pair_duration;
     bool input_eof;
     bool output_eof_sent;
+    bool robust_scene_history_reset_pending;
     uint64_t input_frames;
     uint64_t copied_frames;
     uint64_t promoted_frames;
@@ -243,7 +312,8 @@ struct priv {
 static bool synthesis_enabled(const struct priv *p)
 {
     return p->opts->stage4_synthesis_test ||
-           p->opts->stage5_flow_infill_test;
+           p->opts->stage5_flow_infill_test ||
+           p->opts->stage6_robust_test;
 }
 
 static bool nvof_analysis_enabled(const struct priv *p)
@@ -546,6 +616,262 @@ static const char scene_cut_shader_source[] =
     "    if (group_index < 4)\n"
     "        InterlockedAdd(output_counters[group_index],\n"
     "                       counters[group_index]);\n"
+    "}\n";
+
+static const char robust_scene_descriptor_shader_source[] =
+    "Texture2D<float> gray0 : register(t0);\n"
+    "Texture2D<float> gray1 : register(t1);\n"
+    "Texture2D<float2> uv0 : register(t2);\n"
+    "Texture2D<float2> uv1 : register(t3);\n"
+    "RWStructuredBuffer<uint> descriptor : register(u0);\n"
+    "groupshared uint counters[ROBUST_DESCRIPTOR_COUNT];\n"
+    "\n"
+    "float edge_strength(Texture2D<float> image, int2 p, uint w, uint h)\n"
+    "{\n"
+    "    int2 left = int2(max(p.x - 1, 0), p.y);\n"
+    "    int2 right = int2(min(p.x + 1, (int)w - 1), p.y);\n"
+    "    int2 top = int2(p.x, max(p.y - 1, 0));\n"
+    "    int2 bottom = int2(p.x, min(p.y + 1, (int)h - 1));\n"
+    "    float dx = abs(image.Load(int3(right, 0)) -\n"
+    "                   image.Load(int3(left, 0)));\n"
+    "    float dy = abs(image.Load(int3(bottom, 0)) -\n"
+    "                   image.Load(int3(top, 0)));\n"
+    "    return saturate((dx + dy) * 0.5);\n"
+    "}\n"
+    "\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID,\n"
+    "          uint group_index : SV_GroupIndex)\n"
+    "{\n"
+    "    for (uint clear_index = group_index;\n"
+    "         clear_index < ROBUST_DESCRIPTOR_COUNT; clear_index += 256)\n"
+    "        counters[clear_index] = 0;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    uint w, h;\n"
+    "    gray0.GetDimensions(w, h);\n"
+    "    uint sampled_w = (w + SCENE_SAMPLE_STRIDE - 1) /\n"
+    "                     SCENE_SAMPLE_STRIDE;\n"
+    "    uint sampled_h = (h + SCENE_SAMPLE_STRIDE - 1) /\n"
+    "                     SCENE_SAMPLE_STRIDE;\n"
+    "    if (id.x < sampled_w && id.y < sampled_h) {\n"
+    "        uint2 p = min(id.xy * SCENE_SAMPLE_STRIDE +\n"
+    "                      SCENE_SAMPLE_STRIDE / 2, uint2(w - 1, h - 1));\n"
+    "        float luma0 = saturate(gray0.Load(int3(p, 0)));\n"
+    "        float luma1 = saturate(gray1.Load(int3(p, 0)));\n"
+    "        uint region_x = min(p.x * 3 / max(w, 1), 2);\n"
+    "        uint region_y = min(p.y * 3 / max(h, 1), 2);\n"
+    "        uint region = region_y * 3 + region_x;\n"
+    "        uint bin0 = min((uint)(luma0 * ROBUST_HISTOGRAM_BINS),\n"
+    "                        ROBUST_HISTOGRAM_BINS - 1);\n"
+    "        uint bin1 = min((uint)(luma1 * ROBUST_HISTOGRAM_BINS),\n"
+    "                        ROBUST_HISTOGRAM_BINS - 1);\n"
+    "        uint histogram0 = region * ROBUST_HISTOGRAM_BINS + bin0;\n"
+    "        uint histogram1 = ROBUST_HISTOGRAM_COUNT +\n"
+    "                          region * ROBUST_HISTOGRAM_BINS + bin1;\n"
+    "        InterlockedAdd(counters[histogram0], 1);\n"
+    "        InterlockedAdd(counters[histogram1], 1);\n"
+    "\n"
+    "        uint luma_delta = (uint)round(abs(luma0 - luma1) * 255.0);\n"
+    "        uint2 uvp = min(p / 2, uint2((w - 1) / 2, (h - 1) / 2));\n"
+    "        float2 chroma0 = uv0.Load(int3(uvp, 0));\n"
+    "        float2 chroma1 = uv1.Load(int3(uvp, 0));\n"
+    "        uint chroma_delta = (uint)round(\n"
+    "            (abs(chroma0.x - chroma1.x) +\n"
+    "             abs(chroma0.y - chroma1.y)) * 127.5);\n"
+    "        float edge0 = edge_strength(gray0, (int2)p, w, h);\n"
+    "        float edge1 = edge_strength(gray1, (int2)p, w, h);\n"
+    "        uint edge_delta = (uint)round(abs(edge0 - edge1) * 255.0);\n"
+    "        InterlockedAdd(counters[ROBUST_HISTOGRAM_COUNT * 2 + 0],\n"
+    "                       luma_delta);\n"
+    "        InterlockedAdd(counters[ROBUST_HISTOGRAM_COUNT * 2 + 1],\n"
+    "                       chroma_delta);\n"
+    "        InterlockedAdd(counters[ROBUST_HISTOGRAM_COUNT * 2 + 2],\n"
+    "                       edge_delta);\n"
+    "        if (luma_delta >= SCENE_PIXEL_THRESHOLD)\n"
+    "            InterlockedAdd(\n"
+    "                counters[ROBUST_HISTOGRAM_COUNT * 2 + 3], 1);\n"
+    "        if (luma_delta >= min(255, SCENE_PIXEL_THRESHOLD * 2))\n"
+    "            InterlockedAdd(\n"
+    "                counters[ROBUST_HISTOGRAM_COUNT * 2 + 4], 1);\n"
+    "        InterlockedAdd(counters[ROBUST_HISTOGRAM_COUNT * 2 + 5], 1);\n"
+    "    }\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    for (uint output_index = group_index;\n"
+    "         output_index < ROBUST_DESCRIPTOR_COUNT; output_index += 256)\n"
+    "        InterlockedAdd(descriptor[output_index],\n"
+    "                       counters[output_index]);\n"
+    "}\n";
+
+static const char robust_scene_classify_shader_source[] =
+    "StructuredBuffer<uint> descriptor : register(t0);\n"
+    "RWStructuredBuffer<uint> scene_state : register(u0);\n"
+    "RWStructuredBuffer<uint> scene_summary : register(u1);\n"
+    "\n"
+    "float symmetric_kl(float a, float b)\n"
+    "{\n"
+    "    return 0.5 * (a * log2(a / b) + b * log2(b / a));\n"
+    "}\n"
+    "\n"
+    "[numthreads(1, 1, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    float kl_sum = 0.0;\n"
+    "    float kl_max = 0.0;\n"
+    "    float exposure_sum = 0.0;\n"
+    "    float exposure_min = 255.0;\n"
+    "    float exposure_max = -255.0;\n"
+    "    [unroll]\n"
+    "    for (uint region = 0; region < ROBUST_REGION_COUNT; region++) {\n"
+    "        float samples0 = 0.0;\n"
+    "        float samples1 = 0.0;\n"
+    "        float mean0 = 0.0;\n"
+    "        float mean1 = 0.0;\n"
+    "        [unroll]\n"
+    "        for (uint mean_bin = 0; mean_bin < ROBUST_HISTOGRAM_BINS;\n"
+    "             mean_bin++) {\n"
+    "            uint index = region * ROBUST_HISTOGRAM_BINS + mean_bin;\n"
+    "            float count0 = (float)descriptor[index];\n"
+    "            float count1 = (float)descriptor[\n"
+    "                ROBUST_HISTOGRAM_COUNT + index];\n"
+    "            float center = ((float)mean_bin + 0.5) *\n"
+    "                           (255.0 / ROBUST_HISTOGRAM_BINS);\n"
+    "            samples0 += count0;\n"
+    "            samples1 += count1;\n"
+    "            mean0 += count0 * center;\n"
+    "            mean1 += count1 * center;\n"
+    "        }\n"
+    "        float denominator0 = samples0 +\n"
+    "            0.5 * ROBUST_HISTOGRAM_BINS;\n"
+    "        float denominator1 = samples1 +\n"
+    "            0.5 * ROBUST_HISTOGRAM_BINS;\n"
+    "        float region_kl = 0.0;\n"
+    "        [unroll]\n"
+    "        for (uint kl_bin = 0; kl_bin < ROBUST_HISTOGRAM_BINS;\n"
+    "             kl_bin++) {\n"
+    "            uint index = region * ROBUST_HISTOGRAM_BINS + kl_bin;\n"
+    "            float probability0 = ((float)descriptor[index] + 0.5) /\n"
+    "                                 denominator0;\n"
+    "            float probability1 = ((float)descriptor[\n"
+    "                ROBUST_HISTOGRAM_COUNT + index] + 0.5) /\n"
+    "                denominator1;\n"
+    "            region_kl += symmetric_kl(probability0, probability1);\n"
+    "        }\n"
+    "        float shift = samples0 > 0.0 && samples1 > 0.0\n"
+    "            ? mean1 / samples1 - mean0 / samples0 : 0.0;\n"
+    "        kl_sum += region_kl;\n"
+    "        kl_max = max(kl_max, region_kl);\n"
+    "        exposure_sum += abs(shift);\n"
+    "        exposure_min = min(exposure_min, shift);\n"
+    "        exposure_max = max(exposure_max, shift);\n"
+    "    }\n"
+    "\n"
+    "    float samples = max((float)descriptor[\n"
+    "        ROBUST_HISTOGRAM_COUNT * 2 + 5], 1.0);\n"
+    "    float average_delta = (float)descriptor[\n"
+    "        ROBUST_HISTOGRAM_COUNT * 2 + 0] / samples;\n"
+    "    float chroma_delta = (float)descriptor[\n"
+    "        ROBUST_HISTOGRAM_COUNT * 2 + 1] / samples;\n"
+    "    float edge_delta = (float)descriptor[\n"
+    "        ROBUST_HISTOGRAM_COUNT * 2 + 2] / samples;\n"
+    "    float changed_ratio = (float)descriptor[\n"
+    "        ROBUST_HISTOGRAM_COUNT * 2 + 3] / samples;\n"
+    "    float average_kl = kl_sum / ROBUST_REGION_COUNT;\n"
+    "    float exposure_delta = exposure_sum / ROBUST_REGION_COUNT;\n"
+    "    float exposure_spread = exposure_max - exposure_min;\n"
+    "    uint previous = scene_state[ROBUST_STATE_CLASS];\n"
+    "    uint previous_streak = scene_state[ROBUST_STATE_STREAK];\n"
+    "    float previous_kl = (float)scene_state[\n"
+    "        ROBUST_STATE_KL_MILLI] * 0.001;\n"
+    "    float previous_delta = (float)scene_state[\n"
+    "        ROBUST_STATE_AVERAGE_DELTA_MILLI] * 0.001;\n"
+    "    float previous_changed_ratio = (float)scene_state[\n"
+    "        ROBUST_STATE_CHANGED_RATIO_MILLI] * 0.001;\n"
+    "\n"
+    "    bool flash = exposure_delta >= 18.0 &&\n"
+    "        exposure_spread <= 12.0 && changed_ratio >= 0.25 &&\n"
+    "        average_kl < 0.14 && edge_delta < 12.0 &&\n"
+    "        chroma_delta < 12.0;\n"
+    "    bool hard_cut = average_delta >= 24.0 &&\n"
+    "        changed_ratio >= 0.42 && average_kl >= 0.11 &&\n"
+    "        (kl_max >= 0.22 || chroma_delta >= 10.0 ||\n"
+    "         edge_delta >= 10.0);\n"
+    "    bool exposure_fade = exposure_delta >= 6.0 &&\n"
+    "        exposure_spread <= 20.0 && changed_ratio >= 0.12 &&\n"
+    "        average_kl >= 0.025 && average_kl < 0.18 &&\n"
+    "        edge_delta < 18.0;\n"
+    "    bool sustained_dissolve =\n"
+    "        (previous == ROBUST_SCENE_UNCERTAIN ||\n"
+    "         previous == ROBUST_SCENE_FADE_DISSOLVE) &&\n"
+    "        previous_kl >= 0.30 && average_kl >= 0.30 &&\n"
+    "        previous_delta >= 3.0 && previous_delta <= 16.0 &&\n"
+    "        average_delta >= 3.0 && average_delta <= 16.0 &&\n"
+    "        abs(previous_delta - average_delta) <= 8.0 &&\n"
+    "        previous_changed_ratio <= 0.08 && changed_ratio <= 0.08 &&\n"
+    "        edge_delta < 4.0;\n"
+    "    bool fade = exposure_fade || sustained_dissolve;\n"
+    "    bool uncertain = (average_delta >= 12.0 &&\n"
+    "                      changed_ratio >= 0.18) ||\n"
+    "                     average_kl >= 0.08;\n"
+    "\n"
+    "    uint candidate = ROBUST_SCENE_NORMAL;\n"
+    "    if (flash)\n"
+    "        candidate = ROBUST_SCENE_FLASH;\n"
+    "    else if (hard_cut)\n"
+    "        candidate = ROBUST_SCENE_HARD_CUT;\n"
+    "    else if (fade)\n"
+    "        candidate = ROBUST_SCENE_FADE_DISSOLVE;\n"
+    "    else if (uncertain)\n"
+    "        candidate = ROBUST_SCENE_UNCERTAIN;\n"
+    "\n"
+    "    uint classification = candidate;\n"
+    "    if (candidate == ROBUST_SCENE_UNCERTAIN &&\n"
+    "        (previous == ROBUST_SCENE_FLASH ||\n"
+    "         previous == ROBUST_SCENE_FADE_DISSOLVE) &&\n"
+    "        previous_streak < 3)\n"
+    "        classification = previous;\n"
+    "    else if (candidate == ROBUST_SCENE_NORMAL &&\n"
+    "             previous == ROBUST_SCENE_FADE_DISSOLVE &&\n"
+    "             exposure_delta >= 3.0 && average_kl >= 0.012)\n"
+    "        classification = previous;\n"
+    "\n"
+    "    scene_state[ROBUST_STATE_PREVIOUS_CLASS] = previous;\n"
+    "    scene_state[ROBUST_STATE_CLASS] = classification;\n"
+    "    scene_state[ROBUST_STATE_STREAK] = classification == previous\n"
+    "        ? min(previous_streak + 1, 255) : 1;\n"
+    "    scene_state[ROBUST_STATE_KL_MILLI] =\n"
+    "        (uint)round(average_kl * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_AVERAGE_DELTA_MILLI] =\n"
+    "        (uint)round(average_delta * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_CHANGED_RATIO_MILLI] =\n"
+    "        (uint)round(changed_ratio * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_CHROMA_DELTA_MILLI] =\n"
+    "        (uint)round(chroma_delta * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_EDGE_DELTA_MILLI] =\n"
+    "        (uint)round(edge_delta * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_EXPOSURE_DELTA_MILLI] =\n"
+    "        (uint)round(exposure_delta * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_REGIONAL_KL_MAX_MILLI] =\n"
+    "        (uint)round(kl_max * 1000.0);\n"
+    "    scene_state[ROBUST_STATE_EXPOSURE_SPREAD_MILLI] =\n"
+    "        (uint)round(exposure_spread * 1000.0);\n"
+    "    InterlockedAdd(scene_summary[0], 1);\n"
+    "    InterlockedAdd(scene_summary[1 + classification], 1);\n"
+    "    uint metric_base = 1 + ROBUST_SCENE_CLASS_COUNT +\n"
+    "        classification * ROBUST_SCENE_METRIC_COUNT;\n"
+    "    InterlockedAdd(scene_summary[metric_base + 0],\n"
+    "                   (uint)round(average_kl * 1000.0));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 1],\n"
+    "                   (uint)round(average_delta));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 2],\n"
+    "                   (uint)round(changed_ratio * 1000.0));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 3],\n"
+    "                   (uint)round(chroma_delta));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 4],\n"
+    "                   (uint)round(edge_delta));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 5],\n"
+    "                   (uint)round(exposure_delta));\n"
+    "    InterlockedAdd(scene_summary[metric_base + 6],\n"
+    "                   (uint)round(kl_max * 1000.0));\n"
     "}\n";
 
 static const char flow_diagnostics_shader_source[] =
@@ -970,10 +1296,16 @@ static const char synthesize_p010_shader_source[] =
     "Texture2D<uint> cost0 : register(t6);\n"
     "Texture2D<uint> cost1 : register(t7);\n"
     "#endif\n"
+    "#if USE_ROBUST_SCENE\n"
+    "StructuredBuffer<uint> robust_scene_state : register(t8);\n"
+    "#else\n"
     "StructuredBuffer<uint> scene_counters : register(t8);\n"
+    "#endif\n"
     "RWTexture2D<float> out_y : register(u0);\n"
     "RWTexture2D<float2> out_uv : register(u1);\n"
+    "#if !USE_ROBUST_SCENE\n"
     "RWStructuredBuffer<uint> scene_summary : register(u2);\n"
+    "#endif\n"
     "\n"
     "float2 clamp_luma(float2 p, uint w, uint h)\n"
     "{\n"
@@ -1134,6 +1466,10 @@ static const char synthesize_p010_shader_source[] =
     "\n"
     "bool is_scene_cut()\n"
     "{\n"
+    "#if USE_ROBUST_SCENE\n"
+    "    return robust_scene_state[ROBUST_STATE_CLASS] ==\n"
+    "           ROBUST_SCENE_HARD_CUT;\n"
+    "#else\n"
     "    float samples = (float)scene_counters[0];\n"
     "    if (samples <= 0.0)\n"
     "        return false;\n"
@@ -1141,6 +1477,17 @@ static const char synthesize_p010_shader_source[] =
     "    float changed_ratio = (float)scene_counters[2] / samples;\n"
     "    return average_delta >= SCENE_AVERAGE_THRESHOLD &&\n"
     "           changed_ratio >= SCENE_CHANGED_RATIO;\n"
+    "#endif\n"
+    "}\n"
+    "\n"
+    "uint scene_classification()\n"
+    "{\n"
+    "#if USE_ROBUST_SCENE\n"
+    "    return robust_scene_state[ROBUST_STATE_CLASS];\n"
+    "#else\n"
+    "    return is_scene_cut() ? ROBUST_SCENE_HARD_CUT :\n"
+    "                            ROBUST_SCENE_NORMAL;\n"
+    "#endif\n"
     "}\n"
     "\n"
     "float interpolate_code(float a, float b, float fallback,\n"
@@ -1164,7 +1511,11 @@ static const char synthesize_p010_shader_source[] =
     "    out_y.GetDimensions(w, h);\n"
     "    uint uvw, uvh;\n"
     "    out_uv.GetDimensions(uvw, uvh);\n"
-    "    bool hard_cut = is_scene_cut();\n"
+    "    uint scene = scene_classification();\n"
+    "    bool hold_previous = scene == ROBUST_SCENE_HARD_CUT ||\n"
+    "                         scene == ROBUST_SCENE_FLASH ||\n"
+    "                         scene == ROBUST_SCENE_UNCERTAIN;\n"
+    "    bool crossfade = scene == ROBUST_SCENE_FADE_DISSOLVE;\n"
     "    if (id.x < w && id.y < h) {\n"
     "        float2 target = (float2)id.xy;\n"
     "        float2 p0, p1;\n"
@@ -1172,8 +1523,10 @@ static const char synthesize_p010_shader_source[] =
     "        float a = sample_y(y0, p0, w, h) * (65535.0 / 64.0);\n"
     "        float b = sample_y(y1, p1, w, h) * (65535.0 / 64.0);\n"
     "        float c = sample_y(y0, target, w, h) * (65535.0 / 64.0);\n"
-    "        out_y[id.xy] = encode_p010_code(hard_cut ? c :\n"
-    "            interpolate_code(a, b, c, p0, p1, w, h));\n"
+    "        float d = sample_y(y1, target, w, h) * (65535.0 / 64.0);\n"
+    "        float value = hold_previous ? c : crossfade ? 0.5 * (c + d) :\n"
+    "            interpolate_code(a, b, c, p0, p1, w, h);\n"
+    "        out_y[id.xy] = encode_p010_code(value);\n"
     "    }\n"
     "    if (id.x < uvw && id.y < uvh) {\n"
     "        float2 target = float2(id.x * 2.0, id.y * 2.0 + 0.5);\n"
@@ -1185,6 +1538,8 @@ static const char synthesize_p010_shader_source[] =
     "        float2 uvb = sample_uv(uv1, uvp1, uvw, uvh) * (65535.0 / 64.0);\n"
     "        float2 uvc = sample_uv(uv0, (target - float2(0.0, 0.5)) * 0.5,\n"
     "                               uvw, uvh) * (65535.0 / 64.0);\n"
+    "        float2 uvd = sample_uv(uv1, (target - float2(0.0, 0.5)) * 0.5,\n"
+    "                               uvw, uvh) * (65535.0 / 64.0);\n"
     "        float v0 = confidence_forward(p0, w, h);\n"
     "        float v1 = confidence_backward(p1, w, h);\n"
     "        float2 value = v0 > FLOW_CONFIDENCE_MIN &&\n"
@@ -1192,13 +1547,17 @@ static const char synthesize_p010_shader_source[] =
     "            ? (uva * v0 + uvb * v1) / (v0 + v1)\n"
     "            : v0 > FLOW_CONFIDENCE_MIN ? uva\n"
     "            : v1 > FLOW_CONFIDENCE_MIN ? uvb : uvc;\n"
-    "        out_uv[id.xy] = encode_p010_code_uv(hard_cut ? uvc : value);\n"
+    "        value = hold_previous ? uvc : crossfade ? 0.5 * (uvc + uvd) :\n"
+    "                value;\n"
+    "        out_uv[id.xy] = encode_p010_code_uv(value);\n"
     "    }\n"
+    "#if !USE_ROBUST_SCENE\n"
     "    if (id.x == 0 && id.y == 0) {\n"
     "        InterlockedAdd(scene_summary[0], 1);\n"
-    "        if (hard_cut)\n"
+    "        if (is_scene_cut())\n"
     "            InterlockedAdd(scene_summary[1], 1);\n"
     "    }\n"
+    "#endif\n"
     "}\n";
 
 static const char *nvof_status_name(NV_OF_STATUS status)
@@ -1216,6 +1575,18 @@ static const char *nvof_status_name(NV_OF_STATUS status)
     case NV_OF_ERR_NOT_INITIALIZED: return "not_initialized";
     case NV_OF_ERR_UNSUPPORTED_FEATURE: return "unsupported_feature";
     default: return "generic_error";
+    }
+}
+
+static const char *robust_scene_class_name(enum robust_scene_class scene)
+{
+    switch (scene) {
+    case ROBUST_SCENE_NORMAL: return "normal";
+    case ROBUST_SCENE_FLASH: return "flash";
+    case ROBUST_SCENE_FADE_DISSOLVE: return "fade-dissolve";
+    case ROBUST_SCENE_HARD_CUT: return "hard-cut";
+    case ROBUST_SCENE_UNCERTAIN: return "uncertain";
+    default: return "unknown";
     }
 }
 
@@ -1330,6 +1701,47 @@ static void release_scene_cut_resources(struct priv *p)
     p->nvof.scene_cut_shader = NULL;
 }
 
+static void release_robust_scene_resources(struct priv *p)
+{
+    if (p->nvof.robust_scene_summary_readback)
+        ID3D11Buffer_Release(p->nvof.robust_scene_summary_readback);
+    p->nvof.robust_scene_summary_readback = NULL;
+    if (p->nvof.robust_scene_summary_uav)
+        ID3D11UnorderedAccessView_Release(p->nvof.robust_scene_summary_uav);
+    p->nvof.robust_scene_summary_uav = NULL;
+    if (p->nvof.robust_scene_summary_buffer)
+        ID3D11Buffer_Release(p->nvof.robust_scene_summary_buffer);
+    p->nvof.robust_scene_summary_buffer = NULL;
+    if (p->nvof.robust_scene_state_srv)
+        ID3D11ShaderResourceView_Release(p->nvof.robust_scene_state_srv);
+    p->nvof.robust_scene_state_srv = NULL;
+    if (p->nvof.robust_scene_state_uav)
+        ID3D11UnorderedAccessView_Release(p->nvof.robust_scene_state_uav);
+    p->nvof.robust_scene_state_uav = NULL;
+    if (p->nvof.robust_scene_state_buffer)
+        ID3D11Buffer_Release(p->nvof.robust_scene_state_buffer);
+    p->nvof.robust_scene_state_buffer = NULL;
+    if (p->nvof.robust_scene_descriptor_srv)
+        ID3D11ShaderResourceView_Release(
+            p->nvof.robust_scene_descriptor_srv);
+    p->nvof.robust_scene_descriptor_srv = NULL;
+    if (p->nvof.robust_scene_descriptor_uav)
+        ID3D11UnorderedAccessView_Release(
+            p->nvof.robust_scene_descriptor_uav);
+    p->nvof.robust_scene_descriptor_uav = NULL;
+    if (p->nvof.robust_scene_descriptor_buffer)
+        ID3D11Buffer_Release(p->nvof.robust_scene_descriptor_buffer);
+    p->nvof.robust_scene_descriptor_buffer = NULL;
+    if (p->nvof.robust_scene_classify_shader)
+        ID3D11ComputeShader_Release(
+            p->nvof.robust_scene_classify_shader);
+    p->nvof.robust_scene_classify_shader = NULL;
+    if (p->nvof.robust_scene_descriptor_shader)
+        ID3D11ComputeShader_Release(
+            p->nvof.robust_scene_descriptor_shader);
+    p->nvof.robust_scene_descriptor_shader = NULL;
+}
+
 static void destroy_nvof(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -1351,6 +1763,7 @@ static void destroy_nvof(struct mp_filter *f)
     p->nvof.infill_flow_shader = NULL;
     release_flow_diagnostics(p);
     release_scene_cut_resources(p);
+    release_robust_scene_resources(p);
     release_gpu_profile_queries(p);
     if (p->nvof.d3dcompiler_module)
         FreeLibrary(p->nvof.d3dcompiler_module);
@@ -1652,6 +2065,253 @@ static bool load_scene_cut_shader(struct mp_filter *f)
     return true;
 }
 
+static bool load_robust_scene_shaders(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.robust_scene_descriptor_shader &&
+        p->nvof.robust_scene_classify_shader &&
+        p->nvof.robust_scene_descriptor_buffer &&
+        p->nvof.robust_scene_descriptor_uav &&
+        p->nvof.robust_scene_descriptor_srv &&
+        p->nvof.robust_scene_state_buffer &&
+        p->nvof.robust_scene_state_uav &&
+        p->nvof.robust_scene_state_srv &&
+        p->nvof.robust_scene_summary_buffer &&
+        p->nvof.robust_scene_summary_uav &&
+        p->nvof.robust_scene_summary_readback)
+        return true;
+    release_robust_scene_resources(p);
+    if (!p->nvof.d3d_compile) {
+        MP_ERR(f, "NVOF robust scene analysis requires the D3DCompiler "
+                  "runtime\n");
+        return false;
+    }
+
+    char sample_stride[16];
+    char pixel_threshold[16];
+    char region_count[16];
+    char histogram_bins[16];
+    char histogram_count[16];
+    char descriptor_count[16];
+    snprintf(sample_stride, sizeof(sample_stride), "%d",
+             p->opts->scene_cut_sample_stride);
+    snprintf(pixel_threshold, sizeof(pixel_threshold), "%d",
+             p->opts->scene_cut_pixel_threshold);
+    snprintf(region_count, sizeof(region_count), "%d",
+             ROBUST_SCENE_REGION_COUNT);
+    snprintf(histogram_bins, sizeof(histogram_bins), "%d",
+             ROBUST_SCENE_HISTOGRAM_BINS);
+    snprintf(histogram_count, sizeof(histogram_count), "%d",
+             ROBUST_SCENE_HISTOGRAM_COUNT);
+    snprintf(descriptor_count, sizeof(descriptor_count), "%d",
+             ROBUST_SCENE_DESCRIPTOR_COUNT);
+    D3D_SHADER_MACRO descriptor_macros[] = {
+        {"SCENE_SAMPLE_STRIDE", sample_stride},
+        {"SCENE_PIXEL_THRESHOLD", pixel_threshold},
+        {"ROBUST_REGION_COUNT", region_count},
+        {"ROBUST_HISTOGRAM_BINS", histogram_bins},
+        {"ROBUST_HISTOGRAM_COUNT", histogram_count},
+        {"ROBUST_DESCRIPTOR_COUNT", descriptor_count},
+        {NULL, NULL},
+    };
+    D3D_SHADER_MACRO classify_macros[] = {
+        {"ROBUST_REGION_COUNT", region_count},
+        {"ROBUST_HISTOGRAM_BINS", histogram_bins},
+        {"ROBUST_HISTOGRAM_COUNT", histogram_count},
+        {"ROBUST_SCENE_CLASS_COUNT", "5"},
+        {"ROBUST_SCENE_METRIC_COUNT", "7"},
+        {"ROBUST_SCENE_NORMAL", "0"},
+        {"ROBUST_SCENE_FLASH", "1"},
+        {"ROBUST_SCENE_FADE_DISSOLVE", "2"},
+        {"ROBUST_SCENE_HARD_CUT", "3"},
+        {"ROBUST_SCENE_UNCERTAIN", "4"},
+        {"ROBUST_STATE_CLASS", "0"},
+        {"ROBUST_STATE_PREVIOUS_CLASS", "1"},
+        {"ROBUST_STATE_STREAK", "2"},
+        {"ROBUST_STATE_KL_MILLI", "3"},
+        {"ROBUST_STATE_AVERAGE_DELTA_MILLI", "4"},
+        {"ROBUST_STATE_CHANGED_RATIO_MILLI", "5"},
+        {"ROBUST_STATE_CHROMA_DELTA_MILLI", "6"},
+        {"ROBUST_STATE_EDGE_DELTA_MILLI", "7"},
+        {"ROBUST_STATE_EXPOSURE_DELTA_MILLI", "8"},
+        {"ROBUST_STATE_REGIONAL_KL_MAX_MILLI", "9"},
+        {"ROBUST_STATE_EXPOSURE_SPREAD_MILLI", "10"},
+        {NULL, NULL},
+    };
+    const char *sources[] = {
+        robust_scene_descriptor_shader_source,
+        robust_scene_classify_shader_source,
+    };
+    const size_t source_sizes[] = {
+        sizeof(robust_scene_descriptor_shader_source) - 1,
+        sizeof(robust_scene_classify_shader_source) - 1,
+    };
+    const char *names[] = {
+        "robust_scene_descriptor.hlsl",
+        "robust_scene_classify.hlsl",
+    };
+    const D3D_SHADER_MACRO *macro_sets[] = {
+        descriptor_macros,
+        classify_macros,
+    };
+    ID3D11ComputeShader **shaders[] = {
+        &p->nvof.robust_scene_descriptor_shader,
+        &p->nvof.robust_scene_classify_shader,
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(sources); n++) {
+        ID3DBlob *bytecode = NULL;
+        ID3DBlob *errors = NULL;
+        HRESULT hr = p->nvof.d3d_compile(
+            sources[n], source_sizes[n], names[n], macro_sets[n], NULL,
+            "main", "cs_5_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3 |
+            D3DCOMPILE_WARNINGS_ARE_ERRORS,
+            0, &bytecode, &errors);
+        if (FAILED(hr)) {
+            const char *message = errors
+                ? ID3D10Blob_GetBufferPointer(errors)
+                : "no compiler diagnostics";
+            MP_ERR(f, "NVOF robust scene shader compilation failed "
+                      "shader=%s hr=0x%08lx detail=%s\n",
+                   names[n], (unsigned long)hr, message);
+            if (errors)
+                ID3D10Blob_Release(errors);
+            if (bytecode)
+                ID3D10Blob_Release(bytecode);
+            release_robust_scene_resources(p);
+            return false;
+        }
+        if (errors)
+            ID3D10Blob_Release(errors);
+        hr = ID3D11Device_CreateComputeShader(
+            p->device, ID3D10Blob_GetBufferPointer(bytecode),
+            ID3D10Blob_GetBufferSize(bytecode), NULL, shaders[n]);
+        ID3D10Blob_Release(bytecode);
+        if (FAILED(hr)) {
+            MP_ERR(f, "NVOF could not create robust scene shader "
+                      "shader=%s hr=0x%08lx\n",
+                   names[n], (unsigned long)hr);
+            release_robust_scene_resources(p);
+            return false;
+        }
+    }
+
+    D3D11_BUFFER_DESC descriptor_desc = {
+        .ByteWidth = ROBUST_SCENE_DESCRIPTOR_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS |
+                     D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    HRESULT hr = ID3D11Device_CreateBuffer(
+        p->device, &descriptor_desc, NULL,
+        &p->nvof.robust_scene_descriptor_buffer);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .ViewDimension = D3D11_UAV_DIMENSION_BUFFER,
+        .Buffer = {
+            .FirstElement = 0,
+            .NumElements = ROBUST_SCENE_DESCRIPTOR_COUNT,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device,
+            (ID3D11Resource *)p->nvof.robust_scene_descriptor_buffer,
+            &uav_desc, &p->nvof.robust_scene_descriptor_uav);
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .ViewDimension = D3D11_SRV_DIMENSION_BUFFER,
+        .Buffer = {
+            .FirstElement = 0,
+            .NumElements = ROBUST_SCENE_DESCRIPTOR_COUNT,
+        },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device,
+            (ID3D11Resource *)p->nvof.robust_scene_descriptor_buffer,
+            &srv_desc, &p->nvof.robust_scene_descriptor_srv);
+    }
+
+    const uint32_t zero_state[ROBUST_SCENE_STATE_COUNT] = {0};
+    D3D11_SUBRESOURCE_DATA state_data = { .pSysMem = zero_state };
+    D3D11_BUFFER_DESC state_desc = {
+        .ByteWidth = ROBUST_SCENE_STATE_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS |
+                     D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &state_desc, &state_data,
+            &p->nvof.robust_scene_state_buffer);
+    }
+    uav_desc.Buffer.NumElements = ROBUST_SCENE_STATE_COUNT;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device,
+            (ID3D11Resource *)p->nvof.robust_scene_state_buffer,
+            &uav_desc, &p->nvof.robust_scene_state_uav);
+    }
+    srv_desc.Buffer.NumElements = ROBUST_SCENE_STATE_COUNT;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            p->device,
+            (ID3D11Resource *)p->nvof.robust_scene_state_buffer,
+            &srv_desc, &p->nvof.robust_scene_state_srv);
+    }
+
+    const uint32_t zero_summary[ROBUST_SCENE_SUMMARY_COUNT] = {0};
+    D3D11_SUBRESOURCE_DATA summary_data = { .pSysMem = zero_summary };
+    D3D11_BUFFER_DESC summary_desc = {
+        .ByteWidth = ROBUST_SCENE_SUMMARY_COUNT * sizeof(uint32_t),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_UNORDERED_ACCESS,
+        .MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+        .StructureByteStride = sizeof(uint32_t),
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &summary_desc, &summary_data,
+            &p->nvof.robust_scene_summary_buffer);
+    }
+    uav_desc.Buffer.NumElements = ROBUST_SCENE_SUMMARY_COUNT;
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateUnorderedAccessView(
+            p->device,
+            (ID3D11Resource *)p->nvof.robust_scene_summary_buffer,
+            &uav_desc, &p->nvof.robust_scene_summary_uav);
+    }
+    D3D11_BUFFER_DESC readback_desc = {
+        .ByteWidth = summary_desc.ByteWidth,
+        .Usage = D3D11_USAGE_STAGING,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateBuffer(
+            p->device, &readback_desc, NULL,
+            &p->nvof.robust_scene_summary_readback);
+    }
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF robust scene buffer creation failed hr=0x%08lx\n",
+               (unsigned long)hr);
+        release_robust_scene_resources(p);
+        return false;
+    }
+
+    MP_INFO(f, "NVOF robust scene classifier ready regions=3x3 "
+               "histogram-bins=%d sample-stride=%d descriptors="
+               "luma+chroma+edge history=hysteresis\n",
+            ROBUST_SCENE_HISTOGRAM_BINS,
+            p->opts->scene_cut_sample_stride);
+    return true;
+}
+
 static bool load_flow_diagnostics_shader(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -1877,9 +2537,17 @@ static bool load_synthesize_p010_shader(struct mp_filter *f)
     D3D_SHADER_MACRO macros[] = {
         {"USE_FILLED_FLOW",
          p->opts->stage5_flow_infill_test ? "1" : "0"},
+        {"USE_ROBUST_SCENE",
+         p->opts->stage6_robust_test ? "1" : "0"},
         {"FLOW_CONFIDENCE_MIN", confidence_min},
         {"SCENE_AVERAGE_THRESHOLD", scene_average_threshold},
         {"SCENE_CHANGED_RATIO", scene_changed_ratio},
+        {"ROBUST_STATE_CLASS", "0"},
+        {"ROBUST_SCENE_NORMAL", "0"},
+        {"ROBUST_SCENE_FLASH", "1"},
+        {"ROBUST_SCENE_FADE_DISSOLVE", "2"},
+        {"ROBUST_SCENE_HARD_CUT", "3"},
+        {"ROBUST_SCENE_UNCERTAIN", "4"},
         {NULL, NULL},
     };
     HRESULT hr = p->nvof.d3d_compile(
@@ -1912,9 +2580,11 @@ static bool load_synthesize_p010_shader(struct mp_filter *f)
         return false;
     }
     MP_INFO(f, "NVOF P010 synthesis shader ready inputs=Y/UV+%s "
-               "output=P010 midpoint=0.5\n",
+               "scene=%s output=P010 midpoint=0.5\n",
             p->opts->stage5_flow_infill_test
-                ? "filled-flow-confidence" : "flow+cost");
+                ? "filled-flow-confidence" : "flow+cost",
+            p->opts->stage6_robust_test
+                ? "robust-3x3-histogram" : "legacy-threshold");
     return true;
 }
 
@@ -2194,14 +2864,19 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
             resources_ok = false;
         }
     }
-    bool shaders_ok = resources_ok && load_extract_luma_shader(f) &&
-        (!synthesis_enabled(p) || load_scene_cut_shader(f)) &&
+    bool scene_shaders_ok = resources_ok && (!synthesis_enabled(p) ||
+        (p->opts->stage6_robust_test
+            ? load_robust_scene_shaders(f)
+            : load_scene_cut_shader(f)));
+    bool shaders_ok = scene_shaders_ok && load_extract_luma_shader(f) &&
+        scene_shaders_ok &&
         (!p->opts->flow_diagnostics ||
          load_flow_diagnostics_shader(f)) &&
         (!p->opts->stage5_flow_infill_test ||
          load_flow_infill_shaders(f)) &&
         (!(p->opts->stage4_synthesis_test ||
-           p->opts->stage5_flow_infill_test) ||
+           p->opts->stage5_flow_infill_test ||
+           p->opts->stage6_robust_test) ||
          load_synthesize_p010_shader(f));
     if (!shaders_ok) {
         release_nvof_session(f);
@@ -2349,11 +3024,209 @@ static bool dispatch_scene_cut_analysis(struct mp_filter *f)
     return true;
 }
 
+static bool dispatch_robust_scene_analysis(struct mp_filter *f,
+                                           struct mp_image *frame0,
+                                           struct mp_image *frame1)
+{
+    struct priv *p = f->priv;
+    if (!p->nvof.robust_scene_descriptor_shader ||
+        !p->nvof.robust_scene_classify_shader ||
+        !p->nvof.robust_scene_descriptor_buffer ||
+        !p->nvof.robust_scene_descriptor_uav ||
+        !p->nvof.robust_scene_descriptor_srv ||
+        !p->nvof.robust_scene_state_buffer ||
+        !p->nvof.robust_scene_state_uav ||
+        !p->nvof.robust_scene_state_srv ||
+        !p->nvof.robust_scene_summary_uav ||
+        !p->nvof.gray[0].srv || !p->nvof.gray[1].srv) {
+        MP_ERR(f, "NVOF robust scene resources are incomplete\n");
+        return false;
+    }
+
+    ID3D11Texture2D *textures[] = {
+        (ID3D11Texture2D *)frame0->planes[0],
+        (ID3D11Texture2D *)frame1->planes[0],
+    };
+    ID3D11Device3 *device3 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device3, (void **)&device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF robust scene analysis requires ID3D11Device3 "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    ID3D11ShaderResourceView1 *uv_views[2] = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 uv_desc = {
+        .Format = DXGI_FORMAT_R16G16_UNORM,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = {
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 1,
+        },
+    };
+    hr = ID3D11Device3_CreateShaderResourceView1(
+        device3, (ID3D11Resource *)textures[0], &uv_desc, &uv_views[0]);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device3_CreateShaderResourceView1(
+            device3, (ID3D11Resource *)textures[1], &uv_desc,
+            &uv_views[1]);
+    }
+    ID3D11Device3_Release(device3);
+    if (FAILED(hr)) {
+        MP_ERR(f, "NVOF robust scene UV view creation failed "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        for (int n = 0; n < MP_ARRAY_SIZE(uv_views); n++) {
+            if (uv_views[n])
+                ID3D11ShaderResourceView1_Release(uv_views[n]);
+        }
+        return false;
+    }
+
+    const uint32_t zero_descriptor[ROBUST_SCENE_DESCRIPTOR_COUNT] = {0};
+    const uint32_t zero_state[ROBUST_SCENE_STATE_COUNT] = {0};
+    lock_d3d11_context(p);
+    struct gpu_profile_token profile = gpu_profile_begin_locked(
+        p, GPU_PROFILE_SCENE_CUT);
+    ID3D11DeviceContext_UpdateSubresource(
+        p->context,
+        (ID3D11Resource *)p->nvof.robust_scene_descriptor_buffer,
+        0, NULL, zero_descriptor, 0, 0);
+    if (p->robust_scene_history_reset_pending) {
+        ID3D11DeviceContext_UpdateSubresource(
+            p->context,
+            (ID3D11Resource *)p->nvof.robust_scene_state_buffer,
+            0, NULL, zero_state, 0, 0);
+        p->robust_scene_history_reset_pending = false;
+    }
+
+    ID3D11ShaderResourceView *descriptor_srvs[] = {
+        p->nvof.gray[0].srv,
+        p->nvof.gray[1].srv,
+        (ID3D11ShaderResourceView *)uv_views[0],
+        (ID3D11ShaderResourceView *)uv_views[1],
+    };
+    ID3D11UnorderedAccessView *descriptor_uav =
+        p->nvof.robust_scene_descriptor_uav;
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.robust_scene_descriptor_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(descriptor_srvs), descriptor_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &descriptor_uav, NULL);
+    UINT sampled_width = (p->nvof.width +
+        p->opts->scene_cut_sample_stride - 1) /
+        p->opts->scene_cut_sample_stride;
+    UINT sampled_height = (p->nvof.height +
+        p->opts->scene_cut_sample_stride - 1) /
+        p->opts->scene_cut_sample_stride;
+    ID3D11DeviceContext_Dispatch(
+        p->context, (sampled_width + 15) / 16,
+        (sampled_height + 15) / 16, 1);
+
+    ID3D11ShaderResourceView *null_descriptor_srvs[
+        MP_ARRAY_SIZE(descriptor_srvs)] = {0};
+    ID3D11UnorderedAccessView *null_descriptor_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, MP_ARRAY_SIZE(null_descriptor_srvs),
+        null_descriptor_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, 1, &null_descriptor_uav, NULL);
+
+    ID3D11ShaderResourceView *classify_srv =
+        p->nvof.robust_scene_descriptor_srv;
+    ID3D11UnorderedAccessView *classify_uavs[] = {
+        p->nvof.robust_scene_state_uav,
+        p->nvof.robust_scene_summary_uav,
+    };
+    ID3D11DeviceContext_CSSetShader(
+        p->context, p->nvof.robust_scene_classify_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, 1, &classify_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(classify_uavs), classify_uavs, NULL);
+    ID3D11DeviceContext_Dispatch(p->context, 1, 1, 1);
+
+    ID3D11ShaderResourceView *null_classify_srv = NULL;
+    ID3D11UnorderedAccessView *null_classify_uavs[
+        MP_ARRAY_SIZE(classify_uavs)] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(
+        p->context, 0, 1, &null_classify_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        p->context, 0, MP_ARRAY_SIZE(null_classify_uavs),
+        null_classify_uavs, NULL);
+    ID3D11DeviceContext_CSSetShader(p->context, NULL, NULL, 0);
+    gpu_profile_end_locked(p, profile);
+    unlock_d3d11_context(p);
+
+    for (int n = 0; n < MP_ARRAY_SIZE(uv_views); n++)
+        ID3D11ShaderResourceView1_Release(uv_views[n]);
+    return true;
+}
+
+static bool read_robust_scene_summary(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->nvof.robust_scene_summary_buffer ||
+        !p->nvof.robust_scene_summary_readback) {
+        if (!p->synthesized_frames)
+            return true;
+        MP_ERR(f, "NVOF robust scene summary resources are incomplete\n");
+        return false;
+    }
+    lock_d3d11_context(p);
+    ID3D11DeviceContext_CopyResource(
+        p->context,
+        (ID3D11Resource *)p->nvof.robust_scene_summary_readback,
+        (ID3D11Resource *)p->nvof.robust_scene_summary_buffer);
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+    HRESULT hr = ID3D11DeviceContext_Map(
+        p->context,
+        (ID3D11Resource *)p->nvof.robust_scene_summary_readback,
+        0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        unlock_d3d11_context(p);
+        MP_ERR(f, "NVOF robust scene summary readback failed "
+                  "hr=0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    const uint32_t *values = mapped.pData;
+    p->nvof.scene_cut_pairs = values[0];
+    for (int n = 0; n < ROBUST_SCENE_CLASS_COUNT; n++) {
+        p->nvof.robust_scene_classes[n] = values[n + 1];
+        int metric_base = 1 + ROBUST_SCENE_CLASS_COUNT +
+                          n * ROBUST_SCENE_METRIC_COUNT;
+        for (int metric = 0; metric < ROBUST_SCENE_METRIC_COUNT;
+             metric++) {
+            p->nvof.robust_scene_metric_totals[n][metric] =
+                values[metric_base + metric];
+        }
+    }
+    p->nvof.scene_cuts =
+        p->nvof.robust_scene_classes[ROBUST_SCENE_HARD_CUT];
+    p->scene_cut_midpoints = p->nvof.scene_cuts;
+    ID3D11DeviceContext_Unmap(
+        p->context,
+        (ID3D11Resource *)p->nvof.robust_scene_summary_readback, 0);
+    unlock_d3d11_context(p);
+    if (p->nvof.scene_cut_pairs != p->synthesized_frames) {
+        MP_ERR(f, "NVOF robust scene summary mismatch pairs=%llu "
+                  "synthesized=%llu\n",
+               (unsigned long long)p->nvof.scene_cut_pairs,
+               (unsigned long long)p->synthesized_frames);
+        return false;
+    }
+    return true;
+}
+
 static bool read_scene_cut_summary(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     if (!synthesis_enabled(p))
         return true;
+    if (p->opts->stage6_robust_test)
+        return read_robust_scene_summary(f);
     if (!p->nvof.scene_cut_summary_buffer ||
         !p->nvof.scene_cut_summary_readback) {
         MP_ERR(f, "NVOF scene-cut summary resources are incomplete\n");
@@ -2709,8 +3582,13 @@ static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
         !extract_luma(f, frame0, 0) || !extract_luma(f, frame1, 1))
         return false;
 
-    if (synthesis_enabled(p) && !dispatch_scene_cut_analysis(f))
-        return false;
+    if (synthesis_enabled(p)) {
+        bool scene_ok = p->opts->stage6_robust_test
+            ? dispatch_robust_scene_analysis(f, frame0, frame1)
+            : dispatch_scene_cut_analysis(f);
+        if (!scene_ok)
+            return false;
+    }
 
     bool temporal_hints_reset = p->nvof.disable_temporal_hints_next;
     bool temporal_hints_disabled = temporal_hints_reset ||
@@ -2873,6 +3751,7 @@ static bool validate_input(struct mp_filter *f, struct mp_image *img)
         img->params.chroma_location != PL_CHROMA_LEFT) {
         MP_ERR(f, "NVOF MEMC synthesis supports only MPEG2/4/H.264 left "
                    "chroma siting mode=%s received=%d\n",
+               p->opts->stage6_robust_test ? "stage6" :
                p->opts->stage5_flow_infill_test ? "stage5" : "stage4",
                img->params.chroma_location);
         return false;
@@ -2983,7 +3862,9 @@ static struct texture_pool *create_texture_pool(struct mp_filter *f,
     ID3D11Device_AddRef(pool->device);
     pool->width = MP_ALIGN_UP(in->w, 2);
     pool->height = MP_ALIGN_UP(in->h, 2);
-    const char *mode = p->opts->stage5_flow_infill_test
+    const char *mode = p->opts->stage6_robust_test
+                     ? "robust-scene-test" :
+                       p->opts->stage5_flow_infill_test
                      ? "flow-infill-test" :
                        p->opts->stage4_synthesis_test ? "synthesis-test" :
                        p->opts->stage3_nvof_test ? "nvof-test" :
@@ -3339,8 +4220,11 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
           p->nvof.flow_state_backward[FLOW_INFILL_FINAL_INDEX].srv
         : p->nvof.flow_forward.srv && p->nvof.flow_backward.srv &&
           p->nvof.cost_forward.srv && p->nvof.cost_backward.srv;
+    bool scene_resources_ready = p->opts->stage6_robust_test
+        ? p->nvof.robust_scene_state_srv != NULL
+        : p->nvof.scene_cut_srv && p->nvof.scene_cut_summary_uav;
     if (!p->nvof.synthesize_p010_shader || !flow_resources_ready ||
-        !p->nvof.scene_cut_srv || !p->nvof.scene_cut_summary_uav) {
+        !scene_resources_ready) {
         MP_ERR(f, "NVOF P010 synthesis resources are incomplete\n");
         return false;
     }
@@ -3458,11 +4342,14 @@ static bool synthesize_p010_frame(struct mp_filter *f, struct mp_image *out,
         srvs[6] = p->nvof.cost_forward.srv;
         srvs[7] = p->nvof.cost_backward.srv;
     }
-    srvs[8] = p->nvof.scene_cut_srv;
+    srvs[8] = p->opts->stage6_robust_test
+        ? p->nvof.robust_scene_state_srv
+        : p->nvof.scene_cut_srv;
     ID3D11UnorderedAccessView *uavs[] = {
         (ID3D11UnorderedAccessView *)output_views[0],
         (ID3D11UnorderedAccessView *)output_views[1],
-        p->nvof.scene_cut_summary_uav,
+        p->opts->stage6_robust_test
+            ? NULL : p->nvof.scene_cut_summary_uav,
     };
     lock_d3d11_context(p);
     struct gpu_profile_token profile = gpu_profile_begin_locked(
@@ -3598,6 +4485,7 @@ static void clear_timing_state(struct priv *p)
     p->input_eof = false;
     p->output_eof_sent = false;
     p->nvof.disable_temporal_hints_next = true;
+    p->robust_scene_history_reset_pending = true;
 }
 
 static bool valid_pair(struct mp_filter *f, struct mp_image *frame0,
@@ -3610,6 +4498,7 @@ static bool valid_pair(struct mp_filter *f, struct mp_image *frame0,
         MP_WARN(f, "NVOF MEMC stage 2 reset history because input format "
                    "or D3D11 context changed\n");
         p->discontinuities++;
+        p->robust_scene_history_reset_pending = true;
         return false;
     }
 
@@ -3623,6 +4512,7 @@ static bool valid_pair(struct mp_filter *f, struct mp_image *frame0,
                    "is invalid delta=%.6f maximum=%.6f\n",
                 delta, maximum_duration);
         p->discontinuities++;
+        p->robust_scene_history_reset_pending = true;
         return false;
     }
     *duration = delta;
@@ -3726,6 +4616,7 @@ static void process_stage2(struct mp_filter *f)
         if (!private_copy) {
             MP_ERR(f, "NVOF could not copy input to a private P010 "
                       "analysis texture mode=%s\n",
+                   p->opts->stage6_robust_test ? "stage6" :
                    p->opts->stage5_flow_infill_test ? "stage5" :
                    p->opts->stage4_synthesis_test ? "stage4" : "stage3");
             fail_filter(f);
@@ -3910,10 +4801,57 @@ static void destroy(struct mp_filter *f)
         }
     }
     if (p->nvof.scene_cut_pairs) {
-        MP_INFO(f, "NVOF GPU scene-cut summary pairs=%llu cuts=%llu "
-                   "midpoint-policy=copy-f0\n",
-                (unsigned long long)p->nvof.scene_cut_pairs,
-                (unsigned long long)p->nvof.scene_cuts);
+        if (p->opts->stage6_robust_test) {
+            MP_INFO(f, "NVOF robust scene summary pairs=%llu "
+                       "normal=%llu flash=%llu fade-dissolve=%llu "
+                       "hard-cut=%llu uncertain=%llu "
+                       "policies=normal-warp,fade-crossfade,"
+                       "flash-hard-cut-uncertain-hold-f0\n",
+                    (unsigned long long)p->nvof.scene_cut_pairs,
+                    (unsigned long long)p->nvof.robust_scene_classes[
+                        ROBUST_SCENE_NORMAL],
+                    (unsigned long long)p->nvof.robust_scene_classes[
+                        ROBUST_SCENE_FLASH],
+                    (unsigned long long)p->nvof.robust_scene_classes[
+                        ROBUST_SCENE_FADE_DISSOLVE],
+                    (unsigned long long)p->nvof.robust_scene_classes[
+                        ROBUST_SCENE_HARD_CUT],
+                    (unsigned long long)p->nvof.robust_scene_classes[
+                        ROBUST_SCENE_UNCERTAIN]);
+            for (int scene = 0; scene < ROBUST_SCENE_CLASS_COUNT; scene++) {
+                uint64_t count = p->nvof.robust_scene_classes[scene];
+                if (!count)
+                    continue;
+                uint64_t *metrics =
+                    p->nvof.robust_scene_metric_totals[scene];
+                MP_INFO(f, "NVOF robust scene metrics class=%s count=%llu "
+                           "kl=%.4f average-delta=%.2f "
+                           "changed-ratio=%.3f chroma-delta=%.2f "
+                           "edge-delta=%.2f exposure-delta=%.2f "
+                           "regional-kl-max=%.4f\n",
+                        robust_scene_class_name(scene),
+                        (unsigned long long)count,
+                        metrics[ROBUST_SCENE_METRIC_KL_MILLI] /
+                            (1000.0 * count),
+                        metrics[ROBUST_SCENE_METRIC_AVERAGE_DELTA] /
+                            (double)count,
+                        metrics[ROBUST_SCENE_METRIC_CHANGED_RATIO_MILLI] /
+                            (1000.0 * count),
+                        metrics[ROBUST_SCENE_METRIC_CHROMA_DELTA] /
+                            (double)count,
+                        metrics[ROBUST_SCENE_METRIC_EDGE_DELTA] /
+                            (double)count,
+                        metrics[ROBUST_SCENE_METRIC_EXPOSURE_DELTA] /
+                            (double)count,
+                        metrics[ROBUST_SCENE_METRIC_REGIONAL_KL_MAX_MILLI] /
+                            (1000.0 * count));
+            }
+        } else {
+            MP_INFO(f, "NVOF GPU scene-cut summary pairs=%llu cuts=%llu "
+                       "midpoint-policy=copy-f0\n",
+                    (unsigned long long)p->nvof.scene_cut_pairs,
+                    (unsigned long long)p->nvof.scene_cuts);
+        }
     }
     if (p->opts->gpu_timing) {
         for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++) {
@@ -3969,17 +4907,20 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
                      p->opts->stage2_timing_test +
                      p->opts->stage3_nvof_test +
                      p->opts->stage4_synthesis_test +
-                     p->opts->stage5_flow_infill_test;
+                     p->opts->stage5_flow_infill_test +
+                     p->opts->stage6_robust_test;
     if (mode_count != 1) {
         MP_ERR(f, "NVOF MEMC requires exactly one validation mode: "
                 "stage1-passthrough=yes, stage2-timing-test=yes, or "
                 "stage3-nvof-test=yes, stage4-synthesis-test=yes, or "
-                "stage5-flow-infill-test=yes\n");
+                "stage5-flow-infill-test=yes, or "
+                "stage6-robust-test=yes\n");
         goto fail;
     }
     if (p->opts->flow_diagnostics &&
         !nvof_analysis_enabled(p)) {
-        MP_ERR(f, "NVOF flow diagnostics require stage 3, 4, or 5 mode\n");
+        MP_ERR(f, "NVOF flow diagnostics require stage 3, 4, 5, or 6 "
+                  "mode\n");
         goto fail;
     }
     if (p->opts->stage2_timing_test) {
@@ -4001,6 +4942,13 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
                    "synthesis with native bidirectional OFA, "
                    "forward-backward consistency rejection, and two-pass "
                    "luma-guided flow infill; "
+                   "unsupported formats or synthesis failures are fatal\n");
+    }
+    if (p->opts->stage6_robust_test) {
+        MP_WARN(f, "NVOF MEMC stage 6 enables strict x2 P010 midpoint "
+                   "synthesis with native bidirectional OFA and GPU-resident "
+                   "3x3 histogram, chroma, edge, exposure, and hysteresis "
+                   "scene classification; flow diffusion is disabled and "
                    "unsupported formats or synthesis failures are fatal\n");
     }
     if (p->opts->flow_diagnostics) {
@@ -4065,12 +5013,13 @@ fail:
 
 #define OPT_BASE_STRUCT struct opts
 static const m_option_t option_fields[] = {
-    {"memc", OPT_BOOL(stage5_flow_infill_test)},
+    {"memc", OPT_BOOL(stage6_robust_test)},
     {"stage1-passthrough", OPT_BOOL(stage1_passthrough)},
     {"stage2-timing-test", OPT_BOOL(stage2_timing_test)},
     {"stage3-nvof-test", OPT_BOOL(stage3_nvof_test)},
     {"stage4-synthesis-test", OPT_BOOL(stage4_synthesis_test)},
     {"stage5-flow-infill-test", OPT_BOOL(stage5_flow_infill_test)},
+    {"stage6-robust-test", OPT_BOOL(stage6_robust_test)},
     {"flow-diagnostics", OPT_BOOL(flow_diagnostics)},
     {"flow-fb-abs", OPT_DOUBLE(flow_fb_abs), M_RANGE(0.001, 255.0)},
     {"flow-fb-rel", OPT_DOUBLE(flow_fb_rel), M_RANGE(0.0, 10.0)},
@@ -4103,6 +5052,7 @@ const struct mp_user_filter_entry vf_nvofmemc = {
             .stage3_nvof_test = false,
             .stage4_synthesis_test = false,
             .stage5_flow_infill_test = false,
+            .stage6_robust_test = false,
             .flow_diagnostics = false,
             .flow_fb_abs = 6.0,
             .flow_fb_rel = 0.05,
