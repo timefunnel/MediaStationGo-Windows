@@ -304,17 +304,24 @@
             playback_unavailable: '当前没有可切换轨道的播放项目',
             authentication_in_progress: '登录请求正在处理中',
             session_changed: '账号状态已变化，请重试',
-            frame_interpolation_runtime_unavailable: 'NVOF MEMC 插帧组件不可用',
+            frame_interpolation_runtime_unavailable: 'RIFE 插帧组件不可用',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
             frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
             frame_interpolation_nvidia_output_invalid: 'NVIDIA GPU 信息无效',
             frame_interpolation_gpu_unsupported: '首版插帧仅支持 NVIDIA RTX',
             frame_interpolation_platform_unsupported: '当前系统不支持 RTX 插帧',
-            frame_interpolation_not_initialized: 'NVOF MEMC 插帧组件尚未初始化',
-            frame_interpolation_nvofa_library_unavailable: 'NVIDIA Optical Flow 运行库不可用',
-            frame_interpolation_nvofa_api_missing: 'NVIDIA Optical Flow API 不完整',
-            frame_interpolation_nvofa_probe_failed: 'NVIDIA Optical Flow API 探测失败',
-            frame_interpolation_nvofa_api_unsupported: 'NVIDIA Optical Flow API 版本过低',
+            frame_interpolation_not_initialized: 'RIFE 插帧组件尚未初始化',
+            frame_interpolation_runtime_location_unavailable: '无法定位 RIFE 运行组件',
+            frame_interpolation_manifest_missing: 'RIFE 运行清单缺失',
+            frame_interpolation_manifest_invalid: 'RIFE 运行清单无效',
+            frame_interpolation_runtime_component_missing: 'RIFE 运行组件不完整',
+            frame_interpolation_runtime_load_failed: 'RIFE 运行库加载失败',
+            frame_interpolation_runtime_abi_mismatch: 'RIFE 运行库版本不匹配',
+            frame_interpolation_engine_cache_mismatch: 'RIFE Engine 与当前显卡或驱动不匹配',
+            frame_interpolation_engine_missing: '当前分辨率的 RIFE Engine 缺失',
+            frame_interpolation_engine_corrupt: 'RIFE Engine 校验失败',
+            frame_interpolation_engine_shape_unsupported: '当前分辨率尚无原生 RIFE Engine',
+            frame_interpolation_runtime_path_invalid: 'RIFE 运行路径无效',
             frame_interpolation_d3d_compiler_unavailable: 'D3D11 着色器编译组件不可用',
             frame_interpolation_mode_invalid: 'RTX 插帧目标设置无效',
             frame_interpolation_request_invalid: 'RTX 插帧请求无效',
@@ -334,7 +341,7 @@
             frame_interpolation_hdr10_transfer_invalid: 'HDR10 缺少 PQ/ST2084 色彩元数据',
             frame_interpolation_color_space_unsupported: '视频色彩空间不支持插帧',
             frame_interpolation_color_range_unsupported: '视频色彩范围不支持插帧',
-            frame_interpolation_filter_invalid: 'NVOF MEMC 滤镜参数无效',
+            frame_interpolation_filter_invalid: 'RIFE 滤镜参数无效',
             frame_interpolation_hwdec_invalid: 'RTX 插帧硬件解码参数无效',
             frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
         };
@@ -728,12 +735,12 @@
         const label = byId('frame-interpolation-status');
         select.value = frameInterpolationMode;
         if (status.componentStatus === 'ready') {
-            const api = status.opticalFlowApi ? `Optical Flow API ${status.opticalFlowApi}` : null;
-            const components = [status.gpuName, api, status.backend].filter(Boolean);
-            label.textContent = components.join(' · ') || 'NVOF MEMC 插帧组件已就绪';
+            const engines = Number.isFinite(status.engineCount) ? `${status.engineCount} 个 Engine` : null;
+            const components = [status.gpuName, status.model, status.runtimeVersion, engines].filter(Boolean);
+            label.textContent = components.join(' · ') || 'RIFE 插帧组件已就绪';
             label.dataset.state = 'ready';
         } else {
-            const error = new Error(status.failureDetail || 'NVOF MEMC 插帧组件不可用');
+            const error = new Error(status.failureDetail || 'RIFE 插帧组件不可用');
             error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
@@ -2047,7 +2054,9 @@
         const diagnostics = info.frameInterpolationDiagnostics || {};
         if (activeInterpolation) {
             appendInfoRow(interpolation.list, '模式 / 输出', `${activeInterpolation.mode} · ${activeInterpolation.targetFps} fps`);
-            appendInfoRow(interpolation.list, '后端 / API', `${activeInterpolation.backend} · ${activeInterpolation.opticalFlowApi}`);
+            appendInfoRow(interpolation.list, '后端 / 运行库', `${activeInterpolation.backend} · ${activeInterpolation.runtimeVersion}`);
+            appendInfoRow(interpolation.list, '模型 / Engine', `${activeInterpolation.model} · ${activeInterpolation.engineKey}`);
+            appendInfoRow(interpolation.list, '精度 / Scale', `${activeInterpolation.precision} · ${activeInterpolation.scale}`);
             appendInfoRow(interpolation.list, '原生滤镜', infoValue(activeInterpolation.videoFilter));
             appendInfoRow(interpolation.list, '硬件解码', infoValue(diagnostics.hwdecCurrent || activeInterpolation.hwdec));
         } else {

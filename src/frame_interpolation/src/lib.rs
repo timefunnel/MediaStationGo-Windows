@@ -1,10 +1,18 @@
-use std::path::Path;
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
+use std::fs::File;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const NVOF_REQUIRED_API: u32 = 0x50;
-const NVOF_BACKEND: &str = "NVIDIA NVOF D3D11 P010 MEMC";
-const NVOF_FILTER: &str = "vf_nvofmemc";
+const RIFE_RUNTIME_ABI: u32 = 1;
+const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
+const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
+const RIFE_MODEL: &str = "RIFE v4.25 Lite";
+const RIFE_TENSORRT_VERSION: &str = "1.4.0.76";
+const RIFE_SCALE: &str = "1.0";
+const RIFE_PRECISION: &str = "fp16";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InterpolationMode {
@@ -66,10 +74,13 @@ pub struct CapabilityReport {
     pub gpu_name: Option<String>,
     pub gpu_uuid: Option<String>,
     pub driver_version: Option<String>,
-    pub optical_flow_api: Option<String>,
+    pub runtime_version: Option<String>,
+    pub model: Option<String>,
+    pub engine_count: usize,
     pub backend: Option<&'static str>,
     pub filter: Option<&'static str>,
     pub failure: Option<InterpolationError>,
+    runtime: Option<RuntimeComponents>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +88,24 @@ struct GpuInfo {
     name: String,
     uuid: String,
     driver: String,
+}
+
+#[derive(Clone, Debug)]
+struct EngineArtifact {
+    width: u32,
+    height: u32,
+    key: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeComponents {
+    runtime_dll: PathBuf,
+    cuda_runtime_dll: PathBuf,
+    tensor_rt_version: String,
+    model: String,
+    model_sha256: String,
+    engines: Vec<EngineArtifact>,
 }
 
 static REPORT: OnceLock<CapabilityReport> = OnceLock::new();
@@ -97,15 +126,18 @@ pub fn capability_report() -> CapabilityReport {
 
 fn build_capability_report() -> CapabilityReport {
     match probe_capability() {
-        Ok((gpu, api_version)) => CapabilityReport {
+        Ok((gpu, runtime)) => CapabilityReport {
             ready: true,
             gpu_name: Some(gpu.name),
             gpu_uuid: Some(gpu.uuid),
             driver_version: Some(gpu.driver),
-            optical_flow_api: Some(format_api_version(api_version)),
-            backend: Some(NVOF_BACKEND),
-            filter: Some(NVOF_FILTER),
+            runtime_version: Some(format!("TensorRT-RTX {}", runtime.tensor_rt_version)),
+            model: Some(runtime.model.clone()),
+            engine_count: runtime.engines.len(),
+            backend: Some(RIFE_BACKEND),
+            filter: Some(RIFE_FILTER),
             failure: None,
+            runtime: Some(runtime),
         },
         Err(error) => CapabilityReport {
             failure: Some(error),
@@ -114,26 +146,17 @@ fn build_capability_report() -> CapabilityReport {
     }
 }
 
-fn probe_capability() -> Result<(GpuInfo, u32), InterpolationError> {
+fn probe_capability() -> Result<(GpuInfo, RuntimeComponents), InterpolationError> {
     if !cfg!(target_os = "windows") {
         return Err(InterpolationError::new(
             "frame_interpolation_platform_unsupported",
-            "NVOF MEMC frame interpolation is supported only on Windows",
+            "RIFE TensorRT-RTX frame interpolation is supported only on Windows",
         ));
     }
     let gpu = probe_gpu()?;
-    let api_version = probe_nvof_api()?;
-    if api_version < NVOF_REQUIRED_API {
-        return Err(InterpolationError::new(
-            "frame_interpolation_nvofa_api_unsupported",
-            format!(
-                "NVOF API {} is below required 5.0",
-                format_api_version(api_version)
-            ),
-        ));
-    }
+    let runtime = probe_runtime(&gpu)?;
     probe_d3d_compiler()?;
-    Ok((gpu, api_version))
+    Ok((gpu, runtime))
 }
 
 fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
@@ -181,46 +204,297 @@ fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
     Ok(GpuInfo { name, uuid, driver })
 }
 
+fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        InterpolationError::new(
+            "frame_interpolation_runtime_location_unavailable",
+            format!("The application path is unavailable: {error}"),
+        )
+    })?;
+    let executable_dir = executable.parent().ok_or_else(|| {
+        InterpolationError::new(
+            "frame_interpolation_runtime_location_unavailable",
+            format!(
+                "The application path has no parent: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    let manifest_path = executable_dir
+        .join("frame-interpolation")
+        .join("runtime-manifest.json");
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        InterpolationError::new(
+            "frame_interpolation_manifest_missing",
+            format!("{} could not be read: {error}", manifest_path.display()),
+        )
+    })?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            format!("{} is invalid JSON: {error}", manifest_path.display()),
+        )
+    })?;
+    if manifest.get("schema").and_then(Value::as_u64) != Some(1) {
+        return Err(InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            "The RIFE runtime manifest schema is not supported",
+        ));
+    }
+    let manifest_gpu_uuid = manifest_string(&manifest, "gpuUuid")?;
+    let manifest_driver = manifest_string(&manifest, "driverVersion")?;
+    if manifest_gpu_uuid != gpu.uuid || manifest_driver != gpu.driver {
+        return Err(InterpolationError::new(
+            "frame_interpolation_engine_cache_mismatch",
+            format!(
+                "The staged engines target GPU {} driver {}, but the active GPU is {} driver {}",
+                manifest_gpu_uuid, manifest_driver, gpu.uuid, gpu.driver
+            ),
+        ));
+    }
+    let tensor_rt_version = manifest_string(&manifest, "tensorRtVersion")?;
+    let model = manifest_string(&manifest, "model")?;
+    let model_sha256 = manifest_string(&manifest, "modelSha256")?;
+    let runtime_abi = manifest
+        .get("runtimeAbi")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                "The RIFE runtime ABI is missing or invalid",
+            )
+        })?;
+    if tensor_rt_version != RIFE_TENSORRT_VERSION
+        || model != RIFE_MODEL
+        || runtime_abi != RIFE_RUNTIME_ABI
+    {
+        return Err(InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            format!(
+                "Unsupported runtime tuple TensorRT={} model={} ABI={}",
+                tensor_rt_version, model, runtime_abi
+            ),
+        ));
+    }
+    let runtime_dll = component_path(executable_dir, &manifest, "runtimeDll")?;
+    let cuda_runtime_dll = component_path(executable_dir, &manifest, "cudaRuntimeDll")?;
+    let tensor_rt_dll = component_path(executable_dir, &manifest, "tensorRtDll")?;
+    for path in [&runtime_dll, &cuda_runtime_dll, &tensor_rt_dll] {
+        if !path.is_file() {
+            return Err(InterpolationError::new(
+                "frame_interpolation_runtime_component_missing",
+                format!("Required runtime component is missing: {}", path.display()),
+            ));
+        }
+    }
+    probe_runtime_abi(&runtime_dll)?;
+
+    let entries = manifest
+        .get("engines")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                "The RIFE engine list is missing",
+            )
+        })?;
+    let engine_dir = manifest_path
+        .parent()
+        .expect("manifest path has a parent")
+        .join("engine-cache");
+    let mut engines = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let width = manifest_u32(entry, "width")?;
+        let height = manifest_u32(entry, "height")?;
+        let scale = manifest_string(entry, "scale")?;
+        let precision = manifest_string(entry, "precision")?;
+        let key = manifest_string(entry, "engineKey")?;
+        let file = manifest_string(entry, "file")?;
+        let expected_hash = manifest_string(entry, "sha256")?;
+        if scale != RIFE_SCALE || precision != RIFE_PRECISION {
+            return Err(InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                format!("Unsupported engine scale={scale} precision={precision}"),
+            ));
+        }
+        let expected_key = engine_cache_key(
+            &gpu.uuid,
+            &gpu.driver,
+            &tensor_rt_version,
+            &model_sha256,
+            width,
+            height,
+        );
+        if key != expected_key || file != format!("{key}.engine") {
+            return Err(InterpolationError::new(
+                "frame_interpolation_engine_cache_mismatch",
+                format!("The {width}x{height} engine cache key is invalid"),
+            ));
+        }
+        let path = engine_dir.join(&file);
+        if !path.is_file() {
+            return Err(InterpolationError::new(
+                "frame_interpolation_engine_missing",
+                format!(
+                    "The {width}x{height} RIFE engine is missing: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let actual_hash = hash_file(&path)?;
+        if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+            return Err(InterpolationError::new(
+                "frame_interpolation_engine_corrupt",
+                format!("The {width}x{height} RIFE engine hash does not match its manifest"),
+            ));
+        }
+        engines.push(EngineArtifact {
+            width,
+            height,
+            key,
+            path,
+        });
+    }
+    if engines.is_empty() {
+        return Err(InterpolationError::new(
+            "frame_interpolation_engine_missing",
+            "The RIFE runtime does not contain any validated engines",
+        ));
+    }
+    Ok(RuntimeComponents {
+        runtime_dll,
+        cuda_runtime_dll,
+        tensor_rt_version,
+        model,
+        model_sha256,
+        engines,
+    })
+}
+
+fn manifest_string(manifest: &Value, name: &'static str) -> Result<String, InterpolationError> {
+    manifest
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                format!("The RIFE runtime manifest field {name} is missing"),
+            )
+        })
+}
+
+fn manifest_u32(manifest: &Value, name: &'static str) -> Result<u32, InterpolationError> {
+    manifest
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                format!("The RIFE runtime manifest field {name} is invalid"),
+            )
+        })
+}
+
+fn component_path(
+    executable_dir: &Path,
+    manifest: &Value,
+    name: &'static str,
+) -> Result<PathBuf, InterpolationError> {
+    let file = manifest_string(manifest, name)?;
+    let path = Path::new(&file);
+    if path.file_name().and_then(|value| value.to_str()) != Some(file.as_str()) {
+        return Err(InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            format!("Runtime component {name} must be a file name"),
+        ));
+    }
+    Ok(executable_dir.join(file))
+}
+
+fn engine_cache_key(
+    gpu_uuid: &str,
+    driver: &str,
+    tensor_rt_version: &str,
+    model_sha256: &str,
+    width: u32,
+    height: u32,
+) -> String {
+    let material = format!(
+        "gpu_uuid={gpu_uuid}\ndriver={driver}\ntensorrt={tensor_rt_version}\nmodel_sha256={model_sha256}\nwidth={width}\nheight={height}\nscale={RIFE_SCALE}\nprecision={RIFE_PRECISION}"
+    );
+    format!("{:x}", Sha256::digest(material.as_bytes()))
+}
+
+fn hash_file(path: &Path) -> Result<String, InterpolationError> {
+    let mut file = File::open(path).map_err(|error| {
+        InterpolationError::new(
+            "frame_interpolation_engine_missing",
+            format!("{} could not be opened: {error}", path.display()),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            InterpolationError::new(
+                "frame_interpolation_engine_corrupt",
+                format!("{} could not be read: {error}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(target_os = "windows")]
-fn probe_nvof_api() -> Result<u32, InterpolationError> {
-    use std::ffi::OsStr;
+fn probe_runtime_abi(path: &Path) -> Result<(), InterpolationError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
-    type GetMaxSupportedApiVersion = unsafe extern "system" fn(*mut u32) -> u32;
-    let library_name = OsStr::new("nvofapi64.dll")
+    type AbiVersion = unsafe extern "C" fn() -> u32;
+    let wide = path
+        .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    let module = unsafe { LoadLibraryW(library_name.as_ptr()) };
+    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
     if module.is_null() {
         return Err(InterpolationError::new(
-            "frame_interpolation_nvofa_library_unavailable",
+            "frame_interpolation_runtime_load_failed",
             format!(
-                "nvofapi64.dll could not be loaded: {}",
+                "{} could not be loaded: {}",
+                path.display(),
                 std::io::Error::last_os_error()
             ),
         ));
     }
-    let address =
-        unsafe { GetProcAddress(module, c"NvOFGetMaxSupportedApiVersion".as_ptr().cast()) };
+    let address = unsafe { GetProcAddress(module, c"rife_runtime_abi_version".as_ptr().cast()) };
     let result = if let Some(address) = address {
-        let function: GetMaxSupportedApiVersion = unsafe { std::mem::transmute(address) };
-        let mut version = 0_u32;
-        let status = unsafe { function(&mut version) };
-        if status == 0 {
-            Ok(version)
+        let function: AbiVersion = unsafe { std::mem::transmute(address) };
+        let version = unsafe { function() };
+        if version == RIFE_RUNTIME_ABI {
+            Ok(())
         } else {
             Err(InterpolationError::new(
-                "frame_interpolation_nvofa_probe_failed",
-                format!("NvOFGetMaxSupportedApiVersion returned status {status}"),
+                "frame_interpolation_runtime_abi_mismatch",
+                format!(
+                    "RIFE runtime ABI {version} does not match required ABI {RIFE_RUNTIME_ABI}"
+                ),
             ))
         }
     } else {
         Err(InterpolationError::new(
-            "frame_interpolation_nvofa_api_missing",
-            "NvOFGetMaxSupportedApiVersion is missing from nvofapi64.dll",
+            "frame_interpolation_runtime_abi_mismatch",
+            "rife_runtime_abi_version is missing from the runtime DLL",
         ))
     };
     unsafe { FreeLibrary(module) };
@@ -228,10 +502,10 @@ fn probe_nvof_api() -> Result<u32, InterpolationError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn probe_nvof_api() -> Result<u32, InterpolationError> {
+fn probe_runtime_abi(_path: &Path) -> Result<(), InterpolationError> {
     Err(InterpolationError::new(
         "frame_interpolation_platform_unsupported",
-        "NVOF MEMC frame interpolation is supported only on Windows",
+        "RIFE TensorRT-RTX frame interpolation is supported only on Windows",
     ))
 }
 
@@ -264,12 +538,8 @@ fn probe_d3d_compiler() -> Result<(), InterpolationError> {
 fn probe_d3d_compiler() -> Result<(), InterpolationError> {
     Err(InterpolationError::new(
         "frame_interpolation_platform_unsupported",
-        "NVOF MEMC frame interpolation is supported only on Windows",
+        "RIFE TensorRT-RTX frame interpolation is supported only on Windows",
     ))
-}
-
-fn format_api_version(version: u32) -> String {
-    format!("{}.{}", version >> 4, version & 0x0f)
 }
 
 #[derive(Clone, Debug)]
@@ -296,7 +566,13 @@ pub struct InterpolationPlan {
     pub video_filter: String,
     pub hwdec: &'static str,
     pub backend: &'static str,
-    pub optical_flow_api: String,
+    pub runtime_version: String,
+    pub model: String,
+    pub model_sha256: String,
+    pub engine_key: String,
+    pub engine_path: PathBuf,
+    pub scale: &'static str,
+    pub precision: &'static str,
 }
 
 pub fn prepare_plan(request: PlanRequest) -> Result<Option<InterpolationPlan>, InterpolationError> {
@@ -322,9 +598,15 @@ fn build_plan(
     if !report.ready {
         return Err(InterpolationError::new(
             "frame_interpolation_runtime_unavailable",
-            "The NVOF MEMC capability probe did not report a usable runtime",
+            "The RIFE TensorRT-RTX capability probe did not report a usable runtime",
         ));
     }
+    let runtime = report.runtime.as_ref().ok_or_else(|| {
+        InterpolationError::new(
+            "frame_interpolation_runtime_unavailable",
+            "The RIFE runtime component paths are unavailable",
+        )
+    })?;
     validate_dimensions(request.width, request.height)?;
     validate_dynamic_range(request.dynamic_range.as_deref())?;
     normalize_matrix(request.color_space.as_deref())?;
@@ -350,7 +632,31 @@ fn build_plan(
             ),
         ));
     }
-    let video_filter = "nvofmemc=memc=yes".to_string();
+    let engine = runtime
+        .engines
+        .iter()
+        .find(|engine| engine.width == request.width && engine.height == request.height)
+        .ok_or_else(|| {
+            let supported = runtime
+                .engines
+                .iter()
+                .map(|engine| format!("{}x{}", engine.width, engine.height))
+                .collect::<Vec<_>>()
+                .join(", ");
+            InterpolationError::new(
+                "frame_interpolation_engine_shape_unsupported",
+                format!(
+                    "No exact RIFE engine exists for {}x{}; validated shapes: {supported}",
+                    request.width, request.height
+                ),
+            )
+        })?;
+    let video_filter = format!(
+        "nvofmemc=rife=yes:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        mpv_filter_path(&runtime.runtime_dll)?,
+        mpv_filter_path(&engine.path)?,
+        mpv_filter_path(&runtime.cuda_runtime_dll)?,
+    );
     Ok(InterpolationPlan {
         mode: request.mode,
         target_fps,
@@ -360,12 +666,25 @@ fn build_plan(
         source_fps_den,
         video_filter,
         hwdec: "d3d11va",
-        backend: NVOF_BACKEND,
-        optical_flow_api: report
-            .optical_flow_api
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
+        backend: RIFE_BACKEND,
+        runtime_version: format!("TensorRT-RTX {}", runtime.tensor_rt_version),
+        model: runtime.model.clone(),
+        model_sha256: runtime.model_sha256.clone(),
+        engine_key: engine.key.clone(),
+        engine_path: engine.path.clone(),
+        scale: RIFE_SCALE,
+        precision: RIFE_PRECISION,
     })
+}
+
+fn mpv_filter_path(path: &Path) -> Result<String, InterpolationError> {
+    let value = path.to_str().ok_or_else(|| {
+        InterpolationError::new(
+            "frame_interpolation_runtime_path_invalid",
+            format!("Runtime path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    Ok(format!("%{}%{value}", value.len()))
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), InterpolationError> {
@@ -378,7 +697,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), InterpolationError
     if width > 3840 || height > 2160 {
         return Err(InterpolationError::new(
             "frame_interpolation_dimensions_unsupported",
-            format!("NVOF MEMC supports at most 3840x2160, received {width}x{height}"),
+            format!("RIFE interpolation supports at most 3840x2160, received {width}x{height}"),
         ));
     }
     Ok(())
@@ -472,7 +791,7 @@ fn rational_frame_rate(value: f64) -> Result<(u32, u32), InterpolationError> {
     if !(20.0..=30.001).contains(&value) {
         return Err(InterpolationError::new(
             "frame_interpolation_source_fps_unsupported",
-            format!("Strict x2 NVOF MEMC supports 20-30 FPS sources, received {value:.3}"),
+            format!("Strict x2 RIFE supports 20-30 FPS sources, received {value:.3}"),
         ));
     }
     for (known, numerator, denominator) in [
@@ -529,11 +848,30 @@ mod tests {
     use super::*;
 
     fn ready_report() -> CapabilityReport {
+        let engines = [(1920, 1080), (2304, 1296), (2560, 1440), (3840, 2160)]
+            .into_iter()
+            .map(|(width, height)| EngineArtifact {
+                width,
+                height,
+                key: format!("engine-{width}x{height}"),
+                path: PathBuf::from(format!("/runtime/{width}x{height}.engine")),
+            })
+            .collect();
         CapabilityReport {
             ready: true,
-            optical_flow_api: Some("5.0".to_string()),
-            backend: Some(NVOF_BACKEND),
-            filter: Some(NVOF_FILTER),
+            runtime_version: Some(format!("TensorRT-RTX {RIFE_TENSORRT_VERSION}")),
+            model: Some(RIFE_MODEL.to_string()),
+            engine_count: 4,
+            backend: Some(RIFE_BACKEND),
+            filter: Some(RIFE_FILTER),
+            runtime: Some(RuntimeComponents {
+                runtime_dll: PathBuf::from("/runtime/rife_runtime.dll"),
+                cuda_runtime_dll: PathBuf::from("/runtime/cudart64_12.dll"),
+                tensor_rt_version: RIFE_TENSORRT_VERSION.to_string(),
+                model: RIFE_MODEL.to_string(),
+                model_sha256: "model-sha256".to_string(),
+                engines,
+            }),
             ..CapabilityReport::default()
         }
     }
@@ -567,15 +905,21 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_explicit_x2_use_native_filter() {
+    fn auto_and_explicit_x2_use_rife_filter() {
         for mode in [InterpolationMode::Auto, InterpolationMode::X2] {
             let plan = build_plan(&ready_report(), request(mode, 3840, 2160, 24.0))
                 .expect("4K 24 to 48 plan");
             assert_eq!(plan.target_fps, 48.0);
             assert_eq!((plan.target_fps_num, plan.target_fps_den), (48, 1));
             assert_eq!(plan.hwdec, "d3d11va");
-            assert_eq!(plan.backend, NVOF_BACKEND);
-            assert_eq!(plan.video_filter, "nvofmemc=memc=yes");
+            assert_eq!(plan.backend, RIFE_BACKEND);
+            assert!(plan.video_filter.starts_with("nvofmemc=rife=yes:"));
+            assert!(plan.video_filter.contains("rife-runtime-dll="));
+            assert!(plan.video_filter.contains("rife-engine="));
+            assert!(plan.video_filter.contains("rife-cudart="));
+            assert_eq!(plan.engine_key, "engine-3840x2160");
+            assert_eq!(plan.scale, "1.0");
+            assert_eq!(plan.precision, "fp16");
         }
     }
 
@@ -608,6 +952,16 @@ mod tests {
                 .code,
             "frame_interpolation_dimensions_unsupported"
         );
+    }
+
+    #[test]
+    fn exact_engine_shape_is_required_without_scaling() {
+        let error = build_plan(
+            &ready_report(),
+            request(InterpolationMode::X2, 1920, 800, 24.0),
+        )
+        .expect_err("an unvalidated engine shape must fail");
+        assert_eq!(error.code, "frame_interpolation_engine_shape_unsupported");
     }
 
     #[test]

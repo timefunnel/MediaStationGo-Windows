@@ -2282,6 +2282,8 @@ dependencies = [
 name = "jfn-frame-interpolation"
 version = "0.1.0-dev"
 dependencies = [
+ "serde_json",
+ "sha2",
  "windows-sys 0.61.2",
 ]
 

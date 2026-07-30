@@ -19,9 +19,24 @@ $MpvSourceDir = Join-Path $RepoRoot "third_party\mpv"
 $NvofMemcSource = Join-Path $PSScriptRoot "mpv\vf_nvofmemc.c"
 $NvofMemcPatch = Join-Path $PSScriptRoot "mpv\mpv-nvofmemc.patch"
 $NvofMemcDestination = Join-Path $MpvSourceDir "video\filter\vf_nvofmemc.c"
+$RifeRuntimeHeader = Join-Path $PSScriptRoot "mpv\rife_runtime.h"
+$RifeRuntimeSource = Join-Path $PSScriptRoot "mpv\rife_runtime.cpp"
+$RifeRuntimeBuildScript = Join-Path $PSScriptRoot "build_rife_runtime.ps1"
+$RifeRuntimeHeaderDestination = Join-Path $MpvSourceDir "video\filter\rife_runtime.h"
+$FrameInterpolationRuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
+$RifeRuntimeBuildDir = Join-Path $RepoRoot "build\rife-runtime"
 $NvofApiIncludeDir = Join-Path $RepoRoot "third_party\nvofapi\include"
+$RifeTensorRtVersion = "1.4.0.76"
+$RifeModelPath = Join-Path $FrameInterpolationRuntimeDir "vapoursynth\plugins\models\rife\rife_v4.25_lite.onnx"
+$RifeEngineSpecs = @(
+    @{ Width = 1920; Height = 1080 },
+    @{ Width = 2304; Height = 1296 },
+    @{ Width = 2560; Height = 1440 },
+    @{ Width = 3840; Height = 2160 }
+)
 $NvofMemcPatchApplied = $false
 $NvofMemcSourceCreated = $false
+$RifeRuntimeHeaderCreated = $false
 
 # MSYS2 environment based on target architecture
 if ($Arch -eq "arm64") {
@@ -51,6 +66,12 @@ if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
 foreach ($RequiredNvofFile in @(
     $NvofMemcSource,
     $NvofMemcPatch,
+    $RifeRuntimeHeader,
+    $RifeRuntimeSource,
+    $RifeRuntimeBuildScript,
+    $RifeModelPath,
+    (Join-Path $FrameInterpolationRuntimeDir "bin\cudart64_12.dll"),
+    (Join-Path $FrameInterpolationRuntimeDir ".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_rtx_1_4.dll"),
     (Join-Path $NvofApiIncludeDir "nvOpticalFlowCommon.h"),
     (Join-Path $NvofApiIncludeDir "nvOpticalFlowD3D11.h")
 )) {
@@ -113,6 +134,23 @@ try {
         Copy-Item -LiteralPath $NvofMemcSource -Destination $NvofMemcDestination
         $NvofMemcSourceCreated = $true
     }
+
+    if (Test-Path -LiteralPath $RifeRuntimeHeaderDestination) {
+        $HeaderHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RifeRuntimeHeader).Hash
+        $DestinationHeaderHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RifeRuntimeHeaderDestination).Hash
+        if ($HeaderHash -ne $DestinationHeaderHash) {
+            throw "Existing mpv RIFE runtime header differs from the pinned source: $RifeRuntimeHeaderDestination"
+        }
+    } else {
+        Copy-Item -LiteralPath $RifeRuntimeHeader -Destination $RifeRuntimeHeaderDestination
+        $RifeRuntimeHeaderCreated = $true
+    }
+
+& $RifeRuntimeBuildScript -RuntimeDir $FrameInterpolationRuntimeDir `
+    -OutputDir $RifeRuntimeBuildDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build the RIFE runtime bridge"
+}
 
 Write-Host "=== Building mpv from submodule ===" -ForegroundColor Cyan
 Write-Host "MSYS2: $MsysPath ($MsysEnv)"
@@ -238,6 +276,91 @@ foreach ($pkg in @("libavcodec", "libavutil")) {
 # Copy DLL
 Write-Host "Copying libmpv-2.dll..."
 Copy-Item $BuiltDll $LibDir
+
+Write-Host "Copying RIFE/TensorRT/CUDA runtime DLLs..."
+Copy-Item (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") $LibDir
+Copy-Item (Join-Path $FrameInterpolationRuntimeDir "bin\cudart64_12.dll") $LibDir
+Copy-Item (Join-Path $FrameInterpolationRuntimeDir ".tensorrt\TensorRT-RTX-$RifeTensorRtVersion\bin\tensorrt_rtx_1_4.dll") $LibDir
+
+function Get-LowerSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-TextSha256 {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        ([System.BitConverter]::ToString($Hasher.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $Hasher.Dispose()
+    }
+}
+
+Write-Host "Staging keyed RIFE engine cache..."
+$GpuOutput = @(& nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader,nounits 2>&1)
+$GpuExitCode = $LASTEXITCODE
+$GpuLine = $GpuOutput | Select-Object -First 1
+if ($GpuExitCode -ne 0 -or -not $GpuLine) {
+    $GpuDiagnostic = ($GpuOutput | Out-String).Trim()
+    throw "nvidia-smi could not provide the GPU identity for the RIFE engine cache (exit $GpuExitCode): $GpuDiagnostic"
+}
+$GpuFields = @($GpuLine.ToString().Split(',') | ForEach-Object { $_.Trim() })
+if ($GpuFields.Count -ne 3 -or
+    @($GpuFields | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+    throw "nvidia-smi returned an invalid GPU identity: $GpuLine"
+}
+$GpuName, $GpuUuid, $DriverVersion = $GpuFields
+$ModelSha256 = Get-LowerSha256 $RifeModelPath
+$EngineCacheDir = Join-Path $LibDir "frame-interpolation\engine-cache"
+New-Item -ItemType Directory -Path $EngineCacheDir -Force | Out-Null
+$EngineEntries = @()
+foreach ($Spec in $RifeEngineSpecs) {
+    $Width = $Spec.Width
+    $Height = $Spec.Height
+    $SourceDir = Join-Path $FrameInterpolationRuntimeDir (
+        "engines\poc-rife-v4_25-lite-impl1-${Width}x${Height}-scale1_0-fp16")
+    $Candidates = @(Get-ChildItem -LiteralPath $SourceDir -Filter "*.engine" -File -ErrorAction SilentlyContinue)
+    if ($Candidates.Count -ne 1) {
+        throw "Expected exactly one validated RIFE engine in $SourceDir, found $($Candidates.Count)"
+    }
+    $KeyMaterial = "gpu_uuid=$GpuUuid`ndriver=$DriverVersion`ntensorrt=$RifeTensorRtVersion`nmodel_sha256=$ModelSha256`nwidth=$Width`nheight=$Height`nscale=1.0`nprecision=fp16"
+    $EngineKey = Get-TextSha256 $KeyMaterial
+    $EngineFile = "$EngineKey.engine"
+    $Destination = Join-Path $EngineCacheDir $EngineFile
+    Copy-Item -LiteralPath $Candidates[0].FullName -Destination $Destination
+    $EngineEntries += [ordered]@{
+        width = $Width
+        height = $Height
+        scale = "1.0"
+        precision = "fp16"
+        engineKey = $EngineKey
+        file = $EngineFile
+        sha256 = Get-LowerSha256 $Destination
+    }
+}
+$EngineManifest = [ordered]@{
+    schema = 1
+    gpuName = $GpuName
+    gpuUuid = $GpuUuid
+    driverVersion = $DriverVersion
+    tensorRtVersion = $RifeTensorRtVersion
+    model = "RIFE v4.25 Lite"
+    modelSha256 = $ModelSha256
+    runtimeAbi = 1
+    runtimeDll = "rife_runtime.dll"
+    cudaRuntimeDll = "cudart64_12.dll"
+    tensorRtDll = "tensorrt_rtx_1_4.dll"
+    engines = $EngineEntries
+}
+$ManifestPath = Join-Path $LibDir "frame-interpolation\runtime-manifest.json"
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText(
+    $ManifestPath,
+    ($EngineManifest | ConvertTo-Json -Depth 6),
+    $Utf8NoBom)
+Write-Host "Staged $($EngineEntries.Count) keyed RIFE engines" -ForegroundColor Green
 
 # Generate MSVC import library
 Write-Host "Generating MSVC import library..."
@@ -412,6 +535,9 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
     Write-Host "  $($_.FullName.Substring($OutputDir.Length + 1))"
 }
 } finally {
+    if ($RifeRuntimeHeaderCreated -and (Test-Path -LiteralPath $RifeRuntimeHeaderDestination)) {
+        Remove-Item -LiteralPath $RifeRuntimeHeaderDestination -Force
+    }
     if ($NvofMemcSourceCreated -and (Test-Path -LiteralPath $NvofMemcDestination)) {
         Remove-Item -LiteralPath $NvofMemcDestination -Force
     }

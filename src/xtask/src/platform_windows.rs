@@ -25,6 +25,10 @@ pub fn stage_mpv(out: &Path, mpv_info: &mpv::Mpv, used_external: bool, _bin: &Pa
                 std::fs::copy(entry.path(), out.join(&name))?;
             }
         }
+        let frame_interpolation = lib_dir.join("frame-interpolation");
+        if frame_interpolation.exists() {
+            xfs::copy_dir_recursive(&frame_interpolation, &out.join("frame-interpolation"))?;
+        }
     }
     Ok(())
 }
@@ -42,6 +46,10 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
     }
     if let Some(dir) = &args.external_mpv {
         xfs::copy_glob(&dir.join("lib"), prefix, &["*.dll"])?;
+        let frame_interpolation = dir.join("lib").join("frame-interpolation");
+        if frame_interpolation.exists() {
+            xfs::copy_dir_recursive(&frame_interpolation, &prefix.join("frame-interpolation"))?;
+        }
     }
     Ok(prefix.to_path_buf())
 }

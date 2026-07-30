@@ -636,11 +636,13 @@ impl MediaStationRuntime {
                 && let Some(active) = state.active_interpolation.as_ref()
             {
                 log_debug(&format!(
-                    "NVOF MEMC frame interpolation started: media_id={} target_fps={} backend={} optical_flow_api={} hwdec={}",
+                    "RIFE frame interpolation started: media_id={} target_fps={} backend={} runtime={} model={} engine_key={} hwdec={}",
                     active.media_id,
                     active.plan.target_fps,
                     active.plan.backend,
-                    active.plan.optical_flow_api,
+                    active.plan.runtime_version,
+                    active.plan.model,
+                    active.plan.engine_key,
                     active.plan.hwdec,
                 ));
             }
@@ -2929,7 +2931,7 @@ fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> 
                     .map_or("frame_interpolation_runtime_unavailable", |failure| {
                         failure.code
                     }),
-                "The native NVOF MEMC frame interpolation components are unavailable",
+                "The native RIFE TensorRT-RTX frame interpolation components are unavailable",
             ));
         }
     }
@@ -2962,7 +2964,9 @@ fn frame_interpolation_status_payload() -> Value {
         "gpuName": report.gpu_name,
         "gpuUuid": report.gpu_uuid,
         "driverVersion": report.driver_version,
-        "opticalFlowApi": report.optical_flow_api,
+        "runtimeVersion": report.runtime_version,
+        "model": report.model,
+        "engineCount": report.engine_count,
         "backend": report.backend,
         "filter": report.filter,
         "failureCode": report.failure.as_ref().map(|failure| failure.code),
@@ -3600,7 +3604,7 @@ fn execute_load(
     if let Some(plan) = &interpolation {
         let display_fps = jfn_playback::ingest_driver::jfn_playback_display_hz();
         log_debug(&format!(
-            "NVOF MEMC frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} display_fps={} backend={} optical_flow_api={} hwdec={} filter={}",
+            "RIFE frame interpolation planned: media_id={} mode={} source_fps={}/{} target_fps={} display_fps={} backend={} runtime={} model={} engine_key={} scale={} precision={} hwdec={} filter={}",
             request.media_id,
             plan.mode.as_str(),
             plan.source_fps_num,
@@ -3608,7 +3612,11 @@ fn execute_load(
             plan.target_fps,
             display_fps,
             plan.backend,
-            plan.optical_flow_api,
+            plan.runtime_version,
+            plan.model,
+            plan.engine_key,
+            plan.scale,
+            plan.precision,
             plan.hwdec,
             plan.video_filter,
         ));
@@ -3617,7 +3625,7 @@ fn execute_load(
         let cadence_error = (display_fps - cadence_target).abs();
         if cadence_error > 0.5 {
             log_warn(&format!(
-                "NVOF MEMC display cadence mismatch: display_fps={display_fps:.3} target_fps={:.3} nearest_multiple={cadence_multiple:.0} expected_display_fps={cadence_target:.3} error_hz={cadence_error:.3}; fixed-refresh presentation can judder when VRR is inactive",
+                "RIFE display cadence mismatch: display_fps={display_fps:.3} target_fps={:.3} nearest_multiple={cadence_multiple:.0} expected_display_fps={cadence_target:.3} error_hz={cadence_error:.3}; fixed-refresh presentation can judder when VRR is inactive",
                 plan.target_fps,
             ));
         }
@@ -3783,7 +3791,13 @@ fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
         "targetFps": plan.target_fps,
         "hwdec": plan.hwdec,
         "backend": plan.backend,
-        "opticalFlowApi": plan.optical_flow_api,
+        "runtimeVersion": plan.runtime_version,
+        "model": plan.model,
+        "modelSha256": plan.model_sha256,
+        "engineKey": plan.engine_key,
+        "enginePath": plan.engine_path,
+        "scale": plan.scale,
+        "precision": plan.precision,
         "videoFilter": plan.video_filter,
     })
 }

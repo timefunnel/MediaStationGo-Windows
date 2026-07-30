@@ -576,20 +576,22 @@ pub fn jfn_app_main() -> c_int {
         if report.ready {
             tracing::info!(
                 target: "Main",
-                "NVOF MEMC frame interpolation ready: gpu={} driver={} optical_flow_api={} backend={} filter={}",
+                "RIFE frame interpolation ready: gpu={} driver={} runtime={} model={} engines={} backend={} filter={}",
                 report.gpu_name.as_deref().unwrap_or("unknown"),
                 report.driver_version.as_deref().unwrap_or("unknown"),
                 report
-                    .optical_flow_api
+                    .runtime_version
                     .as_deref()
                     .unwrap_or("unknown"),
+                report.model.as_deref().unwrap_or("unknown"),
+                report.engine_count,
                 report.backend.unwrap_or("unknown"),
                 report.filter.unwrap_or("unknown"),
             );
         } else if let Some(error) = &report.failure {
             tracing::warn!(
                 target: "Main",
-                "NVOF MEMC frame interpolation unavailable: code={} detail={}",
+                "RIFE frame interpolation unavailable: code={} detail={}",
                 error.code,
                 error.detail,
             );

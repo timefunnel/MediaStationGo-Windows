@@ -25,8 +25,17 @@
 #include "video/mp_image.h"
 
 #include "nvOpticalFlowD3D11.h"
+#include "rife_runtime.h"
 
 struct opts {
+    bool rife;
+    char *rife_runtime_dll;
+    char *rife_engine;
+    char *rife_cudart;
+    int rife_scene_sample_stride;
+    int rife_scene_pixel_threshold;
+    double rife_scene_average_threshold;
+    double rife_scene_changed_ratio;
     bool stage1_passthrough;
     bool stage2_timing_test;
     bool stage3_nvof_test;
@@ -356,6 +365,33 @@ struct nvof_state {
     struct gpu_profile_stats gpu_profile[GPU_PROFILE_STAGE_COUNT];
 };
 
+typedef uint32_t (__cdecl *rife_abi_version_fn)(void);
+typedef struct rife_runtime *(__cdecl *rife_create_fn)(
+    const struct rife_runtime_config *, char *, size_t);
+typedef int (__cdecl *rife_process_fn)(
+    struct rife_runtime *, ID3D11Texture2D *, uint32_t,
+    ID3D11Texture2D *, uint32_t, ID3D11Texture2D *, uint32_t,
+    int *, char *, size_t);
+typedef void (__cdecl *rife_reset_fn)(struct rife_runtime *);
+typedef int (__cdecl *rife_get_stats_fn)(
+    const struct rife_runtime *, struct rife_runtime_stats *);
+typedef void (__cdecl *rife_destroy_fn)(struct rife_runtime *);
+
+struct rife_state {
+    HMODULE module;
+    rife_abi_version_fn abi_version;
+    rife_create_fn create;
+    rife_process_fn process;
+    rife_reset_fn reset;
+    rife_get_stats_fn get_stats;
+    rife_destroy_fn destroy;
+    struct rife_runtime *runtime;
+    int width;
+    int height;
+    int color_matrix;
+    int limited_range;
+};
+
 struct priv {
     struct opts *opts;
     AVBufferRef *av_device_ref;
@@ -364,6 +400,7 @@ struct priv {
     ID3D10Multithread *multithread;
     struct texture_pool *pool;
     struct nvof_state nvof;
+    struct rife_state rife;
     struct mp_image_params input_params;
     struct mp_image *frame0;
     struct mp_image *frame1;
@@ -390,16 +427,21 @@ struct priv {
     bool pool_logged;
 };
 
-static bool synthesis_enabled(const struct priv *p)
+static bool nvof_synthesis_enabled(const struct priv *p)
 {
     return p->opts->stage4_synthesis_test ||
            p->opts->stage5_flow_infill_test ||
            p->opts->stage6_robust_test;
 }
 
+static bool synthesis_enabled(const struct priv *p)
+{
+    return p->opts->rife || nvof_synthesis_enabled(p);
+}
+
 static bool nvof_analysis_enabled(const struct priv *p)
 {
-    return p->opts->stage3_nvof_test || synthesis_enabled(p);
+    return p->opts->stage3_nvof_test || nvof_synthesis_enabled(p);
 }
 
 static void lock_d3d11_context(struct priv *p)
@@ -412,6 +454,227 @@ static void unlock_d3d11_context(struct priv *p)
 {
     mp_assert(p->multithread);
     ID3D10Multithread_Leave(p->multithread);
+}
+
+static wchar_t *utf8_to_wide(void *parent, const char *value)
+{
+    if (!value || !value[0])
+        return NULL;
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                    value, -1, NULL, 0);
+    if (count <= 0)
+        return NULL;
+    wchar_t *wide = talloc_array(parent, wchar_t, count);
+    if (!wide)
+        return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                             value, -1, wide, count)) {
+        talloc_free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static bool absolute_windows_path(const wchar_t *path)
+{
+    return path && ((path[0] && path[1] == L':' &&
+                     (path[2] == L'\\' || path[2] == L'/')) ||
+                    (path[0] == L'\\' && path[1] == L'\\'));
+}
+
+static void destroy_rife_session(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->rife.runtime)
+        return;
+    struct rife_runtime_stats stats = {0};
+    if (p->rife.get_stats &&
+        p->rife.get_stats(p->rife.runtime, &stats) == RIFE_RUNTIME_OK) {
+        MP_INFO(f, "RIFE runtime summary pairs=%llu inferred=%llu "
+                   "scene-cuts=%llu failures=%llu inference-average-ms=%.3f "
+                   "inference-p95-ms=%.3f inference-max-ms=%.3f "
+                   "scene-average-ms=%.3f scene-max-ms=%.3f\n",
+                (unsigned long long)stats.pairs,
+                (unsigned long long)stats.inferred_pairs,
+                (unsigned long long)stats.scene_cuts,
+                (unsigned long long)stats.failures,
+                stats.inferred_pairs
+                    ? stats.inference_total_ms / stats.inferred_pairs : 0,
+                stats.inference_p95_ms, stats.inference_max_ms,
+                stats.pairs ? stats.scene_total_ms / stats.pairs : 0,
+                stats.scene_max_ms);
+    }
+    p->rife.destroy(p->rife.runtime);
+    p->rife.runtime = NULL;
+    p->rife.width = 0;
+    p->rife.height = 0;
+    p->rife.color_matrix = 0;
+    p->rife.limited_range = 0;
+}
+
+static void destroy_rife_bridge(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    destroy_rife_session(f);
+    if (p->rife.module)
+        FreeLibrary(p->rife.module);
+    p->rife = (struct rife_state){0};
+}
+
+static bool load_rife_symbol(struct mp_filter *f, const char *name,
+                             FARPROC *address)
+{
+    struct priv *p = f->priv;
+    *address = GetProcAddress(p->rife.module, name);
+    if (*address)
+        return true;
+    MP_ERR(f, "RIFE runtime export is missing name=%s win32=%lu\n",
+           name, GetLastError());
+    return false;
+}
+
+static bool load_rife_bridge(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    wchar_t *runtime_path = utf8_to_wide(f, p->opts->rife_runtime_dll);
+    wchar_t *engine_path = utf8_to_wide(f, p->opts->rife_engine);
+    wchar_t *cudart_path = utf8_to_wide(f, p->opts->rife_cudart);
+    if (!runtime_path || !engine_path || !cudart_path ||
+        !absolute_windows_path(runtime_path) ||
+        !absolute_windows_path(engine_path) ||
+        !absolute_windows_path(cudart_path)) {
+        MP_ERR(f, "RIFE requires absolute UTF-8 paths for runtime DLL, "
+                  "TensorRT engine, and CUDA Runtime\n");
+        talloc_free(runtime_path);
+        talloc_free(engine_path);
+        talloc_free(cudart_path);
+        return false;
+    }
+    p->rife.module = LoadLibraryExW(
+        runtime_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    talloc_free(runtime_path);
+    talloc_free(engine_path);
+    talloc_free(cudart_path);
+    if (!p->rife.module) {
+        MP_ERR(f, "RIFE runtime DLL could not be loaded win32=%lu\n",
+               GetLastError());
+        return false;
+    }
+    if (!load_rife_symbol(f, "rife_runtime_abi_version",
+                          (FARPROC *)&p->rife.abi_version) ||
+        !load_rife_symbol(f, "rife_runtime_create",
+                          (FARPROC *)&p->rife.create) ||
+        !load_rife_symbol(f, "rife_runtime_process",
+                          (FARPROC *)&p->rife.process) ||
+        !load_rife_symbol(f, "rife_runtime_reset",
+                          (FARPROC *)&p->rife.reset) ||
+        !load_rife_symbol(f, "rife_runtime_get_stats",
+                          (FARPROC *)&p->rife.get_stats) ||
+        !load_rife_symbol(f, "rife_runtime_destroy",
+                          (FARPROC *)&p->rife.destroy)) {
+        destroy_rife_bridge(f);
+        return false;
+    }
+    uint32_t abi = p->rife.abi_version();
+    if (abi != RIFE_RUNTIME_ABI_VERSION) {
+        MP_ERR(f, "RIFE runtime ABI mismatch expected=%u actual=%u\n",
+               RIFE_RUNTIME_ABI_VERSION, abi);
+        destroy_rife_bridge(f);
+        return false;
+    }
+    MP_INFO(f, "RIFE runtime bridge loaded ABI=%u\n", abi);
+    return true;
+}
+
+static bool rife_color_config(struct mp_filter *f, struct mp_image *frame,
+                              int *matrix, int *limited_range)
+{
+    switch (frame->params.repr.sys) {
+    case PL_COLOR_SYSTEM_BT_601:
+        *matrix = RIFE_COLOR_MATRIX_BT601;
+        break;
+    case PL_COLOR_SYSTEM_BT_709:
+        *matrix = RIFE_COLOR_MATRIX_BT709;
+        break;
+    case PL_COLOR_SYSTEM_BT_2020_NC:
+    case PL_COLOR_SYSTEM_BT_2100_PQ:
+        *matrix = RIFE_COLOR_MATRIX_BT2020_NCL;
+        break;
+    default:
+        MP_ERR(f, "RIFE does not support decoded color matrix=%d\n",
+               frame->params.repr.sys);
+        return false;
+    }
+    if (frame->params.repr.levels == PL_COLOR_LEVELS_LIMITED) {
+        *limited_range = 1;
+    } else if (frame->params.repr.levels == PL_COLOR_LEVELS_FULL) {
+        *limited_range = 0;
+    } else {
+        MP_ERR(f, "RIFE requires explicit limited or full color range, "
+                  "received=%d\n", frame->params.repr.levels);
+        return false;
+    }
+    return true;
+}
+
+static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
+{
+    struct priv *p = f->priv;
+    int matrix = 0;
+    int limited_range = 0;
+    if (!rife_color_config(f, frame, &matrix, &limited_range))
+        return false;
+    if (p->rife.runtime && p->rife.width == frame->w &&
+        p->rife.height == frame->h && p->rife.color_matrix == matrix &&
+        p->rife.limited_range == limited_range)
+        return true;
+    destroy_rife_session(f);
+
+    wchar_t *engine_path = utf8_to_wide(f, p->opts->rife_engine);
+    wchar_t *cudart_path = utf8_to_wide(f, p->opts->rife_cudart);
+    if (!engine_path || !cudart_path) {
+        MP_ERR(f, "RIFE engine or CUDA Runtime path is not valid UTF-8\n");
+        talloc_free(engine_path);
+        talloc_free(cudart_path);
+        return false;
+    }
+    struct rife_runtime_config config = {
+        .abi_version = RIFE_RUNTIME_ABI_VERSION,
+        .device = p->device,
+        .context = p->context,
+        .engine_path = engine_path,
+        .cuda_runtime_path = cudart_path,
+        .source_width = frame->w,
+        .source_height = frame->h,
+        .color_matrix = matrix,
+        .limited_range = limited_range,
+        .scene_sample_stride = p->opts->rife_scene_sample_stride,
+        .scene_pixel_threshold = p->opts->rife_scene_pixel_threshold,
+        .scene_average_threshold = p->opts->rife_scene_average_threshold,
+        .scene_changed_ratio = p->opts->rife_scene_changed_ratio,
+    };
+    char error[1024] = {0};
+    MP_VERBOSE(f, "RIFE runtime create begin source=%dx%d matrix=%d "
+                  "range=%s\n", frame->w, frame->h, matrix,
+               limited_range ? "limited" : "full");
+    p->rife.runtime = p->rife.create(&config, error, sizeof(error));
+    talloc_free(engine_path);
+    talloc_free(cudart_path);
+    if (!p->rife.runtime) {
+        MP_ERR(f, "RIFE runtime initialization failed detail=%s\n",
+               error[0] ? error : "unknown");
+        return false;
+    }
+    p->rife.width = frame->w;
+    p->rife.height = frame->h;
+    p->rife.color_matrix = matrix;
+    p->rife.limited_range = limited_range;
+    MP_INFO(f, "RIFE runtime initialized source=%dx%d format=P010 "
+               "matrix=%d range=%s model=v4.25-lite implementation=1 "
+               "backend=TensorRT-RTX FP16 strict-x2\n",
+            frame->w, frame->h, matrix,
+            limited_range ? "limited" : "full");
+    return true;
 }
 
 static void format_shader_number(char *buffer, size_t size, double value)
@@ -482,7 +745,8 @@ static bool create_gpu_profile_queries(struct mp_filter *f)
                     p->device, &timestamp_desc, &query->end);
             }
             if (FAILED(hr)) {
-                MP_ERR(f, "NVOF GPU timestamp query creation failed "
+                MP_ERR(f, "Frame interpolation GPU timestamp query creation "
+                          "failed "
                           "stage=%s slot=%d hr=0x%08lx\n",
                        gpu_profile_stage_name(stage), index,
                        (unsigned long)hr);
@@ -491,7 +755,7 @@ static bool create_gpu_profile_queries(struct mp_filter *f)
             }
         }
     }
-    MP_INFO(f, "NVOF asynchronous GPU timestamp queries ready "
+    MP_INFO(f, "Frame interpolation asynchronous GPU timestamp queries ready "
                "stages=%d ring-size=%d bucket-ms=%.2f\n",
             GPU_PROFILE_STAGE_COUNT, GPU_PROFILE_RING_SIZE,
             GPU_PROFILE_BUCKET_MS);
@@ -2792,12 +3056,11 @@ static bool load_nvof_api(struct mp_filter *f)
     return true;
 }
 
-static bool load_extract_luma_shader(struct mp_filter *f)
+static bool load_d3dcompiler_runtime(struct mp_filter *f)
 {
     struct priv *p = f->priv;
-    if (p->nvof.extract_luma_shader)
+    if (p->nvof.d3d_compile)
         return true;
-
     static const wchar_t *compiler_names[] = {
         L"d3dcompiler_47.dll",
         L"d3dcompiler_46.dll",
@@ -2809,15 +3072,26 @@ static bool load_extract_luma_shader(struct mp_filter *f)
             break;
     }
     if (!p->nvof.d3dcompiler_module) {
-        MP_ERR(f, "NVOF could not load a D3DCompiler runtime\n");
+        MP_ERR(f, "Frame interpolation could not load a D3DCompiler "
+                  "runtime\n");
         return false;
     }
     p->nvof.d3d_compile = (pD3DCompile)GetProcAddress(
         p->nvof.d3dcompiler_module, "D3DCompile");
     if (!p->nvof.d3d_compile) {
-        MP_ERR(f, "NVOF D3DCompile entry point is missing\n");
+        MP_ERR(f, "Frame interpolation D3DCompile entry point is missing\n");
         return false;
     }
+    return true;
+}
+
+static bool load_extract_luma_shader(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (p->nvof.extract_luma_shader)
+        return true;
+    if (!load_d3dcompiler_runtime(f))
+        return false;
 
     ID3DBlob *bytecode = NULL;
     ID3DBlob *errors = NULL;
@@ -2859,10 +3133,8 @@ static bool load_promote_nv12_shader(struct mp_filter *f)
     struct priv *p = f->priv;
     if (p->nvof.promote_nv12_shader)
         return true;
-    if (!p->nvof.d3d_compile) {
-        MP_ERR(f, "NVOF NV12 promotion requires the D3DCompiler runtime\n");
+    if (!load_d3dcompiler_runtime(f))
         return false;
-    }
 
     ID3DBlob *bytecode = NULL;
     ID3DBlob *errors = NULL;
@@ -3944,12 +4216,12 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
     bool resources_ok =
         create_nvof_resource(f, &p->nvof.gray[0], width, height,
                              DXGI_FORMAT_R8_UNORM, gray_bind,
-                             true, p->opts->flow_diagnostics ||
-                                   synthesis_enabled(p)) &&
+                              true, p->opts->flow_diagnostics ||
+                                    nvof_synthesis_enabled(p)) &&
         create_nvof_resource(f, &p->nvof.gray[1], width, height,
                              DXGI_FORMAT_R8_UNORM, gray_bind,
-                             true, p->opts->flow_diagnostics ||
-                                   synthesis_enabled(p)) &&
+                              true, p->opts->flow_diagnostics ||
+                                    nvof_synthesis_enabled(p)) &&
         create_nvof_resource(f, &p->nvof.flow_forward, width, height,
                              DXGI_FORMAT_R16G16_SINT,
                              D3D11_BIND_SHADER_RESOURCE,
@@ -4021,7 +4293,7 @@ static bool create_nvof_session(struct mp_filter *f, int width, int height)
             resources_ok = false;
         }
     }
-    bool scene_shaders_ok = resources_ok && (!synthesis_enabled(p) ||
+    bool scene_shaders_ok = resources_ok && (!nvof_synthesis_enabled(p) ||
         (p->opts->stage6_robust_test
             ? load_robust_scene_shaders(f)
             : load_scene_cut_shader(f)));
@@ -4432,7 +4704,7 @@ static bool read_robust_synthesis_summary(struct mp_filter *f)
 static bool read_scene_cut_summary(struct mp_filter *f)
 {
     struct priv *p = f->priv;
-    if (!synthesis_enabled(p))
+    if (!nvof_synthesis_enabled(p))
         return true;
     if (p->opts->stage6_robust_test)
         return read_robust_scene_summary(f) &&
@@ -4861,7 +5133,7 @@ static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
         !extract_luma(f, frame0, 0) || !extract_luma(f, frame1, 1))
         return false;
 
-    if (synthesis_enabled(p)) {
+    if (nvof_synthesis_enabled(p)) {
         bool scene_ok = p->opts->stage6_robust_test
             ? dispatch_robust_scene_analysis(f, frame0, frame1)
             : dispatch_scene_cut_analysis(f);
@@ -4871,7 +5143,7 @@ static bool execute_nvof_pair(struct mp_filter *f, struct mp_image *frame0,
 
     bool temporal_hints_reset = p->nvof.disable_temporal_hints_next;
     bool temporal_hints_disabled = temporal_hints_reset ||
-                                   synthesis_enabled(p);
+                                   nvof_synthesis_enabled(p);
     NV_OF_EXECUTE_INPUT_PARAMS input = {
         .inputFrame = p->nvof.gray[0].handle,
         .referenceFrame = p->nvof.gray[1].handle,
@@ -5111,8 +5383,9 @@ static bool validate_input(struct mp_filter *f, struct mp_image *img)
     }
     if (synthesis_enabled(p) &&
         img->params.chroma_location != PL_CHROMA_LEFT) {
-        MP_ERR(f, "NVOF MEMC synthesis supports only MPEG2/4/H.264 left "
+        MP_ERR(f, "Frame interpolation supports only MPEG2/4/H.264 left "
                    "chroma siting mode=%s received=%d\n",
+               p->opts->rife ? "rife" :
                p->opts->stage6_robust_test ? "stage6" :
                p->opts->stage5_flow_infill_test ? "stage5" : "stage4",
                img->params.chroma_location);
@@ -5224,7 +5497,8 @@ static struct texture_pool *create_texture_pool(struct mp_filter *f,
     ID3D11Device_AddRef(pool->device);
     pool->width = MP_ALIGN_UP(in->w, 2);
     pool->height = MP_ALIGN_UP(in->h, 2);
-    const char *mode = p->opts->stage6_robust_test
+    const char *mode = p->opts->rife ? "rife-tensorrt-rtx" :
+                       p->opts->stage6_robust_test
                      ? "robust-scene-test" :
                        p->opts->stage5_flow_infill_test
                      ? "flow-infill-test" :
@@ -5857,6 +6131,58 @@ static bool write_synthesized_frame(struct mp_filter *f,
     return true;
 }
 
+static bool write_rife_frame(struct mp_filter *f,
+                             struct mp_image *frame0,
+                             struct mp_image *frame1,
+                             double pts, double duration)
+{
+    struct priv *p = f->priv;
+    MP_VERBOSE(f, "RIFE midpoint begin pts=%.6f duration=%.6f\n",
+               pts, duration);
+    if (!ensure_rife_session(f, frame0)) {
+        fail_filter(f);
+        return false;
+    }
+    struct mp_image *out = allocate_output(f, frame0);
+    if (!out) {
+        MP_ERR(f, "RIFE could not allocate a private P010 output frame\n");
+        fail_filter(f);
+        return false;
+    }
+    char error[1024] = {0};
+    int scene_cut = 0;
+    lock_d3d11_context(p);
+    int status = p->rife.process(
+        p->rife.runtime,
+        (ID3D11Texture2D *)frame0->planes[0],
+        (uint32_t)(uintptr_t)frame0->planes[1],
+        (ID3D11Texture2D *)frame1->planes[0],
+        (uint32_t)(uintptr_t)frame1->planes[1],
+        (ID3D11Texture2D *)out->planes[0],
+        (uint32_t)(uintptr_t)out->planes[1],
+        &scene_cut, error, sizeof(error));
+    unlock_d3d11_context(p);
+    if (status != RIFE_RUNTIME_OK) {
+        MP_ERR(f, "RIFE midpoint inference failed status=%d detail=%s\n",
+               status, error[0] ? error : "unknown");
+        talloc_free(out);
+        fail_filter(f);
+        return false;
+    }
+    out->pts = pts;
+    out->dts = MP_NOPTS_VALUE;
+    out->pkt_duration = duration;
+    if (out->nominal_fps > 0)
+        out->nominal_fps *= 2;
+    p->synthesized_frames++;
+    if (scene_cut) {
+        p->scene_cut_midpoints++;
+        MP_VERBOSE(f, "RIFE hard cut detected midpoint-policy=copy-f0\n");
+    }
+    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
+    return true;
+}
+
 static void process_stage1(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -5960,11 +6286,16 @@ static bool emit_stage2_frame(struct mp_filter *f)
         if (phase == OUTPUT_INTERMEDIATE_TEST)
             pts += duration;
     }
-    bool wrote = phase == OUTPUT_INTERMEDIATE_TEST &&
-                  synthesis_enabled(p)
-               ? write_synthesized_frame(f, p->frame0, p->frame1,
-                                          pts, duration, NULL)
-               : write_copied_frame(f, source, pts, duration, true);
+    bool wrote;
+    if (phase == OUTPUT_INTERMEDIATE_TEST && p->opts->rife) {
+        wrote = write_rife_frame(f, p->frame0, p->frame1, pts, duration);
+    } else if (phase == OUTPUT_INTERMEDIATE_TEST &&
+               nvof_synthesis_enabled(p)) {
+        wrote = write_synthesized_frame(f, p->frame0, p->frame1,
+                                        pts, duration, NULL);
+    } else {
+        wrote = write_copied_frame(f, source, pts, duration, true);
+    }
     if (!wrote)
         return false;
 
@@ -5981,6 +6312,8 @@ static bool emit_stage2_frame(struct mp_filter *f)
     } else if (phase == OUTPUT_FINAL) {
         p->original_frames++;
         mp_image_unrefp(&p->frame0);
+        p->frame0 = p->pending_frame;
+        p->pending_frame = NULL;
         p->output_phase = OUTPUT_NONE;
     } else {
         MP_ASSERT_UNREACHABLE();
@@ -6037,12 +6370,13 @@ static void process_stage2(struct mp_filter *f)
         return;
     }
     p->input_frames++;
-    if (nvof_analysis_enabled(p)) {
+    if (nvof_analysis_enabled(p) || p->opts->rife) {
         struct mp_image *private_copy = copy_to_private_texture(f, in);
         talloc_free(in);
         if (!private_copy) {
-            MP_ERR(f, "NVOF could not copy input to a private P010 "
-                      "analysis texture mode=%s\n",
+            MP_ERR(f, "Frame interpolation could not copy input to a "
+                      "private P010 texture mode=%s\n",
+                   p->opts->rife ? "rife" :
                    p->opts->stage6_robust_test ? "stage6" :
                    p->opts->stage5_flow_infill_test ? "stage5" :
                    p->opts->stage4_synthesis_test ? "stage4" : "stage3");
@@ -6053,6 +6387,8 @@ static void process_stage2(struct mp_filter *f)
     }
     if (!p->frame0) {
         p->frame0 = in;
+        MP_VERBOSE(f, "RIFE buffered first private P010 frame pts=%.6f\n",
+                   in->pts);
         mp_pin_out_request_data(f->ppins[0]);
         return;
     }
@@ -6060,9 +6396,11 @@ static void process_stage2(struct mp_filter *f)
     double duration = 0;
     if (!valid_pair(f, p->frame0, in, &duration)) {
         p->nvof.disable_temporal_hints_next = true;
-        mp_image_unrefp(&p->frame0);
-        p->frame0 = in;
-        mp_pin_out_request_data(f->ppins[0]);
+        if (p->opts->rife)
+            destroy_rife_session(f);
+        p->pending_frame = in;
+        p->output_phase = OUTPUT_FINAL;
+        emit_stage2_frame(f);
         return;
     }
     if (nvof_analysis_enabled(p) &&
@@ -6074,6 +6412,9 @@ static void process_stage2(struct mp_filter *f)
     p->frame1 = in;
     p->pair_duration = duration;
     p->output_phase = OUTPUT_ORIGINAL;
+    if (p->opts->rife)
+        MP_VERBOSE(f, "RIFE pair ready delta=%.6f; emitting original\n",
+                   duration);
     emit_stage2_frame(f);
 }
 
@@ -6312,7 +6653,8 @@ static void process(struct mp_filter *f)
     struct priv *p = f->priv;
     if (p->opts->stage6_robust_test)
         process_stage6(f);
-    else if (p->opts->stage2_timing_test || nvof_analysis_enabled(p))
+    else if (p->opts->rife || p->opts->stage2_timing_test ||
+             nvof_analysis_enabled(p))
         process_stage2(f);
     else
         process_stage1(f);
@@ -6322,8 +6664,11 @@ static void reset_filter(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     clear_timing_state(p);
+    if (p->rife.runtime)
+        p->rife.reset(p->rife.runtime);
     p->resets++;
-    MP_VERBOSE(f, "NVOF MEMC reset count=%llu\n",
+    MP_VERBOSE(f, "Frame interpolation reset backend=%s count=%llu\n",
+               p->opts->rife ? "rife" : "nvof",
                (unsigned long long)p->resets);
 }
 
@@ -6332,15 +6677,18 @@ static void destroy(struct mp_filter *f)
     struct priv *p = f->priv;
     int pending_gpu_queries = drain_gpu_profile_queries(p);
     if (pending_gpu_queries) {
-        MP_WARN(f, "NVOF GPU timing drain left unresolved queries=%d\n",
+        MP_WARN(f, "Frame interpolation GPU timing drain left unresolved "
+                   "queries=%d\n",
                 pending_gpu_queries);
     }
     read_scene_cut_summary(f);
-    MP_INFO(f, "NVOF MEMC shutdown input-frames=%llu copied-frames=%llu "
+    MP_INFO(f, "Frame interpolation shutdown backend=%s "
+            "input-frames=%llu copied-frames=%llu "
             "promoted-frames=%llu "
             "original-frames=%llu intermediate-test-frames=%llu "
             "synthesized-frames=%llu scene-cut-midpoints=%llu "
             "discontinuities=%llu resets=%llu\n",
+            p->opts->rife ? "rife" : "nvof",
             (unsigned long long)p->input_frames,
             (unsigned long long)p->copied_frames,
             (unsigned long long)p->promoted_frames,
@@ -6609,11 +6957,13 @@ static void destroy(struct mp_filter *f)
                     (unsigned long long)p->nvof.scene_cuts);
         }
     }
-    if (p->opts->gpu_timing) {
+    if (p->opts->gpu_timing &&
+        (nvof_analysis_enabled(p) || p->opts->rife)) {
         for (int stage = 0; stage < GPU_PROFILE_STAGE_COUNT; stage++) {
             const struct gpu_profile_stats *stats =
                 &p->nvof.gpu_profile[stage];
-            MP_INFO(f, "NVOF GPU timing stage=%s samples=%llu skipped=%llu "
+            MP_INFO(f, "Frame interpolation GPU timing stage=%s "
+                       "samples=%llu skipped=%llu "
                        "invalid=%llu average-ms=%.3f p95-ms=%.3f "
                        "p99-ms=%.3f max-ms=%.3f\n",
                     gpu_profile_stage_name(stage),
@@ -6626,6 +6976,7 @@ static void destroy(struct mp_filter *f)
         }
     }
     clear_timing_state(p);
+    destroy_rife_bridge(f);
     pool_unref(p->pool);
     p->pool = NULL;
     destroy_nvof(f);
@@ -6661,15 +7012,17 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     p->opts = talloc_steal(p, options);
     p->previous_cache_slot = -1;
     p->central_cache_slot = -1;
-    int mode_count = p->opts->stage1_passthrough +
+    int mode_count = p->opts->rife +
+                     p->opts->stage1_passthrough +
                      p->opts->stage2_timing_test +
                      p->opts->stage3_nvof_test +
                      p->opts->stage4_synthesis_test +
                      p->opts->stage5_flow_infill_test +
                      p->opts->stage6_robust_test;
     if (mode_count != 1) {
-        MP_ERR(f, "NVOF MEMC requires exactly one validation mode: "
-                "stage1-passthrough=yes, stage2-timing-test=yes, or "
+        MP_ERR(f, "Frame interpolation requires exactly one mode: "
+                "rife=yes, stage1-passthrough=yes, "
+                "stage2-timing-test=yes, or "
                 "stage3-nvof-test=yes, stage4-synthesis-test=yes, or "
                 "stage5-flow-infill-test=yes, or "
                 "stage6-robust-test=yes\n");
@@ -6684,6 +7037,12 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     if (p->opts->stage2_timing_test) {
         MP_WARN(f, "NVOF MEMC stage 2 timing test repeats F0 for midpoint "
                    "frames; motion compensation is not active\n");
+    }
+    if (p->opts->rife) {
+        MP_WARN(f, "RIFE enables strict x2 P010 midpoint inference with "
+                   "TensorRT-RTX FP16; unsupported formats, missing runtime "
+                   "components, incompatible engines, and inference failures "
+                   "are fatal and never fall back to NVOF or passthrough\n");
     }
     if (p->opts->stage3_nvof_test) {
         MP_WARN(f, "NVOF MEMC stage 3 generates bidirectional flow and cost "
@@ -6738,7 +7097,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     struct mp_hwdec_ctx *hwctx = hwdec_devices_get_by_imgfmt_and_type(
         info->hwdec_devs, IMGFMT_D3D11, AV_HWDEVICE_TYPE_D3D11VA);
     if (!hwctx || !hwctx->av_device_ref) {
-        MP_ERR(f, "NVOF MEMC could not obtain mpv's D3D11 device\n");
+        MP_ERR(f, "Frame interpolation could not obtain mpv's D3D11 device\n");
         goto fail;
     }
 
@@ -6750,20 +7109,25 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     ID3D11Device_AddRef(p->device);
     ID3D11Device_GetImmediateContext(p->device, &p->context);
     if (!p->context) {
-        MP_ERR(f, "NVOF MEMC could not obtain the D3D11 immediate context\n");
+        MP_ERR(f, "Frame interpolation could not obtain the D3D11 "
+                  "immediate context\n");
         goto fail;
     }
     HRESULT hr = ID3D11Device_QueryInterface(
         p->device, &IID_ID3D10Multithread, (void **)&p->multithread);
     if (FAILED(hr) || !p->multithread) {
-        MP_ERR(f, "NVOF MEMC requires ID3D10Multithread for atomic D3D11 "
+        MP_ERR(f, "Frame interpolation requires ID3D10Multithread for "
+                  "atomic D3D11 "
                   "context command blocks hr=0x%08lx\n",
                (unsigned long)hr);
         goto fail;
     }
     ID3D10Multithread_SetMultithreadProtected(p->multithread, TRUE);
-    MP_INFO(f, "NVOF MEMC D3D11 context block locking enabled\n");
-    if (nvof_analysis_enabled(p) && !create_gpu_profile_queries(f))
+    MP_INFO(f, "Frame interpolation D3D11 context block locking enabled\n");
+    if (p->opts->rife && !load_rife_bridge(f))
+        goto fail;
+    if ((nvof_analysis_enabled(p) || p->opts->rife) &&
+        !create_gpu_profile_queries(f))
         goto fail;
     if (nvof_analysis_enabled(p) &&
         (!load_nvof_api(f) || !load_extract_luma_shader(f)))
@@ -6777,6 +7141,18 @@ fail:
 
 #define OPT_BASE_STRUCT struct opts
 static const m_option_t option_fields[] = {
+    {"rife", OPT_BOOL(rife)},
+    {"rife-runtime-dll", OPT_STRING(rife_runtime_dll), .flags = M_OPT_FILE},
+    {"rife-engine", OPT_STRING(rife_engine), .flags = M_OPT_FILE},
+    {"rife-cudart", OPT_STRING(rife_cudart), .flags = M_OPT_FILE},
+    {"rife-scene-sample-stride", OPT_INT(rife_scene_sample_stride),
+        M_RANGE(2, 64)},
+    {"rife-scene-pixel-threshold", OPT_INT(rife_scene_pixel_threshold),
+        M_RANGE(1, 1023)},
+    {"rife-scene-average-threshold", OPT_DOUBLE(rife_scene_average_threshold),
+        M_RANGE(0.001, 1023.0)},
+    {"rife-scene-changed-ratio", OPT_DOUBLE(rife_scene_changed_ratio),
+        M_RANGE(0.001, 1.0)},
     {"memc", OPT_BOOL(stage6_robust_test)},
     {"stage1-passthrough", OPT_BOOL(stage1_passthrough)},
     {"stage2-timing-test", OPT_BOOL(stage2_timing_test)},
@@ -6807,10 +7183,15 @@ static const m_option_t option_fields[] = {
 
 const struct mp_user_filter_entry vf_nvofmemc = {
     .desc = {
-        .description = "NVIDIA NVOF D3D11 P010 MEMC frame interpolation",
+        .description = "NVIDIA D3D11 P010 frame interpolation",
         .name = "nvofmemc",
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
+            .rife = false,
+            .rife_scene_sample_stride = 8,
+            .rife_scene_pixel_threshold = 160,
+            .rife_scene_average_threshold = 180.0,
+            .rife_scene_changed_ratio = 0.75,
             .stage1_passthrough = false,
             .stage2_timing_test = false,
             .stage3_nvof_test = false,
