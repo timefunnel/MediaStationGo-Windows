@@ -55,11 +55,15 @@
   </div>
 
   <section id="player-view" class="player-view hidden" aria-label="播放器">
+    <div id="player-loading" class="player-loading">
+      <span aria-hidden="true"></span>
+      <strong id="player-loading-title"></strong>
+      <p id="player-loading-label">正在准备播放</p>
+    </div>
     <div id="player-controls" class="player-controls visible">
       <div class="player-topline">
         <button id="player-exit" class="icon-button control-button" type="button" title="退出播放" aria-label="退出播放">&#8592;</button>
       </div>
-      <div id="player-loading" class="player-loading"><span></span><p id="player-loading-label">正在准备播放</p></div>
       <div id="player-feedback" class="player-feedback hidden" aria-hidden="true"><span></span></div>
       <div class="player-bottom">
         <div class="player-heading"><strong id="player-title"></strong><span id="player-subtitle"></span></div>
@@ -103,7 +107,7 @@
       </section>
       <section class="setting-block">
         <div class="setting-select-row">
-          <label for="frame-interpolation-mode">NVIDIA RTX RIFE 插帧</label>
+          <label for="frame-interpolation-mode">未单独设置影片的 RTX 插帧</label>
           <select id="frame-interpolation-mode">
             <option value="off">关闭</option>
             <option value="auto">自动</option>

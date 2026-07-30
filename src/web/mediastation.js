@@ -16,6 +16,7 @@
     const imagePending = new Map();
     const imageQueue = [];
     const libraryCache = new Map();
+    const frameInterpolationItemStatuses = new Map();
     const scrollMotions = new WeakMap();
     const history = [];
     const homeRefreshDelayMs = 1200;
@@ -344,6 +345,8 @@
             frame_interpolation_filter_invalid: 'RIFE 滤镜参数无效',
             frame_interpolation_hwdec_invalid: 'RTX 插帧硬件解码参数无效',
             frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
+            frame_interpolation_item_enabled_invalid: '影片插帧设置无效',
+            frame_interpolation_item_setting_invalid: '无法保存该影片的插帧设置',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -416,6 +419,7 @@
         imageCache.clear();
         imagePending.clear();
         libraryCache.clear();
+        frameInterpolationItemStatuses.clear();
         libraryPageObserver.disconnect();
         while (imageQueue.length) {
             imageQueue.shift().reject(new Error('账号状态已变化'));
@@ -756,11 +760,88 @@
                 15000,
             );
             updateFrameInterpolationStatus(status);
+            frameInterpolationItemStatuses.clear();
         } catch (error) {
             const label = byId('frame-interpolation-status');
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
         }
+    }
+
+    async function requestFrameInterpolationItemStatus(mediaId, refresh = false) {
+        if (!refresh && frameInterpolationItemStatuses.has(mediaId)) {
+            return frameInterpolationItemStatuses.get(mediaId);
+        }
+        const status = await nativeRequest(
+            'mediaStationFrameInterpolation',
+            'frame_interpolation_item_status',
+            ['frame_interpolation_item_status', mediaId],
+            15000,
+        );
+        frameInterpolationItemStatuses.set(mediaId, status);
+        return status;
+    }
+
+    function createDetailFrameInterpolationControl(card) {
+        const root = element('label', 'detail-interpolation-toggle');
+        const copy = element('span', 'detail-interpolation-copy');
+        copy.append(
+            element('strong', '', 'RTX 插帧'),
+            element('small', '', '正在读取设置'),
+        );
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.role = 'switch';
+        input.disabled = true;
+        input.setAttribute('aria-label', `为${card.title || '该影片'}启用 RTX 插帧`);
+        root.append(copy, input);
+        const statusText = copy.querySelector('small');
+
+        const applyStatus = (status) => {
+            if (!root.isConnected) return;
+            updateFrameInterpolationStatus(status);
+            input.checked = status.enabled === true;
+            input.disabled = status.componentStatus !== 'ready';
+            if (status.componentStatus !== 'ready') {
+                const error = new Error(status.failureDetail || 'RIFE 插帧组件不可用');
+                error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
+                statusText.textContent = friendlyError(error);
+            } else if (status.enabled) {
+                statusText.textContent = '已为本片开启';
+            } else {
+                statusText.textContent = '本片关闭';
+            }
+        };
+
+        requestFrameInterpolationItemStatus(card.id)
+            .then(applyStatus)
+            .catch((error) => {
+                if (!root.isConnected) return;
+                statusText.textContent = friendlyError(error);
+                input.disabled = true;
+            });
+
+        input.addEventListener('change', async () => {
+            const requested = input.checked;
+            input.disabled = true;
+            statusText.textContent = requested ? '正在开启' : '正在关闭';
+            try {
+                const status = await nativeRequest(
+                    'mediaStationFrameInterpolation',
+                    'frame_interpolation_set_item',
+                    ['frame_interpolation_set_item', card.id, requested],
+                    15000,
+                );
+                frameInterpolationItemStatuses.set(card.id, status);
+                applyStatus(status);
+            } catch (error) {
+                input.checked = !requested;
+                statusText.textContent = friendlyError(error);
+                input.disabled = frameInterpolationStatus?.componentStatus !== 'ready';
+                showToast(friendlyError(error));
+            }
+        });
+        return root;
     }
 
     function scheduleImageCacheStatsRefresh() {
@@ -1503,7 +1584,7 @@
                 : (playTarget.resumePositionMs ? `继续播放${position}` : '开始播放');
             play.append(element('span', '', '▶'), element('span', '', label));
             play.addEventListener('click', () => startPlayback(playTarget, playTarget.resumePositionMs));
-            actions.append(play);
+            actions.append(play, createDetailFrameInterpolationControl(playTarget));
             copy.append(actions);
         }
         if (card.genres?.length) {
@@ -1742,10 +1823,13 @@
             trackRefreshing: false,
             scrubbing: false,
             scrubPositionMs: null,
+            interpolationEnabled: frameInterpolationItemStatuses.get(card.id)?.enabled
+                ?? frameInterpolationMode !== 'off',
         };
         byId('player-title').textContent = cardTitle(card, true);
         byId('player-subtitle').textContent = card.type === 'Episode' ? episodePosition(card) : cardSubtitle(card);
-        setPlayerLoading(true, '正在准备播放');
+        byId('player-loading-title').textContent = cardTitle(card, true);
+        setPlayerLoading(true, player.interpolationEnabled ? '正在初始化 RTX 插帧' : '正在准备播放');
         updatePlayerProgress();
         playerPanel.classList.add('hidden');
         playerPanelTrigger = null;
@@ -1755,9 +1839,30 @@
         setPlayerMode(true);
         showPlayerControls();
         try {
+            await waitForPlayerPaint();
+            let interpolationStatus = frameInterpolationItemStatuses.get(card.id);
+            if (!interpolationStatus) {
+                try {
+                    interpolationStatus = await requestFrameInterpolationItemStatus(card.id);
+                    if (player?.card.id === card.id) {
+                        player.interpolationEnabled = interpolationStatus.enabled === true;
+                        setPlayerLoading(
+                            true,
+                            player.interpolationEnabled ? '正在初始化 RTX 插帧' : '正在准备播放',
+                        );
+                        await waitForPlayerPaint();
+                    }
+                } catch (error) {
+                    console.error(`读取影片插帧设置失败：${friendlyError(error)}`);
+                }
+            }
             const loadInfo = await nativeRequest('mediaStationLoad', 'load', [card.id, Math.max(0, Math.round(startMs || 0))], 60000);
             if (player?.card.id === card.id) {
                 player.loadInfo = loadInfo;
+                player.interpolationEnabled = Boolean(loadInfo.frameInterpolation);
+                if (!player.started && player.interpolationEnabled) {
+                    setPlayerLoading(true, '正在生成插帧首帧');
+                }
                 refreshPlayerTools();
             }
         } catch (error) {
@@ -1801,8 +1906,19 @@
                 break;
             case 'buffering':
                 player.buffering = event.buffering === true;
-                if (player.buffering) setPlayerLoading(true, player.started ? '正在缓冲' : '正在准备播放');
-                else setPlayerLoading(!player.started, '正在准备播放');
+                if (player.buffering) {
+                    setPlayerLoading(
+                        true,
+                        player.started
+                            ? '正在缓冲'
+                            : (player.interpolationEnabled ? '正在生成插帧首帧' : '正在准备播放'),
+                    );
+                } else {
+                    setPlayerLoading(
+                        !player.started,
+                        player.interpolationEnabled ? '正在生成插帧首帧' : '正在准备播放',
+                    );
+                }
                 break;
             case 'finished': case 'canceled':
                 finishPlayer(false);
@@ -1817,6 +1933,13 @@
     function setPlayerLoading(visible, label = '') {
         if (label) byId('player-loading-label').textContent = label;
         byId('player-loading').classList.toggle('hidden', !visible);
+        playerView.classList.toggle('preparing', visible && !player?.started);
+    }
+
+    function waitForPlayerPaint() {
+        return new Promise((resolve) => {
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        });
     }
 
     function updatePlayerProgress() {
@@ -2195,6 +2318,7 @@
         playerClickAt = 0;
         closePlayerPanel(false);
         player = null;
+        playerView.classList.remove('preparing');
         updatePlayerProgress();
         refreshPlayerTools();
         window.clearTimeout(controlsTimer);
@@ -2316,6 +2440,7 @@
                 15000,
             );
             updateFrameInterpolationStatus(status);
+            frameInterpolationItemStatuses.clear();
         } catch (error) {
             frameInterpolationSelect.value = frameInterpolationMode;
             showToast(friendlyError(error));
