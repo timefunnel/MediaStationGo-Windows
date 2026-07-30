@@ -68,7 +68,7 @@ enum output_phase {
 #define ROBUST_SCENE_STATE_COUNT 11
 #define ROBUST_SCENE_METRIC_COUNT 7
 #define ROBUST_SCENE_SUMMARY_COUNT 41
-#define ROBUST_SYNTHESIS_COUNTER_COUNT 13
+#define ROBUST_SYNTHESIS_COUNTER_COUNT 14
 #define ROBUST_TEMPORAL_CACHE_COUNT 2
 #define GPU_PROFILE_RING_SIZE 16
 #define GPU_PROFILE_BUCKET_COUNT 2001
@@ -131,6 +131,7 @@ enum robust_synthesis_counter {
     ROBUST_SYNTHESIS_OCCUPANCY0_COLLISION,
     ROBUST_SYNTHESIS_OCCUPANCY1_COLLISION,
     ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE,
+    ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE,
 };
 
 _Static_assert(ROBUST_SCENE_STATE_COUNT ==
@@ -144,7 +145,7 @@ _Static_assert(ROBUST_SCENE_SUMMARY_COUNT ==
                ROBUST_SCENE_CLASS_COUNT * ROBUST_SCENE_METRIC_COUNT,
                "robust scene summary layout changed");
 _Static_assert(ROBUST_SYNTHESIS_COUNTER_COUNT ==
-               ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE + 1,
+               ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE + 1,
                "robust synthesis summary layout changed");
 
 struct gpu_profile_query {
@@ -1617,18 +1618,108 @@ static const char synthesize_p010_shader_source[] =
     "    return value / 6.0;\n"
     "}\n"
     "\n"
+    "float edge_luma_weight(float center, float sample)\n"
+    "{\n"
+    "    float delta = abs(center - sample) * 255.0;\n"
+    "    return 0.08 + 0.92 * exp2(-0.22 * delta);\n"
+    "}\n"
+    "\n"
+    "float edge_vector_score(float2 candidate, float candidate_weight,\n"
+    "                        float2 center, float2 left, float2 right,\n"
+    "                        float2 top, float2 bottom,\n"
+    "                        float center_weight, float left_weight,\n"
+    "                        float right_weight, float top_weight,\n"
+    "                        float bottom_weight)\n"
+    "{\n"
+    "    float total_weight = center_weight + left_weight + right_weight +\n"
+    "                         top_weight + bottom_weight;\n"
+    "    float distance_score =\n"
+    "        center_weight * length(candidate - center) +\n"
+    "        left_weight * length(candidate - left) +\n"
+    "        right_weight * length(candidate - right) +\n"
+    "        top_weight * length(candidate - top) +\n"
+    "        bottom_weight * length(candidate - bottom);\n"
+    "    float boundary_penalty = (1.0 - candidate_weight) *\n"
+    "        (3.0 + 0.20 * length(candidate - center));\n"
+    "    return distance_score / max(total_weight, 0.001) +\n"
+    "           boundary_penalty;\n"
+    "}\n"
+    "\n"
+    "float2 edge_vector_flow(Texture2D<int2> flow, Texture2D<float> luma,\n"
+    "                        float2 p, uint w, uint h)\n"
+    "{\n"
+    "    float2 center_p = clamp_luma(p, w, h);\n"
+    "    float2 left_p = clamp_luma(p + float2(-2.0, 0.0), w, h);\n"
+    "    float2 right_p = clamp_luma(p + float2(2.0, 0.0), w, h);\n"
+    "    float2 top_p = clamp_luma(p + float2(0.0, -2.0), w, h);\n"
+    "    float2 bottom_p = clamp_luma(p + float2(0.0, 2.0), w, h);\n"
+    "    float2 center = sample_raw_flow(flow, center_p, w, h);\n"
+    "    float2 left = sample_raw_flow(flow, left_p, w, h);\n"
+    "    float2 right = sample_raw_flow(flow, right_p, w, h);\n"
+    "    float2 top = sample_raw_flow(flow, top_p, w, h);\n"
+    "    float2 bottom = sample_raw_flow(flow, bottom_p, w, h);\n"
+    "    float center_luma = sample_y(luma, center_p, w, h);\n"
+    "    float center_weight = 1.0;\n"
+    "    float left_weight = edge_luma_weight(\n"
+    "        center_luma, sample_y(luma, left_p, w, h));\n"
+    "    float right_weight = edge_luma_weight(\n"
+    "        center_luma, sample_y(luma, right_p, w, h));\n"
+    "    float top_weight = edge_luma_weight(\n"
+    "        center_luma, sample_y(luma, top_p, w, h));\n"
+    "    float bottom_weight = edge_luma_weight(\n"
+    "        center_luma, sample_y(luma, bottom_p, w, h));\n"
+    "    float2 best = center;\n"
+    "    float best_score = edge_vector_score(\n"
+    "        center, center_weight, center, left, right, top, bottom,\n"
+    "        center_weight, left_weight, right_weight, top_weight,\n"
+    "        bottom_weight);\n"
+    "    float candidate_score = edge_vector_score(\n"
+    "        left, left_weight, center, left, right, top, bottom,\n"
+    "        center_weight, left_weight, right_weight, top_weight,\n"
+    "        bottom_weight);\n"
+    "    if (candidate_score < best_score) {\n"
+    "        best = left;\n"
+    "        best_score = candidate_score;\n"
+    "    }\n"
+    "    candidate_score = edge_vector_score(\n"
+    "        right, right_weight, center, left, right, top, bottom,\n"
+    "        center_weight, left_weight, right_weight, top_weight,\n"
+    "        bottom_weight);\n"
+    "    if (candidate_score < best_score) {\n"
+    "        best = right;\n"
+    "        best_score = candidate_score;\n"
+    "    }\n"
+    "    candidate_score = edge_vector_score(\n"
+    "        top, top_weight, center, left, right, top, bottom,\n"
+    "        center_weight, left_weight, right_weight, top_weight,\n"
+    "        bottom_weight);\n"
+    "    if (candidate_score < best_score) {\n"
+    "        best = top;\n"
+    "        best_score = candidate_score;\n"
+    "    }\n"
+    "    candidate_score = edge_vector_score(\n"
+    "        bottom, bottom_weight, center, left, right, top, bottom,\n"
+    "        center_weight, left_weight, right_weight, top_weight,\n"
+    "        bottom_weight);\n"
+    "    if (candidate_score < best_score)\n"
+    "        best = bottom;\n"
+    "    return best;\n"
+    "}\n"
+    "\n"
     "float2 candidate_flow0(float2 p, uint candidate, uint w, uint h)\n"
     "{\n"
     "    return candidate == 0 ? sample_raw_flow(flow0, p, w, h) :\n"
     "           candidate == 1 ? median_flow(flow0, p, w, h) :\n"
-    "                            block_flow(flow0, p, w, h);\n"
+    "           candidate == 2 ? block_flow(flow0, p, w, h) :\n"
+    "                            edge_vector_flow(flow0, y0, p, w, h);\n"
     "}\n"
     "\n"
     "float2 candidate_flow1(float2 p, uint candidate, uint w, uint h)\n"
     "{\n"
     "    return candidate == 0 ? sample_raw_flow(flow1, p, w, h) :\n"
     "           candidate == 1 ? median_flow(flow1, p, w, h) :\n"
-    "                            block_flow(flow1, p, w, h);\n"
+    "           candidate == 2 ? block_flow(flow1, p, w, h) :\n"
+    "                            edge_vector_flow(flow1, y1, p, w, h);\n"
     "}\n"
     "\n"
     "bool temporal_scene_is_normal(StructuredBuffer<uint> state)\n"
@@ -1846,8 +1937,10 @@ static const char synthesize_p010_shader_source[] =
     "    float support = 0.0;\n"
     "    result.source = solve_temporal_candidate0(\n"
     "        target, w, h, support);\n"
-    "    result.score = robust_candidate_score0(\n"
-    "        target, result.source, w, h) * support;\n"
+    "    float base_score = robust_candidate_score0(\n"
+    "        target, result.source, w, h);\n"
+    "    result.score = support >= 0.35\n"
+    "        ? base_score * (0.70 + 0.30 * support) : 0.0;\n"
     "    result.id = 3;\n"
     "    return result;\n"
     "}\n"
@@ -1859,16 +1952,20 @@ static const char synthesize_p010_shader_source[] =
     "    float support = 0.0;\n"
     "    result.source = solve_temporal_candidate1(\n"
     "        target, w, h, support);\n"
-    "    result.score = robust_candidate_score1(\n"
-    "        target, result.source, w, h) * support;\n"
+    "    float base_score = robust_candidate_score1(\n"
+    "        target, result.source, w, h);\n"
+    "    result.score = support >= 0.35\n"
+    "        ? base_score * (0.70 + 0.30 * support) : 0.0;\n"
     "    result.id = 3;\n"
     "    return result;\n"
     "}\n"
     "\n"
-    "RobustCandidate better_candidate(RobustCandidate current,\n"
-    "                                 RobustCandidate candidate)\n"
+    "RobustCandidate better_spatial_candidate(RobustCandidate current,\n"
+    "                                         RobustCandidate candidate,\n"
+    "                                         float ratio, float margin)\n"
     "{\n"
-    "    if (candidate.score > current.score + 0.00001)\n"
+    "    float required = current.score * ratio + margin;\n"
+    "    if (candidate.score > required)\n"
     "        return candidate;\n"
     "    return current;\n"
     "}\n"
@@ -1893,17 +1990,21 @@ static const char synthesize_p010_shader_source[] =
     "{\n"
     "    RobustSelection selection;\n"
     "    selection.side0 = evaluate_candidate0(target, 0, w, h);\n"
-    "    selection.side0 = better_candidate(selection.side0,\n"
-    "        evaluate_candidate0(target, 1, w, h));\n"
-    "    selection.side0 = better_candidate(selection.side0,\n"
-    "        evaluate_candidate0(target, 2, w, h));\n"
+    "    selection.side0 = better_spatial_candidate(selection.side0,\n"
+    "        evaluate_candidate0(target, 1, w, h), 1.02, 0.002);\n"
+    "    selection.side0 = better_spatial_candidate(selection.side0,\n"
+    "        evaluate_candidate0(target, 2, w, h), 1.02, 0.002);\n"
+    "    selection.side0 = better_spatial_candidate(selection.side0,\n"
+    "        evaluate_candidate0(target, 4, w, h), 1.03, 0.004);\n"
     "    selection.side0 = better_temporal_candidate(selection.side0,\n"
     "        evaluate_temporal_candidate0(target, w, h));\n"
     "    selection.side1 = evaluate_candidate1(target, 0, w, h);\n"
-    "    selection.side1 = better_candidate(selection.side1,\n"
-    "        evaluate_candidate1(target, 1, w, h));\n"
-    "    selection.side1 = better_candidate(selection.side1,\n"
-    "        evaluate_candidate1(target, 2, w, h));\n"
+    "    selection.side1 = better_spatial_candidate(selection.side1,\n"
+    "        evaluate_candidate1(target, 1, w, h), 1.02, 0.002);\n"
+    "    selection.side1 = better_spatial_candidate(selection.side1,\n"
+    "        evaluate_candidate1(target, 2, w, h), 1.02, 0.002);\n"
+    "    selection.side1 = better_spatial_candidate(selection.side1,\n"
+    "        evaluate_candidate1(target, 4, w, h), 1.03, 0.004);\n"
     "    selection.side1 = better_temporal_candidate(selection.side1,\n"
     "        evaluate_temporal_candidate1(target, w, h));\n"
     "    bool valid0 = selection.side0.score >= 0.002;\n"
@@ -2039,6 +2140,8 @@ static const char synthesize_p010_shader_source[] =
     "                        5 + selected_candidate], 1);\n"
     "                else if (selected_candidate == 3)\n"
     "                    InterlockedAdd(robust_counters[12], 1);\n"
+    "                else if (selected_candidate == 4)\n"
+    "                    InterlockedAdd(robust_counters[13], 1);\n"
     "            }\n"
     "            uint occupancy_count0 = occupancy0.Load(int3(id.xy, 0));\n"
     "            uint occupancy_count1 = occupancy1.Load(int3(id.xy, 0));\n"
@@ -2976,7 +3079,8 @@ static bool load_robust_scene_shaders(struct mp_filter *f)
     MP_INFO(f, "NVOF robust scene classifier ready regions=3x3 "
                "histogram-bins=%d sample-stride=%d descriptors="
                "luma+chroma+edge history=hysteresis "
-               "synthesis=forward-occupancy+raw-median-block-hermite\n",
+               "synthesis=forward-occupancy+raw-median-block-"
+               "edge-vector-hermite\n",
             ROBUST_SCENE_HISTOGRAM_BINS,
             p->opts->scene_cut_sample_stride);
     return true;
@@ -3218,7 +3322,7 @@ static bool load_synthesize_p010_shader(struct mp_filter *f)
         {"ROBUST_SCENE_FADE_DISSOLVE", "2"},
         {"ROBUST_SCENE_HARD_CUT", "3"},
         {"ROBUST_SCENE_UNCERTAIN", "4"},
-        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "13"},
+        {"ROBUST_SYNTHESIS_COUNTER_COUNT", "14"},
         {NULL, NULL},
     };
     HRESULT hr = p->nvof.d3d_compile(
@@ -6107,7 +6211,9 @@ static void destroy(struct mp_filter *f)
                 p->nvof.robust_synthesis_totals[
                     ROBUST_SYNTHESIS_BLOCK_CANDIDATE] +
                 p->nvof.robust_synthesis_totals[
-                    ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE];
+                    ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE] +
+                p->nvof.robust_synthesis_totals[
+                    ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE];
             if (synthesis_samples > 0) {
                 MP_INFO(f, "NVOF robust synthesis summary samples=%llu "
                            "source0/source1/blend/fallback="
@@ -6138,8 +6244,8 @@ static void destroy(struct mp_filter *f)
             }
             if (candidate_samples) {
                 MP_INFO(f, "NVOF robust candidate summary selected=%llu "
-                           "raw/median/block/temporal="
-                           "%.2f/%.2f/%.2f/%.2f%%\n",
+                           "raw/median/block/temporal/edge-vector="
+                           "%.2f/%.2f/%.2f/%.2f/%.2f%%\n",
                         (unsigned long long)candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_RAW_CANDIDATE] /
@@ -6152,6 +6258,9 @@ static void destroy(struct mp_filter *f)
                             candidate_samples,
                         100.0 * p->nvof.robust_synthesis_totals[
                             ROBUST_SYNTHESIS_TEMPORAL_CANDIDATE] /
+                            candidate_samples,
+                        100.0 * p->nvof.robust_synthesis_totals[
+                            ROBUST_SYNTHESIS_EDGE_VECTOR_CANDIDATE] /
                             candidate_samples);
             }
         } else {
@@ -6259,8 +6368,9 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
                    "synthesis with native bidirectional OFA and GPU-resident "
                    "3x3 histogram, chroma, edge, exposure, and hysteresis "
                    "scene classification, forward-projected occupancy, "
-                   "fixed raw/median/block candidates, one-frame source "
-                   "lookahead, four-frame Hermite motion candidates, and "
+                   "raw/median/block and luma-guided vector-median "
+                   "candidates, one-frame source lookahead, four-frame "
+                   "Hermite motion candidates, and "
                    "near-binary source arbitration; flow diffusion is "
                    "disabled and "
                    "unsupported formats or synthesis failures are fatal\n");
