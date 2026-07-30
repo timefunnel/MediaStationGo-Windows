@@ -16,7 +16,6 @@
     const imagePending = new Map();
     const imageQueue = [];
     const libraryCache = new Map();
-    const frameInterpolationItemStatuses = new Map();
     const scrollMotions = new WeakMap();
     const history = [];
     const homeRefreshDelayMs = 1200;
@@ -57,8 +56,6 @@
     let homeRefreshGeneration = 0;
     let heroRotationTimer = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
-    let frameInterpolationMode = window.jmpInfo?.settings?.playback?.frameInterpolationMode || 'off';
-    let frameInterpolationStatus = null;
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -347,6 +344,7 @@
             frame_interpolation_setting_save_failed: 'RTX 插帧设置保存失败',
             frame_interpolation_item_enabled_invalid: '影片插帧设置无效',
             frame_interpolation_item_setting_invalid: '无法保存该影片的插帧设置',
+            frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -419,7 +417,6 @@
         imageCache.clear();
         imagePending.clear();
         libraryCache.clear();
-        frameInterpolationItemStatuses.clear();
         libraryPageObserver.disconnect();
         while (imageQueue.length) {
             imageQueue.shift().reject(new Error('账号状态已变化'));
@@ -733,11 +730,7 @@
 
     function updateFrameInterpolationStatus(status) {
         if (!status) return;
-        frameInterpolationStatus = status;
-        frameInterpolationMode = status.mode || 'off';
-        const select = byId('frame-interpolation-mode');
         const label = byId('frame-interpolation-status');
-        select.value = frameInterpolationMode;
         if (status.componentStatus === 'ready') {
             const engines = Number.isFinite(status.engineCount) ? `${status.engineCount} 个 Engine` : null;
             const components = [status.gpuName, status.model, status.runtimeVersion, engines].filter(Boolean);
@@ -760,88 +753,11 @@
                 15000,
             );
             updateFrameInterpolationStatus(status);
-            frameInterpolationItemStatuses.clear();
         } catch (error) {
             const label = byId('frame-interpolation-status');
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
         }
-    }
-
-    async function requestFrameInterpolationItemStatus(mediaId, refresh = false) {
-        if (!refresh && frameInterpolationItemStatuses.has(mediaId)) {
-            return frameInterpolationItemStatuses.get(mediaId);
-        }
-        const status = await nativeRequest(
-            'mediaStationFrameInterpolation',
-            'frame_interpolation_item_status',
-            ['frame_interpolation_item_status', mediaId],
-            15000,
-        );
-        frameInterpolationItemStatuses.set(mediaId, status);
-        return status;
-    }
-
-    function createDetailFrameInterpolationControl(card) {
-        const root = element('label', 'detail-interpolation-toggle');
-        const copy = element('span', 'detail-interpolation-copy');
-        copy.append(
-            element('strong', '', 'RTX 插帧'),
-            element('small', '', '正在读取设置'),
-        );
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.role = 'switch';
-        input.disabled = true;
-        input.setAttribute('aria-label', `为${card.title || '该影片'}启用 RTX 插帧`);
-        root.append(copy, input);
-        const statusText = copy.querySelector('small');
-
-        const applyStatus = (status) => {
-            if (!root.isConnected) return;
-            updateFrameInterpolationStatus(status);
-            input.checked = status.enabled === true;
-            input.disabled = status.componentStatus !== 'ready';
-            if (status.componentStatus !== 'ready') {
-                const error = new Error(status.failureDetail || 'RIFE 插帧组件不可用');
-                error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
-                statusText.textContent = friendlyError(error);
-            } else if (status.enabled) {
-                statusText.textContent = '已为本片开启';
-            } else {
-                statusText.textContent = '本片关闭';
-            }
-        };
-
-        requestFrameInterpolationItemStatus(card.id)
-            .then(applyStatus)
-            .catch((error) => {
-                if (!root.isConnected) return;
-                statusText.textContent = friendlyError(error);
-                input.disabled = true;
-            });
-
-        input.addEventListener('change', async () => {
-            const requested = input.checked;
-            input.disabled = true;
-            statusText.textContent = requested ? '正在开启' : '正在关闭';
-            try {
-                const status = await nativeRequest(
-                    'mediaStationFrameInterpolation',
-                    'frame_interpolation_set_item',
-                    ['frame_interpolation_set_item', card.id, requested],
-                    15000,
-                );
-                frameInterpolationItemStatuses.set(card.id, status);
-                applyStatus(status);
-            } catch (error) {
-                input.checked = !requested;
-                statusText.textContent = friendlyError(error);
-                input.disabled = frameInterpolationStatus?.componentStatus !== 'ready';
-                showToast(friendlyError(error));
-            }
-        });
-        return root;
     }
 
     function scheduleImageCacheStatsRefresh() {
@@ -1584,7 +1500,7 @@
                 : (playTarget.resumePositionMs ? `继续播放${position}` : '开始播放');
             play.append(element('span', '', '▶'), element('span', '', label));
             play.addEventListener('click', () => startPlayback(playTarget, playTarget.resumePositionMs));
-            actions.append(play, createDetailFrameInterpolationControl(playTarget));
+            actions.append(play);
             copy.append(actions);
         }
         if (card.genres?.length) {
@@ -1809,7 +1725,7 @@
             showToast('该项目不能直接播放');
             return;
         }
-        player = {
+        const activePlayer = {
             card,
             playing: true,
             started: false,
@@ -1823,13 +1739,16 @@
             trackRefreshing: false,
             scrubbing: false,
             scrubPositionMs: null,
-            interpolationEnabled: frameInterpolationItemStatuses.get(card.id)?.enabled
-                ?? frameInterpolationMode !== 'off',
+            interpolationEnabled: false,
+            interpolationChanging: false,
+            interpolationTargetEnabled: null,
+            interpolationResumePlaying: true,
         };
+        player = activePlayer;
         byId('player-title').textContent = cardTitle(card, true);
         byId('player-subtitle').textContent = card.type === 'Episode' ? episodePosition(card) : cardSubtitle(card);
         byId('player-loading-title').textContent = cardTitle(card, true);
-        setPlayerLoading(true, player.interpolationEnabled ? '正在初始化 RTX 插帧' : '正在准备播放');
+        setPlayerLoading(true, '正在准备播放');
         updatePlayerProgress();
         playerPanel.classList.add('hidden');
         playerPanelTrigger = null;
@@ -1840,39 +1759,27 @@
         showPlayerControls();
         try {
             await waitForPlayerPaint();
-            let interpolationStatus = frameInterpolationItemStatuses.get(card.id);
-            if (!interpolationStatus) {
-                try {
-                    interpolationStatus = await requestFrameInterpolationItemStatus(card.id);
-                    if (player?.card.id === card.id) {
-                        player.interpolationEnabled = interpolationStatus.enabled === true;
-                        setPlayerLoading(
-                            true,
-                            player.interpolationEnabled ? '正在初始化 RTX 插帧' : '正在准备播放',
-                        );
-                        await waitForPlayerPaint();
-                    }
-                } catch (error) {
-                    console.error(`读取影片插帧设置失败：${friendlyError(error)}`);
-                }
-            }
-            const loadInfo = await nativeRequest('mediaStationLoad', 'load', [card.id, Math.max(0, Math.round(startMs || 0))], 60000);
-            if (player?.card.id === card.id) {
-                player.loadInfo = loadInfo;
-                player.interpolationEnabled = Boolean(loadInfo.frameInterpolation);
-                if (!player.started && player.interpolationEnabled) {
-                    setPlayerLoading(true, '正在生成插帧首帧');
-                }
+            const loadInfo = await nativeRequest(
+                'mediaStationLoad',
+                'load',
+                [card.id, Math.max(0, Math.round(startMs || 0)), 'off'],
+                60000,
+            );
+            if (player === activePlayer) {
+                activePlayer.loadInfo = loadInfo;
                 refreshPlayerTools();
             }
         } catch (error) {
-            showToast(friendlyError(error));
-            finishPlayer(false);
+            if (player === activePlayer) {
+                showToast(friendlyError(error));
+                finishPlayer(false);
+            }
         }
     }
 
     function handlePlaybackEvent(event) {
         if (!player) return;
+        if (event.kind === 'canceled' && player.interpolationChanging) return;
         if (Number.isFinite(event.positionMs) && !player.scrubbing) player.positionMs = event.positionMs;
         if (Number.isFinite(event.durationMs) && event.durationMs > 0) player.durationMs = event.durationMs;
         updatePlayerProgress();
@@ -1880,9 +1787,17 @@
             case 'started':
                 {
                     const firstFrame = !player.started;
+                    const interpolationChanged = player.interpolationChanging;
+                    const shouldPlay = interpolationChanged ? player.interpolationResumePlaying : true;
+                    if (interpolationChanged) {
+                        player.interpolationEnabled = player.interpolationTargetEnabled === true;
+                        player.interpolationChanging = false;
+                        player.interpolationTargetEnabled = null;
+                    }
                     player.started = true;
-                    player.playing = true;
+                    player.playing = shouldPlay;
                     player.buffering = false;
+                    if (!shouldPlay && window.jmpNative) window.jmpNative.playerPause();
                     refreshPlayerTools();
                     setPlayerLoading(false);
                     if (firstFrame && !player.panelKind) {
@@ -1895,6 +1810,12 @@
                 }
                 break;
             case 'paused':
+                if (player.interpolationChanging) {
+                    player.playing = player.interpolationResumePlaying;
+                    refreshPlayerTools();
+                    showPlayerControls();
+                    break;
+                }
                 player.playing = false;
                 refreshPlayerTools();
                 if (!player.started) {
@@ -1906,25 +1827,22 @@
                 break;
             case 'buffering':
                 player.buffering = event.buffering === true;
-                if (player.buffering) {
+                if (player.interpolationChanging) {
+                    setPlayerLoading(true, interpolationLoadingLabel(player));
+                } else if (player.buffering) {
                     setPlayerLoading(
                         true,
-                        player.started
-                            ? '正在缓冲'
-                            : (player.interpolationEnabled ? '正在生成插帧首帧' : '正在准备播放'),
+                        player.started ? '正在缓冲' : '正在准备播放',
                     );
                 } else {
-                    setPlayerLoading(
-                        !player.started,
-                        player.interpolationEnabled ? '正在生成插帧首帧' : '正在准备播放',
-                    );
+                    setPlayerLoading(!player.started, '正在准备播放');
                 }
                 break;
             case 'finished': case 'canceled':
                 finishPlayer(false);
                 break;
             case 'error':
-                showToast('播放失败');
+                showToast(player.interpolationChanging ? 'RTX 插帧切换失败' : '播放失败');
                 finishPlayer(false);
                 break;
         }
@@ -1940,6 +1858,12 @@
         return new Promise((resolve) => {
             requestAnimationFrame(() => requestAnimationFrame(resolve));
         });
+    }
+
+    function interpolationLoadingLabel(activePlayer) {
+        return activePlayer?.interpolationTargetEnabled
+            ? '正在生成 RTX 插帧首帧'
+            : '正在关闭 RTX 插帧';
     }
 
     function updatePlayerProgress() {
@@ -1993,6 +1917,14 @@
 
     function togglePlayback() {
         if (!player || !window.jmpNative) return;
+        if (player.interpolationChanging) {
+            player.interpolationResumePlaying = !player.interpolationResumePlaying;
+            player.playing = player.interpolationResumePlaying;
+            hidePlayerFeedback();
+            showPlayerControls();
+            refreshPlayerTools();
+            return;
+        }
         if (player.playing) {
             window.jmpNative.playerPause();
             player.playing = false;
@@ -2005,6 +1937,56 @@
             showPlayerControls();
         }
         refreshPlayerTools();
+    }
+
+    async function toggleFrameInterpolation() {
+        const activePlayer = player;
+        if (!activePlayer?.started || !activePlayer.loadInfo || activePlayer.interpolationChanging) return;
+        const requested = !activePlayer.interpolationEnabled;
+        const previousLoadInfo = activePlayer.loadInfo;
+        const reloadPositionMs = Math.max(0, Math.round(activePlayer.positionMs || 0));
+        activePlayer.interpolationChanging = true;
+        activePlayer.interpolationTargetEnabled = requested;
+        activePlayer.interpolationResumePlaying = activePlayer.playing;
+        if (activePlayer.playing && window.jmpNative) window.jmpNative.playerPause();
+        setPlayerLoading(true, requested ? '正在初始化 RTX 插帧' : '正在关闭 RTX 插帧');
+        showPlayerControls();
+        refreshPlayerTools();
+        try {
+            await waitForPlayerPaint();
+            const loadInfo = await nativeRequest(
+                'mediaStationLoad',
+                'load',
+                [activePlayer.card.id, reloadPositionMs, requested ? '2x' : 'off'],
+                60000,
+            );
+            if (player !== activePlayer) return;
+            const enabled = Boolean(loadInfo.frameInterpolation);
+            if (enabled !== requested) {
+                const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
+                error.code = 'frame_interpolation_state_mismatch';
+                throw error;
+            }
+            activePlayer.loadInfo = loadInfo;
+            activePlayer.interpolationEnabled = enabled;
+            if (activePlayer.interpolationChanging) {
+                setPlayerLoading(true, interpolationLoadingLabel(activePlayer));
+                if (window.jmpNative) window.jmpNative.playerPlay();
+            }
+            refreshPlayerTools();
+        } catch (error) {
+            if (player !== activePlayer) return;
+            activePlayer.interpolationChanging = false;
+            activePlayer.interpolationTargetEnabled = null;
+            activePlayer.loadInfo = previousLoadInfo;
+            activePlayer.playing = activePlayer.interpolationResumePlaying;
+            if (activePlayer.interpolationResumePlaying && window.jmpNative) {
+                window.jmpNative.playerPlay();
+            }
+            setPlayerLoading(activePlayer.buffering, activePlayer.buffering ? '正在缓冲' : '');
+            refreshPlayerTools();
+            showToast(friendlyError(error));
+        }
     }
 
     function togglePlayerFullscreen() {
@@ -2030,6 +2012,7 @@
         const playback = byId('player-playback');
         const subtitles = byId('player-subtitles');
         const audio = byId('player-audio');
+        const interpolation = byId('player-interpolation');
         const infoButton = byId('player-info');
         const fullscreen = byId('player-fullscreen');
         const playing = player?.playing === true;
@@ -2041,6 +2024,15 @@
         playback.querySelector('span').textContent = playing ? pauseSymbol : playSymbol;
         subtitles.disabled = !info || !Array.isArray(info.subtitleTracks);
         audio.disabled = !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
+        const interpolationEnabled = player?.interpolationChanging
+            ? player.interpolationTargetEnabled === true
+            : player?.interpolationEnabled === true;
+        interpolation.disabled = !player?.started || !info || player.interpolationChanging;
+        interpolation.title = player?.interpolationChanging
+            ? interpolationLoadingLabel(player)
+            : (interpolationEnabled ? '关闭 RTX 插帧' : '开启 RTX 插帧（2 倍帧率）');
+        interpolation.setAttribute('aria-label', interpolation.title);
+        interpolation.setAttribute('aria-pressed', String(interpolationEnabled));
         infoButton.classList.toggle('hidden', !playbackInfoEnabled);
         infoButton.disabled = !playbackInfoEnabled || !info;
         fullscreen.disabled = !player;
@@ -2427,28 +2419,6 @@
             showToast('播放信息设置保存失败');
         }
     });
-    const frameInterpolationSelect = byId('frame-interpolation-mode');
-    frameInterpolationSelect.value = frameInterpolationMode;
-    frameInterpolationSelect.addEventListener('change', async () => {
-        const requested = frameInterpolationSelect.value;
-        frameInterpolationSelect.disabled = true;
-        try {
-            const status = await nativeRequest(
-                'mediaStationFrameInterpolation',
-                'frame_interpolation_set_mode',
-                ['frame_interpolation_set_mode', requested],
-                15000,
-            );
-            updateFrameInterpolationStatus(status);
-            frameInterpolationItemStatuses.clear();
-        } catch (error) {
-            frameInterpolationSelect.value = frameInterpolationMode;
-            showToast(friendlyError(error));
-            await refreshFrameInterpolationStatus();
-        } finally {
-            frameInterpolationSelect.disabled = false;
-        }
-    });
     byId('clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;
@@ -2474,6 +2444,7 @@
     });
     byId('player-exit').addEventListener('click', () => finishPlayer(true));
     byId('player-playback').addEventListener('click', togglePlayback);
+    byId('player-interpolation').addEventListener('click', toggleFrameInterpolation);
     byId('player-fullscreen').addEventListener('click', togglePlayerFullscreen);
     const playerProgress = byId('player-progress');
     playerProgress.addEventListener('pointerdown', (event) => previewProgressSeek(event.currentTarget.value));
@@ -2519,7 +2490,7 @@
         const inputActive = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
         if (player) {
             const active = document.activeElement;
-            const toolButtons = [byId('player-playback'), byId('player-subtitles'), byId('player-audio'), byId('player-info'), byId('player-fullscreen')]
+            const toolButtons = [byId('player-playback'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
                 .filter((button) => !button.disabled);
             if (!playerPanel.classList.contains('hidden')) {
                 if (event.key === 'Escape' || event.key === 'Backspace') {

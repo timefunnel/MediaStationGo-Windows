@@ -9,7 +9,6 @@
 use jfn_platform_abi::WindowDecorations;
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -56,8 +55,6 @@ struct SettingsData {
     audio_channels: String,
     log_level: String,
     device_name: String,
-    frame_interpolation_mode: String,
-    frame_interpolation_media_modes: BTreeMap<String, String>,
     window: JfnWindowGeometry,
     audio_exclusive: bool,
     disable_gpu_compositing: bool,
@@ -76,8 +73,6 @@ impl Default for SettingsData {
             audio_channels: String::new(),
             log_level: String::new(),
             device_name: String::new(),
-            frame_interpolation_mode: "off".to_string(),
-            frame_interpolation_media_modes: BTreeMap::new(),
             window: JfnWindowGeometry::default(),
             audio_exclusive: false,
             disable_gpu_compositing: false,
@@ -115,26 +110,6 @@ impl SettingsData {
                 s.truncate(DEVICE_NAME_MAX);
             }
             self.device_name = s;
-        }
-        if let Some(s) = v.get("frameInterpolationMode").and_then(Value::as_str) {
-            self.frame_interpolation_mode = match s {
-                "off" | "auto" | "2x" => s.to_string(),
-                "60" => "2x".to_string(),
-                _ => self.frame_interpolation_mode.clone(),
-            };
-        }
-        if let Some(modes) = v
-            .get("frameInterpolationMediaModes")
-            .and_then(Value::as_object)
-        {
-            self.frame_interpolation_media_modes = modes
-                .iter()
-                .filter_map(|(media_id, mode)| {
-                    let mode = mode.as_str()?;
-                    (valid_media_interpolation_entry(media_id, mode))
-                        .then(|| (media_id.clone(), mode.to_string()))
-                })
-                .collect();
         }
         if let Some(n) = v.get("windowWidth").and_then(Value::as_i64) {
             self.window.width = n as i32;
@@ -251,23 +226,6 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
-        if self.frame_interpolation_mode != "off" {
-            o.insert(
-                "frameInterpolationMode".into(),
-                Value::String(self.frame_interpolation_mode.clone()),
-            );
-        }
-        if !self.frame_interpolation_media_modes.is_empty() {
-            o.insert(
-                "frameInterpolationMediaModes".into(),
-                Value::Object(
-                    self.frame_interpolation_media_modes
-                        .iter()
-                        .map(|(media_id, mode)| (media_id.clone(), Value::String(mode.clone())))
-                        .collect(),
-                ),
-            );
-        }
         Value::Object(o)
     }
 
@@ -310,10 +268,6 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
-        o.insert(
-            "frameInterpolationMode".into(),
-            Value::String(self.frame_interpolation_mode.clone()),
-        );
         o.insert(
             "deviceNameDefault".into(),
             Value::String(default_device_name()),
@@ -527,64 +481,6 @@ string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
 
-pub fn frame_interpolation_mode() -> String {
-    state().lock().data.frame_interpolation_mode.clone()
-}
-
-pub fn set_frame_interpolation_mode(value: &str) -> bool {
-    if !matches!(value, "off" | "auto" | "2x") {
-        return false;
-    }
-    state().lock().data.frame_interpolation_mode = value.to_string();
-    true
-}
-
-pub fn frame_interpolation_mode_for_media(media_id: &str) -> String {
-    let state = state().lock();
-    state
-        .data
-        .frame_interpolation_media_modes
-        .get(media_id)
-        .cloned()
-        .unwrap_or_else(|| state.data.frame_interpolation_mode.clone())
-}
-
-pub fn frame_interpolation_media_override(media_id: &str) -> Option<String> {
-    state()
-        .lock()
-        .data
-        .frame_interpolation_media_modes
-        .get(media_id)
-        .cloned()
-}
-
-pub fn set_frame_interpolation_media_mode(media_id: &str, value: &str) -> bool {
-    if !valid_media_interpolation_entry(media_id, value) {
-        return false;
-    }
-    state()
-        .lock()
-        .data
-        .frame_interpolation_media_modes
-        .insert(media_id.to_string(), value.to_string());
-    true
-}
-
-pub fn clear_frame_interpolation_media_mode(media_id: &str) {
-    state()
-        .lock()
-        .data
-        .frame_interpolation_media_modes
-        .remove(media_id);
-}
-
-fn valid_media_interpolation_entry(media_id: &str, mode: &str) -> bool {
-    !media_id.trim().is_empty()
-        && media_id.len() <= 256
-        && !media_id.chars().any(char::is_control)
-        && matches!(mode, "off" | "auto" | "2x")
-}
-
 pub fn device_name() -> String {
     state().lock().data.device_name.clone()
 }
@@ -698,7 +594,7 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{HWDEC_DEFAULT, SettingsData, normalize_device_name};
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     const PLATFORM: &str = "platform-host";
 
@@ -779,83 +675,15 @@ mod tests {
     }
 
     #[test]
-    fn frame_interpolation_mode_defaults_off_and_persists_explicit_choice() {
-        let mut settings = SettingsData::default();
-        assert_eq!(settings.frame_interpolation_mode, "off");
-        assert!(settings.to_json().get("frameInterpolationMode").is_none());
-
-        settings.overlay_json(&json!({ "frameInterpolationMode": "2x" }));
-        assert_eq!(settings.frame_interpolation_mode, "2x");
-        assert_eq!(
-            settings
-                .to_json()
-                .get("frameInterpolationMode")
-                .and_then(Value::as_str),
-            Some("2x")
-        );
-    }
-
-    #[test]
-    fn migrates_legacy_60_fps_interpolation_mode_to_x2() {
-        let mut settings = SettingsData::default();
-        settings.overlay_json(&json!({ "frameInterpolationMode": "60" }));
-        assert_eq!(settings.frame_interpolation_mode, "2x");
-        assert_eq!(
-            settings
-                .to_json()
-                .get("frameInterpolationMode")
-                .and_then(Value::as_str),
-            Some("2x")
-        );
-    }
-
-    #[test]
-    fn invalid_frame_interpolation_mode_is_ignored() {
-        let mut settings = SettingsData::default();
-        settings.overlay_json(&json!({ "frameInterpolationMode": "frames" }));
-        assert_eq!(settings.frame_interpolation_mode, "off");
-    }
-
-    #[test]
-    fn persists_valid_per_media_interpolation_modes() {
+    fn legacy_frame_interpolation_settings_are_not_persisted() {
         let mut settings = SettingsData::default();
         settings.overlay_json(&json!({
-            "frameInterpolationMediaModes": {
-                "movie-a": "2x",
-                "movie-b": "off",
-                "movie-invalid": "120"
-            }
+            "frameInterpolationMode": "2x",
+            "frameInterpolationMediaModes": { "movie-a": "2x" }
         }));
 
-        assert_eq!(
-            settings.frame_interpolation_media_modes.get("movie-a"),
-            Some(&"2x".to_string())
-        );
-        assert_eq!(
-            settings.frame_interpolation_media_modes.get("movie-b"),
-            Some(&"off".to_string())
-        );
-        assert!(
-            !settings
-                .frame_interpolation_media_modes
-                .contains_key("movie-invalid")
-        );
-        assert_eq!(
-            settings.to_json().get("frameInterpolationMediaModes"),
-            Some(&json!({ "movie-a": "2x", "movie-b": "off" }))
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_per_media_interpolation_keys() {
-        let mut settings = SettingsData::default();
-        settings.overlay_json(&json!({
-            "frameInterpolationMediaModes": {
-                "": "2x",
-                "movie\ninvalid": "2x"
-            }
-        }));
-
-        assert!(settings.frame_interpolation_media_modes.is_empty());
+        let saved = settings.to_json();
+        assert!(saved.get("frameInterpolationMode").is_none());
+        assert!(saved.get("frameInterpolationMediaModes").is_none());
     }
 }

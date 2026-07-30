@@ -432,17 +432,6 @@ button:focus-visible, input:focus-visible {
 .overview-preview:focus-visible { outline-offset: 6px; }
 .detail-actions { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin: 20px 0 22px; }
 .detail-actions .primary-command { min-width: 156px; }
-.detail-interpolation-toggle { display: flex; align-items: center; justify-content: space-between; min-width: 214px; gap: 18px; padding: 8px 12px 8px 15px; border-radius: 5px; background: rgba(9,12,13,0.52); cursor: pointer; backdrop-filter: blur(10px); transition: background 150ms ease; }
-.detail-interpolation-toggle:hover { background: rgba(24,29,31,0.72); }
-.detail-interpolation-copy { display: grid; min-width: 0; gap: 2px; }
-.detail-interpolation-copy strong { font-size: 13px; font-weight: 650; }
-.detail-interpolation-copy small { overflow: hidden; color: rgba(255,255,255,0.6); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.detail-interpolation-toggle input { position: relative; flex: 0 0 auto; width: 38px; height: 20px; margin: 0; appearance: none; border: 1px solid rgba(255,255,255,0.24); border-radius: 10px; background: #242b2f; cursor: pointer; transition: background 150ms ease, border-color 150ms ease; }
-.detail-interpolation-toggle input::after { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; content: ""; border-radius: 50%; background: #d9dddf; transition: transform 150ms ease; }
-.detail-interpolation-toggle input:checked { border-color: var(--accent); background: var(--accent); }
-.detail-interpolation-toggle input:checked::after { background: #07110f; transform: translateX(18px); }
-.detail-interpolation-toggle input:disabled { cursor: wait; opacity: 0.5; }
-.detail-interpolation-toggle:has(input:disabled) { cursor: wait; }
 .tag-list { display: flex; flex-wrap: wrap; gap: 7px; }
 .tag { padding: 4px 8px; color: #c5cbcd; border: 1px solid rgba(255,255,255,0.16); border-radius: 4px; background: rgba(9,11,12,0.26); font-size: 11px; }
 .rating { color: var(--amber); }
@@ -567,6 +556,7 @@ button:focus-visible, input:focus-visible {
 .player-tools .player-fullscreen[aria-pressed="true"] { color: var(--text); }
 .player-tools .player-fullscreen[aria-pressed="true"]:hover { background: rgba(255,255,255,0.08); }
 .player-tools .icon-button span { font-size: 13px; font-weight: 750; }
+.player-tools .player-interpolation span { font-size: 12px; }
 .player-tools .player-playback span { position: relative; display: block; width: 18px; height: 18px; font-size: 0; line-height: 0; }
 .player-tools .player-playback span::before, .player-tools .player-playback span::after { position: absolute; content: ""; }
 .player-tools .player-playback:not(.is-playing) span::before { top: 2px; left: 5.5px; width: 0; height: 0; border-top: 7px solid transparent; border-bottom: 7px solid transparent; border-left: 11px solid currentColor; }

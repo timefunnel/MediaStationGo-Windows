@@ -2454,18 +2454,8 @@ fn valid_text(value: &str, maximum_len: usize) -> bool {
 
 fn frame_interpolation_plan(
     source: &PlaybackSource,
-    media_id: &str,
+    mode: InterpolationMode,
 ) -> Result<Option<InterpolationPlan>, LoadFailure> {
-    let configured = jfn_config::frame_interpolation_mode_for_media(media_id);
-    let mode = InterpolationMode::parse(&configured).ok_or_else(|| {
-        log_error(&format!(
-            "RTX frame interpolation setting is invalid: value={configured}"
-        ));
-        LoadFailure::new(
-            "frame_interpolation_mode_invalid",
-            "The saved frame interpolation mode is invalid",
-        )
-    })?;
     if mode == InterpolationMode::Off {
         return Ok(None);
     }
@@ -2883,9 +2873,6 @@ pub(crate) fn handle_frame_interpolation_message(
     let operation = list_string(args, 1);
     let result = match operation.as_str() {
         "frame_interpolation_status" => Ok(frame_interpolation_status_payload()),
-        "frame_interpolation_set_mode" => set_frame_interpolation_mode(args),
-        "frame_interpolation_item_status" => frame_interpolation_item_status(args),
-        "frame_interpolation_set_item" => set_frame_interpolation_item(args),
         "frame_interpolation_diagnostics" => {
             let media_id = (args.size() >= 3
                 && args.get_type(2).as_ref() == &sys::cef_value_type_t::VTYPE_STRING)
@@ -2910,59 +2897,9 @@ pub(crate) fn handle_frame_interpolation_message(
     true
 }
 
-fn set_frame_interpolation_mode(args: &ListValue) -> Result<Value, LoadFailure> {
-    if args.size() < 3 || args.get_type(2).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
-        return Err(LoadFailure::new(
-            "frame_interpolation_mode_invalid",
-            "The requested frame interpolation mode is missing",
-        ));
-    }
-    let requested = list_string(args, 2);
-    let mode = InterpolationMode::parse(&requested).ok_or_else(|| {
-        LoadFailure::new(
-            "frame_interpolation_mode_invalid",
-            "The requested frame interpolation mode is invalid",
-        )
-    })?;
-    if mode != InterpolationMode::Off {
-        let report = jfn_frame_interpolation::capability_report();
-        if !report.ready {
-            return Err(LoadFailure::new(
-                report
-                    .failure
-                    .as_ref()
-                    .map_or("frame_interpolation_runtime_unavailable", |failure| {
-                        failure.code
-                    }),
-                "The native RIFE TensorRT-RTX frame interpolation components are unavailable",
-            ));
-        }
-    }
-    let previous = jfn_config::frame_interpolation_mode();
-    if !jfn_config::set_frame_interpolation_mode(mode.as_str()) {
-        return Err(LoadFailure::new(
-            "frame_interpolation_mode_invalid",
-            "The requested frame interpolation mode is invalid",
-        ));
-    }
-    if !jfn_config::settings_save() {
-        let _ = jfn_config::set_frame_interpolation_mode(&previous);
-        return Err(LoadFailure::new(
-            "frame_interpolation_setting_save_failed",
-            "The frame interpolation setting could not be saved",
-        ));
-    }
-    log_debug(&format!(
-        "RTX frame interpolation mode saved: mode={}",
-        mode.as_str()
-    ));
-    Ok(frame_interpolation_status_payload())
-}
-
 fn frame_interpolation_status_payload() -> Value {
     let report = jfn_frame_interpolation::capability_report();
     json!({
-        "mode": jfn_config::frame_interpolation_mode(),
         "componentStatus": if report.ready { "ready" } else { "unavailable" },
         "gpuName": report.gpu_name,
         "gpuUuid": report.gpu_uuid,
@@ -2975,99 +2912,6 @@ fn frame_interpolation_status_payload() -> Value {
         "failureCode": report.failure.as_ref().map(|failure| failure.code),
         "failureDetail": report.failure.map(|failure| failure.detail),
     })
-}
-
-fn frame_interpolation_item_status(args: &ListValue) -> Result<Value, LoadFailure> {
-    let media_id = frame_interpolation_media_id(args)?;
-    Ok(frame_interpolation_item_status_payload(&media_id))
-}
-
-fn set_frame_interpolation_item(args: &ListValue) -> Result<Value, LoadFailure> {
-    let media_id = frame_interpolation_media_id(args)?;
-    if args.size() < 4 || args.get_type(3).as_ref() != &sys::cef_value_type_t::VTYPE_BOOL {
-        return Err(LoadFailure::new(
-            "frame_interpolation_item_enabled_invalid",
-            "The per-video frame interpolation setting is missing",
-        ));
-    }
-    let enabled = args.bool(3) != 0;
-    if enabled {
-        let report = jfn_frame_interpolation::capability_report();
-        if !report.ready {
-            return Err(LoadFailure::new(
-                report
-                    .failure
-                    .as_ref()
-                    .map_or("frame_interpolation_runtime_unavailable", |failure| {
-                        failure.code
-                    }),
-                "The native RIFE TensorRT-RTX frame interpolation components are unavailable",
-            ));
-        }
-    }
-    let mode = if enabled {
-        match jfn_config::frame_interpolation_mode().as_str() {
-            "auto" => "auto",
-            _ => "2x",
-        }
-    } else {
-        "off"
-    };
-    let previous = jfn_config::frame_interpolation_media_override(&media_id);
-    if !jfn_config::set_frame_interpolation_media_mode(&media_id, mode) {
-        return Err(LoadFailure::new(
-            "frame_interpolation_item_setting_invalid",
-            "The per-video frame interpolation setting is invalid",
-        ));
-    }
-    if !jfn_config::settings_save() {
-        if let Some(previous) = previous {
-            let _ = jfn_config::set_frame_interpolation_media_mode(&media_id, &previous);
-        } else {
-            jfn_config::clear_frame_interpolation_media_mode(&media_id);
-        }
-        return Err(LoadFailure::new(
-            "frame_interpolation_setting_save_failed",
-            "The per-video frame interpolation setting could not be saved",
-        ));
-    }
-    log_debug(&format!(
-        "RTX frame interpolation per-video mode saved: media_id={media_id} mode={mode}"
-    ));
-    Ok(frame_interpolation_item_status_payload(&media_id))
-}
-
-fn frame_interpolation_media_id(args: &ListValue) -> Result<String, LoadFailure> {
-    if args.size() < 3 || args.get_type(2).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
-        return Err(LoadFailure::new(
-            "invalid_media_id",
-            "The media identifier is missing",
-        ));
-    }
-    let media_id = list_string(args, 2);
-    if !valid_identifier(&media_id, MAX_MEDIA_ID_LEN) {
-        return Err(LoadFailure::new(
-            "invalid_media_id",
-            "The media identifier is invalid",
-        ));
-    }
-    Ok(media_id)
-}
-
-fn frame_interpolation_item_status_payload(media_id: &str) -> Value {
-    let global_mode = jfn_config::frame_interpolation_mode();
-    let override_mode = jfn_config::frame_interpolation_media_override(media_id);
-    let effective_mode = override_mode.clone().unwrap_or_else(|| global_mode.clone());
-    let mut payload = frame_interpolation_status_payload();
-    let object = payload
-        .as_object_mut()
-        .expect("frame interpolation status payload is always an object");
-    object.insert("mediaId".into(), json!(media_id));
-    object.insert("globalMode".into(), json!(global_mode));
-    object.insert("overrideMode".into(), json!(override_mode));
-    object.insert("effectiveMode".into(), json!(effective_mode));
-    object.insert("enabled".into(), json!(effective_mode != "off"));
-    payload
 }
 
 fn frame_interpolation_diagnostics_payload(media_id: Option<&str>) -> Result<Value, LoadFailure> {
@@ -3590,6 +3434,7 @@ struct LoadRequest {
     request_id: String,
     media_id: String,
     start_ms: u64,
+    interpolation_mode: InterpolationMode,
 }
 
 fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadFailure)> {
@@ -3631,10 +3476,13 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
         ));
     }
     let start_ms = parse_start_ms(args).map_err(|failure| (request_id.clone(), failure))?;
+    let interpolation_mode =
+        parse_load_interpolation_mode(args).map_err(|failure| (request_id.clone(), failure))?;
     Ok(LoadRequest {
         request_id,
         media_id,
         start_ms,
+        interpolation_mode,
     })
 }
 
@@ -3658,6 +3506,27 @@ fn parse_start_ms(args: &ListValue) -> Result<u64, LoadFailure> {
         ));
     }
     Ok(value.round() as u64)
+}
+
+fn parse_load_interpolation_mode(args: &ListValue) -> Result<InterpolationMode, LoadFailure> {
+    if args.size() < 4 || args.get_type(3).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The playback frame interpolation mode is missing",
+        ));
+    }
+    parse_load_interpolation_mode_value(&list_string(args, 3))
+}
+
+fn parse_load_interpolation_mode_value(value: &str) -> Result<InterpolationMode, LoadFailure> {
+    match value {
+        "off" => Ok(InterpolationMode::Off),
+        "2x" => Ok(InterpolationMode::X2),
+        _ => Err(LoadFailure::new(
+            "frame_interpolation_mode_invalid",
+            "The playback frame interpolation mode is invalid",
+        )),
+    }
 }
 
 fn valid_identifier(value: &str, maximum_len: usize) -> bool {
@@ -3696,7 +3565,12 @@ fn execute_load(
         audio_summary,
         source.subtitles.len()
     ));
-    let interpolation = frame_interpolation_plan(&source, &request.media_id)?;
+    let interpolation = frame_interpolation_plan(&source, request.interpolation_mode)?;
+    log_debug(&format!(
+        "MediaStation playback interpolation request: media_id={} mode={}",
+        request.media_id,
+        request.interpolation_mode.as_str()
+    ));
     if let Some(plan) = &interpolation {
         let display_fps = jfn_playback::ingest_driver::jfn_playback_display_hz();
         log_debug(&format!(
@@ -4641,6 +4515,23 @@ mod tests {
             .begin_auth_request("auth-2")
             .expect("authentication slot should be released");
         drop(load_guard);
+    }
+
+    #[test]
+    fn playback_interpolation_mode_accepts_only_explicit_session_values() {
+        assert_eq!(
+            parse_load_interpolation_mode_value("off").expect("off should be valid"),
+            InterpolationMode::Off
+        );
+        assert_eq!(
+            parse_load_interpolation_mode_value("2x").expect("2x should be valid"),
+            InterpolationMode::X2
+        );
+        for stale_or_invalid in ["auto", "60", "", "on"] {
+            let error = parse_load_interpolation_mode_value(stale_or_invalid)
+                .expect_err("only the playback control's explicit values are accepted");
+            assert_eq!(error.code, "frame_interpolation_mode_invalid");
+        }
     }
 
     #[test]
