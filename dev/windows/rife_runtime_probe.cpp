@@ -34,6 +34,9 @@ using ProcessFn = int(__cdecl *)(
     rife_frame_diagnostics *, char *, size_t);
 using GetStatsFn = int(__cdecl *)(const rife_runtime *, rife_runtime_stats *);
 using DestroyFn = void(__cdecl *)(rife_runtime *);
+using QueuePrewarmFn = int(__cdecl *)(const wchar_t *, const wchar_t *,
+                                      uint32_t, uint32_t, ID3D11Device *,
+                                      ID3D11DeviceContext *, char *, size_t);
 
 template <typename T>
 bool load_symbol(HMODULE module, const char *name, T &output)
@@ -481,11 +484,14 @@ int wmain(int argc, wchar_t **argv)
     ProcessFn process = nullptr;
     GetStatsFn get_stats = nullptr;
     DestroyFn destroy = nullptr;
+    QueuePrewarmFn queue_prewarm = nullptr;
     if (!load_symbol(module, "rife_runtime_abi_version", abi_version)
         || !load_symbol(module, "rife_runtime_create", create)
         || !load_symbol(module, "rife_runtime_process", process)
         || !load_symbol(module, "rife_runtime_get_stats", get_stats)
-        || !load_symbol(module, "rife_runtime_destroy", destroy)) {
+        || !load_symbol(module, "rife_runtime_destroy", destroy)
+        || !load_symbol(module, "rife_runtime_queue_prewarm_with_device",
+                        queue_prewarm)) {
         FreeLibrary(module);
         return 4;
     }
@@ -520,6 +526,21 @@ int wmain(int argc, wchar_t **argv)
         return 7;
     }
 
+    char prewarm_error[1024]{};
+    const auto prewarm_started = std::chrono::steady_clock::now();
+    const int prewarm_status = queue_prewarm(
+        argv[engine_argument], argv[cudart_argument], width, height,
+        device.Get(), context.Get(), prewarm_error, sizeof(prewarm_error));
+    const double prewarm_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - prewarm_started).count();
+    if (prewarm_status != RIFE_RUNTIME_OK) {
+        std::fprintf(stderr,
+                     "RIFE_RUNTIME_PROBE_PREWARM_FAILED status=%d detail=%s\n",
+                     prewarm_status, prewarm_error);
+        FreeLibrary(module);
+        return 8;
+    }
+
     ComPtr<ID3D11Texture2D> frame0;
     ComPtr<ID3D11Texture2D> frame1;
     ComPtr<ID3D11Texture2D> output;
@@ -535,7 +556,7 @@ int wmain(int argc, wchar_t **argv)
                                      height, 64)) {
         std::fprintf(stderr, "RIFE_RUNTIME_PROBE_TEXTURE_FAILED\n");
         FreeLibrary(module);
-        return 8;
+        return 9;
     }
 
     const rife_runtime_config config{
@@ -559,7 +580,7 @@ int wmain(int argc, wchar_t **argv)
         std::fprintf(stderr, "RIFE_RUNTIME_PROBE_CREATE_FAILED detail=%s\n",
                      error);
         FreeLibrary(module);
-        return 9;
+        return 10;
     }
 
     if (sequence_mode) {
@@ -611,7 +632,7 @@ int wmain(int argc, wchar_t **argv)
         std::fprintf(stderr,
                      "RIFE_RUNTIME_PROBE_FAILED detail=%s scene-cut=%u\n",
                      error, diagnostics.scene_cut);
-        return 10;
+        return 11;
     }
 
     double total = 0;
@@ -625,7 +646,9 @@ int wmain(int argc, wchar_t **argv)
         "RIFE_RUNTIME_PROBE_OK adapter=%ls source=%ux%u warmup=%d "
         "iterations=%d throughput=%.2fqps mean=%.2fms p95=%.2fms "
         "runtime-p95=%.2fms scene-mean=%.3fms inferred=%llu cuts=%llu "
-        "cache-reopen=%s cold-init=%.2fms cached-init=%.2fms "
+        "prewarm=%.2fms cache-reopen=%s cold-init=%.2fms cached-init=%.2fms "
+        "stages=cuda:%.2f,bind:%.2f,read:%.2f,trt:%.2f,deserialize:%.2f,"
+        "context:%.2f,validate:%.2f,d3d:%.2f "
         "scene-class=%u average-delta=%.3f changed-ratio=%.4f "
         "average-kl=%.5f "
         "unique-luma=%u non-8bit-luma=%llu p010-packed=%s\n",
@@ -634,9 +657,18 @@ int wmain(int argc, wchar_t **argv)
         stats.pairs ? stats.scene_total_ms / stats.pairs : 0,
         static_cast<unsigned long long>(stats.inferred_pairs),
         static_cast<unsigned long long>(stats.scene_cuts),
+        prewarm_ms,
         cached_stats.runtime_cache_hit ? "hit" : "miss",
         stats.runtime_initialization_ms,
         cached_stats.runtime_initialization_ms,
+        stats.runtime_cuda_load_ms,
+        stats.runtime_cuda_bind_ms,
+        stats.runtime_engine_read_ms,
+        stats.runtime_trt_runtime_ms,
+        stats.runtime_engine_deserialize_ms,
+        stats.runtime_execution_context_ms,
+        stats.runtime_engine_validate_ms,
+        stats.runtime_d3d_resources_ms,
         diagnostics.classification, diagnostics.average_delta,
         diagnostics.changed_ratio, diagnostics.average_kl,
         validation.unique_luma_codes,

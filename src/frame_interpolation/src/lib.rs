@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const RIFE_RUNTIME_ABI: u32 = 2;
+const RIFE_RUNTIME_ABI: u32 = 3;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
 const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
 const RIFE_MODEL: &str = "RIFE v4.26";
@@ -558,6 +558,8 @@ pub struct PlanRequest {
 #[derive(Clone, Debug)]
 pub struct InterpolationPlan {
     pub mode: InterpolationMode,
+    pub source_width: u32,
+    pub source_height: u32,
     pub target_fps: f64,
     pub target_fps_num: u32,
     pub target_fps_den: u32,
@@ -652,13 +654,17 @@ fn build_plan(
             )
         })?;
     let video_filter = format!(
-        "nvofmemc=rife=yes:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        "nvofmemc=rife=yes:rife-source-width={}:rife-source-height={}:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        request.width,
+        request.height,
         mpv_filter_path(&runtime.runtime_dll)?,
         mpv_filter_path(&engine.path)?,
         mpv_filter_path(&runtime.cuda_runtime_dll)?,
     );
     Ok(InterpolationPlan {
         mode: request.mode,
+        source_width: request.width,
+        source_height: request.height,
         target_fps,
         target_fps_num,
         target_fps_den,

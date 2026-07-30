@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define RIFE_RUNTIME_ABI_VERSION 2u
+#define RIFE_RUNTIME_ABI_VERSION 3u
 #define RIFE_SCENE_CLASS_COUNT 5u
 
 enum rife_color_matrix {
@@ -63,9 +63,17 @@ struct rife_runtime_stats {
     double scene_total_ms;
     double scene_max_ms;
     uint32_t runtime_cache_hit;
-    uint32_t reserved;
+    uint32_t runtime_prewarm_hit;
     uint64_t runtime_reuses;
     double runtime_initialization_ms;
+    double runtime_cuda_load_ms;
+    double runtime_cuda_bind_ms;
+    double runtime_engine_read_ms;
+    double runtime_trt_runtime_ms;
+    double runtime_engine_deserialize_ms;
+    double runtime_execution_context_ms;
+    double runtime_engine_validate_ms;
+    double runtime_d3d_resources_ms;
     uint64_t scene_classes[RIFE_SCENE_CLASS_COUNT];
 };
 
@@ -90,6 +98,26 @@ struct rife_frame_diagnostics {
 struct rife_runtime;
 
 __declspec(dllexport) uint32_t __cdecl rife_runtime_abi_version(void);
+
+__declspec(dllexport) int __cdecl rife_runtime_prewarm_with_device(
+    const wchar_t *engine_path,
+    const wchar_t *cuda_runtime_path,
+    uint32_t source_width,
+    uint32_t source_height,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context,
+    char *error,
+    size_t error_capacity);
+
+__declspec(dllexport) int __cdecl rife_runtime_queue_prewarm_with_device(
+    const wchar_t *engine_path,
+    const wchar_t *cuda_runtime_path,
+    uint32_t source_width,
+    uint32_t source_height,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context,
+    char *error,
+    size_t error_capacity);
 
 __declspec(dllexport) struct rife_runtime *__cdecl rife_runtime_create(
     const struct rife_runtime_config *config,

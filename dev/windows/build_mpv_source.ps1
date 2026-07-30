@@ -18,6 +18,7 @@ $OutputDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvSourceDir = Join-Path $RepoRoot "third_party\mpv"
 $NvofMemcSource = Join-Path $PSScriptRoot "mpv\vf_nvofmemc.c"
 $NvofMemcPatch = Join-Path $PSScriptRoot "mpv\mpv-nvofmemc.patch"
+$D3d11DevicePatch = Join-Path $PSScriptRoot "mpv\mpv-d3d11-device.patch"
 $NvofMemcDestination = Join-Path $MpvSourceDir "video\filter\vf_nvofmemc.c"
 $RifeRuntimeHeader = Join-Path $PSScriptRoot "mpv\rife_runtime.h"
 $RifeRuntimeSource = Join-Path $PSScriptRoot "mpv\rife_runtime.cpp"
@@ -35,6 +36,7 @@ $RifeEngineSpecs = @(
     @{ Width = 3840; Height = 2160 }
 )
 $NvofMemcPatchApplied = $false
+$D3d11DevicePatchApplied = $false
 $NvofMemcSourceCreated = $false
 $RifeRuntimeHeaderCreated = $false
 
@@ -66,6 +68,7 @@ if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
 foreach ($RequiredNvofFile in @(
     $NvofMemcSource,
     $NvofMemcPatch,
+    $D3d11DevicePatch,
     $RifeRuntimeHeader,
     $RifeRuntimeSource,
     $RifeRuntimeBuildScript,
@@ -110,6 +113,20 @@ if (-not (Test-Path $MsysBash)) {
 }
 
 try {
+    & git -C $MpvSourceDir apply --check $D3d11DevicePatch 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $MpvSourceDir apply $D3d11DevicePatch
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply the D3D11 device access mpv patch"
+        }
+        $D3d11DevicePatchApplied = $true
+    } else {
+        & git -C $MpvSourceDir apply --reverse --check $D3d11DevicePatch 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The mpv source does not match the pinned D3D11 device access patch"
+        }
+    }
+
     & git -C $MpvSourceDir apply --check $NvofMemcPatch 2>$null
     if ($LASTEXITCODE -eq 0) {
         & git -C $MpvSourceDir apply $NvofMemcPatch
@@ -348,7 +365,7 @@ $EngineManifest = [ordered]@{
     tensorRtVersion = $RifeTensorRtVersion
     model = "RIFE v4.26"
     modelSha256 = $ModelSha256
-    runtimeAbi = 2
+    runtimeAbi = 3
     runtimeDll = "rife_runtime.dll"
     cudaRuntimeDll = "cudart64_12.dll"
     tensorRtDll = "tensorrt_rtx_1_4.dll"
@@ -545,6 +562,12 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
         & git -C $MpvSourceDir apply --reverse $NvofMemcPatch
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to restore the mpv source after the NVOF MEMC build"
+        }
+    }
+    if ($D3d11DevicePatchApplied) {
+        & git -C $MpvSourceDir apply --reverse $D3d11DevicePatch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to restore the mpv source after the D3D11 device access build"
         }
     }
 }

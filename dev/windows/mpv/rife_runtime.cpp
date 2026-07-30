@@ -6,6 +6,7 @@
 
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #include <NvInferRuntime.h>
@@ -16,11 +17,13 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -412,7 +415,13 @@ struct TrtDelete {
 };
 
 template <typename T>
-using TrtPtr = std::unique_ptr<T, TrtDelete<T>>;
+using TrtShared = std::shared_ptr<T>;
+
+template <typename T>
+TrtShared<T> share_trt(T *value)
+{
+    return TrtShared<T>(value, TrtDelete<T>());
+}
 
 std::vector<char> read_file(const wchar_t *path)
 {
@@ -464,6 +473,250 @@ bool tensor_size(const nvinfer1::Dims &dims, nvinfer1::DataType type,
         return false;
     bytes = elements * element_size;
     return true;
+}
+
+struct PrewarmState {
+    ~PrewarmState()
+    {
+        if (cuda.module)
+            FreeLibrary(cuda.module);
+    }
+
+    bool matches(const wchar_t *engine_path_arg, const wchar_t *cudart,
+                 uint32_t width, uint32_t height,
+                 ID3D11Device *expected_device) const
+    {
+        return engine_path == (engine_path_arg ? engine_path_arg : L"")
+            && cuda_runtime_path == (cudart ? cudart : L"")
+            && source_width == width
+            && source_height == height
+            && device.Get() == expected_device
+            && execution;
+    }
+
+    std::wstring engine_path;
+    std::wstring cuda_runtime_path;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    CudaApi cuda{};
+    std::shared_ptr<Logger> logger;
+    TrtShared<nvinfer1::IRuntime> trt_runtime;
+    TrtShared<nvinfer1::ICudaEngine> engine;
+    TrtShared<nvinfer1::IExecutionContext> execution;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+};
+
+struct PrewarmCache {
+    std::mutex mutex;
+    std::condition_variable work_available;
+    std::vector<std::shared_ptr<PrewarmState>> states;
+    std::vector<std::shared_ptr<struct PrewarmTask>> pending;
+    bool worker_started = false;
+};
+
+struct PrewarmTask {
+    std::wstring engine_path;
+    std::wstring cuda_runtime_path;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    std::mutex mutex;
+    std::condition_variable completed;
+    bool started = false;
+    bool done = false;
+    int status = RIFE_RUNTIME_TENSORRT_FAILED;
+    std::string error;
+};
+
+PrewarmCache &prewarm_cache()
+{
+    static PrewarmCache *cache = new PrewarmCache();
+    return *cache;
+}
+
+std::shared_ptr<PrewarmState> find_prewarm_state(const wchar_t *engine,
+                                                 const wchar_t *cudart,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 ID3D11Device *device)
+{
+    PrewarmCache &cache = prewarm_cache();
+    std::scoped_lock lock(cache.mutex);
+    for (const auto &state : cache.states) {
+        if (state && state->matches(engine, cudart, width, height, device))
+            return state;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<PrewarmTask> find_pending_prewarm_task(
+    const wchar_t *engine, const wchar_t *cudart,
+    uint32_t width, uint32_t height, ID3D11Device *device)
+{
+    PrewarmCache &cache = prewarm_cache();
+    std::scoped_lock lock(cache.mutex);
+    for (const auto &task : cache.pending) {
+        if (task
+            && task->engine_path == (engine ? engine : L"")
+            && task->cuda_runtime_path == (cudart ? cudart : L"")
+            && task->source_width == width
+            && task->source_height == height
+            && task->device.Get() == device)
+            return task;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<PrewarmState> build_prewarm_state(
+    const wchar_t *engine_path,
+    const wchar_t *cuda_runtime_path,
+    uint32_t source_width,
+    uint32_t source_height,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context,
+    char *error,
+    size_t error_capacity)
+{
+    auto state = std::make_shared<PrewarmState>();
+    state->engine_path = engine_path;
+    state->cuda_runtime_path = cuda_runtime_path;
+    state->source_width = source_width;
+    state->source_height = source_height;
+    if (!device || !context) {
+        set_error(error, error_capacity,
+                  "RIFE prewarm requires mpv's D3D11 device and context");
+        return nullptr;
+    }
+    state->device = device;
+    state->context = context;
+    if (!load_cuda(cuda_runtime_path, state->cuda, error, error_capacity))
+        return nullptr;
+    if (!cuda_ok(state->cuda,
+                 state->cuda.d3d11_set_device(state->device.Get(), -1),
+                 "cudaD3D11SetDirect3DDevice(prewarm)", error,
+                 error_capacity))
+        return nullptr;
+    const std::vector<char> engine_data = read_file(engine_path);
+    if (engine_data.empty()) {
+        set_error(error, error_capacity,
+                  "TensorRT engine could not be read during prewarm");
+        return nullptr;
+    }
+    state->logger = std::make_shared<Logger>();
+    state->trt_runtime = share_trt(
+        nvinfer1::createInferRuntime(*state->logger));
+    if (!state->trt_runtime) {
+        set_error(error, error_capacity,
+                  "TensorRT runtime creation failed during prewarm: %s",
+                  state->logger->last_error.c_str());
+        return nullptr;
+    }
+    state->engine = share_trt(state->trt_runtime->deserializeCudaEngine(
+        engine_data.data(), engine_data.size()));
+    if (!state->engine) {
+        set_error(error, error_capacity,
+                  "TensorRT engine deserialization failed during prewarm: %s",
+                  state->logger->last_error.c_str());
+        return nullptr;
+    }
+    state->execution = share_trt(state->engine->createExecutionContext());
+    if (!state->execution) {
+        set_error(error, error_capacity,
+                  "TensorRT execution context creation failed during prewarm");
+        return nullptr;
+    }
+    return state;
+}
+
+void run_prewarm_worker()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    PrewarmCache &cache = prewarm_cache();
+    for (;;) {
+        std::shared_ptr<PrewarmTask> task;
+        {
+            std::unique_lock lock(cache.mutex);
+            cache.work_available.wait(lock, [&cache] {
+                return std::any_of(
+                    cache.pending.begin(), cache.pending.end(),
+                    [](const auto &candidate) {
+                        return candidate && !candidate->started;
+                    });
+            });
+            auto next = std::find_if(
+                cache.pending.begin(), cache.pending.end(),
+                [](const auto &candidate) {
+                    return candidate && !candidate->started;
+                });
+            task = *next;
+            task->started = true;
+        }
+
+        char task_error[1024]{};
+        auto state = build_prewarm_state(
+            task->engine_path.c_str(), task->cuda_runtime_path.c_str(),
+            task->source_width, task->source_height, task->device.Get(),
+            task->context.Get(), task_error, sizeof(task_error));
+        const bool success = static_cast<bool>(state);
+        {
+            std::scoped_lock lock(cache.mutex);
+            if (success) {
+                const bool duplicate = std::any_of(
+                    cache.states.begin(), cache.states.end(),
+                    [&](const auto &candidate) {
+                        return candidate && candidate->matches(
+                            task->engine_path.c_str(),
+                            task->cuda_runtime_path.c_str(),
+                            task->source_width, task->source_height,
+                            task->device.Get());
+                    });
+                if (!duplicate)
+                    cache.states.push_back(std::move(state));
+            }
+            cache.pending.erase(
+                std::remove(cache.pending.begin(), cache.pending.end(), task),
+                cache.pending.end());
+        }
+        {
+            std::scoped_lock lock(task->mutex);
+            task->status = success ? RIFE_RUNTIME_OK
+                                   : RIFE_RUNTIME_TENSORRT_FAILED;
+            task->error = task_error[0]
+                ? task_error
+                : "RIFE background prewarm failed without a diagnostic";
+            task->done = true;
+        }
+        task->completed.notify_all();
+    }
+}
+
+void ensure_prewarm_worker()
+{
+    PrewarmCache &cache = prewarm_cache();
+    std::scoped_lock lock(cache.mutex);
+    if (cache.worker_started)
+        return;
+    cache.worker_started = true;
+    std::thread(run_prewarm_worker).detach();
+}
+
+int wait_for_pending_prewarm(const wchar_t *engine, const wchar_t *cudart,
+                             uint32_t width, uint32_t height,
+                             ID3D11Device *device,
+                             char *error, size_t error_capacity)
+{
+    auto task = find_pending_prewarm_task(engine, cudart, width, height, device);
+    if (!task)
+        return RIFE_RUNTIME_OK;
+    std::unique_lock lock(task->mutex);
+    task->completed.wait(lock, [&task] { return task->done; });
+    if (task->status != RIFE_RUNTIME_OK) {
+        set_error(error, error_capacity, "%s", task->error.c_str());
+        return task->status;
+    }
+    return RIFE_RUNTIME_OK;
 }
 
 bool create_raw_buffer(ID3D11Device *device, size_t bytes,
@@ -681,7 +934,7 @@ public:
             cuda_.unregister_resource(output_resource_);
         if (input_resource_ && cuda_.unregister_resource)
             cuda_.unregister_resource(input_resource_);
-        if (cuda_.module)
+        if (cuda_.module && cuda_owned_)
             FreeLibrary(cuda_.module);
     }
 
@@ -700,41 +953,80 @@ public:
                       "RIFE requires ID3D11Device3 planar views");
             return false;
         }
-        if (!load_cuda(config.cuda_runtime_path, cuda_, error, error_capacity))
-            return false;
-        if (!cuda_ok(cuda_, cuda_.d3d11_set_device(device_.Get(), -1),
-                     "cudaD3D11SetDirect3DDevice", error, error_capacity))
-            return false;
+        prewarm_state_ = find_prewarm_state(
+            config.engine_path, config.cuda_runtime_path,
+            config.source_width, config.source_height, config.device);
+        if (prewarm_state_) {
+            cuda_ = prewarm_state_->cuda;
+            logger_ = prewarm_state_->logger;
+            trt_runtime_ = prewarm_state_->trt_runtime;
+            engine_ = prewarm_state_->engine;
+            execution_ = prewarm_state_->execution;
+            prewarm_hit_ = true;
+        } else {
+            logger_ = std::make_shared<Logger>();
+            cuda_owned_ = true;
+        }
+        const auto cuda_started = std::chrono::steady_clock::now();
+        if (!prewarm_state_) {
+            if (!load_cuda(config.cuda_runtime_path, cuda_, error, error_capacity))
+                return false;
+            cuda_load_ms_ = elapsed_ms(cuda_started);
+        }
+        if (!prewarm_state_) {
+            const auto cuda_bind_started = std::chrono::steady_clock::now();
+            if (!cuda_ok(cuda_, cuda_.d3d11_set_device(device_.Get(), -1),
+                         "cudaD3D11SetDirect3DDevice", error, error_capacity))
+                return false;
+            cuda_bind_ms_ = elapsed_ms(cuda_bind_started);
+        }
 
-        const std::vector<char> engine_data = read_file(config.engine_path);
-        if (engine_data.empty()) {
-            set_error(error, error_capacity, "TensorRT engine could not be read");
-            return false;
+        if (!prewarm_state_) {
+            const auto engine_read_started = std::chrono::steady_clock::now();
+            const std::vector<char> engine_data = read_file(config.engine_path);
+            engine_read_ms_ = elapsed_ms(engine_read_started);
+            if (engine_data.empty()) {
+                set_error(error, error_capacity,
+                          "TensorRT engine could not be read");
+                return false;
+            }
+            const auto trt_runtime_started = std::chrono::steady_clock::now();
+            trt_runtime_ = share_trt(
+                nvinfer1::createInferRuntime(*logger_));
+            trt_runtime_ms_ = elapsed_ms(trt_runtime_started);
+            if (!trt_runtime_) {
+                set_error(error, error_capacity,
+                          "TensorRT runtime creation failed: %s",
+                          logger_->last_error.c_str());
+                return false;
+            }
+            const auto engine_deserialize_started = std::chrono::steady_clock::now();
+            engine_ = share_trt(trt_runtime_->deserializeCudaEngine(
+                engine_data.data(), engine_data.size()));
+            engine_deserialize_ms_ = elapsed_ms(engine_deserialize_started);
+            if (!engine_) {
+                set_error(error, error_capacity,
+                          "TensorRT engine deserialization failed: %s",
+                          logger_->last_error.c_str());
+                return false;
+            }
+            const auto execution_context_started = std::chrono::steady_clock::now();
+            execution_ = share_trt(engine_->createExecutionContext());
+            execution_context_ms_ = elapsed_ms(execution_context_started);
+            if (!execution_) {
+                set_error(error, error_capacity,
+                          "TensorRT execution context creation failed");
+                return false;
+            }
         }
-        trt_runtime_.reset(nvinfer1::createInferRuntime(logger_));
-        if (!trt_runtime_) {
-            set_error(error, error_capacity, "TensorRT runtime creation failed: %s",
-                      logger_.last_error.c_str());
-            return false;
-        }
-        engine_.reset(trt_runtime_->deserializeCudaEngine(
-            engine_data.data(), engine_data.size()));
-        if (!engine_) {
-            set_error(error, error_capacity,
-                      "TensorRT engine deserialization failed: %s",
-                      logger_.last_error.c_str());
-            return false;
-        }
-        execution_.reset(engine_->createExecutionContext());
-        if (!execution_) {
-            set_error(error, error_capacity,
-                      "TensorRT execution context creation failed");
-            return false;
-        }
+        const auto engine_validate_started = std::chrono::steady_clock::now();
         if (!validate_engine(error, error_capacity))
             return false;
+        engine_validate_ms_ = elapsed_ms(engine_validate_started);
+        const auto d3d_resources_started = std::chrono::steady_clock::now();
         if (!create_resources(error, error_capacity))
             return false;
+        d3d_resources_ms_ = elapsed_ms(d3d_resources_started);
         return true;
     }
 
@@ -769,8 +1061,17 @@ public:
         if (cache_hit)
             reuse_count_++;
         stats_.runtime_cache_hit = cache_hit ? 1u : 0u;
+        stats_.runtime_prewarm_hit = prewarm_hit_ ? 1u : 0u;
         stats_.runtime_reuses = reuse_count_;
         stats_.runtime_initialization_ms = initialization_ms;
+        stats_.runtime_cuda_load_ms = cuda_load_ms_;
+        stats_.runtime_cuda_bind_ms = cuda_bind_ms_;
+        stats_.runtime_engine_read_ms = engine_read_ms_;
+        stats_.runtime_trt_runtime_ms = trt_runtime_ms_;
+        stats_.runtime_engine_deserialize_ms = engine_deserialize_ms_;
+        stats_.runtime_execution_context_ms = execution_context_ms_;
+        stats_.runtime_engine_validate_ms = engine_validate_ms_;
+        stats_.runtime_d3d_resources_ms = d3d_resources_ms_;
     }
 
     int process(ID3D11Texture2D *frame0, uint32_t frame0_slice,
@@ -1274,7 +1575,7 @@ private:
         }
         if (ok && !execution_->enqueueV3(stream_)) {
             set_error(error, error_capacity, "TensorRT enqueueV3 failed: %s",
-                      logger_.last_error.c_str());
+                      logger_->last_error.c_str());
             ok = false;
         }
         if (ok && !cuda_ok(cuda_, cuda_.stream_synchronize(stream_),
@@ -1330,6 +1631,12 @@ private:
         inference_histogram_[bucket]++;
     }
 
+    static double elapsed_ms(const std::chrono::steady_clock::time_point &started)
+    {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    }
+
     rife_runtime_config config_{};
     std::wstring engine_path_;
     std::wstring cuda_runtime_path_;
@@ -1337,10 +1644,10 @@ private:
     CudaStream stream_ = nullptr;
     CudaGraphicsResource input_resource_ = nullptr;
     CudaGraphicsResource output_resource_ = nullptr;
-    Logger logger_;
-    TrtPtr<nvinfer1::IRuntime> trt_runtime_;
-    TrtPtr<nvinfer1::ICudaEngine> engine_;
-    TrtPtr<nvinfer1::IExecutionContext> execution_;
+    std::shared_ptr<Logger> logger_;
+    TrtShared<nvinfer1::IRuntime> trt_runtime_;
+    TrtShared<nvinfer1::ICudaEngine> engine_;
+    TrtShared<nvinfer1::IExecutionContext> execution_;
     const char *input_name_ = nullptr;
     const char *output_name_ = nullptr;
     size_t input_bytes_ = 0;
@@ -1369,6 +1676,17 @@ private:
     uint32_t previous_scene_class_ = RIFE_SCENE_NORMAL;
     uint32_t previous_scene_streak_ = 0;
     uint64_t reuse_count_ = 0;
+    double cuda_load_ms_ = 0;
+    double cuda_bind_ms_ = 0;
+    double engine_read_ms_ = 0;
+    double trt_runtime_ms_ = 0;
+    double engine_deserialize_ms_ = 0;
+    double execution_context_ms_ = 0;
+    double engine_validate_ms_ = 0;
+    double d3d_resources_ms_ = 0;
+    std::shared_ptr<PrewarmState> prewarm_state_;
+    bool cuda_owned_ = false;
+    bool prewarm_hit_ = false;
 };
 
 struct RuntimeCache {
@@ -1408,6 +1726,109 @@ extern "C" uint32_t __cdecl rife_runtime_abi_version(void)
     return RIFE_RUNTIME_ABI_VERSION;
 }
 
+extern "C" int __cdecl rife_runtime_prewarm_with_device(
+    const wchar_t *engine_path,
+    const wchar_t *cuda_runtime_path,
+    uint32_t source_width,
+    uint32_t source_height,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context,
+    char *error,
+    size_t error_capacity)
+{
+    if (error && error_capacity)
+        error[0] = '\0';
+    if (!engine_path || !cuda_runtime_path || !engine_path[0]
+        || !cuda_runtime_path[0] || source_width == 0 || source_height == 0
+        || !device || !context) {
+        set_error(error, error_capacity, "RIFE prewarm arguments are invalid");
+        return RIFE_RUNTIME_INVALID_ARGUMENT;
+    }
+    if (!pin_runtime_module(error, error_capacity))
+        return RIFE_RUNTIME_TENSORRT_FAILED;
+    const int pending_status = wait_for_pending_prewarm(
+        engine_path, cuda_runtime_path, source_width, source_height,
+        device, error, error_capacity);
+    if (pending_status != RIFE_RUNTIME_OK)
+        return pending_status;
+    if (find_prewarm_state(engine_path, cuda_runtime_path,
+                           source_width, source_height, device))
+        return RIFE_RUNTIME_OK;
+    auto state = build_prewarm_state(
+        engine_path, cuda_runtime_path, source_width, source_height,
+        device, context,
+        error, error_capacity);
+    if (!state)
+        return RIFE_RUNTIME_TENSORRT_FAILED;
+    PrewarmCache &cache = prewarm_cache();
+    std::scoped_lock lock(cache.mutex);
+    const bool already_present = std::any_of(
+        cache.states.begin(), cache.states.end(),
+        [&](const auto &candidate) {
+            return candidate
+                && candidate->matches(engine_path, cuda_runtime_path,
+                                      source_width, source_height, device);
+        });
+    if (!already_present)
+        cache.states.push_back(std::move(state));
+    return RIFE_RUNTIME_OK;
+}
+
+extern "C" int __cdecl rife_runtime_queue_prewarm_with_device(
+    const wchar_t *engine_path,
+    const wchar_t *cuda_runtime_path,
+    uint32_t source_width,
+    uint32_t source_height,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context,
+    char *error,
+    size_t error_capacity)
+{
+    if (error && error_capacity)
+        error[0] = '\0';
+    if (!engine_path || !cuda_runtime_path || !engine_path[0]
+        || !cuda_runtime_path[0] || source_width == 0 || source_height == 0
+        || !device || !context) {
+        set_error(error, error_capacity, "RIFE prewarm arguments are invalid");
+        return RIFE_RUNTIME_INVALID_ARGUMENT;
+    }
+    if (!pin_runtime_module(error, error_capacity))
+        return RIFE_RUNTIME_TENSORRT_FAILED;
+    if (find_prewarm_state(engine_path, cuda_runtime_path,
+                           source_width, source_height, device)
+        || find_pending_prewarm_task(engine_path, cuda_runtime_path,
+                                     source_width, source_height, device))
+        return RIFE_RUNTIME_OK;
+
+    auto task = std::make_shared<PrewarmTask>();
+    task->engine_path = engine_path;
+    task->cuda_runtime_path = cuda_runtime_path;
+    task->source_width = source_width;
+    task->source_height = source_height;
+    task->device = device;
+    task->context = context;
+    ensure_prewarm_worker();
+    {
+        PrewarmCache &cache = prewarm_cache();
+        std::scoped_lock lock(cache.mutex);
+        const bool duplicate = std::any_of(
+            cache.pending.begin(), cache.pending.end(),
+            [&](const auto &candidate) {
+                return candidate
+                    && candidate->engine_path == task->engine_path
+                    && candidate->cuda_runtime_path == task->cuda_runtime_path
+                    && candidate->source_width == task->source_width
+                    && candidate->source_height == task->source_height
+                    && candidate->device.Get() == task->device.Get();
+            });
+        if (duplicate)
+            return RIFE_RUNTIME_OK;
+        cache.pending.push_back(task);
+    }
+    prewarm_cache().work_available.notify_one();
+    return RIFE_RUNTIME_OK;
+}
+
 extern "C" struct rife_runtime *__cdecl rife_runtime_create(
     const struct rife_runtime_config *config,
     char *error,
@@ -1431,6 +1852,12 @@ extern "C" struct rife_runtime *__cdecl rife_runtime_create(
         return nullptr;
     }
     if (!pin_runtime_module(error, error_capacity))
+        return nullptr;
+    const int pending_status = wait_for_pending_prewarm(
+        config->engine_path, config->cuda_runtime_path,
+        config->source_width, config->source_height, config->device,
+        error, error_capacity);
+    if (pending_status != RIFE_RUNTIME_OK)
         return nullptr;
     const auto started = std::chrono::steady_clock::now();
     auto runtime = std::make_unique<rife_runtime>();

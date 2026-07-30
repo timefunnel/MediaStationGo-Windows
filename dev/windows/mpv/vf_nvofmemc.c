@@ -32,6 +32,8 @@ struct opts {
     char *rife_runtime_dll;
     char *rife_engine;
     char *rife_cudart;
+    int rife_source_width;
+    int rife_source_height;
     int rife_scene_sample_stride;
     int rife_scene_pixel_threshold;
     double rife_scene_average_threshold;
@@ -376,6 +378,9 @@ typedef void (__cdecl *rife_reset_fn)(struct rife_runtime *);
 typedef int (__cdecl *rife_get_stats_fn)(
     const struct rife_runtime *, struct rife_runtime_stats *);
 typedef void (__cdecl *rife_destroy_fn)(struct rife_runtime *);
+typedef int (__cdecl *rife_queue_prewarm_fn)(
+    const wchar_t *, const wchar_t *, uint32_t, uint32_t,
+    ID3D11Device *, ID3D11DeviceContext *, char *, size_t);
 
 struct rife_state {
     HMODULE module;
@@ -385,6 +390,7 @@ struct rife_state {
     rife_reset_fn reset;
     rife_get_stats_fn get_stats;
     rife_destroy_fn destroy;
+    rife_queue_prewarm_fn queue_prewarm;
     struct rife_runtime *runtime;
     int width;
     int height;
@@ -586,7 +592,9 @@ static bool load_rife_bridge(struct mp_filter *f)
         !load_rife_symbol(f, "rife_runtime_get_stats",
                           (FARPROC *)&p->rife.get_stats) ||
         !load_rife_symbol(f, "rife_runtime_destroy",
-                          (FARPROC *)&p->rife.destroy)) {
+                          (FARPROC *)&p->rife.destroy) ||
+        !load_rife_symbol(f, "rife_runtime_queue_prewarm_with_device",
+                          (FARPROC *)&p->rife.queue_prewarm)) {
         destroy_rife_bridge(f);
         return false;
     }
@@ -598,6 +606,42 @@ static bool load_rife_bridge(struct mp_filter *f)
         return false;
     }
     MP_INFO(f, "RIFE runtime bridge loaded ABI=%u\n", abi);
+    return true;
+}
+
+static bool queue_rife_prewarm(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    if (!p->opts->rife)
+        return true;
+    if (p->opts->rife_source_width <= 0
+        || p->opts->rife_source_height <= 0) {
+        MP_ERR(f, "RIFE background prewarm requires source dimensions\n");
+        return false;
+    }
+    wchar_t *engine_path = utf8_to_wide(f, p->opts->rife_engine);
+    wchar_t *cudart_path = utf8_to_wide(f, p->opts->rife_cudart);
+    if (!engine_path || !cudart_path) {
+        MP_ERR(f, "RIFE background prewarm paths are not valid UTF-8\n");
+        talloc_free(engine_path);
+        talloc_free(cudart_path);
+        return false;
+    }
+    char error[1024] = {0};
+    const int status = p->rife.queue_prewarm(
+        engine_path, cudart_path,
+        (uint32_t)p->opts->rife_source_width,
+        (uint32_t)p->opts->rife_source_height,
+        p->device, p->context, error, sizeof(error));
+    talloc_free(engine_path);
+    talloc_free(cudart_path);
+    if (status != RIFE_RUNTIME_OK) {
+        MP_ERR(f, "RIFE background prewarm could not be queued status=%d "
+                  "detail=%s\n", status, error[0] ? error : "unknown");
+        return false;
+    }
+    MP_INFO(f, "RIFE background prewarm queued source=%dx%d\n",
+            p->opts->rife_source_width, p->opts->rife_source_height);
     return true;
 }
 
@@ -7182,6 +7226,8 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     MP_INFO(f, "Frame interpolation D3D11 context block locking enabled\n");
     if (p->opts->rife && !load_rife_bridge(f))
         goto fail;
+    if (!queue_rife_prewarm(f))
+        goto fail;
     if ((nvof_analysis_enabled(p) || p->opts->rife) &&
         !create_gpu_profile_queries(f))
         goto fail;
@@ -7201,6 +7247,8 @@ static const m_option_t option_fields[] = {
     {"rife-runtime-dll", OPT_STRING(rife_runtime_dll), .flags = M_OPT_FILE},
     {"rife-engine", OPT_STRING(rife_engine), .flags = M_OPT_FILE},
     {"rife-cudart", OPT_STRING(rife_cudart), .flags = M_OPT_FILE},
+    {"rife-source-width", OPT_INT(rife_source_width), M_RANGE(0, 7680)},
+    {"rife-source-height", OPT_INT(rife_source_height), M_RANGE(0, 4320)},
     {"rife-scene-sample-stride", OPT_INT(rife_scene_sample_stride),
         M_RANGE(2, 64)},
     {"rife-scene-pixel-threshold", OPT_INT(rife_scene_pixel_threshold),
@@ -7244,6 +7292,8 @@ const struct mp_user_filter_entry vf_nvofmemc = {
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
             .rife = false,
+            .rife_source_width = 0,
+            .rife_source_height = 0,
             .rife_scene_sample_stride = 8,
             .rife_scene_pixel_threshold = 32,
             .rife_scene_average_threshold = 24.0,
