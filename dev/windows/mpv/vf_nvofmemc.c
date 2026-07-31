@@ -31,6 +31,7 @@ struct opts {
     bool rife;
     char *rife_runtime_dll;
     char *rife_engine;
+    char *rife_model;
     char *rife_cudart;
     int rife_source_width;
     int rife_source_height;
@@ -736,11 +737,12 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
         return false;
     }
     MP_INFO(f, "RIFE runtime initialized source=%dx%d format=P010 "
-               "matrix=%d range=%s model=v4.26 implementation=1 "
+               "matrix=%d range=%s model=%s implementation=1 "
                "backend=TensorRT-RTX FP16 strict-x2 cache=%s "
                "init-ms=%.3f reuses=%llu\n",
             frame->w, frame->h, matrix,
             limited_range ? "limited" : "full",
+            p->opts->rife_model,
             stats.runtime_cache_hit ? "hit" : "cold",
             stats.runtime_initialization_ms,
             (unsigned long long)stats.runtime_reuses);
@@ -7140,6 +7142,10 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
                    "frames; motion compensation is not active\n");
     }
     if (p->opts->rife) {
+        if (!p->opts->rife_model || !p->opts->rife_model[0]) {
+            MP_ERR(f, "RIFE requires an explicit rife-model identifier\n");
+            goto fail;
+        }
         MP_WARN(f, "RIFE enables strict x2 P010 midpoint inference with "
                    "TensorRT-RTX FP16; unsupported formats, missing runtime "
                    "components, incompatible engines, and inference failures "
@@ -7247,6 +7253,7 @@ static const m_option_t option_fields[] = {
     {"rife", OPT_BOOL(rife)},
     {"rife-runtime-dll", OPT_STRING(rife_runtime_dll), .flags = M_OPT_FILE},
     {"rife-engine", OPT_STRING(rife_engine), .flags = M_OPT_FILE},
+    {"rife-model", OPT_STRING(rife_model)},
     {"rife-cudart", OPT_STRING(rife_cudart), .flags = M_OPT_FILE},
     {"rife-source-width", OPT_INT(rife_source_width), M_RANGE(0, 7680)},
     {"rife-source-height", OPT_INT(rife_source_height), M_RANGE(0, 4320)},

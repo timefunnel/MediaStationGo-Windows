@@ -549,6 +549,8 @@ int wmain(int argc, wchar_t **argv)
 {
     const bool sequence_mode = argc == 13
         && std::wcscmp(argv[1], L"--sequence") == 0;
+    const bool switch_mode = argc == 8
+        && std::wcscmp(argv[1], L"--switch") == 0;
     if (argc != 8 && !sequence_mode) {
         std::fprintf(stderr,
                      "usage: rife_runtime_probe.exe <runtime-dll> <engine> "
@@ -556,20 +558,23 @@ int wmain(int argc, wchar_t **argv)
                      "   or: rife_runtime_probe.exe --sequence "
                      "<runtime-dll> <engine> <cudart> <width> <height> "
                      "<fps-num> <fps-den> <start-pts> <input-p010> "
-                     "<midpoints-p010> <diagnostics-csv>\n");
+                     "<midpoints-p010> <diagnostics-csv>\n"
+                     "   or: rife_runtime_probe.exe --switch "
+                     "<runtime-dll> <first-engine> <second-engine> <cudart> "
+                     "<width> <height>\n");
         return 2;
     }
-    const int runtime_argument = sequence_mode ? 2 : 1;
-    const int engine_argument = sequence_mode ? 3 : 2;
-    const int cudart_argument = sequence_mode ? 4 : 3;
-    const int width_argument = sequence_mode ? 5 : 4;
-    const int height_argument = sequence_mode ? 6 : 5;
+    const int runtime_argument = sequence_mode || switch_mode ? 2 : 1;
+    const int engine_argument = sequence_mode || switch_mode ? 3 : 2;
+    const int cudart_argument = sequence_mode ? 4 : switch_mode ? 5 : 3;
+    const int width_argument = sequence_mode ? 5 : switch_mode ? 6 : 4;
+    const int height_argument = sequence_mode ? 6 : switch_mode ? 7 : 5;
     const uint32_t width = static_cast<uint32_t>(
         _wtoi(argv[width_argument]));
     const uint32_t height = static_cast<uint32_t>(
         _wtoi(argv[height_argument]));
-    const int warmup = sequence_mode ? 0 : _wtoi(argv[6]);
-    const int iterations = sequence_mode ? 0 : _wtoi(argv[7]);
+    const int warmup = sequence_mode || switch_mode ? 0 : _wtoi(argv[6]);
+    const int iterations = sequence_mode || switch_mode ? 0 : _wtoi(argv[7]);
     const uint32_t fps_numerator = sequence_mode
         ? static_cast<uint32_t>(_wtoi(argv[7])) : 0;
     const uint32_t fps_denominator = sequence_mode
@@ -587,7 +592,7 @@ int wmain(int argc, wchar_t **argv)
     if (!width || !height
         || (sequence_mode
             ? !fps_numerator || !fps_denominator || start_pts < 0
-            : warmup < 1 || iterations < 1))
+            : !switch_mode && (warmup < 1 || iterations < 1)))
         return 2;
 
     HMODULE module = LoadLibraryExW(
@@ -701,6 +706,24 @@ int wmain(int argc, wchar_t **argv)
                      error);
         FreeLibrary(module);
         return 10;
+    }
+
+    if (switch_mode) {
+        destroy(runtime);
+        rife_runtime_config second_config = config;
+        second_config.engine_path = argv[4];
+        runtime = create(&second_config, error, sizeof(error));
+        if (!runtime) {
+            std::fprintf(stderr,
+                         "RIFE_RUNTIME_PROBE_SWITCH_FAILED detail=%s\n",
+                         error);
+            FreeLibrary(module);
+            return 11;
+        }
+        destroy(runtime);
+        std::fprintf(stdout, "RIFE_RUNTIME_PROBE_SWITCH_OK\n");
+        FreeLibrary(module);
+        return 0;
     }
 
     if (sequence_mode) {

@@ -798,7 +798,8 @@ fn build_plan(
             )
         })?;
     let video_filter = format!(
-        "nvofmemc=rife=yes:rife-source-width={}:rife-source-height={}:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        "nvofmemc=rife=yes:rife-model={}:rife-source-width={}:rife-source-height={}:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        model.model.as_str(),
         request.width,
         request.height,
         mpv_filter_path(&runtime.runtime_dll)?,
@@ -1091,6 +1092,7 @@ mod tests {
             assert_eq!(plan.hwdec, "d3d11va");
             assert_eq!(plan.backend, RIFE_BACKEND);
             assert!(plan.video_filter.starts_with("nvofmemc=rife=yes:"));
+            assert!(plan.video_filter.contains("rife-model=rife-v4.26"));
             assert!(plan.video_filter.contains("rife-runtime-dll="));
             assert!(plan.video_filter.contains("rife-engine="));
             assert!(plan.video_filter.contains("rife-cudart="));
@@ -1110,6 +1112,7 @@ mod tests {
         assert_eq!(plan.model_id, "rife-v4.25-lite");
         assert_eq!(plan.model, "RIFE v4.25 Lite");
         assert_eq!(plan.engine_key, "rife-v4.25-lite-3840x2160");
+        assert!(plan.video_filter.contains("rife-model=rife-v4.25-lite"));
 
         let mut report = ready_report();
         report

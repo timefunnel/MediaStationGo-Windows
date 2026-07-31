@@ -411,6 +411,60 @@ bool cuda_ok(const CudaApi &api, CudaError status, const char *operation,
     return false;
 }
 
+struct CudaD3D11Binding {
+    std::mutex mutex;
+    std::wstring cuda_runtime_path;
+    ComPtr<ID3D11Device> device;
+    bool bound = false;
+};
+
+CudaD3D11Binding &cuda_d3d11_binding()
+{
+    // The runtime DLL is pinned. Keep the process binding alive so CUDA and
+    // D3D11 objects cannot be torn down in an unsafe static-destructor order.
+    static CudaD3D11Binding *binding = new CudaD3D11Binding();
+    return *binding;
+}
+
+bool bind_cuda_d3d11(const CudaApi &api, const wchar_t *cuda_runtime_path,
+                     ID3D11Device *device, const char *operation,
+                     char *error, size_t error_capacity)
+{
+    if (!cuda_runtime_path || !cuda_runtime_path[0] || !device) {
+        set_error(error, error_capacity,
+                  "%s requires a CUDA Runtime path and D3D11 device",
+                  operation);
+        return false;
+    }
+    const std::wstring requested_path(cuda_runtime_path);
+    CudaD3D11Binding &binding = cuda_d3d11_binding();
+    std::scoped_lock lock(binding.mutex);
+    if (binding.bound) {
+        if (binding.cuda_runtime_path != requested_path) {
+            set_error(error, error_capacity,
+                      "%s rejected: this process is already bound through "
+                      "a different CUDA Runtime path",
+                      operation);
+            return false;
+        }
+        if (binding.device.Get() != device) {
+            set_error(error, error_capacity,
+                      "%s rejected: this process is already bound to a "
+                      "different D3D11 device",
+                      operation);
+            return false;
+        }
+        return true;
+    }
+    if (!cuda_ok(api, api.d3d11_set_device(device, -1), operation,
+                 error, error_capacity))
+        return false;
+    binding.cuda_runtime_path = requested_path;
+    binding.device = device;
+    binding.bound = true;
+    return true;
+}
+
 class Logger final : public nvinfer1::ILogger {
 public:
     void log(Severity severity, const char *message) noexcept override
@@ -611,10 +665,9 @@ std::shared_ptr<PrewarmState> build_prewarm_state(
     state->context = context;
     if (!load_cuda(cuda_runtime_path, state->cuda, error, error_capacity))
         return nullptr;
-    if (!cuda_ok(state->cuda,
-                 state->cuda.d3d11_set_device(state->device.Get(), -1),
-                 "cudaD3D11SetDirect3DDevice(prewarm)", error,
-                 error_capacity))
+    if (!bind_cuda_d3d11(
+            state->cuda, cuda_runtime_path, state->device.Get(),
+            "cudaD3D11SetDirect3DDevice(prewarm)", error, error_capacity))
         return nullptr;
     const std::vector<char> engine_data = read_file(engine_path);
     if (engine_data.empty()) {
@@ -997,8 +1050,9 @@ public:
         }
         if (!prewarm_state_) {
             const auto cuda_bind_started = std::chrono::steady_clock::now();
-            if (!cuda_ok(cuda_, cuda_.d3d11_set_device(device_.Get(), -1),
-                         "cudaD3D11SetDirect3DDevice", error, error_capacity))
+            if (!bind_cuda_d3d11(
+                    cuda_, config.cuda_runtime_path, device_.Get(),
+                    "cudaD3D11SetDirect3DDevice", error, error_capacity))
                 return false;
             cuda_bind_ms_ = elapsed_ms(cuda_bind_started);
         }
