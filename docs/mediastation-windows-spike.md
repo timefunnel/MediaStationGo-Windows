@@ -6,6 +6,9 @@ This branch validates whether Jellium Desktop can host a dedicated
 MediaStationGo Windows client. It is not the final application repository.
 The Android TV project remains a read-only protocol and interaction reference.
 
+The active RIFE precision, TensorRT profile, and VRR refresh-matching work is
+tracked in [windows-rife-tensorrt-profiles.md](windows-rife-tensorrt-profiles.md).
+
 The Spike must prove these paths before product UI work expands:
 
 1. Resolve PlaybackInfo streams through an explicit redirect chain.
