@@ -161,7 +161,10 @@ impl SettingsData {
             self.hide_scrollbar = b;
         }
         if let Some(model) = v.get("frameInterpolationModel").and_then(Value::as_str)
-            && matches!(model, "rife-v4.26" | "rife-v4.25-lite")
+            && matches!(
+                model,
+                "rife-v4.26" | "rife-v4.26-scale0.5" | "rife-v4.25-lite"
+            )
         {
             self.frame_interpolation_model = if model == FRAME_INTERPOLATION_MODEL_DEFAULT {
                 String::new()
@@ -509,7 +512,10 @@ pub fn frame_interpolation_model() -> String {
 }
 
 pub fn set_frame_interpolation_model(model: &str) {
-    if matches!(model, "rife-v4.26" | "rife-v4.25-lite") {
+    if matches!(
+        model,
+        "rife-v4.26" | "rife-v4.26-scale0.5" | "rife-v4.25-lite"
+    ) {
         state().lock().data.frame_interpolation_model =
             if model == FRAME_INTERPOLATION_MODEL_DEFAULT {
                 String::new()
@@ -737,6 +743,17 @@ mod tests {
                 .get("frameInterpolationModel")
                 .and_then(|value| value.as_str()),
             Some("rife-v4.25-lite")
+        );
+
+        settings.overlay_json(&json!({
+            "frameInterpolationModel": "rife-v4.26-scale0.5"
+        }));
+        assert_eq!(
+            settings
+                .to_json()
+                .get("frameInterpolationModel")
+                .and_then(|value| value.as_str()),
+            Some("rife-v4.26-scale0.5")
         );
 
         settings.overlay_json(&json!({

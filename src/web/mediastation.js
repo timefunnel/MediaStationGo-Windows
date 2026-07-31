@@ -27,6 +27,7 @@
     const pauseSymbol = '\u23f8\ufe0e';
     const interpolationModels = Object.freeze({
         'rife-v4.26': { label: '质量优先', name: 'RIFE v4.26' },
+        'rife-v4.26-scale0.5': { label: '均衡优先', name: 'RIFE v4.26 · Scale 0.5' },
         'rife-v4.25-lite': { label: '流畅优先', name: 'RIFE v4.25 Lite' },
     });
     let imageActive = 0;
@@ -318,12 +319,16 @@
             frame_interpolation_manifest_missing: 'RIFE 运行清单缺失',
             frame_interpolation_manifest_invalid: 'RIFE 运行清单无效',
             frame_interpolation_runtime_component_missing: 'RIFE 运行组件不完整',
+            frame_interpolation_runtime_component_corrupt: 'RIFE 运行组件校验失败',
             frame_interpolation_runtime_load_failed: 'RIFE 运行库加载失败',
             frame_interpolation_runtime_abi_mismatch: 'RIFE 运行库版本不匹配',
             frame_interpolation_engine_cache_mismatch: 'RIFE Engine 与当前显卡或驱动不匹配',
             frame_interpolation_engine_missing: '当前分辨率的 RIFE Engine 缺失',
             frame_interpolation_engine_corrupt: 'RIFE Engine 校验失败',
+            frame_interpolation_engine_cache_unavailable: 'RIFE Engine 缓存不可用',
+            frame_interpolation_engine_build_failed: 'RIFE Engine 生成失败',
             frame_interpolation_model_unavailable: '所选 RIFE 模型未安装',
+            frame_interpolation_model_corrupt: '所选 RIFE 模型校验失败',
             frame_interpolation_model_invalid: '所选 RIFE 模型无效',
             frame_interpolation_engine_shape_unsupported: '当前分辨率尚无原生 RIFE Engine',
             frame_interpolation_runtime_path_invalid: 'RIFE 运行路径无效',
@@ -337,7 +342,7 @@
             frame_interpolation_target_not_higher: '插帧目标帧率必须高于原始帧率',
             frame_interpolation_display_fps_unknown: '无法读取当前显示器刷新率',
             frame_interpolation_display_refresh_insufficient: '目标帧率高于当前显示器刷新率',
-            frame_interpolation_dimensions_unsupported: '当前版本最高支持 3840×2160 插帧',
+            frame_interpolation_dimensions_unsupported: '该分辨率超出当前插帧链路限制',
             frame_interpolation_source_fps_unsupported: '当前仅支持 20 至 30 FPS 片源进行严格 2 倍插帧',
             frame_interpolation_hlg_not_validated: '当前版本尚未开放 HLG 插帧',
             frame_interpolation_hdr10_plus_unsupported: '当前版本不支持 HDR10+ 插帧',

@@ -4616,6 +4616,11 @@ mod tests {
             parse_interpolation_model_value("rife-v4.25-lite").expect("v4.25 Lite should be valid"),
             InterpolationModel::RifeV425Lite
         );
+        assert_eq!(
+            parse_interpolation_model_value("rife-v4.26-scale0.5")
+                .expect("v4.26 scale=0.5 should be valid"),
+            InterpolationModel::RifeV426Scale05
+        );
         for invalid in ["", "auto", "rife-v4.26-heavy"] {
             let error = parse_interpolation_model_value(invalid)
                 .expect_err("unbundled models must be rejected");
