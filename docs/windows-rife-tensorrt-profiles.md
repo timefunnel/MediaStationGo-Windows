@@ -12,11 +12,11 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 ### 进度台账
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`，文档检查点
-`72a93b2`。
+`2ae088a`。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
-| `scale=0.5` FP32 性能 | 进行中 | 已完成三档 ONNX/Engine 精度审计，以及 1080p、3840x2160 同机同参数 probe；确认质量档和 Lite 主计算路径已是 FP16，只有 `scale=0.5` 仍有性能关键的 FP32 islands | 对 `scale=0.5` 做逐层耗时归因，建立只修改该模型的候选精度图，并先跑数值和 Engine 验证 |
+| `scale=0.5` FP32 性能 | 进行中 | 已完成三档 ONNX/Engine 精度审计、1080p/3840x2160 同机 probe 和 `scale=0.5` 的 4K Engine 逐层归因；5 个含 `GridSample` 的融合层合计占诊断 Engine 图内时间 `44.46%` | 建立只修改该模型的候选 FP16 精度图，并依次跑 PyTorch/ONNX、ONNX/Engine、probe 和播放器验证 |
 | TensorRT profile 优化 | 未开始，等待任务 1 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则 | 等 `scale=0.5` 精度和性能基线冻结后，再设计并实测多 shape profile |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
@@ -62,6 +62,23 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 失败必须显式，不得回退到 Lite、`scale=1.0`、NVOF 或透传路径。
 - 只有数值、画质、任意合法分辨率和性能均通过后，才能冻结
   `scale=0.5` 的基准数据并开始最终 profile 优化。
+
+#### 2026-08-01 逐层耗时归因检查点
+
+- 输入 ONNX SHA-256：
+  `dda9c05402da61a383f3ce24d4df66ea7d0006418c98e831f55442a1b6e295ac`；
+  当前缓存 Engine SHA-256：
+  `b081b039b93f8b24153e75e4dbbade16dfe00a5aade7bac744cb1f022f98c9f6`。
+- 使用 TensorRT-RTX 1.4.0.76 按产品相同的两套 profile 临时构建
+  `profilingVerbosity=detailed` 诊断 Engine；选择 profile 1，实际输入为
+  `FP16 [1,11,2176,3840]`，加载现有 4K runtime cache 的临时副本。
+- 独立逐层 profile 共 35 次，图内总时间均值 `33.0143 ms`。5 个层名中含
+  `Grid` 的融合层均值依次为 `1.2169`、`0.6294`、`2.0523`、`7.1017`、
+  `3.6783 ms`，合计 `14.6786 ms`，占 `44.46%`。ONNX 静态类型审计同时
+  确认这 5 个 `GridSample` 输出仍为 FP32，因此采样/坐标路径是第一性能目标。
+- 逐层 profiler 会插入同步并禁用 CUDA Graph，本组总时间只用于图内成本归因，
+  不替代播放器 probe 的正式 TensorRT/端到端基准。正式性能结论仍使用相同
+  warmup、迭代次数、runtime cache 和后台负载条件下的非 profiler A/B 数据。
 
 ### 2. 完成 TensorRT profile 优化
 
