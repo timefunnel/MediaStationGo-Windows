@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 const DEVICE_NAME_MAX: usize = 64;
+const FRAME_INTERPOLATION_MODEL_DEFAULT: &str = "rife-v4.26";
 #[cfg(target_os = "windows")]
 const HWDEC_DEFAULT: &str = "auto";
 #[cfg(not(target_os = "windows"))]
@@ -62,6 +63,7 @@ struct SettingsData {
     force_transcoding: bool,
     window_decorations: Option<WindowDecorations>,
     hide_scrollbar: bool,
+    frame_interpolation_model: String,
 }
 
 impl Default for SettingsData {
@@ -80,6 +82,7 @@ impl Default for SettingsData {
             force_transcoding: false,
             window_decorations: None,
             hide_scrollbar: true,
+            frame_interpolation_model: String::new(),
         }
     }
 }
@@ -157,6 +160,15 @@ impl SettingsData {
         if let Some(b) = v.get("hideScrollbar").and_then(Value::as_bool) {
             self.hide_scrollbar = b;
         }
+        if let Some(model) = v.get("frameInterpolationModel").and_then(Value::as_str)
+            && matches!(model, "rife-v4.26" | "rife-v4.25-lite")
+        {
+            self.frame_interpolation_model = if model == FRAME_INTERPOLATION_MODEL_DEFAULT {
+                String::new()
+            } else {
+                model.to_string()
+            };
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -225,6 +237,12 @@ impl SettingsData {
         }
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
+        }
+        if !self.frame_interpolation_model.is_empty() {
+            o.insert(
+                "frameInterpolationModel".into(),
+                Value::String(self.frame_interpolation_model.clone()),
+            );
         }
         Value::Object(o)
     }
@@ -481,6 +499,26 @@ string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
 
+pub fn frame_interpolation_model() -> String {
+    let configured = state().lock().data.frame_interpolation_model.clone();
+    if configured.is_empty() {
+        FRAME_INTERPOLATION_MODEL_DEFAULT.to_string()
+    } else {
+        configured
+    }
+}
+
+pub fn set_frame_interpolation_model(model: &str) {
+    if matches!(model, "rife-v4.26" | "rife-v4.25-lite") {
+        state().lock().data.frame_interpolation_model =
+            if model == FRAME_INTERPOLATION_MODEL_DEFAULT {
+                String::new()
+            } else {
+                model.to_string()
+            };
+    }
+}
+
 pub fn device_name() -> String {
     state().lock().data.device_name.clone()
 }
@@ -685,5 +723,30 @@ mod tests {
         let saved = settings.to_json();
         assert!(saved.get("frameInterpolationMode").is_none());
         assert!(saved.get("frameInterpolationMediaModes").is_none());
+    }
+
+    #[test]
+    fn frame_interpolation_model_persists_only_an_explicit_supported_choice() {
+        let mut settings = SettingsData::default();
+        settings.overlay_json(&json!({
+            "frameInterpolationModel": "rife-v4.25-lite"
+        }));
+        assert_eq!(
+            settings
+                .to_json()
+                .get("frameInterpolationModel")
+                .and_then(|value| value.as_str()),
+            Some("rife-v4.25-lite")
+        );
+
+        settings.overlay_json(&json!({
+            "frameInterpolationModel": "rife-v4.26"
+        }));
+        assert!(settings.to_json().get("frameInterpolationModel").is_none());
+
+        settings.overlay_json(&json!({
+            "frameInterpolationModel": "rife-auto"
+        }));
+        assert!(settings.to_json().get("frameInterpolationModel").is_none());
     }
 }

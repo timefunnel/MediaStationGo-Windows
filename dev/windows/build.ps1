@@ -21,6 +21,11 @@ $XtaskArgs = @("xtask", "build")
 $MpvInstallDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvDir = Join-Path $RepoRoot "third_party\mpv"
 if (Test-Path (Join-Path $MpvInstallDir "lib\mpv.lib")) {
+    $RifeRuntime = Join-Path $MpvInstallDir "lib\rife_runtime.dll"
+    if (Test-Path -LiteralPath $RifeRuntime -PathType Leaf) {
+        & (Join-Path $PSScriptRoot "stage_frame_interpolation_runtime.ps1") `
+            -OutputLibDir (Join-Path $MpvInstallDir "lib")
+    }
     $XtaskArgs += "--external-mpv=$MpvInstallDir"
 } elseif (Test-Path (Join-Path $MpvDir "lib\mpv.lib")) {
     $XtaskArgs += "--external-mpv=$MpvDir"

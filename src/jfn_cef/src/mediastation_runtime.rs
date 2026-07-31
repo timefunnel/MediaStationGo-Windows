@@ -1,6 +1,8 @@
 use base64::Engine as _;
 use cef::{ImplListValue, ListValue, sys};
-use jfn_frame_interpolation::{InterpolationMode, InterpolationPlan, PlanRequest, prepare_plan};
+use jfn_frame_interpolation::{
+    InterpolationMode, InterpolationModel, InterpolationPlan, PlanRequest, prepare_plan,
+};
 use jfn_mediastation::{
     ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
     MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaStationApiClient,
@@ -2455,6 +2457,7 @@ fn valid_text(value: &str, maximum_len: usize) -> bool {
 fn frame_interpolation_plan(
     source: &PlaybackSource,
     mode: InterpolationMode,
+    model: InterpolationModel,
 ) -> Result<Option<InterpolationPlan>, LoadFailure> {
     if mode == InterpolationMode::Off {
         return Ok(None);
@@ -2475,6 +2478,7 @@ fn frame_interpolation_plan(
         .unwrap_or(0);
     let request = PlanRequest {
         mode,
+        model,
         width,
         height,
         source_fps: video.frame_rate.unwrap_or(0.0),
@@ -2873,6 +2877,7 @@ pub(crate) fn handle_frame_interpolation_message(
     let operation = list_string(args, 1);
     let result = match operation.as_str() {
         "frame_interpolation_status" => Ok(frame_interpolation_status_payload()),
+        "frame_interpolation_set_model" => set_frame_interpolation_model(args),
         "frame_interpolation_diagnostics" => {
             let media_id = (args.size() >= 3
                 && args.get_type(2).as_ref() == &sys::cef_value_type_t::VTYPE_STRING)
@@ -2899,6 +2904,17 @@ pub(crate) fn handle_frame_interpolation_message(
 
 fn frame_interpolation_status_payload() -> Value {
     let report = jfn_frame_interpolation::capability_report();
+    let models = report
+        .models
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "name": model.name,
+                "engineCount": model.engine_count,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "componentStatus": if report.ready { "ready" } else { "unavailable" },
         "gpuName": report.gpu_name,
@@ -2906,12 +2922,39 @@ fn frame_interpolation_status_payload() -> Value {
         "driverVersion": report.driver_version,
         "runtimeVersion": report.runtime_version,
         "model": report.model,
+        "models": models,
+        "selectedModel": jfn_config::frame_interpolation_model(),
         "engineCount": report.engine_count,
         "backend": report.backend,
         "filter": report.filter,
         "failureCode": report.failure.as_ref().map(|failure| failure.code),
         "failureDetail": report.failure.map(|failure| failure.detail),
     })
+}
+
+fn set_frame_interpolation_model(args: &ListValue) -> Result<Value, LoadFailure> {
+    if args.size() < 3 || args.get_type(2).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "frame_interpolation_model_invalid",
+            "The RIFE model selection is missing",
+        ));
+    }
+    let model = parse_interpolation_model_value(&list_string(args, 2))?;
+    let previous = jfn_config::frame_interpolation_model();
+    jfn_config::set_frame_interpolation_model(model.as_str());
+    if !jfn_config::settings_save() {
+        jfn_config::set_frame_interpolation_model(&previous);
+        return Err(LoadFailure::new(
+            "frame_interpolation_setting_save_failed",
+            "The RIFE model selection could not be persisted",
+        ));
+    }
+    log_debug(&format!(
+        "RIFE frame interpolation model selected: model={} name={}",
+        model.as_str(),
+        model.display_name()
+    ));
+    Ok(frame_interpolation_status_payload())
 }
 
 fn frame_interpolation_diagnostics_payload(media_id: Option<&str>) -> Result<Value, LoadFailure> {
@@ -3435,6 +3478,7 @@ struct LoadRequest {
     media_id: String,
     start_ms: u64,
     interpolation_mode: InterpolationMode,
+    interpolation_model: InterpolationModel,
 }
 
 fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadFailure)> {
@@ -3478,11 +3522,14 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
     let start_ms = parse_start_ms(args).map_err(|failure| (request_id.clone(), failure))?;
     let interpolation_mode =
         parse_load_interpolation_mode(args).map_err(|failure| (request_id.clone(), failure))?;
+    let interpolation_model =
+        parse_load_interpolation_model(args).map_err(|failure| (request_id.clone(), failure))?;
     Ok(LoadRequest {
         request_id,
         media_id,
         start_ms,
         interpolation_mode,
+        interpolation_model,
     })
 }
 
@@ -3529,6 +3576,25 @@ fn parse_load_interpolation_mode_value(value: &str) -> Result<InterpolationMode,
     }
 }
 
+fn parse_load_interpolation_model(args: &ListValue) -> Result<InterpolationModel, LoadFailure> {
+    if args.size() < 5 || args.get_type(4).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "frame_interpolation_model_invalid",
+            "The RIFE model selection is missing",
+        ));
+    }
+    parse_interpolation_model_value(&list_string(args, 4))
+}
+
+fn parse_interpolation_model_value(value: &str) -> Result<InterpolationModel, LoadFailure> {
+    InterpolationModel::parse(value).ok_or_else(|| {
+        LoadFailure::new(
+            "frame_interpolation_model_invalid",
+            "The RIFE model selection is invalid",
+        )
+    })
+}
+
 fn valid_identifier(value: &str, maximum_len: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum_len && !value.chars().any(char::is_control)
 }
@@ -3565,11 +3631,16 @@ fn execute_load(
         audio_summary,
         source.subtitles.len()
     ));
-    let interpolation = frame_interpolation_plan(&source, request.interpolation_mode)?;
+    let interpolation = frame_interpolation_plan(
+        &source,
+        request.interpolation_mode,
+        request.interpolation_model,
+    )?;
     log_debug(&format!(
-        "MediaStation playback interpolation request: media_id={} mode={}",
+        "MediaStation playback interpolation request: media_id={} mode={} model={}",
         request.media_id,
-        request.interpolation_mode.as_str()
+        request.interpolation_mode.as_str(),
+        request.interpolation_model.as_str()
     ));
     if let Some(plan) = &interpolation {
         let display_fps = jfn_playback::ingest_driver::jfn_playback_display_hz();
@@ -3762,6 +3833,7 @@ fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
         "hwdec": plan.hwdec,
         "backend": plan.backend,
         "runtimeVersion": plan.runtime_version,
+        "modelId": plan.model_id,
         "model": plan.model,
         "modelSha256": plan.model_sha256,
         "engineKey": plan.engine_key,
@@ -4535,6 +4607,23 @@ mod tests {
     }
 
     #[test]
+    fn playback_interpolation_model_accepts_only_bundled_models() {
+        assert_eq!(
+            parse_interpolation_model_value("rife-v4.26").expect("v4.26 should be valid"),
+            InterpolationModel::RifeV426
+        );
+        assert_eq!(
+            parse_interpolation_model_value("rife-v4.25-lite").expect("v4.25 Lite should be valid"),
+            InterpolationModel::RifeV425Lite
+        );
+        for invalid in ["", "auto", "rife-v4.26-heavy"] {
+            let error = parse_interpolation_model_value(invalid)
+                .expect_err("unbundled models must be rejected");
+            assert_eq!(error.code, "frame_interpolation_model_invalid");
+        }
+    }
+
+    #[test]
     fn stale_authentication_cannot_reconfigure_a_cleared_session() {
         let runtime = Arc::new(MediaStationRuntime::new().expect("runtime should initialize"));
         runtime.configure_session(session("user-1"));
@@ -4723,6 +4812,7 @@ mod tests {
         assert!(!text.contains("url"));
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the mpv track-list fields used by this test.
     fn mpv_track_node(
         kind: &str,
         id: i64,

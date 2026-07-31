@@ -25,6 +25,10 @@
     const playbackInfoSettingKey = 'MediaStationGo.Windows.playbackInfoEnabled.v1';
     const playSymbol = '\u23f5\ufe0e';
     const pauseSymbol = '\u23f8\ufe0e';
+    const interpolationModels = Object.freeze({
+        'rife-v4.26': { label: '质量优先', name: 'RIFE v4.26' },
+        'rife-v4.25-lite': { label: '流畅优先', name: 'RIFE v4.25 Lite' },
+    });
     let imageActive = 0;
     let imageDiskStats = { imageBytes: 0, imageCount: 0 };
     let imageStatsTimer = 0;
@@ -56,6 +60,7 @@
     let homeRefreshGeneration = 0;
     let heroRotationTimer = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
+    let preferredInterpolationModel = 'rife-v4.26';
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -318,6 +323,8 @@
             frame_interpolation_engine_cache_mismatch: 'RIFE Engine 与当前显卡或驱动不匹配',
             frame_interpolation_engine_missing: '当前分辨率的 RIFE Engine 缺失',
             frame_interpolation_engine_corrupt: 'RIFE Engine 校验失败',
+            frame_interpolation_model_unavailable: '所选 RIFE 模型未安装',
+            frame_interpolation_model_invalid: '所选 RIFE 模型无效',
             frame_interpolation_engine_shape_unsupported: '当前分辨率尚无原生 RIFE Engine',
             frame_interpolation_runtime_path_invalid: 'RIFE 运行路径无效',
             frame_interpolation_d3d_compiler_unavailable: 'D3D11 着色器编译组件不可用',
@@ -731,9 +738,13 @@
     function updateFrameInterpolationStatus(status) {
         if (!status) return;
         const label = byId('frame-interpolation-status');
+        if (interpolationModels[status.selectedModel]) {
+            preferredInterpolationModel = status.selectedModel;
+        }
         if (status.componentStatus === 'ready') {
             const engines = Number.isFinite(status.engineCount) ? `${status.engineCount} 个 Engine` : null;
-            const components = [status.gpuName, status.model, status.runtimeVersion, engines].filter(Boolean);
+            const modelCount = Array.isArray(status.models) ? `${status.models.length} 个模型` : null;
+            const components = [status.gpuName, modelCount, status.runtimeVersion, engines].filter(Boolean);
             label.textContent = components.join(' · ') || 'RIFE 插帧组件已就绪';
             label.dataset.state = 'ready';
         } else {
@@ -1740,8 +1751,9 @@
             scrubbing: false,
             scrubPositionMs: null,
             interpolationEnabled: false,
+            interpolationModel: null,
             interpolationChanging: false,
-            interpolationTargetEnabled: null,
+            interpolationTargetModel: null,
             interpolationResumePlaying: true,
         };
         player = activePlayer;
@@ -1762,7 +1774,7 @@
             const loadInfo = await nativeRequest(
                 'mediaStationLoad',
                 'load',
-                [card.id, Math.max(0, Math.round(startMs || 0)), 'off'],
+                [card.id, Math.max(0, Math.round(startMs || 0)), 'off', preferredInterpolationModel],
                 60000,
             );
             if (player === activePlayer) {
@@ -1790,9 +1802,10 @@
                     const interpolationChanged = player.interpolationChanging;
                     const shouldPlay = interpolationChanged ? player.interpolationResumePlaying : true;
                     if (interpolationChanged) {
-                        player.interpolationEnabled = player.interpolationTargetEnabled === true;
+                        player.interpolationEnabled = player.interpolationTargetModel !== null;
+                        player.interpolationModel = player.interpolationTargetModel;
                         player.interpolationChanging = false;
-                        player.interpolationTargetEnabled = null;
+                        player.interpolationTargetModel = null;
                     }
                     player.started = true;
                     player.playing = shouldPlay;
@@ -1861,8 +1874,9 @@
     }
 
     function interpolationLoadingLabel(activePlayer) {
-        return activePlayer?.interpolationTargetEnabled
-            ? '正在生成 RTX 插帧首帧'
+        const target = activePlayer?.interpolationTargetModel;
+        return target
+            ? `正在加载${interpolationModels[target]?.label || ''}插帧`
             : '正在关闭 RTX 插帧';
     }
 
@@ -1939,36 +1953,66 @@
         refreshPlayerTools();
     }
 
-    async function toggleFrameInterpolation() {
+    async function setFrameInterpolation(modelId) {
         const activePlayer = player;
         if (!activePlayer?.started || !activePlayer.loadInfo || activePlayer.interpolationChanging) return;
-        const requested = !activePlayer.interpolationEnabled;
+        if (modelId !== null && !Object.prototype.hasOwnProperty.call(interpolationModels, modelId)) {
+            const error = new Error('所选 RIFE 模型无效');
+            error.code = 'frame_interpolation_model_invalid';
+            showToast(friendlyError(error));
+            return;
+        }
+        const requestedModel = modelId;
+        const activeModel = activePlayer.interpolationEnabled
+            ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId)
+            : null;
+        if (requestedModel === activeModel) {
+            closePlayerPanel(false);
+            return;
+        }
         const previousLoadInfo = activePlayer.loadInfo;
+        const previousModel = activePlayer.interpolationModel;
         const reloadPositionMs = Math.max(0, Math.round(activePlayer.positionMs || 0));
         activePlayer.interpolationChanging = true;
-        activePlayer.interpolationTargetEnabled = requested;
+        activePlayer.interpolationTargetModel = requestedModel;
         activePlayer.interpolationResumePlaying = activePlayer.playing;
         if (activePlayer.playing && window.jmpNative) window.jmpNative.playerPause();
-        setPlayerLoading(true, requested ? '正在初始化 RTX 插帧' : '正在关闭 RTX 插帧');
+        closePlayerPanel(false);
+        setPlayerLoading(true, interpolationLoadingLabel(activePlayer));
         showPlayerControls();
         refreshPlayerTools();
         try {
             await waitForPlayerPaint();
+            if (requestedModel) {
+                const status = await nativeRequest(
+                    'mediaStationFrameInterpolation',
+                    'frame_interpolation_set_model',
+                    ['frame_interpolation_set_model', requestedModel],
+                    15000,
+                );
+                if (player !== activePlayer) return;
+                preferredInterpolationModel = requestedModel;
+                updateFrameInterpolationStatus(status);
+            }
             const loadInfo = await nativeRequest(
                 'mediaStationLoad',
                 'load',
-                [activePlayer.card.id, reloadPositionMs, requested ? '2x' : 'off'],
+                [
+                    activePlayer.card.id,
+                    reloadPositionMs,
+                    requestedModel ? '2x' : 'off',
+                    requestedModel || preferredInterpolationModel,
+                ],
                 60000,
             );
             if (player !== activePlayer) return;
-            const enabled = Boolean(loadInfo.frameInterpolation);
-            if (enabled !== requested) {
+            const actualModel = loadInfo.frameInterpolation?.modelId || null;
+            if (actualModel !== requestedModel) {
                 const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
                 error.code = 'frame_interpolation_state_mismatch';
                 throw error;
             }
             activePlayer.loadInfo = loadInfo;
-            activePlayer.interpolationEnabled = enabled;
             if (activePlayer.interpolationChanging) {
                 setPlayerLoading(true, interpolationLoadingLabel(activePlayer));
                 if (window.jmpNative) window.jmpNative.playerPlay();
@@ -1977,7 +2021,8 @@
         } catch (error) {
             if (player !== activePlayer) return;
             activePlayer.interpolationChanging = false;
-            activePlayer.interpolationTargetEnabled = null;
+            activePlayer.interpolationTargetModel = null;
+            activePlayer.interpolationModel = previousModel;
             activePlayer.loadInfo = previousLoadInfo;
             activePlayer.playing = activePlayer.interpolationResumePlaying;
             if (activePlayer.interpolationResumePlaying && window.jmpNative) {
@@ -2025,12 +2070,17 @@
         subtitles.disabled = !info || !Array.isArray(info.subtitleTracks);
         audio.disabled = !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
         const interpolationEnabled = player?.interpolationChanging
-            ? player.interpolationTargetEnabled === true
+            ? player.interpolationTargetModel !== null
             : player?.interpolationEnabled === true;
+        const interpolationModel = player?.interpolationChanging
+            ? player.interpolationTargetModel
+            : (player?.interpolationModel || info?.frameInterpolation?.modelId || null);
         interpolation.disabled = !player?.started || !info || player.interpolationChanging;
         interpolation.title = player?.interpolationChanging
             ? interpolationLoadingLabel(player)
-            : (interpolationEnabled ? '关闭 RTX 插帧' : '开启 RTX 插帧（2 倍帧率）');
+            : (interpolationEnabled
+                ? `RTX 插帧：${interpolationModels[interpolationModel]?.label || '已开启'}`
+                : 'RTX 插帧');
         interpolation.setAttribute('aria-label', interpolation.title);
         interpolation.setAttribute('aria-pressed', String(interpolationEnabled));
         infoButton.classList.toggle('hidden', !playbackInfoEnabled);
@@ -2134,6 +2184,32 @@
                     meta: trackMeta(track, 'audio'),
                     selected: info.audioTrackKey === track.key,
                     onSelect: () => selectPlayerTrack('audio', track.key),
+                }));
+            }
+            playerPanelContent.append(group);
+            return;
+        }
+
+        if (kind === 'interpolation') {
+            byId('player-panel-title').textContent = 'RTX 插帧';
+            const selectedModel = player.interpolationChanging
+                ? player.interpolationTargetModel
+                : (player.interpolationEnabled
+                    ? (player.interpolationModel || info.frameInterpolation?.modelId)
+                    : null);
+            const group = element('div');
+            group.append(createTrackOption({
+                title: '关闭',
+                meta: '',
+                selected: selectedModel === null,
+                onSelect: () => setFrameInterpolation(null),
+            }));
+            for (const [modelId, model] of Object.entries(interpolationModels)) {
+                group.append(createTrackOption({
+                    title: model.label,
+                    meta: model.name,
+                    selected: selectedModel === modelId,
+                    onSelect: () => setFrameInterpolation(modelId),
                 }));
             }
             playerPanelContent.append(group);
@@ -2444,7 +2520,7 @@
     });
     byId('player-exit').addEventListener('click', () => finishPlayer(true));
     byId('player-playback').addEventListener('click', togglePlayback);
-    byId('player-interpolation').addEventListener('click', toggleFrameInterpolation);
+    byId('player-interpolation').addEventListener('click', (event) => openPlayerPanel('interpolation', event.currentTarget));
     byId('player-fullscreen').addEventListener('click', togglePlayerFullscreen);
     const playerProgress = byId('player-progress');
     playerProgress.addEventListener('pointerdown', (event) => previewProgressSeek(event.currentTarget.value));

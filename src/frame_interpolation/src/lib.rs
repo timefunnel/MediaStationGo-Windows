@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 const RIFE_RUNTIME_ABI: u32 = 4;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
 const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
-const RIFE_MODEL: &str = "RIFE v4.26";
 const RIFE_TENSORRT_VERSION: &str = "1.4.0.76";
 const RIFE_SCALE: &str = "1.0";
 const RIFE_PRECISION: &str = "fp16";
@@ -45,6 +44,39 @@ impl InterpolationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InterpolationModel {
+    #[default]
+    RifeV426,
+    RifeV425Lite,
+}
+
+impl InterpolationModel {
+    pub const ALL: [Self; 2] = [Self::RifeV426, Self::RifeV425Lite];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rife-v4.26" => Some(Self::RifeV426),
+            "rife-v4.25-lite" => Some(Self::RifeV425Lite),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RifeV426 => "rife-v4.26",
+            Self::RifeV425Lite => "rife-v4.25-lite",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::RifeV426 => "RIFE v4.26",
+            Self::RifeV425Lite => "RIFE v4.25 Lite",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterpolationError {
     pub code: &'static str,
@@ -76,11 +108,19 @@ pub struct CapabilityReport {
     pub driver_version: Option<String>,
     pub runtime_version: Option<String>,
     pub model: Option<String>,
+    pub models: Vec<ModelCapability>,
     pub engine_count: usize,
     pub backend: Option<&'static str>,
     pub filter: Option<&'static str>,
     pub failure: Option<InterpolationError>,
     runtime: Option<RuntimeComponents>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCapability {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub engine_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -99,13 +139,18 @@ struct EngineArtifact {
 }
 
 #[derive(Clone, Debug)]
+struct ModelRuntime {
+    model: InterpolationModel,
+    model_sha256: String,
+    engines: Vec<EngineArtifact>,
+}
+
+#[derive(Clone, Debug)]
 struct RuntimeComponents {
     runtime_dll: PathBuf,
     cuda_runtime_dll: PathBuf,
     tensor_rt_version: String,
-    model: String,
-    model_sha256: String,
-    engines: Vec<EngineArtifact>,
+    models: Vec<ModelRuntime>,
 }
 
 static REPORT: OnceLock<CapabilityReport> = OnceLock::new();
@@ -126,19 +171,37 @@ pub fn capability_report() -> CapabilityReport {
 
 fn build_capability_report() -> CapabilityReport {
     match probe_capability() {
-        Ok((gpu, runtime)) => CapabilityReport {
-            ready: true,
-            gpu_name: Some(gpu.name),
-            gpu_uuid: Some(gpu.uuid),
-            driver_version: Some(gpu.driver),
-            runtime_version: Some(format!("TensorRT-RTX {}", runtime.tensor_rt_version)),
-            model: Some(runtime.model.clone()),
-            engine_count: runtime.engines.len(),
-            backend: Some(RIFE_BACKEND),
-            filter: Some(RIFE_FILTER),
-            failure: None,
-            runtime: Some(runtime),
-        },
+        Ok((gpu, runtime)) => {
+            let models = runtime
+                .models
+                .iter()
+                .map(|model| ModelCapability {
+                    id: model.model.as_str(),
+                    name: model.model.display_name(),
+                    engine_count: model.engines.len(),
+                })
+                .collect::<Vec<_>>();
+            let model_names = models
+                .iter()
+                .map(|model| model.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let engine_count = models.iter().map(|model| model.engine_count).sum();
+            CapabilityReport {
+                ready: true,
+                gpu_name: Some(gpu.name),
+                gpu_uuid: Some(gpu.uuid),
+                driver_version: Some(gpu.driver),
+                runtime_version: Some(format!("TensorRT-RTX {}", runtime.tensor_rt_version)),
+                model: Some(model_names),
+                models,
+                engine_count,
+                backend: Some(RIFE_BACKEND),
+                filter: Some(RIFE_FILTER),
+                failure: None,
+                runtime: Some(runtime),
+            }
+        }
         Err(error) => CapabilityReport {
             failure: Some(error),
             ..CapabilityReport::default()
@@ -220,9 +283,8 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
             ),
         )
     })?;
-    let manifest_path = executable_dir
-        .join("frame-interpolation")
-        .join("runtime-manifest.json");
+    let runtime_dir = executable_dir.join("frame-interpolation");
+    let manifest_path = runtime_dir.join("runtime-manifest.json");
     let bytes = std::fs::read(&manifest_path).map_err(|error| {
         InterpolationError::new(
             "frame_interpolation_manifest_missing",
@@ -235,7 +297,7 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
             format!("{} is invalid JSON: {error}", manifest_path.display()),
         )
     })?;
-    if manifest.get("schema").and_then(Value::as_u64) != Some(1) {
+    if manifest.get("schema").and_then(Value::as_u64) != Some(2) {
         return Err(InterpolationError::new(
             "frame_interpolation_manifest_invalid",
             "The RIFE runtime manifest schema is not supported",
@@ -253,8 +315,6 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
         ));
     }
     let tensor_rt_version = manifest_string(&manifest, "tensorRtVersion")?;
-    let model = manifest_string(&manifest, "model")?;
-    let model_sha256 = manifest_string(&manifest, "modelSha256")?;
     let runtime_abi = manifest
         .get("runtimeAbi")
         .and_then(Value::as_u64)
@@ -265,15 +325,12 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
                 "The RIFE runtime ABI is missing or invalid",
             )
         })?;
-    if tensor_rt_version != RIFE_TENSORRT_VERSION
-        || model != RIFE_MODEL
-        || runtime_abi != RIFE_RUNTIME_ABI
-    {
+    if tensor_rt_version != RIFE_TENSORRT_VERSION || runtime_abi != RIFE_RUNTIME_ABI {
         return Err(InterpolationError::new(
             "frame_interpolation_manifest_invalid",
             format!(
-                "Unsupported runtime tuple TensorRT={} model={} ABI={}",
-                tensor_rt_version, model, runtime_abi
+                "Unsupported runtime tuple TensorRT={} ABI={}",
+                tensor_rt_version, runtime_abi
             ),
         ));
     }
@@ -291,27 +348,93 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
     probe_runtime_abi(&runtime_dll)?;
 
     let entries = manifest
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                "The RIFE model list is missing",
+            )
+        })?;
+    let engine_dir = runtime_dir.join("engine-cache");
+    let mut models = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let model = parse_model_runtime(entry, gpu, &tensor_rt_version, &engine_dir)?;
+        if models
+            .iter()
+            .any(|existing: &ModelRuntime| existing.model == model.model)
+        {
+            return Err(InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                format!("Duplicate RIFE model entry: {}", model.model.as_str()),
+            ));
+        }
+        models.push(model);
+    }
+    for required in InterpolationModel::ALL {
+        if !models.iter().any(|model| model.model == required) {
+            return Err(InterpolationError::new(
+                "frame_interpolation_model_unavailable",
+                format!(
+                    "Required RIFE model is missing: {}",
+                    required.display_name()
+                ),
+            ));
+        }
+    }
+    models.sort_by_key(|model| {
+        InterpolationModel::ALL
+            .iter()
+            .position(|candidate| *candidate == model.model)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(RuntimeComponents {
+        runtime_dll,
+        cuda_runtime_dll,
+        tensor_rt_version,
+        models,
+    })
+}
+
+fn parse_model_runtime(
+    entry: &Value,
+    gpu: &GpuInfo,
+    tensor_rt_version: &str,
+    engine_dir: &Path,
+) -> Result<ModelRuntime, InterpolationError> {
+    let model_id = manifest_string(entry, "id")?;
+    let model = InterpolationModel::parse(&model_id).ok_or_else(|| {
+        InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            format!("Unsupported RIFE model id: {model_id}"),
+        )
+    })?;
+    let model_name = manifest_string(entry, "name")?;
+    if model_name != model.display_name() {
+        return Err(InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            format!("RIFE model name does not match id {model_id}"),
+        ));
+    }
+    let model_sha256 = manifest_string(entry, "modelSha256")?;
+    let entries = entry
         .get("engines")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             InterpolationError::new(
                 "frame_interpolation_manifest_invalid",
-                "The RIFE engine list is missing",
+                format!("The {} engine list is missing", model.display_name()),
             )
         })?;
-    let engine_dir = manifest_path
-        .parent()
-        .expect("manifest path has a parent")
-        .join("engine-cache");
     let mut engines = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let width = manifest_u32(entry, "width")?;
-        let height = manifest_u32(entry, "height")?;
-        let scale = manifest_string(entry, "scale")?;
-        let precision = manifest_string(entry, "precision")?;
-        let key = manifest_string(entry, "engineKey")?;
-        let file = manifest_string(entry, "file")?;
-        let expected_hash = manifest_string(entry, "sha256")?;
+    for engine in entries {
+        let width = manifest_u32(engine, "width")?;
+        let height = manifest_u32(engine, "height")?;
+        let scale = manifest_string(engine, "scale")?;
+        let precision = manifest_string(engine, "precision")?;
+        let key = manifest_string(engine, "engineKey")?;
+        let file = manifest_string(engine, "file")?;
+        let expected_hash = manifest_string(engine, "sha256")?;
         if scale != RIFE_SCALE || precision != RIFE_PRECISION {
             return Err(InterpolationError::new(
                 "frame_interpolation_manifest_invalid",
@@ -321,7 +444,7 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
         let expected_key = engine_cache_key(
             &gpu.uuid,
             &gpu.driver,
-            &tensor_rt_version,
+            tensor_rt_version,
             &model_sha256,
             width,
             height,
@@ -329,7 +452,10 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
         if key != expected_key || file != format!("{key}.engine") {
             return Err(InterpolationError::new(
                 "frame_interpolation_engine_cache_mismatch",
-                format!("The {width}x{height} engine cache key is invalid"),
+                format!(
+                    "The {} {width}x{height} engine cache key is invalid",
+                    model.display_name()
+                ),
             ));
         }
         let path = engine_dir.join(&file);
@@ -337,7 +463,8 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
             return Err(InterpolationError::new(
                 "frame_interpolation_engine_missing",
                 format!(
-                    "The {width}x{height} RIFE engine is missing: {}",
+                    "The {} {width}x{height} engine is missing: {}",
+                    model.display_name(),
                     path.display()
                 ),
             ));
@@ -346,7 +473,10 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
         if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
             return Err(InterpolationError::new(
                 "frame_interpolation_engine_corrupt",
-                format!("The {width}x{height} RIFE engine hash does not match its manifest"),
+                format!(
+                    "The {} {width}x{height} engine hash does not match its manifest",
+                    model.display_name()
+                ),
             ));
         }
         engines.push(EngineArtifact {
@@ -359,13 +489,13 @@ fn probe_runtime(gpu: &GpuInfo) -> Result<RuntimeComponents, InterpolationError>
     if engines.is_empty() {
         return Err(InterpolationError::new(
             "frame_interpolation_engine_missing",
-            "The RIFE runtime does not contain any validated engines",
+            format!(
+                "{} does not contain any validated engines",
+                model.display_name()
+            ),
         ));
     }
-    Ok(RuntimeComponents {
-        runtime_dll,
-        cuda_runtime_dll,
-        tensor_rt_version,
+    Ok(ModelRuntime {
         model,
         model_sha256,
         engines,
@@ -545,6 +675,7 @@ fn probe_d3d_compiler() -> Result<(), InterpolationError> {
 #[derive(Clone, Debug)]
 pub struct PlanRequest {
     pub mode: InterpolationMode,
+    pub model: InterpolationModel,
     pub width: u32,
     pub height: u32,
     pub source_fps: f64,
@@ -569,6 +700,7 @@ pub struct InterpolationPlan {
     pub hwdec: &'static str,
     pub backend: &'static str,
     pub runtime_version: String,
+    pub model_id: &'static str,
     pub model: String,
     pub model_sha256: String,
     pub engine_key: String,
@@ -634,12 +766,22 @@ fn build_plan(
             ),
         ));
     }
-    let engine = runtime
+    let model = runtime
+        .models
+        .iter()
+        .find(|model| model.model == request.model)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_model_unavailable",
+                format!("{} is not installed", request.model.display_name()),
+            )
+        })?;
+    let engine = model
         .engines
         .iter()
         .find(|engine| engine.width == request.width && engine.height == request.height)
         .ok_or_else(|| {
-            let supported = runtime
+            let supported = model
                 .engines
                 .iter()
                 .map(|engine| format!("{}x{}", engine.width, engine.height))
@@ -648,8 +790,10 @@ fn build_plan(
             InterpolationError::new(
                 "frame_interpolation_engine_shape_unsupported",
                 format!(
-                    "No exact RIFE engine exists for {}x{}; validated shapes: {supported}",
-                    request.width, request.height
+                    "No exact {} engine exists for {}x{}; validated shapes: {supported}",
+                    request.model.display_name(),
+                    request.width,
+                    request.height
                 ),
             )
         })?;
@@ -674,8 +818,9 @@ fn build_plan(
         hwdec: "d3d11va",
         backend: RIFE_BACKEND,
         runtime_version: format!("TensorRT-RTX {}", runtime.tensor_rt_version),
-        model: runtime.model.clone(),
-        model_sha256: runtime.model_sha256.clone(),
+        model_id: model.model.as_str(),
+        model: model.model.display_name().to_string(),
+        model_sha256: model.model_sha256.clone(),
         engine_key: engine.key.clone(),
         engine_path: engine.path.clone(),
         scale: RIFE_SCALE,
@@ -854,29 +999,45 @@ mod tests {
     use super::*;
 
     fn ready_report() -> CapabilityReport {
-        let engines = [(1920, 1080), (2304, 1296), (2560, 1440), (3840, 2160)]
-            .into_iter()
-            .map(|(width, height)| EngineArtifact {
-                width,
-                height,
-                key: format!("engine-{width}x{height}"),
-                path: PathBuf::from(format!("/runtime/{width}x{height}.engine")),
-            })
-            .collect();
+        let model_runtime = |model: InterpolationModel| ModelRuntime {
+            model,
+            model_sha256: format!("{}-sha256", model.as_str()),
+            engines: [(1920, 1080), (2304, 1296), (2560, 1440), (3840, 2160)]
+                .into_iter()
+                .map(|(width, height)| EngineArtifact {
+                    width,
+                    height,
+                    key: format!("{}-{width}x{height}", model.as_str()),
+                    path: PathBuf::from(format!(
+                        "/runtime/{}/{width}x{height}.engine",
+                        model.as_str()
+                    )),
+                })
+                .collect(),
+        };
         CapabilityReport {
             ready: true,
             runtime_version: Some(format!("TensorRT-RTX {RIFE_TENSORRT_VERSION}")),
-            model: Some(RIFE_MODEL.to_string()),
-            engine_count: 4,
+            model: Some("RIFE v4.26, RIFE v4.25 Lite".to_string()),
+            models: InterpolationModel::ALL
+                .into_iter()
+                .map(|model| ModelCapability {
+                    id: model.as_str(),
+                    name: model.display_name(),
+                    engine_count: 4,
+                })
+                .collect(),
+            engine_count: 8,
             backend: Some(RIFE_BACKEND),
             filter: Some(RIFE_FILTER),
             runtime: Some(RuntimeComponents {
                 runtime_dll: PathBuf::from("/runtime/rife_runtime.dll"),
                 cuda_runtime_dll: PathBuf::from("/runtime/cudart64_12.dll"),
                 tensor_rt_version: RIFE_TENSORRT_VERSION.to_string(),
-                model: RIFE_MODEL.to_string(),
-                model_sha256: "model-sha256".to_string(),
-                engines,
+                models: InterpolationModel::ALL
+                    .into_iter()
+                    .map(model_runtime)
+                    .collect(),
             }),
             ..CapabilityReport::default()
         }
@@ -885,6 +1046,7 @@ mod tests {
     fn request(mode: InterpolationMode, width: u32, height: u32, source_fps: f64) -> PlanRequest {
         PlanRequest {
             mode,
+            model: InterpolationModel::RifeV426,
             width,
             height,
             source_fps,
@@ -911,6 +1073,15 @@ mod tests {
     }
 
     #[test]
+    fn models_round_trip() {
+        for model in InterpolationModel::ALL {
+            assert_eq!(InterpolationModel::parse(model.as_str()), Some(model));
+            assert!(!model.display_name().is_empty());
+        }
+        assert_eq!(InterpolationModel::parse("rife-auto"), None);
+    }
+
+    #[test]
     fn auto_and_explicit_x2_use_rife_filter() {
         for mode in [InterpolationMode::Auto, InterpolationMode::X2] {
             let plan = build_plan(&ready_report(), request(mode, 3840, 2160, 24.0))
@@ -923,10 +1094,38 @@ mod tests {
             assert!(plan.video_filter.contains("rife-runtime-dll="));
             assert!(plan.video_filter.contains("rife-engine="));
             assert!(plan.video_filter.contains("rife-cudart="));
-            assert_eq!(plan.engine_key, "engine-3840x2160");
+            assert_eq!(plan.model_id, "rife-v4.26");
+            assert_eq!(plan.model, "RIFE v4.26");
+            assert_eq!(plan.engine_key, "rife-v4.26-3840x2160");
             assert_eq!(plan.scale, "1.0");
             assert_eq!(plan.precision, "fp16");
         }
+    }
+
+    #[test]
+    fn plan_uses_the_explicit_model_without_fallback() {
+        let mut input = request(InterpolationMode::X2, 3840, 2160, 24.0);
+        input.model = InterpolationModel::RifeV425Lite;
+        let plan = build_plan(&ready_report(), input).expect("Lite model plan");
+        assert_eq!(plan.model_id, "rife-v4.25-lite");
+        assert_eq!(plan.model, "RIFE v4.25 Lite");
+        assert_eq!(plan.engine_key, "rife-v4.25-lite-3840x2160");
+
+        let mut report = ready_report();
+        report
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .models
+            .retain(|model| model.model == InterpolationModel::RifeV426);
+        let mut missing = request(InterpolationMode::X2, 3840, 2160, 24.0);
+        missing.model = InterpolationModel::RifeV425Lite;
+        assert_eq!(
+            build_plan(&report, missing)
+                .expect_err("model selection must not fall back")
+                .code,
+            "frame_interpolation_model_unavailable"
+        );
     }
 
     #[test]
