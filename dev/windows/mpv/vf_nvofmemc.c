@@ -711,6 +711,7 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
         .scene_pixel_threshold = p->opts->rife_scene_pixel_threshold,
         .scene_average_threshold = p->opts->rife_scene_average_threshold,
         .scene_changed_ratio = p->opts->rife_scene_changed_ratio,
+        .profiling_enabled = 0,
     };
     char error[1024] = {0};
     MP_VERBOSE(f, "RIFE runtime create begin source=%dx%d matrix=%d "

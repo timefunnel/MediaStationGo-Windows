@@ -32,10 +32,12 @@ namespace {
 
 using CudaError = int;
 using CudaStream = cudaStream_t;
+using CudaEvent = cudaEvent_t;
 using CudaGraphicsResource = void *;
 
 constexpr CudaError kCudaSuccess = 0;
 constexpr unsigned int kCudaStreamNonBlocking = 1;
+constexpr unsigned int kCudaEventDefault = 0;
 constexpr size_t kInferenceHistogramBuckets = 4001;
 constexpr double kInferenceHistogramBucketMs = 0.025;
 constexpr uint32_t kSceneRegionColumns = 3;
@@ -337,6 +339,12 @@ struct CudaApi {
     CudaError(__cdecl *stream_create)(CudaStream *, unsigned int) = nullptr;
     CudaError(__cdecl *stream_synchronize)(CudaStream) = nullptr;
     CudaError(__cdecl *stream_destroy)(CudaStream) = nullptr;
+    CudaError(__cdecl *event_create)(CudaEvent *, unsigned int) = nullptr;
+    CudaError(__cdecl *event_record)(CudaEvent, CudaStream) = nullptr;
+    CudaError(__cdecl *event_synchronize)(CudaEvent) = nullptr;
+    CudaError(__cdecl *event_elapsed_time)(float *, CudaEvent,
+                                           CudaEvent) = nullptr;
+    CudaError(__cdecl *event_destroy)(CudaEvent) = nullptr;
     const char *(__cdecl *error_string)(CudaError) = nullptr;
 };
 
@@ -378,6 +386,16 @@ bool load_cuda(const wchar_t *path, CudaApi &api,
                        api.stream_synchronize, error, error_capacity)
         && load_symbol(api.module, "cudaStreamDestroy",
                        api.stream_destroy, error, error_capacity)
+        && load_symbol(api.module, "cudaEventCreateWithFlags",
+                       api.event_create, error, error_capacity)
+        && load_symbol(api.module, "cudaEventRecord",
+                       api.event_record, error, error_capacity)
+        && load_symbol(api.module, "cudaEventSynchronize",
+                       api.event_synchronize, error, error_capacity)
+        && load_symbol(api.module, "cudaEventElapsedTime",
+                       api.event_elapsed_time, error, error_capacity)
+        && load_symbol(api.module, "cudaEventDestroy",
+                       api.event_destroy, error, error_capacity)
         && load_symbol(api.module, "cudaGetErrorString",
                        api.error_string, error, error_capacity);
 }
@@ -928,6 +946,10 @@ class Runtime {
 public:
     ~Runtime()
     {
+        if (profile_event_end_ && cuda_.event_destroy)
+            cuda_.event_destroy(profile_event_end_);
+        if (profile_event_start_ && cuda_.event_destroy)
+            cuda_.event_destroy(profile_event_start_);
         if (stream_ && cuda_.stream_destroy)
             cuda_.stream_destroy(stream_);
         if (output_resource_ && cuda_.unregister_resource)
@@ -1043,7 +1065,8 @@ public:
             && config_.scene_sample_stride == config.scene_sample_stride
             && config_.scene_pixel_threshold == config.scene_pixel_threshold
             && config_.scene_average_threshold == config.scene_average_threshold
-            && config_.scene_changed_ratio == config.scene_changed_ratio;
+            && config_.scene_changed_ratio == config.scene_changed_ratio
+            && config_.profiling_enabled == config.profiling_enabled;
     }
 
     bool device_available() const
@@ -1055,6 +1078,8 @@ public:
     {
         stats_ = {};
         inference_histogram_.fill(0);
+        for (auto &histogram : profile_histograms_)
+            histogram.fill(0);
         previous_scene_ = {};
         previous_scene_class_ = RIFE_SCENE_NORMAL;
         previous_scene_streak_ = 0;
@@ -1081,6 +1106,10 @@ public:
                 rife_frame_diagnostics *diagnostics,
                 char *error, size_t error_capacity)
     {
+        const bool profiling = config_.profiling_enabled != 0;
+        const auto process_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         *diagnostics = {};
         diagnostics->source0_pts = source0_pts;
         diagnostics->source1_pts = source1_pts;
@@ -1119,6 +1148,8 @@ public:
         ID3D11ShaderResourceView *input_srvs[] = {
             input_y0.Get(), input_y1.Get(), input_uv0.Get(), input_uv1.Get(),
         };
+        const double frame_setup_ms = profiling
+            ? elapsed_ms(process_started) : 0;
         const auto scene_started = std::chrono::steady_clock::now();
         SceneMetrics scene;
         if (!detect_scene(input_srvs, scene, error, error_capacity)) {
@@ -1157,9 +1188,12 @@ public:
             return RIFE_RUNTIME_OK;
         }
 
+        std::array<double, RIFE_PROFILE_STAGE_COUNT> profile_ms{};
+        profile_ms[RIFE_PROFILE_FRAME_SETUP] = frame_setup_ms;
+        profile_ms[RIFE_PROFILE_SCENE_DETECTION] = scene_ms;
         const auto inference_started = std::chrono::steady_clock::now();
         if (!run_inference(input_srvs, output_y.Get(), output_uv.Get(),
-                           error, error_capacity)) {
+                           profile_ms, error, error_capacity)) {
             stats_.failures++;
             return RIFE_RUNTIME_INFERENCE_FAILED;
         }
@@ -1169,6 +1203,19 @@ public:
         record_inference(inference_ms);
         stats_.inferred_pairs++;
         diagnostics->inference_ms = inference_ms;
+        if (profiling) {
+            profile_ms[RIFE_PROFILE_PROCESS_TOTAL] =
+                elapsed_ms(process_started);
+            diagnostics->profile_stage_ms[RIFE_PROFILE_PROCESS_TOTAL] =
+                profile_ms[RIFE_PROFILE_PROCESS_TOTAL];
+            for (size_t stage = RIFE_PROFILE_FRAME_SETUP;
+                 stage < RIFE_PROFILE_STAGE_COUNT; ++stage) {
+                diagnostics->profile_stage_ms[stage] = profile_ms[stage];
+            }
+            for (size_t stage = 0; stage < RIFE_PROFILE_STAGE_COUNT; ++stage)
+                record_profile(stage, profile_ms[stage]);
+            stats_.profiled_pairs++;
+        }
         return RIFE_RUNTIME_OK;
     }
 
@@ -1192,6 +1239,24 @@ public:
                     result.inference_p95_ms =
                         static_cast<double>(index) * kInferenceHistogramBucketMs;
                     break;
+                }
+            }
+        }
+        if (result.profiled_pairs) {
+            const uint64_t target = static_cast<uint64_t>(
+                std::ceil(result.profiled_pairs * 0.95));
+            for (size_t stage = 0;
+                 stage < RIFE_PROFILE_STAGE_COUNT; ++stage) {
+                uint64_t accumulated = 0;
+                for (size_t index = 0;
+                     index < profile_histograms_[stage].size(); ++index) {
+                    accumulated += profile_histograms_[stage][index];
+                    if (accumulated >= target) {
+                        result.profile_stages[stage].p95_ms =
+                            static_cast<double>(index)
+                            * kInferenceHistogramBucketMs;
+                        break;
+                    }
                 }
             }
         }
@@ -1306,6 +1371,13 @@ private:
                       "RIFE D3D11 completion query could not be created");
             return false;
         }
+        if (config_.profiling_enabled
+            && FAILED(device_->CreateQuery(
+                &query_desc, &input_completion_query_))) {
+            set_error(error, error_capacity,
+                      "RIFE D3D11 profiling query could not be created");
+            return false;
+        }
         if (!cuda_ok(cuda_, cuda_.register_d3d11_resource(
                                &input_resource_, input_buffer_.Get(), 0),
                      "cudaGraphicsD3D11RegisterResource(input)", error,
@@ -1317,6 +1389,16 @@ private:
             return false;
         if (!cuda_ok(cuda_, cuda_.stream_create(&stream_, kCudaStreamNonBlocking),
                      "cudaStreamCreateWithFlags", error, error_capacity))
+            return false;
+        if (config_.profiling_enabled
+            && (!cuda_ok(cuda_, cuda_.event_create(
+                                     &profile_event_start_, kCudaEventDefault),
+                         "cudaEventCreateWithFlags(start)", error,
+                         error_capacity)
+                || !cuda_ok(cuda_, cuda_.event_create(
+                                       &profile_event_end_, kCudaEventDefault),
+                            "cudaEventCreateWithFlags(end)", error,
+                            error_capacity)))
             return false;
         return true;
     }
@@ -1523,11 +1605,36 @@ private:
         return true;
     }
 
-    bool run_inference(ID3D11ShaderResourceView **input_srvs,
-                       ID3D11UnorderedAccessView *output_y,
-                       ID3D11UnorderedAccessView *output_uv,
-                       char *error, size_t error_capacity)
+    bool wait_for_d3d11_query(ID3D11Query *query, const char *label,
+                              char *error, size_t error_capacity)
     {
+        BOOL complete = FALSE;
+        for (;;) {
+            const HRESULT status = context_->GetData(
+                query, &complete, sizeof(complete), 0);
+            if (status == S_OK && complete)
+                return true;
+            if (FAILED(status)) {
+                set_error(error, error_capacity,
+                          "%s wait failed (hr=0x%08lx)", label,
+                          static_cast<unsigned long>(status));
+                return false;
+            }
+            SwitchToThread();
+        }
+    }
+
+    bool run_inference(
+        ID3D11ShaderResourceView **input_srvs,
+        ID3D11UnorderedAccessView *output_y,
+        ID3D11UnorderedAccessView *output_uv,
+        std::array<double, RIFE_PROFILE_STAGE_COUNT> &profile_ms,
+        char *error, size_t error_capacity)
+    {
+        const bool profiling = config_.profiling_enabled != 0;
+        const auto input_conversion_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         ID3D11Buffer *constants[] = {constants_buffer_.Get()};
         ID3D11UnorderedAccessView *input_uavs[] = {input_tensor_uav_.Get()};
         context_->CSSetShader(prepare_shader_.Get(), nullptr, 0);
@@ -1541,12 +1648,41 @@ private:
         context_->CSSetShaderResources(0, 4, null_input_srvs);
         context_->CSSetUnorderedAccessViews(0, 1, null_input_uavs, nullptr);
         context_->CSSetShader(nullptr, nullptr, 0);
+        if (profiling) {
+            context_->End(input_completion_query_.Get());
+            if (!wait_for_d3d11_query(
+                    input_completion_query_.Get(),
+                    "RIFE input conversion", error, error_capacity))
+                return false;
+            profile_ms[RIFE_PROFILE_INPUT_CONVERSION] =
+                elapsed_ms(input_conversion_started);
+        }
 
         CudaGraphicsResource resources[] = {input_resource_, output_resource_};
+        const auto cuda_map_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         if (!cuda_ok(cuda_, cuda_.map_resources(2, resources, stream_),
                      "cudaGraphicsMapResources", error, error_capacity))
             return false;
         bool mapped = true;
+        if (profiling) {
+            if (!cuda_ok(cuda_, cuda_.event_record(
+                                   profile_event_end_, stream_),
+                         "cudaEventRecord(map)", error, error_capacity)
+                || !cuda_ok(cuda_, cuda_.event_synchronize(
+                                       profile_event_end_),
+                            "cudaEventSynchronize(map)", error,
+                            error_capacity)) {
+                cuda_.unmap_resources(2, resources, stream_);
+                return false;
+            }
+            profile_ms[RIFE_PROFILE_CUDA_MAP] = elapsed_ms(cuda_map_started);
+        }
+
+        const auto tensor_bind_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         void *input_pointer = nullptr;
         void *output_pointer = nullptr;
         size_t mapped_input_bytes = 0;
@@ -1573,21 +1709,70 @@ private:
                       "TensorRT tensor address binding failed");
             ok = false;
         }
+        if (profiling)
+            profile_ms[RIFE_PROFILE_TENSOR_BIND] =
+                elapsed_ms(tensor_bind_started);
+        if (ok && profiling
+            && !cuda_ok(cuda_, cuda_.event_record(
+                                   profile_event_start_, stream_),
+                        "cudaEventRecord(TensorRT start)", error,
+                        error_capacity))
+            ok = false;
         if (ok && !execution_->enqueueV3(stream_)) {
             set_error(error, error_capacity, "TensorRT enqueueV3 failed: %s",
                       logger_->last_error.c_str());
             ok = false;
         }
+        if (ok && profiling
+            && !cuda_ok(cuda_, cuda_.event_record(
+                                   profile_event_end_, stream_),
+                        "cudaEventRecord(TensorRT end)", error,
+                        error_capacity))
+            ok = false;
         if (ok && !cuda_ok(cuda_, cuda_.stream_synchronize(stream_),
                            "cudaStreamSynchronize", error, error_capacity))
             ok = false;
-        if (mapped && !cuda_ok(cuda_, cuda_.unmap_resources(2, resources, stream_),
-                               "cudaGraphicsUnmapResources", error,
-                               error_capacity))
-            ok = false;
+        if (ok && profiling) {
+            float tensor_rt_ms = 0;
+            if (!cuda_ok(cuda_, cuda_.event_elapsed_time(
+                                   &tensor_rt_ms, profile_event_start_,
+                                   profile_event_end_),
+                         "cudaEventElapsedTime(TensorRT)", error,
+                         error_capacity))
+                ok = false;
+            else
+                profile_ms[RIFE_PROFILE_TENSORRT] = tensor_rt_ms;
+        }
+        const auto cuda_unmap_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        if (mapped) {
+            if (!cuda_ok(cuda_, cuda_.unmap_resources(
+                                   2, resources, stream_),
+                         "cudaGraphicsUnmapResources", error,
+                         error_capacity)) {
+                ok = false;
+            } else if (profiling
+                       && (!cuda_ok(cuda_, cuda_.event_record(
+                                              profile_event_end_, stream_),
+                                    "cudaEventRecord(unmap)", error,
+                                    error_capacity)
+                           || !cuda_ok(cuda_, cuda_.event_synchronize(
+                                                 profile_event_end_),
+                                       "cudaEventSynchronize(unmap)", error,
+                                       error_capacity))) {
+                ok = false;
+            }
+        }
+        if (profiling)
+            profile_ms[RIFE_PROFILE_CUDA_UNMAP] =
+                elapsed_ms(cuda_unmap_started);
         if (!ok)
             return false;
 
+        const auto output_conversion_started = profiling
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         ID3D11ShaderResourceView *output_srvs[5]{};
         output_srvs[4] = output_tensor_srv_.Get();
         ID3D11UnorderedAccessView *output_uavs[] = {output_y, output_uv};
@@ -1604,20 +1789,14 @@ private:
         context_->CSSetUnorderedAccessViews(0, 2, null_output_uavs, nullptr);
         context_->CSSetShader(nullptr, nullptr, 0);
         context_->End(completion_query_.Get());
-        BOOL complete = FALSE;
-        for (;;) {
-            const HRESULT status = context_->GetData(
-                completion_query_.Get(), &complete, sizeof(complete), 0);
-            if (status == S_OK && complete)
-                return true;
-            if (FAILED(status)) {
-                set_error(error, error_capacity,
-                          "D3D11 completion wait failed (hr=0x%08lx)",
-                          static_cast<unsigned long>(status));
-                return false;
-            }
-            SwitchToThread();
-        }
+        if (!wait_for_d3d11_query(
+                completion_query_.Get(), "RIFE output conversion",
+                error, error_capacity))
+            return false;
+        if (profiling)
+            profile_ms[RIFE_PROFILE_OUTPUT_CONVERSION] =
+                elapsed_ms(output_conversion_started);
+        return true;
     }
 
     void record_inference(double milliseconds)
@@ -1631,6 +1810,21 @@ private:
         inference_histogram_[bucket]++;
     }
 
+    void record_profile(size_t stage, double milliseconds)
+    {
+        if (stage >= RIFE_PROFILE_STAGE_COUNT || milliseconds < 0
+            || !std::isfinite(milliseconds))
+            return;
+        stats_.profile_stages[stage].total_ms += milliseconds;
+        stats_.profile_stages[stage].max_ms = std::max(
+            stats_.profile_stages[stage].max_ms, milliseconds);
+        const size_t bucket = std::min(
+            static_cast<size_t>(milliseconds
+                                / kInferenceHistogramBucketMs),
+            profile_histograms_[stage].size() - 1);
+        profile_histograms_[stage][bucket]++;
+    }
+
     static double elapsed_ms(const std::chrono::steady_clock::time_point &started)
     {
         return std::chrono::duration<double, std::milli>(
@@ -1642,6 +1836,8 @@ private:
     std::wstring cuda_runtime_path_;
     CudaApi cuda_{};
     CudaStream stream_ = nullptr;
+    CudaEvent profile_event_start_ = nullptr;
+    CudaEvent profile_event_end_ = nullptr;
     CudaGraphicsResource input_resource_ = nullptr;
     CudaGraphicsResource output_resource_ = nullptr;
     std::shared_ptr<Logger> logger_;
@@ -1670,8 +1866,11 @@ private:
     ComPtr<ID3D11Buffer> constants_buffer_;
     ComPtr<ID3D11Buffer> scene_constants_buffer_;
     ComPtr<ID3D11Query> completion_query_;
+    ComPtr<ID3D11Query> input_completion_query_;
     rife_runtime_stats stats_{};
     std::array<uint64_t, kInferenceHistogramBuckets> inference_histogram_{};
+    std::array<std::array<uint64_t, kInferenceHistogramBuckets>,
+               RIFE_PROFILE_STAGE_COUNT> profile_histograms_{};
     SceneMetrics previous_scene_{};
     uint32_t previous_scene_class_ = RIFE_SCENE_NORMAL;
     uint32_t previous_scene_streak_ = 0;
@@ -1843,6 +2042,7 @@ extern "C" struct rife_runtime *__cdecl rife_runtime_create(
         || config->color_matrix > RIFE_COLOR_MATRIX_BT2020_NCL
         || config->limited_range > 1 || config->scene_sample_stride < 2
         || config->scene_pixel_threshold == 0
+        || config->profiling_enabled > 1
         || !std::isfinite(config->scene_average_threshold)
         || config->scene_average_threshold <= 0
         || !std::isfinite(config->scene_changed_ratio)

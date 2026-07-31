@@ -9,8 +9,9 @@
 extern "C" {
 #endif
 
-#define RIFE_RUNTIME_ABI_VERSION 3u
+#define RIFE_RUNTIME_ABI_VERSION 4u
 #define RIFE_SCENE_CLASS_COUNT 5u
+#define RIFE_PROFILE_STAGE_COUNT 9u
 
 enum rife_color_matrix {
     RIFE_COLOR_MATRIX_BT601 = 0,
@@ -36,6 +37,24 @@ enum rife_scene_classification {
     RIFE_SCENE_UNCERTAIN = 4,
 };
 
+enum rife_profile_stage {
+    RIFE_PROFILE_PROCESS_TOTAL = 0,
+    RIFE_PROFILE_FRAME_SETUP = 1,
+    RIFE_PROFILE_SCENE_DETECTION = 2,
+    RIFE_PROFILE_INPUT_CONVERSION = 3,
+    RIFE_PROFILE_CUDA_MAP = 4,
+    RIFE_PROFILE_TENSOR_BIND = 5,
+    RIFE_PROFILE_TENSORRT = 6,
+    RIFE_PROFILE_CUDA_UNMAP = 7,
+    RIFE_PROFILE_OUTPUT_CONVERSION = 8,
+};
+
+struct rife_timing_stats {
+    double total_ms;
+    double p95_ms;
+    double max_ms;
+};
+
 struct rife_runtime_config {
     uint32_t abi_version;
     ID3D11Device *device;
@@ -50,6 +69,7 @@ struct rife_runtime_config {
     uint32_t scene_pixel_threshold;
     float scene_average_threshold;
     float scene_changed_ratio;
+    uint32_t profiling_enabled;
 };
 
 struct rife_runtime_stats {
@@ -75,6 +95,8 @@ struct rife_runtime_stats {
     double runtime_engine_validate_ms;
     double runtime_d3d_resources_ms;
     uint64_t scene_classes[RIFE_SCENE_CLASS_COUNT];
+    uint64_t profiled_pairs;
+    struct rife_timing_stats profile_stages[RIFE_PROFILE_STAGE_COUNT];
 };
 
 struct rife_frame_diagnostics {
@@ -93,6 +115,7 @@ struct rife_frame_diagnostics {
     double exposure_spread;
     uint32_t classification;
     uint32_t scene_cut;
+    double profile_stage_ms[RIFE_PROFILE_STAGE_COUNT];
 };
 
 struct rife_runtime;

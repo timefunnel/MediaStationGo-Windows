@@ -95,6 +95,44 @@ playback, subtitle composition, audio/video drift, display cadence, thermal
 stability, and recovery after repeated seeks still require explicit acceptance
 testing.
 
+## Profiled 4K cost distribution
+
+Runtime ABI 4 adds an explicit probe-only stage profiler. The product filter
+sets `profiling_enabled=0`, so normal playback does not add the profiler's D3D11
+or CUDA synchronization points. The probe uses D3D11 completion queries around
+both conversion shaders and CUDA events around TensorRT. Upload completion is
+isolated before each sample, and the first TensorRT warm-up inference is excluded
+from steady-state statistics.
+
+The following profile used 62 consecutive inferred frame pairs from a real
+3840x2160 P010 film sequence around 31:00 on the RTX 5070 Ti reference machine:
+
+| Stage | Average | p95 | Maximum | Share of total |
+| --- | ---: | ---: | ---: | ---: |
+| Total runtime process | 37.445 ms | 39.800 ms | 41.062 ms | 100.00% |
+| Frame validation and views | 0.028 ms | 0.025 ms | 0.040 ms | 0.07% |
+| Scene detection and readback | 0.323 ms | 0.850 ms | 0.879 ms | 0.86% |
+| P010 to FP16 input conversion | 0.410 ms | 0.700 ms | 1.067 ms | 1.09% |
+| D3D11 to CUDA map | 0.269 ms | 0.525 ms | 0.983 ms | 0.72% |
+| Tensor address binding | 0.005 ms | <0.025 ms | 0.020 ms | 0.01% |
+| TensorRT-RTX RIFE inference | 35.897 ms | 38.200 ms | 38.729 ms | 95.86% |
+| CUDA to D3D11 unmap | 0.263 ms | 0.525 ms | 0.694 ms | 0.70% |
+| FP16 output to P010 conversion | 0.221 ms | 0.250 ms | 0.323 ms | 0.59% |
+| Unattributed control overhead | 0.031 ms | n/a | n/a | 0.08% |
+
+A separate 300-pair synthetic 4K run measured 35.785 ms average and 36.550 ms
+p95 total time; TensorRT accounted for 34.481 ms, or 96.36%. Both workloads
+therefore identify the full-resolution RIFE TensorRT graph as the dominant 4K
+bottleneck. P010 conversion, D3D11/CUDA interoperability, scene detection, and
+host control combined account for approximately 1.55 ms on the real sequence.
+The NVOFA execution path is not enabled by the product RIFE mode and contributes
+no time to this profile.
+
+The first inference before warm-up took 107.582 ms in the real-sequence probe.
+That is a separate first-use latency issue and is not included in the steady-state
+table. This short profile establishes cost attribution only; it does not replace
+the required long-form stability acceptance test.
+
 ## Real-film quality comparison
 
 The active model was changed from v4.25 Lite to v4.26 after comparing both the

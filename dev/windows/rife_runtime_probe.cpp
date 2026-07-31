@@ -158,6 +158,21 @@ bool upload_p010_frame(ID3D11DeviceContext *context,
     return true;
 }
 
+bool wait_for_d3d11(ID3D11DeviceContext *context, ID3D11Query *query)
+{
+    context->End(query);
+    BOOL complete = FALSE;
+    for (;;) {
+        const HRESULT status = context->GetData(
+            query, &complete, sizeof(complete), 0);
+        if (status == S_OK && complete)
+            return true;
+        if (FAILED(status))
+            return false;
+        SwitchToThread();
+    }
+}
+
 bool create_readback_texture(ID3D11Device *device,
                              ID3D11Texture2D *source,
                              ComPtr<ID3D11Texture2D> &readback)
@@ -249,6 +264,78 @@ const char *scene_class_name(uint32_t classification)
     }
 }
 
+double profile_average(const rife_runtime_stats &stats, size_t stage)
+{
+    return stats.profiled_pairs && stage < RIFE_PROFILE_STAGE_COUNT
+        ? stats.profile_stages[stage].total_ms / stats.profiled_pairs : 0;
+}
+
+void print_profile_summary(const rife_runtime_stats &stats)
+{
+    if (!stats.profiled_pairs) {
+        std::printf("RIFE_PROFILE_SUMMARY disabled\n");
+        return;
+    }
+    const double total = profile_average(stats, RIFE_PROFILE_PROCESS_TOTAL);
+    double attributed = 0;
+    for (size_t stage = RIFE_PROFILE_FRAME_SETUP;
+         stage < RIFE_PROFILE_STAGE_COUNT; ++stage)
+        attributed += profile_average(stats, stage);
+    const double residual = std::max(0.0, total - attributed);
+    const auto percentage = [total](double value) {
+        return total > 0 ? value * 100.0 / total : 0.0;
+    };
+    std::printf(
+        "RIFE_PROFILE_SUMMARY pairs=%llu "
+        "total=avg:%.3f,p95:%.3f,max:%.3f "
+        "frame-setup=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "scene=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "input-convert=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "cuda-map=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "tensor-bind=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "tensorrt=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "cuda-unmap=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "output-convert=avg:%.3f,p95:%.3f,max:%.3f,pct:%.2f "
+        "residual=avg:%.3f,pct:%.2f\n",
+        static_cast<unsigned long long>(stats.profiled_pairs),
+        total,
+        stats.profile_stages[RIFE_PROFILE_PROCESS_TOTAL].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_PROCESS_TOTAL].max_ms,
+        profile_average(stats, RIFE_PROFILE_FRAME_SETUP),
+        stats.profile_stages[RIFE_PROFILE_FRAME_SETUP].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_FRAME_SETUP].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_FRAME_SETUP)),
+        profile_average(stats, RIFE_PROFILE_SCENE_DETECTION),
+        stats.profile_stages[RIFE_PROFILE_SCENE_DETECTION].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_SCENE_DETECTION].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_SCENE_DETECTION)),
+        profile_average(stats, RIFE_PROFILE_INPUT_CONVERSION),
+        stats.profile_stages[RIFE_PROFILE_INPUT_CONVERSION].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_INPUT_CONVERSION].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_INPUT_CONVERSION)),
+        profile_average(stats, RIFE_PROFILE_CUDA_MAP),
+        stats.profile_stages[RIFE_PROFILE_CUDA_MAP].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_CUDA_MAP].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_CUDA_MAP)),
+        profile_average(stats, RIFE_PROFILE_TENSOR_BIND),
+        stats.profile_stages[RIFE_PROFILE_TENSOR_BIND].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_TENSOR_BIND].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_TENSOR_BIND)),
+        profile_average(stats, RIFE_PROFILE_TENSORRT),
+        stats.profile_stages[RIFE_PROFILE_TENSORRT].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_TENSORRT].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_TENSORRT)),
+        profile_average(stats, RIFE_PROFILE_CUDA_UNMAP),
+        stats.profile_stages[RIFE_PROFILE_CUDA_UNMAP].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_CUDA_UNMAP].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_CUDA_UNMAP)),
+        profile_average(stats, RIFE_PROFILE_OUTPUT_CONVERSION),
+        stats.profile_stages[RIFE_PROFILE_OUTPUT_CONVERSION].p95_ms,
+        stats.profile_stages[RIFE_PROFILE_OUTPUT_CONVERSION].max_ms,
+        percentage(profile_average(stats, RIFE_PROFILE_OUTPUT_CONVERSION)),
+        residual, percentage(residual));
+}
+
 int run_sequence_probe(rife_runtime *runtime,
                        ProcessFn process,
                        GetStatsFn get_stats,
@@ -283,7 +370,11 @@ int run_sequence_probe(rife_runtime *runtime,
         return 12;
     }
     ComPtr<ID3D11Texture2D> readback;
-    if (!create_readback_texture(device, output_texture, readback)) {
+    ComPtr<ID3D11Query> upload_query;
+    D3D11_QUERY_DESC upload_query_desc{};
+    upload_query_desc.Query = D3D11_QUERY_EVENT;
+    if (!create_readback_texture(device, output_texture, readback)
+        || FAILED(device->CreateQuery(&upload_query_desc, &upload_query))) {
         std::fprintf(stderr, "RIFE_SEQUENCE_READBACK_CREATE_FAILED\n");
         return 13;
     }
@@ -291,7 +382,10 @@ int run_sequence_probe(rife_runtime *runtime,
     csv << "pair,source0_pts,source1_pts,midpoint_pts,class,policy,"
            "average_delta,changed_ratio,average_kl,regional_kl_max,"
            "chroma_delta,edge_delta,exposure_delta,exposure_spread,"
-           "scene_ms,inference_ms,output_delta_f0,output_delta_f1,"
+           "scene_ms,inference_ms,process_ms,frame_setup_ms,"
+           "input_conversion_ms,cuda_map_ms,tensor_bind_ms,tensorrt_ms,"
+           "cuda_unmap_ms,output_conversion_ms,"
+           "output_delta_f0,output_delta_f1,"
            "temporal_imbalance,outside_endpoints_ratio\n";
     csv << std::fixed << std::setprecision(6);
 
@@ -309,6 +403,12 @@ int run_sequence_probe(rife_runtime *runtime,
         }
         upload_p010_frame(context, frame0, bytes0, width);
         upload_p010_frame(context, frame1, bytes1, width);
+        if (!wait_for_d3d11(context, upload_query.Get())) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_UPLOAD_WAIT_FAILED pair=%llu\n",
+                         static_cast<unsigned long long>(pairs));
+            return 15;
+        }
         const double source0_pts = start_pts
             + static_cast<double>(pairs) * fps_denominator / fps_numerator;
         const double source1_pts = start_pts
@@ -347,6 +447,16 @@ int run_sequence_probe(rife_runtime *runtime,
             << ',' << diagnostics.exposure_delta << ','
             << diagnostics.exposure_spread << ',' << diagnostics.scene_ms
             << ',' << diagnostics.inference_ms << ','
+            << diagnostics.profile_stage_ms[RIFE_PROFILE_PROCESS_TOTAL] << ','
+            << diagnostics.profile_stage_ms[RIFE_PROFILE_FRAME_SETUP] << ','
+            << diagnostics.profile_stage_ms[RIFE_PROFILE_INPUT_CONVERSION]
+            << ',' << diagnostics.profile_stage_ms[RIFE_PROFILE_CUDA_MAP]
+            << ',' << diagnostics.profile_stage_ms[RIFE_PROFILE_TENSOR_BIND]
+            << ',' << diagnostics.profile_stage_ms[RIFE_PROFILE_TENSORRT]
+            << ',' << diagnostics.profile_stage_ms[RIFE_PROFILE_CUDA_UNMAP]
+            << ','
+            << diagnostics.profile_stage_ms[RIFE_PROFILE_OUTPUT_CONVERSION]
+            << ','
             << output_metrics.delta_from_frame0 << ','
             << output_metrics.delta_from_frame1 << ','
             << output_metrics.temporal_imbalance << ','
@@ -380,6 +490,7 @@ int run_sequence_probe(rife_runtime *runtime,
         static_cast<unsigned long long>(stats.scene_cuts),
         static_cast<unsigned long long>(stats.failures),
         stats.inference_p95_ms, stats.scene_max_ms);
+    print_profile_summary(stats);
     return 0;
 }
 
@@ -465,6 +576,14 @@ int wmain(int argc, wchar_t **argv)
         ? static_cast<uint32_t>(_wtoi(argv[8])) : 0;
     const double start_pts = sequence_mode ? std::wcstod(argv[9], nullptr)
                                            : 0;
+    wchar_t profiling_value[16]{};
+    const DWORD profiling_length = GetEnvironmentVariableW(
+        L"MSGO_RIFE_PROFILE", profiling_value,
+        static_cast<DWORD>(std::size(profiling_value)));
+    if (profiling_length >= std::size(profiling_value))
+        return 2;
+    const uint32_t profiling_enabled = profiling_length == 0
+        || std::wcscmp(profiling_value, L"0") != 0;
     if (!width || !height
         || (sequence_mode
             ? !fps_numerator || !fps_denominator || start_pts < 0
@@ -573,6 +692,7 @@ int wmain(int argc, wchar_t **argv)
         32,
         24.0f,
         0.42f,
+        profiling_enabled,
     };
     char error[1024]{};
     rife_runtime *runtime = create(&config, error, sizeof(error));
@@ -584,6 +704,28 @@ int wmain(int argc, wchar_t **argv)
     }
 
     if (sequence_mode) {
+        rife_frame_diagnostics warmup_diagnostics{};
+        const int warmup_status = process(
+            runtime, frame0.Get(), 0, frame1.Get(), 0, output.Get(), 0,
+            start_pts, start_pts + static_cast<double>(fps_denominator)
+                / fps_numerator,
+            &warmup_diagnostics, error, sizeof(error));
+        if (warmup_status != RIFE_RUNTIME_OK) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_WARMUP_FAILED status=%d detail=%s\n",
+                         warmup_status, error);
+            destroy(runtime);
+            FreeLibrary(module);
+            return 11;
+        }
+        destroy(runtime);
+        runtime = create(&config, error, sizeof(error));
+        if (!runtime) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_REOPEN_FAILED detail=%s\n", error);
+            FreeLibrary(module);
+            return 11;
+        }
         const int result = run_sequence_probe(
             runtime, process, get_stats, device.Get(), context.Get(),
             frame0.Get(), frame1.Get(), output.Get(), width, height,
@@ -601,6 +743,11 @@ int wmain(int argc, wchar_t **argv)
                      output.Get(), 0, index / 24.0, (index + 1) / 24.0,
                      &diagnostics, error, sizeof(error))
              == RIFE_RUNTIME_OK && !diagnostics.scene_cut;
+    }
+    if (ok) {
+        destroy(runtime);
+        runtime = create(&config, error, sizeof(error));
+        ok = runtime != nullptr;
     }
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(iterations));
@@ -674,5 +821,6 @@ int wmain(int argc, wchar_t **argv)
         validation.unique_luma_codes,
         static_cast<unsigned long long>(validation.non_8bit_luma_samples),
         validation.p010_packed ? "yes" : "no");
+    print_profile_summary(stats);
     return 0;
 }
