@@ -35,7 +35,8 @@ using ProcessFn = int(__cdecl *)(
 using GetStatsFn = int(__cdecl *)(const rife_runtime *, rife_runtime_stats *);
 using DestroyFn = void(__cdecl *)(rife_runtime *);
 using QueuePrewarmFn = int(__cdecl *)(const wchar_t *, const wchar_t *,
-                                      uint32_t, uint32_t, ID3D11Device *,
+                                      uint32_t, uint32_t, uint32_t,
+                                      ID3D11Device *,
                                       ID3D11DeviceContext *, char *, size_t);
 
 template <typename T>
@@ -653,7 +654,7 @@ int wmain(int argc, wchar_t **argv)
     char prewarm_error[1024]{};
     const auto prewarm_started = std::chrono::steady_clock::now();
     const int prewarm_status = queue_prewarm(
-        argv[engine_argument], argv[cudart_argument], width, height,
+        argv[engine_argument], argv[cudart_argument], width, height, 128,
         device.Get(), context.Get(), prewarm_error, sizeof(prewarm_error));
     const double prewarm_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prewarm_started).count();
@@ -691,6 +692,7 @@ int wmain(int argc, wchar_t **argv)
         argv[cudart_argument],
         width,
         height,
+        128,
         RIFE_COLOR_MATRIX_BT709,
         1,
         8,

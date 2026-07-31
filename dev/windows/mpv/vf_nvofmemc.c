@@ -35,6 +35,7 @@ struct opts {
     char *rife_cudart;
     int rife_source_width;
     int rife_source_height;
+    int rife_shape_alignment;
     int rife_scene_sample_stride;
     int rife_scene_pixel_threshold;
     double rife_scene_average_threshold;
@@ -380,7 +381,7 @@ typedef int (__cdecl *rife_get_stats_fn)(
     const struct rife_runtime *, struct rife_runtime_stats *);
 typedef void (__cdecl *rife_destroy_fn)(struct rife_runtime *);
 typedef int (__cdecl *rife_queue_prewarm_fn)(
-    const wchar_t *, const wchar_t *, uint32_t, uint32_t,
+    const wchar_t *, const wchar_t *, uint32_t, uint32_t, uint32_t,
     ID3D11Device *, ID3D11DeviceContext *, char *, size_t);
 
 struct rife_state {
@@ -616,8 +617,11 @@ static bool queue_rife_prewarm(struct mp_filter *f)
     if (!p->opts->rife)
         return true;
     if (p->opts->rife_source_width <= 0
-        || p->opts->rife_source_height <= 0) {
-        MP_ERR(f, "RIFE background prewarm requires source dimensions\n");
+        || p->opts->rife_source_height <= 0
+        || (p->opts->rife_shape_alignment != 64
+            && p->opts->rife_shape_alignment != 128)) {
+        MP_ERR(f, "RIFE background prewarm requires source dimensions and "
+                  "a 64 or 128 shape alignment\n");
         return false;
     }
     wchar_t *engine_path = utf8_to_wide(f, p->opts->rife_engine);
@@ -633,6 +637,7 @@ static bool queue_rife_prewarm(struct mp_filter *f)
         engine_path, cudart_path,
         (uint32_t)p->opts->rife_source_width,
         (uint32_t)p->opts->rife_source_height,
+        (uint32_t)p->opts->rife_shape_alignment,
         p->device, p->context, error, sizeof(error));
     talloc_free(engine_path);
     talloc_free(cudart_path);
@@ -706,6 +711,7 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
         .cuda_runtime_path = cudart_path,
         .source_width = frame->w,
         .source_height = frame->h,
+        .shape_alignment = p->opts->rife_shape_alignment,
         .color_matrix = matrix,
         .limited_range = limited_range,
         .scene_sample_stride = p->opts->rife_scene_sample_stride,
@@ -7255,8 +7261,10 @@ static const m_option_t option_fields[] = {
     {"rife-engine", OPT_STRING(rife_engine), .flags = M_OPT_FILE},
     {"rife-model", OPT_STRING(rife_model)},
     {"rife-cudart", OPT_STRING(rife_cudart), .flags = M_OPT_FILE},
-    {"rife-source-width", OPT_INT(rife_source_width), M_RANGE(0, 7680)},
-    {"rife-source-height", OPT_INT(rife_source_height), M_RANGE(0, 4320)},
+    {"rife-source-width", OPT_INT(rife_source_width), M_RANGE(0, 16384)},
+    {"rife-source-height", OPT_INT(rife_source_height), M_RANGE(0, 16384)},
+    {"rife-shape-alignment", OPT_INT(rife_shape_alignment),
+        M_RANGE(64, 128)},
     {"rife-scene-sample-stride", OPT_INT(rife_scene_sample_stride),
         M_RANGE(2, 64)},
     {"rife-scene-pixel-threshold", OPT_INT(rife_scene_pixel_threshold),
@@ -7302,6 +7310,7 @@ const struct mp_user_filter_entry vf_nvofmemc = {
             .rife = false,
             .rife_source_width = 0,
             .rife_source_height = 0,
+            .rife_shape_alignment = 0,
             .rife_scene_sample_stride = 8,
             .rife_scene_pixel_threshold = 32,
             .rife_scene_average_threshold = 24.0,

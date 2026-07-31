@@ -152,15 +152,17 @@ def verify_export(wrapper: nn.Module, output_path: Path) -> tuple[float, float]:
         error_sum += float(difference.sum(dtype=np.float64))
         error_count += difference.size
     mean_error = error_sum / error_count
-    if max_error > 1.0e-2:
+    max_limit, mean_limit = 1.0e-2, 1.0e-3
+    if max_error > max_limit or mean_error > mean_limit:
         raise RuntimeError(
             f"PyTorch to ONNX validation failed: max_abs={max_error:.8f}, "
-            f"mean_abs={mean_error:.8f}"
+            f"mean_abs={mean_error:.8f}, max_limit={max_limit:.8f}, "
+            f"mean_limit={mean_limit:.8f}"
         )
     return max_error, mean_error
 
 
-def add_metadata(output_path: Path, weight_path: Path, input_height: int, input_width: int) -> None:
+def add_metadata(output_path: Path, weight_path: Path) -> None:
     model = onnx.load(str(output_path))
     metadata = {
         "mediastation_model_id": MODEL_ID,
@@ -168,7 +170,8 @@ def add_metadata(output_path: Path, weight_path: Path, input_height: int, input_
         "mediastation_precision": "fp16_io",
         "mediastation_input_contract": "fp16[1,11,H,W]",
         "mediastation_output_contract": "fp16[1,3,H,W]",
-        "mediastation_engine_shape": f"1x11x{input_height}x{input_width}",
+        "mediastation_engine_shape": "dynamic",
+        "mediastation_shape_alignment": "128",
         "vs_rife_commit": UPSTREAM_COMMIT,
         "vs_rife_weight_sha256": sha256(weight_path),
         "export_tool": "rife_v426_scale05_export.py",
@@ -186,17 +189,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vs-rife-dir", type=Path, required=True)
     parser.add_argument("--weight", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--input-width", type=int, required=True)
-    parser.add_argument("--input-height", type=int, required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.input_width <= 0 or args.input_height <= 0:
-        raise ValueError("Input dimensions must be positive")
-    if args.input_width % 128 or args.input_height % 128:
-        raise ValueError("v4.26 scale=0.5 input dimensions must be divisible by 128")
     if not args.weight.is_file():
         raise FileNotFoundError(f"Official v4.26 weight is missing: {args.weight}")
     actual_weight_sha256 = sha256(args.weight)
@@ -210,43 +207,57 @@ def main() -> None:
     model = load_upstream_ifnet(args.vs_rife_dir, args.weight)
     wrapper = RuntimeContractV426Scale05(model).eval()
     example = make_validation_input()
-
-    torch.onnx.export(
-        wrapper,
-        (example,),
-        str(args.output),
-        input_names=["input"],
-        output_names=["output"],
-        opset_version=20,
-        do_constant_folding=True,
-        dynamic_axes={
-            "input": {2: "height", 3: "width"},
-            "output": {2: "height", 3: "width"},
-        },
-        dynamo=False,
-    )
-    max_error, mean_error = verify_export(wrapper, args.output)
-    add_metadata(args.output, args.weight, args.input_height, args.input_width)
-    onnx_model = onnx.load(str(args.output))
-    io_types = [
-        value.type.tensor_type.elem_type
-        for value in (*onnx_model.graph.input, *onnx_model.graph.output)
-    ]
-    if io_types != [onnx.TensorProto.FLOAT16, onnx.TensorProto.FLOAT16]:
-        raise RuntimeError(f"ONNX IO contract is not FP16: {io_types}")
+    temporary_output = args.output.with_suffix(f"{args.output.suffix}.tmp")
+    temporary_output.unlink(missing_ok=True)
+    try:
+        torch.onnx.export(
+            wrapper,
+            (example,),
+            str(temporary_output),
+            input_names=["input"],
+            output_names=["output"],
+            opset_version=16,
+            do_constant_folding=True,
+            dynamic_axes={
+                "input": {2: "height", 3: "width"},
+                "output": {2: "height", 3: "width"},
+            },
+            dynamo=False,
+        )
+        max_error, mean_error = verify_export(wrapper, temporary_output)
+        add_metadata(temporary_output, args.weight)
+        onnx_model = onnx.load(str(temporary_output))
+        io_values = (*onnx_model.graph.input, *onnx_model.graph.output)
+        io_types = [value.type.tensor_type.elem_type for value in io_values]
+        io_shapes = [
+            tuple(
+                dimension.dim_value or dimension.dim_param
+                for dimension in value.type.tensor_type.shape.dim
+            )
+            for value in io_values
+        ]
+        if io_types != [onnx.TensorProto.FLOAT16, onnx.TensorProto.FLOAT16]:
+            raise RuntimeError(f"ONNX IO contract is not FP16: {io_types}")
+        if io_shapes != [(1, CHANNELS, "height", "width"), (1, 3, "height", "width")]:
+            raise RuntimeError(f"ONNX IO shape contract is not dynamic: {io_shapes}")
+        temporary_output.replace(args.output)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+    output_sha256 = sha256(args.output)
     print(
         json.dumps(
             {
                 "status": "RIFE_V426_SCALE05_ONNX_OK",
                 "model_id": MODEL_ID,
                 "scale": SCALE,
-                "input": f"1x11x{args.input_height}x{args.input_width}",
+                "input": "1x11xHxW",
                 "output": "1x3xHxW",
                 "pytorch_to_onnx_max_abs": max_error,
                 "pytorch_to_onnx_mean_abs": mean_error,
                 "weight_sha256": actual_weight_sha256,
                 "upstream_commit": UPSTREAM_COMMIT,
-                "output": str(args.output),
+                "output_path": str(args.output),
+                "output_sha256": output_sha256,
             },
             sort_keys=True,
         )

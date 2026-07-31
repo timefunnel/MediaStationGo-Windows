@@ -47,9 +47,7 @@ if ($Arch -eq "arm64") {
 $OutputLib = Join-Path $OutputDir "lib\mpv.lib"
 if ((Test-Path $OutputLib) -and -not $Force) {
     $OutputLibDir = Split-Path -Parent $OutputLib
-    if (Test-Path -LiteralPath (Join-Path $OutputLibDir "rife_runtime.dll") -PathType Leaf) {
-        & $RifeRuntimeStageScript -OutputLibDir $OutputLibDir
-    }
+    & $RifeRuntimeStageScript -OutputLibDir $OutputLibDir
     Write-Host "mpv already built at $OutputDir" -ForegroundColor Green
     Write-Host "Use -Force to rebuild"
     exit 0
@@ -281,10 +279,10 @@ Copy-Item (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") $LibDir
 Copy-Item (Join-Path $FrameInterpolationRuntimeDir "bin\cudart64_12.dll") $LibDir
 Copy-Item (Join-Path $FrameInterpolationRuntimeDir ".tensorrt\TensorRT-RTX-$RifeTensorRtVersion\bin\tensorrt_rtx_1_4.dll") $LibDir
 
-Write-Host "Staging keyed RIFE engine cache..."
+Write-Host "Staging dynamic RIFE runtime..."
 & $RifeRuntimeStageScript -OutputLibDir $LibDir
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to stage the RIFE engine cache"
+    throw "Failed to stage the dynamic RIFE runtime"
 }
 
 # Generate MSVC import library

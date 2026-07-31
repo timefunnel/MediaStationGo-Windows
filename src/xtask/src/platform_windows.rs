@@ -21,7 +21,7 @@ pub fn stage_mpv(out: &Path, mpv_info: &mpv::Mpv, used_external: bool, _bin: &Pa
         for entry in std::fs::read_dir(&lib_dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            if name.to_string_lossy().ends_with(".dll") {
+            if name.to_string_lossy().ends_with(".dll") || name == "tensorrt_rtx.exe" {
                 std::fs::copy(entry.path(), out.join(&name))?;
             }
         }
@@ -46,6 +46,7 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
     }
     if let Some(dir) = &args.external_mpv {
         xfs::copy_glob(&dir.join("lib"), prefix, &["*.dll"])?;
+        xfs::copy_glob(&dir.join("lib"), prefix, &["tensorrt_rtx.exe"])?;
         let frame_interpolation = dir.join("lib").join("frame-interpolation");
         if frame_interpolation.exists() {
             replace_frame_interpolation(&frame_interpolation, &prefix.join("frame-interpolation"))?;

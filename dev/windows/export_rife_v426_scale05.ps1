@@ -73,9 +73,7 @@ try {
     & $Python $Exporter `
         --vs-rife-dir $VsRifeDir `
         --weight $WeightPath `
-        --output $TempOutput `
-        --input-width 3840 `
-        --input-height 2176
+        --output $TempOutput
     if ($LASTEXITCODE -ne 0) {
         throw "RIFE v4.26 scale=0.5 ONNX export or PyTorch validation failed"
     }

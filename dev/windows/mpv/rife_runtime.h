@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define RIFE_RUNTIME_ABI_VERSION 4u
+#define RIFE_RUNTIME_ABI_VERSION 5u
 #define RIFE_SCENE_CLASS_COUNT 5u
 #define RIFE_PROFILE_STAGE_COUNT 9u
 
@@ -63,6 +63,7 @@ struct rife_runtime_config {
     const wchar_t *cuda_runtime_path;
     uint32_t source_width;
     uint32_t source_height;
+    uint32_t shape_alignment;
     uint32_t color_matrix;
     uint32_t limited_range;
     uint32_t scene_sample_stride;
@@ -127,6 +128,7 @@ __declspec(dllexport) int __cdecl rife_runtime_prewarm_with_device(
     const wchar_t *cuda_runtime_path,
     uint32_t source_width,
     uint32_t source_height,
+    uint32_t shape_alignment,
     ID3D11Device *device,
     ID3D11DeviceContext *context,
     char *error,
@@ -137,6 +139,7 @@ __declspec(dllexport) int __cdecl rife_runtime_queue_prewarm_with_device(
     const wchar_t *cuda_runtime_path,
     uint32_t source_width,
     uint32_t source_height,
+    uint32_t shape_alignment,
     ID3D11Device *device,
     ID3D11DeviceContext *context,
     char *error,

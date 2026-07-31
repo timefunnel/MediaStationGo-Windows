@@ -4,46 +4,51 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $RuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
 $TensorRtVersion = "1.4.0.76"
-$RuntimeAbi = 4
-$EngineSpecs = @(
-    @{ Width = 1920; Height = 1080 },
-    @{ Width = 2304; Height = 1296 },
-    @{ Width = 2560; Height = 1440 },
-    @{ Width = 3840; Height = 2160 }
-)
+$RuntimeAbi = 5
+$RuntimeBin = Join-Path $RuntimeDir "bin"
+$SourceModelDir = Join-Path $RuntimeDir "vapoursynth\plugins\models\rife"
 $Models = @(
     @{
         Id = "rife-v4.26"
         Name = "RIFE v4.26"
-        ModelPath = Join-Path $RuntimeDir "vapoursynth\plugins\models\rife\rife_v4.26.onnx"
-        EnginePrefix = "poc-rife-v4_26-impl1"
+        File = "rife_v4.26_fp16_io.onnx"
+        Scale = "1.0"
+        Alignment = 64
+        MinWidth = 64
+        MinHeight = 64
+        OptWidth = 1920
+        OptHeight = 1088
+    },
+    @{
+        Id = "rife-v4.26-scale0.5"
+        Name = "RIFE v4.26 (scale=0.5)"
+        File = "rife_v4.26_scale0.5.onnx"
+        Scale = "0.5"
+        Alignment = 128
+        MinWidth = 128
+        MinHeight = 128
+        OptWidth = 1920
+        OptHeight = 1152
     },
     @{
         Id = "rife-v4.25-lite"
         Name = "RIFE v4.25 Lite"
-        ModelPath = Join-Path $RuntimeDir "vapoursynth\plugins\models\rife\rife_v4.25_lite.onnx"
-        EnginePrefix = "poc-rife-v4_25-lite-impl1"
+        File = "rife_v4.25_lite_fp16_io.onnx"
+        Scale = "1.0"
+        Alignment = 128
+        MinWidth = 128
+        MinHeight = 128
+        OptWidth = 1920
+        OptHeight = 1152
     }
 )
 
 function Get-LowerSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
-}
-
-function Get-TextSha256 {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    $Hasher = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
-        ([System.BitConverter]::ToString($Hasher.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant()
-    } finally {
-        $Hasher.Dispose()
-    }
 }
 
 $OutputLibDir = [System.IO.Path]::GetFullPath($OutputLibDir)
@@ -56,89 +61,82 @@ foreach ($RuntimeFile in @("rife_runtime.dll", "cudart64_12.dll", "tensorrt_rtx_
         throw "Required frame interpolation runtime file is missing: $RuntimePath"
     }
 }
-foreach ($Model in $Models) {
-    if (-not (Test-Path -LiteralPath $Model.ModelPath -PathType Leaf)) {
-        throw "Required RIFE model is missing: $($Model.ModelPath)"
+$BuilderComponents = @(
+    "tensorrt_rtx.exe",
+    "tensorrt_onnxparser_rtx_1_4.dll"
+)
+foreach ($Component in $BuilderComponents) {
+    $Source = Join-Path $RuntimeBin $Component
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "Required TensorRT-RTX builder component is missing: $Source"
     }
+    Copy-Item -LiteralPath $Source -Destination (Join-Path $OutputLibDir $Component) -Force
 }
 
-$GpuOutput = @(& nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader,nounits 2>&1)
-$GpuExitCode = $LASTEXITCODE
-$GpuLine = $GpuOutput | Select-Object -First 1
-if ($GpuExitCode -ne 0 -or -not $GpuLine) {
-    $GpuDiagnostic = ($GpuOutput | Out-String).Trim()
-    throw "nvidia-smi could not provide the GPU identity for the RIFE engine cache (exit $GpuExitCode): $GpuDiagnostic"
+$StageDir = Join-Path $OutputLibDir "frame-interpolation"
+$ModelDir = Join-Path $StageDir "models"
+New-Item -ItemType Directory -Path $ModelDir -Force | Out-Null
+$LegacyEngineDir = Join-Path $StageDir "engine-cache"
+if (Test-Path -LiteralPath $LegacyEngineDir) {
+    $ResolvedStage = [System.IO.Path]::GetFullPath($StageDir).TrimEnd('\') + '\'
+    $ResolvedLegacy = [System.IO.Path]::GetFullPath($LegacyEngineDir)
+    if (-not $ResolvedLegacy.StartsWith(
+        $ResolvedStage,
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove an Engine directory outside the staged runtime: $ResolvedLegacy"
+    }
+    Remove-Item -LiteralPath $ResolvedLegacy -Recurse -Force
 }
-$GpuFields = @($GpuLine.ToString().Split(',') | ForEach-Object { $_.Trim() })
-if ($GpuFields.Count -ne 3 -or
-    @($GpuFields | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
-    throw "nvidia-smi returned an invalid GPU identity: $GpuLine"
-}
-$GpuName, $GpuUuid, $DriverVersion = $GpuFields
 
-$EngineCacheDir = Join-Path $OutputLibDir "frame-interpolation\engine-cache"
-New-Item -ItemType Directory -Path $EngineCacheDir -Force | Out-Null
-$ModelEntries = @()
-$ExpectedEngineFiles = [System.Collections.Generic.HashSet[string]]::new(
+$ExpectedModels = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase)
+$ModelEntries = @()
 foreach ($Model in $Models) {
-    $ModelSha256 = Get-LowerSha256 $Model.ModelPath
-    $EngineEntries = @()
-    foreach ($Spec in $EngineSpecs) {
-        $Width = $Spec.Width
-        $Height = $Spec.Height
-        $SourceDir = Join-Path $RuntimeDir (
-            "engines\$($Model.EnginePrefix)-${Width}x${Height}-scale1_0-fp16")
-        $Candidates = @(Get-ChildItem -LiteralPath $SourceDir -Filter "*.engine" -File -ErrorAction SilentlyContinue)
-        if ($Candidates.Count -ne 1) {
-            throw "Expected exactly one validated $($Model.Name) engine in $SourceDir, found $($Candidates.Count)"
-        }
-        $KeyMaterial = "gpu_uuid=$GpuUuid`ndriver=$DriverVersion`ntensorrt=$TensorRtVersion`nmodel_sha256=$ModelSha256`nwidth=$Width`nheight=$Height`nscale=1.0`nprecision=fp16"
-        $EngineKey = Get-TextSha256 $KeyMaterial
-        $EngineFile = "$EngineKey.engine"
-        $Destination = Join-Path $EngineCacheDir $EngineFile
-        Copy-Item -LiteralPath $Candidates[0].FullName -Destination $Destination -Force
-        [void]$ExpectedEngineFiles.Add($EngineFile)
-        $EngineEntries += [ordered]@{
-            width = $Width
-            height = $Height
-            scale = "1.0"
-            precision = "fp16"
-            engineKey = $EngineKey
-            file = $EngineFile
-            sha256 = Get-LowerSha256 $Destination
-        }
+    $Source = Join-Path $SourceModelDir $Model.File
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "Required dynamic RIFE ONNX is missing: $Source"
     }
+    $Destination = Join-Path $ModelDir $Model.File
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    [void]$ExpectedModels.Add($Model.File)
     $ModelEntries += [ordered]@{
         id = $Model.Id
         name = $Model.Name
-        modelSha256 = $ModelSha256
-        engines = $EngineEntries
+        onnxFile = $Model.File
+        onnxSha256 = Get-LowerSha256 $Destination
+        scale = $Model.Scale
+        precision = "fp16"
+        shapeAlignment = $Model.Alignment
+        profile = [ordered]@{
+            minWidth = $Model.MinWidth
+            minHeight = $Model.MinHeight
+            optWidth = $Model.OptWidth
+            optHeight = $Model.OptHeight
+            maxWidth = 16384
+            maxHeight = 16384
+        }
     }
 }
-
-Get-ChildItem -LiteralPath $EngineCacheDir -Filter "*.engine" -File | Where-Object {
-    -not $ExpectedEngineFiles.Contains($_.Name)
+Get-ChildItem -LiteralPath $ModelDir -Filter "*.onnx" -File | Where-Object {
+    -not $ExpectedModels.Contains($_.Name)
 } | Remove-Item -Force
 
 $Manifest = [ordered]@{
-    schema = 2
-    gpuName = $GpuName
-    gpuUuid = $GpuUuid
-    driverVersion = $DriverVersion
+    schema = 3
     tensorRtVersion = $TensorRtVersion
     runtimeAbi = $RuntimeAbi
     runtimeDll = "rife_runtime.dll"
     cudaRuntimeDll = "cudart64_12.dll"
     tensorRtDll = "tensorrt_rtx_1_4.dll"
+    onnxParserDll = "tensorrt_onnxparser_rtx_1_4.dll"
+    engineBuilder = "tensorrt_rtx.exe"
     models = $ModelEntries
 }
-$ManifestPath = Join-Path $OutputLibDir "frame-interpolation\runtime-manifest.json"
+$ManifestPath = Join-Path $StageDir "runtime-manifest.json"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText(
     $ManifestPath,
     ($Manifest | ConvertTo-Json -Depth 8),
     $Utf8NoBom)
 
-$EngineCount = ($ModelEntries | ForEach-Object { $_.engines.Count } | Measure-Object -Sum).Sum
-Write-Host "Staged $EngineCount keyed RIFE engines across $($ModelEntries.Count) models" -ForegroundColor Green
+Write-Host "Staged $($ModelEntries.Count) dynamic RIFE ONNX models; device Engines build on demand" -ForegroundColor Green
