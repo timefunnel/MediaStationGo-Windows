@@ -719,14 +719,22 @@ bool find_engine_io(nvinfer1::ICudaEngine &engine,
 
 bool configure_shape(nvinfer1::ICudaEngine &engine,
                      nvinfer1::IExecutionContext &execution,
+                     CudaStream stream,
                      const char *input_name, const char *output_name,
                      uint32_t source_width, uint32_t source_height,
                      uint32_t shape_alignment,
+                     uint32_t &optimization_profile,
                      uint32_t &padded_width, uint32_t &padded_height,
                      size_t &input_bytes, size_t &output_bytes,
                      size_t &device_memory_bytes,
                      char *error, size_t error_capacity)
 {
+    constexpr int32_t kUniversalProfile = 0;
+    constexpr int32_t kOptimizedProfile = 1;
+    constexpr int32_t kRequiredProfiles = 2;
+    constexpr int32_t kProfileMax = 16384;
+    constexpr int32_t kOptimizedHeight = 2176;
+    constexpr int32_t kOptimizedWidth = 3840;
     if (!padded_dimension(source_width, shape_alignment, padded_width)
         || !padded_dimension(source_height, shape_alignment, padded_height)) {
         set_error(error, error_capacity,
@@ -735,6 +743,63 @@ bool configure_shape(nvinfer1::ICudaEngine &engine,
                   source_width, source_height, shape_alignment);
         return false;
     }
+    if (!stream || engine.getNbOptimizationProfiles() != kRequiredProfiles) {
+        set_error(error, error_capacity,
+                  "TensorRT engine must expose exactly two optimization "
+                  "profiles (universal and optimized)");
+        return false;
+    }
+    auto profile_shape = [&](int32_t profile,
+                             nvinfer1::OptProfileSelector selector) {
+        return engine.getProfileShape(input_name, profile, selector);
+    };
+    auto shape_matches = [](const nvinfer1::Dims &shape, int32_t height,
+                            int32_t width) {
+        return shape.nbDims == 4 && shape.d[0] == 1 && shape.d[1] == 11
+            && shape.d[2] == height && shape.d[3] == width;
+    };
+    const nvinfer1::Dims universal_min = profile_shape(
+        kUniversalProfile, nvinfer1::OptProfileSelector::kMIN);
+    const nvinfer1::Dims universal_opt = profile_shape(
+        kUniversalProfile, nvinfer1::OptProfileSelector::kOPT);
+    const nvinfer1::Dims universal_max = profile_shape(
+        kUniversalProfile, nvinfer1::OptProfileSelector::kMAX);
+    const nvinfer1::Dims optimized_min = profile_shape(
+        kOptimizedProfile, nvinfer1::OptProfileSelector::kMIN);
+    const nvinfer1::Dims optimized_opt = profile_shape(
+        kOptimizedProfile, nvinfer1::OptProfileSelector::kOPT);
+    const nvinfer1::Dims optimized_max = profile_shape(
+        kOptimizedProfile, nvinfer1::OptProfileSelector::kMAX);
+    if (!shape_matches(universal_min, static_cast<int32_t>(shape_alignment),
+                       static_cast<int32_t>(shape_alignment))
+        || !shape_matches(universal_opt, kOptimizedHeight, kOptimizedWidth)
+        || !shape_matches(universal_max, kProfileMax, kProfileMax)
+        || !shape_matches(optimized_min, kOptimizedHeight, kOptimizedWidth)
+        || !shape_matches(optimized_opt, kOptimizedHeight, kOptimizedWidth)
+        || !shape_matches(optimized_max, kOptimizedHeight, kOptimizedWidth)) {
+        set_error(error, error_capacity,
+                  "TensorRT optimization profile contract is incompatible "
+                  "universal=%dx%d+%dx%d+%dx%d "
+                  "optimized=%dx%d+%dx%d+%dx%d alignment=%u",
+                  universal_min.d[3], universal_min.d[2],
+                  universal_opt.d[3], universal_opt.d[2],
+                  universal_max.d[3], universal_max.d[2],
+                  optimized_min.d[3], optimized_min.d[2],
+                  optimized_opt.d[3], optimized_opt.d[2],
+                  optimized_max.d[3], optimized_max.d[2], shape_alignment);
+        return false;
+    }
+    const int32_t selected_profile =
+        padded_width == static_cast<uint32_t>(kOptimizedWidth)
+            && padded_height == static_cast<uint32_t>(kOptimizedHeight)
+        ? kOptimizedProfile : kUniversalProfile;
+    if (!execution.setOptimizationProfileAsync(selected_profile, stream)) {
+        set_error(error, error_capacity,
+                  "TensorRT rejected optimization profile %d for %ux%u",
+                  selected_profile, padded_width, padded_height);
+        return false;
+    }
+    optimization_profile = static_cast<uint32_t>(selected_profile);
     const nvinfer1::Dims4 input_shape(
         1, 11, static_cast<int32_t>(padded_height),
         static_cast<int32_t>(padded_width));
@@ -891,6 +956,7 @@ struct PrewarmState {
     TrtShared<nvinfer1::IExecutionContext> execution;
     void *device_memory = nullptr;
     size_t device_memory_bytes = 0;
+    uint32_t optimization_profile = 0;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
 };
@@ -1036,16 +1102,6 @@ std::shared_ptr<PrewarmState> build_prewarm_state(
     uint32_t padded_height = 0;
     size_t input_bytes = 0;
     size_t output_bytes = 0;
-    if (!configure_shape(
-            *state->engine, *state->execution, input_name, output_name,
-            source_width, source_height, shape_alignment,
-            padded_width, padded_height, input_bytes, output_bytes,
-            state->device_memory_bytes, error, error_capacity)
-        || !allocate_execution_memory(
-            state->cuda, *state->execution, state->device_memory_bytes,
-            state->device_memory, error, error_capacity))
-        return nullptr;
-
     CudaStream stream = nullptr;
     void *input_memory = nullptr;
     void *output_memory = nullptr;
@@ -1057,9 +1113,26 @@ std::shared_ptr<PrewarmState> build_prewarm_state(
         if (input_memory && state->cuda.free_device)
             state->cuda.free_device(input_memory);
     };
-    bool prewarmed = cuda_ok(
-        state->cuda, state->cuda.stream_create(&stream, kCudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags(prewarm)", error, error_capacity);
+    if (!cuda_ok(
+            state->cuda,
+            state->cuda.stream_create(&stream, kCudaStreamNonBlocking),
+            "cudaStreamCreateWithFlags(prewarm)", error, error_capacity)) {
+        release_temporary();
+        return nullptr;
+    }
+    if (!configure_shape(
+            *state->engine, *state->execution, stream, input_name, output_name,
+            source_width, source_height, shape_alignment,
+            state->optimization_profile, padded_width, padded_height,
+            input_bytes, output_bytes,
+            state->device_memory_bytes, error, error_capacity)
+        || !allocate_execution_memory(
+            state->cuda, *state->execution, state->device_memory_bytes,
+            state->device_memory, error, error_capacity)) {
+        release_temporary();
+        return nullptr;
+    }
+    bool prewarmed = true;
     if (prewarmed)
         prewarmed = cuda_ok(
             state->cuda, state->cuda.malloc_device(&input_memory, input_bytes),
@@ -1473,6 +1546,9 @@ public:
                 return false;
             cuda_bind_ms_ = elapsed_ms(cuda_bind_started);
         }
+        if (!cuda_ok(cuda_, cuda_.stream_create(&stream_, kCudaStreamNonBlocking),
+                     "cudaStreamCreateWithFlags", error, error_capacity))
+            return false;
 
         if (!prewarm_state_) {
             const auto engine_read_started = std::chrono::steady_clock::now();
@@ -1557,6 +1633,7 @@ public:
             reuse_count_++;
         stats_.runtime_cache_hit = cache_hit ? 1u : 0u;
         stats_.runtime_prewarm_hit = prewarm_hit_ ? 1u : 0u;
+        stats_.optimization_profile = optimization_profile_;
         stats_.runtime_reuses = reuse_count_;
         stats_.runtime_initialization_ms = initialization_ms;
         stats_.runtime_cuda_load_ms = cuda_load_ms_;
@@ -1740,10 +1817,10 @@ private:
                             error, error_capacity))
             return false;
         if (!configure_shape(
-                *engine_, *execution_, input_name_, output_name_,
+                *engine_, *execution_, stream_, input_name_, output_name_,
                 config_.source_width, config_.source_height,
-                config_.shape_alignment, padded_width_, padded_height_,
-                input_bytes_, output_bytes_, device_memory_bytes_,
+                config_.shape_alignment, optimization_profile_, padded_width_,
+                padded_height_, input_bytes_, output_bytes_, device_memory_bytes_,
                 error, error_capacity))
             return false;
         if (!prewarm_state_
@@ -1826,9 +1903,6 @@ private:
                                &output_resource_, output_buffer_.Get(), 0),
                         "cudaGraphicsD3D11RegisterResource(output)", error,
                         error_capacity))
-            return false;
-        if (!cuda_ok(cuda_, cuda_.stream_create(&stream_, kCudaStreamNonBlocking),
-                     "cudaStreamCreateWithFlags", error, error_capacity))
             return false;
         if (config_.profiling_enabled
             && (!cuda_ok(cuda_, cuda_.event_create(
@@ -2295,6 +2369,7 @@ private:
     size_t output_bytes_ = 0;
     uint32_t padded_width_ = 0;
     uint32_t padded_height_ = 0;
+    uint32_t optimization_profile_ = 0;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Device3> device3_;

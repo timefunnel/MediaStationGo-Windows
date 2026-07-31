@@ -483,8 +483,9 @@ int run_sequence_probe(rife_runtime *runtime,
         return 20;
     }
     std::printf(
-        "RIFE_SEQUENCE_OK frames=%llu pairs=%llu inferred=%llu cuts=%llu "
+        "RIFE_SEQUENCE_OK profile=%u frames=%llu pairs=%llu inferred=%llu cuts=%llu "
         "failures=%llu inference-p95=%.3fms scene-max=%.3fms\n",
+        stats.optimization_profile,
         static_cast<unsigned long long>(pairs + 1),
         static_cast<unsigned long long>(pairs),
         static_cast<unsigned long long>(stats.inferred_pairs),
@@ -590,7 +591,16 @@ int wmain(int argc, wchar_t **argv)
         return 2;
     const uint32_t profiling_enabled = profiling_length == 0
         || std::wcscmp(profiling_value, L"0") != 0;
+    wchar_t alignment_value[16]{};
+    const DWORD alignment_length = GetEnvironmentVariableW(
+        L"MSGO_RIFE_ALIGNMENT", alignment_value,
+        static_cast<DWORD>(std::size(alignment_value)));
+    if (alignment_length >= std::size(alignment_value))
+        return 2;
+    const uint32_t shape_alignment = alignment_length == 0
+        ? 128u : static_cast<uint32_t>(_wtoi(alignment_value));
     if (!width || !height
+        || (shape_alignment != 64 && shape_alignment != 128)
         || (sequence_mode
             ? !fps_numerator || !fps_denominator || start_pts < 0
             : !switch_mode && (warmup < 1 || iterations < 1)))
@@ -654,7 +664,8 @@ int wmain(int argc, wchar_t **argv)
     char prewarm_error[1024]{};
     const auto prewarm_started = std::chrono::steady_clock::now();
     const int prewarm_status = queue_prewarm(
-        argv[engine_argument], argv[cudart_argument], width, height, 128,
+        argv[engine_argument], argv[cudart_argument], width, height,
+        shape_alignment,
         device.Get(), context.Get(), prewarm_error, sizeof(prewarm_error));
     const double prewarm_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prewarm_started).count();
@@ -692,7 +703,7 @@ int wmain(int argc, wchar_t **argv)
         argv[cudart_argument],
         width,
         height,
-        128,
+        shape_alignment,
         RIFE_COLOR_MATRIX_BT709,
         1,
         8,
@@ -815,7 +826,8 @@ int wmain(int argc, wchar_t **argv)
     const double p95 = samples[static_cast<size_t>(
         (samples.size() - 1) * 0.95 + 0.5)];
     std::printf(
-        "RIFE_RUNTIME_PROBE_OK adapter=%ls source=%ux%u warmup=%d "
+        "RIFE_RUNTIME_PROBE_OK adapter=%ls source=%ux%u alignment=%u "
+        "profile=%u warmup=%d "
         "iterations=%d throughput=%.2fqps mean=%.2fms p95=%.2fms "
         "runtime-p95=%.2fms scene-mean=%.3fms inferred=%llu cuts=%llu "
         "prewarm=%.2fms cache-reopen=%s cold-init=%.2fms cached-init=%.2fms "
@@ -824,7 +836,8 @@ int wmain(int argc, wchar_t **argv)
         "scene-class=%u average-delta=%.3f changed-ratio=%.4f "
         "average-kl=%.5f "
         "unique-luma=%u non-8bit-luma=%llu p010-packed=%s\n",
-        adapter_name.c_str(), width, height, warmup, iterations, 1000.0 / mean,
+        adapter_name.c_str(), width, height, shape_alignment,
+        stats.optimization_profile, warmup, iterations, 1000.0 / mean,
         mean, p95, stats.inference_p95_ms,
         stats.pairs ? stats.scene_total_ms / stats.pairs : 0,
         static_cast<unsigned long long>(stats.inferred_pairs),

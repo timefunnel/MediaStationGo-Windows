@@ -18,6 +18,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 
+#include "common/tags.h"
 #include "filters/filter.h"
 #include "filters/filter_internal.h"
 #include "filters/user_filters.h"
@@ -434,6 +435,7 @@ struct priv {
     uint64_t resets;
     uint32_t rife_last_scene_class;
     bool rife_scene_class_initialized;
+    uint64_t rife_last_timing_warning_frame;
     bool pool_logged;
 };
 
@@ -500,13 +502,14 @@ static void destroy_rife_session(struct mp_filter *f)
     struct rife_runtime_stats stats = {0};
     if (p->rife.get_stats &&
         p->rife.get_stats(p->rife.runtime, &stats) == RIFE_RUNTIME_OK) {
-        MP_INFO(f, "RIFE runtime summary pairs=%llu inferred=%llu "
+        MP_INFO(f, "RIFE runtime summary profile=%u pairs=%llu inferred=%llu "
                    "scene-cuts=%llu failures=%llu inference-average-ms=%.3f "
                    "inference-p95-ms=%.3f inference-max-ms=%.3f "
                    "scene-average-ms=%.3f scene-max-ms=%.3f "
                    "cache=%s init-ms=%.3f reuses=%llu "
                    "scene-classes=normal:%llu,flash:%llu,fade:%llu,"
                    "hard-cut:%llu,uncertain:%llu\n",
+                stats.optimization_profile,
                 (unsigned long long)stats.pairs,
                 (unsigned long long)stats.inferred_pairs,
                 (unsigned long long)stats.scene_cuts,
@@ -744,11 +747,12 @@ static bool ensure_rife_session(struct mp_filter *f, struct mp_image *frame)
     }
     MP_INFO(f, "RIFE runtime initialized source=%dx%d format=P010 "
                "matrix=%d range=%s model=%s implementation=1 "
-               "backend=TensorRT-RTX FP16 strict-x2 cache=%s "
+               "backend=TensorRT-RTX FP16 strict-x2 profile=%u cache=%s "
                "init-ms=%.3f reuses=%llu\n",
             frame->w, frame->h, matrix,
             limited_range ? "limited" : "full",
             p->opts->rife_model,
+            stats.optimization_profile,
             stats.runtime_cache_hit ? "hit" : "cold",
             stats.runtime_initialization_ms,
             (unsigned long long)stats.runtime_reuses);
@@ -5459,15 +5463,20 @@ static bool validate_input(struct mp_filter *f, struct mp_image *img)
                img->params.color.primaries, img->params.color.transfer);
         return false;
     }
-    if (synthesis_enabled(p) &&
-        img->params.chroma_location != PL_CHROMA_LEFT) {
-        MP_ERR(f, "Frame interpolation supports only MPEG2/4/H.264 left "
-                   "chroma siting mode=%s received=%d\n",
-               p->opts->rife ? "rife" :
-               p->opts->stage6_robust_test ? "stage6" :
-               p->opts->stage5_flow_infill_test ? "stage5" : "stage4",
-               img->params.chroma_location);
-        return false;
+    if (synthesis_enabled(p)) {
+        bool chroma_supported = img->params.chroma_location == PL_CHROMA_LEFT ||
+            (p->opts->rife &&
+             img->params.chroma_location == PL_CHROMA_TOP_LEFT);
+        if (!chroma_supported) {
+            MP_ERR(f, "Frame interpolation chroma siting is unsupported "
+                       "mode=%s received=%d expected=%s\n",
+                   p->opts->rife ? "rife" :
+                   p->opts->stage6_robust_test ? "stage6" :
+                   p->opts->stage5_flow_infill_test ? "stage5" : "stage4",
+                   img->params.chroma_location,
+                   p->opts->rife ? "left-or-top-left" : "left");
+            return false;
+        }
     }
     if (img->pts == MP_NOPTS_VALUE || !isfinite(img->pts)) {
         MP_ERR(f, "NVOF MEMC requires finite timestamps\n");
@@ -6266,10 +6275,15 @@ static bool write_rife_frame(struct mp_filter *f,
     double pair_interval_ms =
         isfinite(frame0->pts) && isfinite(frame1->pts)
             ? fabs(frame1->pts - frame0->pts) * 1000.0 : 0;
-    bool timing_outlier = pair_interval_ms > 0 &&
-        diagnostics.inference_ms > pair_interval_ms * 0.8;
-    if (scene_event || timing_outlier || p->synthesized_frames % 240 == 0) {
-        int level = diagnostics.scene_cut || timing_outlier ? MSGL_WARN
+    bool timing_over_budget = pair_interval_ms > 0 &&
+        diagnostics.inference_ms > pair_interval_ms;
+    bool timing_warning = timing_over_budget &&
+        (p->rife_last_timing_warning_frame == 0 ||
+         p->synthesized_frames - p->rife_last_timing_warning_frame >= 240);
+    if (timing_warning)
+        p->rife_last_timing_warning_frame = p->synthesized_frames;
+    if (scene_event || timing_warning || p->synthesized_frames % 240 == 0) {
+        int level = diagnostics.scene_cut || timing_warning ? MSGL_WARN
                                                           : MSGL_INFO;
         MP_MSG(f, level, "RIFE frame evidence source0-pts=%.6f "
                "source1-pts=%.6f midpoint-pts=%.6f class=%s policy=%s "
@@ -6781,6 +6795,27 @@ static void reset_filter(struct mp_filter *f)
                (unsigned long long)p->resets);
 }
 
+static bool command_filter(struct mp_filter *f,
+                           struct mp_filter_command *cmd)
+{
+    struct priv *p = f->priv;
+    if (cmd->type != MP_FILTER_COMMAND_GET_META || !p->opts->rife)
+        return false;
+
+    struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
+    mp_tags_set_str(tags, "status",
+                    p->rife.runtime ? "active" : "initializing");
+    mp_tags_set_str(tags, "model", p->opts->rife_model);
+    mp_tags_set_str(tags, "input-frames",
+                    mp_tprintf(80, "%llu",
+                               (unsigned long long)p->input_frames));
+    mp_tags_set_str(tags, "synthesized-frames",
+                    mp_tprintf(80, "%llu",
+                               (unsigned long long)p->synthesized_frames));
+    *(struct mp_tags **)cmd->res = tags;
+    return true;
+}
+
 static void destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
@@ -7102,6 +7137,7 @@ static void destroy(struct mp_filter *f)
 static const struct mp_filter_info nvofmemc_filter = {
     .name = "nvofmemc",
     .process = process,
+    .command = command_filter,
     .reset = reset_filter,
     .destroy = destroy,
     .priv_size = sizeof(struct priv),

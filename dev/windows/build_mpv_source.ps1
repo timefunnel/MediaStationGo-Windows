@@ -47,6 +47,13 @@ if ($Arch -eq "arm64") {
 $OutputLib = Join-Path $OutputDir "lib\mpv.lib"
 if ((Test-Path $OutputLib) -and -not $Force) {
     $OutputLibDir = Split-Path -Parent $OutputLib
+    & $RifeRuntimeBuildScript -RuntimeDir $FrameInterpolationRuntimeDir `
+        -OutputDir $RifeRuntimeBuildDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build the RIFE runtime bridge"
+    }
+    Copy-Item -LiteralPath (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") `
+        -Destination (Join-Path $OutputLibDir "rife_runtime.dll") -Force
     & $RifeRuntimeStageScript -OutputLibDir $OutputLibDir
     Write-Host "mpv already built at $OutputDir" -ForegroundColor Green
     Write-Host "Use -Force to rebuild"

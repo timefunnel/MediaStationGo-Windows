@@ -357,6 +357,7 @@
             frame_interpolation_item_enabled_invalid: '影片插帧设置无效',
             frame_interpolation_item_setting_invalid: '无法保存该影片的插帧设置',
             frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
+            frame_interpolation_filter_inactive: 'RIFE 原生滤镜未生效',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -1860,7 +1861,9 @@
                 finishPlayer(false);
                 break;
             case 'error':
-                showToast(player.interpolationChanging ? 'RTX 插帧切换失败' : '播放失败');
+                showToast(event.errorCode
+                    ? friendlyError({ code: event.errorCode })
+                    : (player.interpolationChanging ? 'RTX 插帧切换失败' : '播放失败'));
                 finishPlayer(false);
                 break;
         }

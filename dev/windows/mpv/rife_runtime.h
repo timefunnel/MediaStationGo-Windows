@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define RIFE_RUNTIME_ABI_VERSION 5u
+#define RIFE_RUNTIME_ABI_VERSION 6u
 #define RIFE_SCENE_CLASS_COUNT 5u
 #define RIFE_PROFILE_STAGE_COUNT 9u
 
@@ -85,6 +85,7 @@ struct rife_runtime_stats {
     double scene_max_ms;
     uint32_t runtime_cache_hit;
     uint32_t runtime_prewarm_hit;
+    uint32_t optimization_profile;
     uint64_t runtime_reuses;
     double runtime_initialization_ms;
     double runtime_cuda_load_ms;

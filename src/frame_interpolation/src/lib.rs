@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-const RIFE_RUNTIME_ABI: u32 = 5;
+const RIFE_RUNTIME_ABI: u32 = 6;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
 const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
 const RIFE_TENSORRT_VERSION: &str = "1.4.0.76";
 const RIFE_PRECISION: &str = "fp16";
 const RIFE_PROFILE_MAX: u32 = 16_384;
+const RIFE_PROFILE_OPT_WIDTH: u32 = 3_840;
+const RIFE_PROFILE_OPT_HEIGHT: u32 = 2_176;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InterpolationMode {
@@ -639,7 +641,7 @@ fn engine_cache_key(
 ) -> String {
     let profile = &model.profile;
     let material = format!(
-        "gpu_uuid={}\ndriver={}\ntensorrt={tensor_rt_version}\nruntime_abi={RIFE_RUNTIME_ABI}\nbuilder_sha256={builder_sha256}\nmodel={}\nmodel_sha256={}\nscale={}\nprecision={RIFE_PRECISION}\nalignment={}\nprofile={}x{}+{}x{}+{}x{}",
+        "gpu_uuid={}\ndriver={}\ntensorrt={tensor_rt_version}\nruntime_abi={RIFE_RUNTIME_ABI}\nbuilder_sha256={builder_sha256}\nmodel={}\nmodel_sha256={}\nscale={}\nprecision={RIFE_PRECISION}\nalignment={}\nprofiles=universal:{}x{}+{}x{}+{}x{}|optimized:{}x{}",
         gpu.uuid,
         gpu.driver,
         model.model.as_str(),
@@ -652,6 +654,8 @@ fn engine_cache_key(
         profile.opt_height,
         profile.max_width,
         profile.max_height,
+        profile.opt_width,
+        profile.opt_height,
     );
     format!("{:x}", Sha256::digest(material.as_bytes()))
 }
@@ -661,7 +665,6 @@ fn validate_profile(
     profile: &EngineProfile,
 ) -> Result<(), InterpolationError> {
     let alignment = model.shape_alignment();
-    let expected_opt_height = if alignment == 64 { 1_088 } else { 1_152 };
     let values = [
         profile.min_width,
         profile.min_height,
@@ -672,8 +675,8 @@ fn validate_profile(
     ];
     if profile.min_width != alignment
         || profile.min_height != alignment
-        || profile.opt_width != 1_920
-        || profile.opt_height != expected_opt_height
+        || profile.opt_width != RIFE_PROFILE_OPT_WIDTH
+        || profile.opt_height != RIFE_PROFILE_OPT_HEIGHT
         || profile.max_width != RIFE_PROFILE_MAX
         || profile.max_height != RIFE_PROFILE_MAX
         || values.iter().any(|value| value % alignment != 0)
@@ -728,7 +731,7 @@ fn validate_cached_engine(
     let key = metadata.get("engineKey").and_then(Value::as_str);
     let file = metadata.get("engineFile").and_then(Value::as_str);
     let expected_hash = metadata.get("sha256").and_then(Value::as_str);
-    if metadata.get("schema").and_then(Value::as_u64) != Some(1)
+    if metadata.get("schema").and_then(Value::as_u64) != Some(2)
         || key != Some(expected_key)
         || file != engine_path.file_name().and_then(|value| value.to_str())
         || expected_hash.is_none()
@@ -894,6 +897,7 @@ fn build_model_engine(
                 .unwrap_or_else(|| Path::new(".")),
         )
         .arg(path_argument("--onnx=", &model.onnx_path))
+        .arg("--profile=0")
         .arg(format!(
             "--minShapes=input:1x11x{}x{}",
             profile.min_height, profile.min_width
@@ -905,6 +909,19 @@ fn build_model_engine(
         .arg(format!(
             "--maxShapes=input:1x11x{}x{}",
             profile.max_height, profile.max_width
+        ))
+        .arg("--profile=1")
+        .arg(format!(
+            "--minShapes=input:1x11x{}x{}",
+            profile.opt_height, profile.opt_width
+        ))
+        .arg(format!(
+            "--optShapes=input:1x11x{}x{}",
+            profile.opt_height, profile.opt_width
+        ))
+        .arg(format!(
+            "--maxShapes=input:1x11x{}x{}",
+            profile.opt_height, profile.opt_width
         ))
         .arg(path_argument("--saveEngine=", &temporary_engine))
         .args(["--skipInference", "--useGpu"])
@@ -945,7 +962,7 @@ fn build_model_engine(
         "frame_interpolation_engine_corrupt",
     )?;
     let metadata = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "engineKey": model.engine_key,
         "engineFile": engine_path.file_name().and_then(|value| value.to_str()),
         "sha256": engine_sha256,
@@ -954,14 +971,28 @@ fn build_model_engine(
         "scale": model.model.scale(),
         "precision": RIFE_PRECISION,
         "shapeAlignment": model.model.shape_alignment(),
-        "profile": {
-            "minWidth": profile.min_width,
-            "minHeight": profile.min_height,
-            "optWidth": profile.opt_width,
-            "optHeight": profile.opt_height,
-            "maxWidth": profile.max_width,
-            "maxHeight": profile.max_height,
-        },
+        "profiles": [
+            {
+                "index": 0,
+                "purpose": "universal",
+                "minWidth": profile.min_width,
+                "minHeight": profile.min_height,
+                "optWidth": profile.opt_width,
+                "optHeight": profile.opt_height,
+                "maxWidth": profile.max_width,
+                "maxHeight": profile.max_height,
+            },
+            {
+                "index": 1,
+                "purpose": "optimized",
+                "minWidth": profile.opt_width,
+                "minHeight": profile.opt_height,
+                "optWidth": profile.opt_width,
+                "optHeight": profile.opt_height,
+                "maxWidth": profile.opt_width,
+                "maxHeight": profile.opt_height,
+            },
+        ],
     });
     let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
         InterpolationError::new(
@@ -1217,7 +1248,7 @@ fn build_plan(
         })?;
     let engine = ensure_model_engine(runtime, model)?;
     let video_filter = format!(
-        "nvofmemc=rife=yes:rife-model={}:rife-source-width={}:rife-source-height={}:rife-shape-alignment={}:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
+        "@rife:nvofmemc=rife=yes:rife-model={}:rife-source-width={}:rife-source-height={}:rife-shape-alignment={}:rife-runtime-dll={}:rife-engine={}:rife-cudart={}",
         model.model.as_str(),
         request.width,
         request.height,
@@ -1435,8 +1466,8 @@ mod tests {
                 profile: EngineProfile {
                     min_width: alignment,
                     min_height: alignment,
-                    opt_width: 1_920,
-                    opt_height: if alignment == 64 { 1_088 } else { 1_152 },
+                    opt_width: RIFE_PROFILE_OPT_WIDTH,
+                    opt_height: RIFE_PROFILE_OPT_HEIGHT,
                     max_width: RIFE_PROFILE_MAX,
                     max_height: RIFE_PROFILE_MAX,
                 },
@@ -1525,7 +1556,7 @@ mod tests {
             assert_eq!((plan.target_fps_num, plan.target_fps_den), (48, 1));
             assert_eq!(plan.hwdec, "d3d11va");
             assert_eq!(plan.backend, RIFE_BACKEND);
-            assert!(plan.video_filter.starts_with("nvofmemc=rife=yes:"));
+            assert!(plan.video_filter.starts_with("@rife:nvofmemc=rife=yes:"));
             assert!(plan.video_filter.contains("rife-model=rife-v4.26"));
             assert!(plan.video_filter.contains("rife-runtime-dll="));
             assert!(plan.video_filter.contains("rife-engine="));

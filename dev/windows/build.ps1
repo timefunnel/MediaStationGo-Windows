@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $BuildDir = Join-Path $RepoRoot "build"
+$RifeRuntimeBuildDir = Join-Path $BuildDir "rife-runtime"
 
 . (Join-Path $PSScriptRoot "env.ps1")
 
@@ -21,11 +22,16 @@ $XtaskArgs = @("xtask", "build")
 $MpvInstallDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvDir = Join-Path $RepoRoot "third_party\mpv"
 if (Test-Path (Join-Path $MpvInstallDir "lib\mpv.lib")) {
-    $RifeRuntime = Join-Path $MpvInstallDir "lib\rife_runtime.dll"
-    if (Test-Path -LiteralPath $RifeRuntime -PathType Leaf) {
-        & (Join-Path $PSScriptRoot "stage_frame_interpolation_runtime.ps1") `
-            -OutputLibDir (Join-Path $MpvInstallDir "lib")
+    $MpvInstallLibDir = Join-Path $MpvInstallDir "lib"
+    & (Join-Path $PSScriptRoot "build_rife_runtime.ps1") `
+        -OutputDir $RifeRuntimeBuildDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build the RIFE runtime bridge"
     }
+    Copy-Item -LiteralPath (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") `
+        -Destination (Join-Path $MpvInstallLibDir "rife_runtime.dll") -Force
+    & (Join-Path $PSScriptRoot "stage_frame_interpolation_runtime.ps1") `
+        -OutputLibDir $MpvInstallLibDir
     $XtaskArgs += "--external-mpv=$MpvInstallDir"
 } elseif (Test-Path (Join-Path $MpvDir "lib\mpv.lib")) {
     $XtaskArgs += "--external-mpv=$MpvDir"

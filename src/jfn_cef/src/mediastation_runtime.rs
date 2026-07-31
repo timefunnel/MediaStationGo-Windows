@@ -14,7 +14,7 @@ use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
     jfn_mpv_get_property_int, jfn_mpv_get_property_node, jfn_mpv_get_property_string,
     jfn_mpv_load_file, jfn_mpv_set_audio_track_checked, jfn_mpv_set_subtitle_track_checked,
-    jfn_mpv_sub_add_checked, jfn_mpv_sub_remove_current_checked,
+    jfn_mpv_stop, jfn_mpv_sub_add_checked, jfn_mpv_sub_remove_current_checked,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::{
@@ -270,8 +270,12 @@ fn dispatch_playback_event(event: &PlaybackEvent) {
 
 fn playback_event_payload(event: &PlaybackEvent) -> Value {
     let kind = playback_event_kind_label(event.kind);
+    let error_code = (event.kind == PlaybackEventKind::Error
+        && event.error_message == RIFE_FILTER_INACTIVE)
+        .then_some(RIFE_FILTER_INACTIVE);
     json!({
         "kind": kind,
+        "errorCode": error_code,
         "positionMs": event.snapshot.position_us.max(0) / 1_000,
         "durationMs": event.snapshot.duration_us.max(0) / 1_000,
         "buffering": event.snapshot.buffering,
@@ -301,6 +305,26 @@ const fn playback_event_kind_label(kind: PlaybackEventKind) -> &'static str {
         PlaybackEventKind::ArtworkChanged => "artwork",
         PlaybackEventKind::QueueCapsChanged => "queue",
         PlaybackEventKind::Seeked => "seeked",
+    }
+}
+
+fn interpolation_filter_failed(
+    filter_seen: &mut bool,
+    missing_filter_samples: &mut u8,
+    status: Option<&str>,
+) -> bool {
+    match status {
+        Some("initializing" | "active") => {
+            *filter_seen = true;
+            *missing_filter_samples = 0;
+            false
+        }
+        Some(_) => true,
+        None if *filter_seen => true,
+        None => {
+            *missing_filter_samples = (*missing_filter_samples).saturating_add(1);
+            *missing_filter_samples >= RIFE_FILTER_MISSING_SAMPLE_LIMIT
+        }
     }
 }
 
@@ -346,7 +370,12 @@ struct RuntimeState {
 struct ActiveInterpolation {
     media_id: String,
     plan: InterpolationPlan,
+    filter_seen: bool,
+    missing_filter_samples: u8,
 }
+
+const RIFE_FILTER_INACTIVE: &str = "frame_interpolation_filter_inactive";
+const RIFE_FILTER_MISSING_SAMPLE_LIMIT: u8 = 3;
 
 #[derive(Clone)]
 struct SessionProfile {
@@ -624,17 +653,36 @@ impl MediaStationRuntime {
                 event.snapshot.seeking
             ));
         }
+        let filter_status = (event.kind == PlaybackEventKind::PositionChanged)
+            .then(|| mpv_property_string(c"vf-metadata/rife/status"));
+        let mut dispatched_event = None;
         let (jobs, reconcile) = {
             let mut state = self.state.lock();
+            let filter_failed = filter_status.as_ref().is_some_and(|status| {
+                state.active_interpolation.as_mut().is_some_and(|active| {
+                    interpolation_filter_failed(
+                        &mut active.filter_seen,
+                        &mut active.missing_filter_samples,
+                        status.as_deref(),
+                    )
+                })
+            });
+            if filter_failed {
+                let mut failure = event.clone();
+                failure.kind = PlaybackEventKind::Error;
+                failure.error_message = RIFE_FILTER_INACTIVE.to_string();
+                dispatched_event = Some(failure);
+            }
+            let effective_event = dispatched_event.as_ref().unwrap_or(event);
             if matches!(
-                event.kind,
+                effective_event.kind,
                 PlaybackEventKind::Finished
                     | PlaybackEventKind::Canceled
                     | PlaybackEventKind::Error
             ) {
                 state.active_subtitle = None;
                 state.active_interpolation = None;
-            } else if event.kind == PlaybackEventKind::Started
+            } else if effective_event.kind == PlaybackEventKind::Started
                 && let Some(active) = state.active_interpolation.as_ref()
             {
                 log_debug(&format!(
@@ -648,7 +696,7 @@ impl MediaStationRuntime {
                     active.plan.hwdec,
                 ));
             }
-            let reconcile = if event.kind == PlaybackEventKind::Started {
+            let reconcile = if effective_event.kind == PlaybackEventKind::Started {
                 state.active_report.as_mut().and_then(|active| {
                     if active.runtime_tracks_reconciled {
                         return None;
@@ -667,7 +715,7 @@ impl MediaStationRuntime {
                 None
             };
             (
-                plan_playback_reports(&mut state, event, Instant::now()),
+                plan_playback_reports(&mut state, effective_event, Instant::now()),
                 reconcile,
             )
         };
@@ -685,7 +733,13 @@ impl MediaStationRuntime {
                 ));
             }
         }
-        dispatch_playback_event(event);
+        if let Some(failure) = dispatched_event.as_ref() {
+            log_error("RIFE native filter is missing or inactive; stopping playback");
+            dispatch_playback_event(failure);
+            jfn_mpv_stop();
+        } else {
+            dispatch_playback_event(event);
+        }
     }
 
     fn enqueue_report(&self, job: Option<ReportJob>) {
@@ -952,6 +1006,8 @@ impl MediaStationRuntime {
         state.active_interpolation = load.interpolation.map(|plan| ActiveInterpolation {
             media_id: load.media_id.to_string(),
             plan,
+            filter_seen: false,
+            missing_filter_samples: 0,
         });
         let stopped = activate_playback_report(
             &mut state,
@@ -4942,6 +4998,41 @@ mod tests {
         assert!(!text.contains("media.example"));
         assert!(!text.contains("error_message"));
         assert!(!text.contains("artwork"));
+        assert!(payload["errorCode"].is_null());
+    }
+
+    #[test]
+    fn playback_event_payload_exposes_only_known_interpolation_failure_code() {
+        let mut event = playback_event(PlaybackEventKind::Error, 42_000);
+        event.error_message = RIFE_FILTER_INACTIVE.to_string();
+
+        let payload = playback_event_payload(&event);
+        assert_eq!(payload["errorCode"], RIFE_FILTER_INACTIVE);
+    }
+
+    #[test]
+    fn interpolation_filter_health_fails_explicitly_without_fallback() {
+        let mut seen = false;
+        let mut missing = 0;
+        assert!(!interpolation_filter_failed(&mut seen, &mut missing, None));
+        assert!(!interpolation_filter_failed(&mut seen, &mut missing, None));
+        assert!(interpolation_filter_failed(&mut seen, &mut missing, None));
+
+        seen = false;
+        missing = 0;
+        assert!(!interpolation_filter_failed(
+            &mut seen,
+            &mut missing,
+            Some("initializing"),
+        ));
+        assert!(seen);
+        assert!(interpolation_filter_failed(&mut seen, &mut missing, None));
+
+        assert!(interpolation_filter_failed(
+            &mut seen,
+            &mut missing,
+            Some("unexpected"),
+        ));
     }
 
     #[test]

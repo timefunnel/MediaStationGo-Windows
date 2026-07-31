@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $RuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
 $TensorRtVersion = "1.4.0.76"
-$RuntimeAbi = 5
+$RuntimeAbi = 6
 $RuntimeBin = Join-Path $RuntimeDir "bin"
 $SourceModelDir = Join-Path $RuntimeDir "vapoursynth\plugins\models\rife"
 $Models = @(
@@ -19,8 +19,8 @@ $Models = @(
         Alignment = 64
         MinWidth = 64
         MinHeight = 64
-        OptWidth = 1920
-        OptHeight = 1088
+        OptWidth = 3840
+        OptHeight = 2176
     },
     @{
         Id = "rife-v4.26-scale0.5"
@@ -30,8 +30,8 @@ $Models = @(
         Alignment = 128
         MinWidth = 128
         MinHeight = 128
-        OptWidth = 1920
-        OptHeight = 1152
+        OptWidth = 3840
+        OptHeight = 2176
     },
     @{
         Id = "rife-v4.25-lite"
@@ -41,8 +41,8 @@ $Models = @(
         Alignment = 128
         MinWidth = 128
         MinHeight = 128
-        OptWidth = 1920
-        OptHeight = 1152
+        OptWidth = 3840
+        OptHeight = 2176
     }
 )
 
