@@ -13,13 +13,14 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
-任务 1 完成。任务 2 已开始，均衡档三 profile 临时候选的纯 TensorRT A/B
-通过，尚未修改正式 Engine/profile 合同。
+任务 1 完成。任务 2 已开始，三档三 profile 临时候选的纯 TensorRT A/B
+均已完成；质量档和 Lite 的 UHD 范围 profile 有约 `2%` 回归，尚未修改正式
+Engine/profile 合同。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
-| TensorRT profile 优化 | 进行中：均衡档三 profile 临时候选通过纯 TensorRT A/B，正式合同尚未修改 | 保持一个模型一个 Engine；以 universal + 中低分辨率范围 + 4K 范围替代逐分辨率 fixed 的候选，在均衡档非 UHD shape 上改善约 `48%` 至 `54%`，UHD 无回归 | 对质量档和 Lite 复测同一候选；通过后实现通用 profile 描述、选择、缓存键和原生 probe，并验证真实播放器 |
+| TensorRT profile 优化 | 进行中：三档三 profile 临时候选均已完成纯 TensorRT A/B，正式合同尚未修改 | 保持一个模型一个 Engine；三档在非 UHD shape 上改善约 `44%` 至 `54%`；均衡档 UHD 无回归，但质量档和 Lite 分别回归 `2.091%`、`2.353%` | 为质量档和 Lite 构建保留 UHD fixed 的四 profile 候选并复测；按实测冻结每模型集合后再实现通用合同、原生 probe 和真实播放器验证 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -176,7 +177,7 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - profile 不匹配时使用 universal profile；不得切换模型、修改 `scale` 或
   隐藏失败。Engine/profile 合同变化必须同步 manifest schema、ABI 和缓存键。
 
-#### 2026-08-01 均衡档三 profile 临时候选检查点
+#### 2026-08-01 三档三 profile 临时候选检查点
 
 - 当前正式 Engine 仍保持两套 profile，本检查点没有修改播放器代码、manifest、
   ABI 或正式缓存。先使用 TensorRT-RTX 自带的 `--useProfile` 对同一 ONNX 的
@@ -207,9 +208,46 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 这组结果确认当前超大 universal 是均衡档 1440p、超宽 4K 和 DCI 4K 的主要
   profile 性能问题；为所有分辨率增加独立 fixed profile 没有必要。候选在 UHD
   保持现有性能，同时让一个有界 4K profile 覆盖 UHD、超宽 4K 和 DCI 4K。
-- 本检查点尚不是产品验收：还必须对质量档和 Lite 分别复测，并在实现通用
-  profile 合同后运行原生 P010 probe、任意合法 shape 兜底、Engine 构建/缓存、
-  模型切换和真实播放验证。若任一层不成立，正式集合不得切换到该候选。
+- 质量档候选使用正式
+  `534aeae1a47bd7585defc6902fd6135b71545f85522626197eb109888ab7dfc2`
+  ONNX。profile 0 为 alignment `64` 的 universal；profile 1 为
+  `64x64 + 2560x1472 + 2560x1472` 中低分辨率范围；profile 2 为
+  `64x64 + 3840x2176 + 4096x2176` 4K 范围。临时 Engine 构建耗时
+  `5.896 s`、大小 `34925692` 字节、SHA-256 为
+  `9b4bc92100fe998c6066491f4152acab5cd712ef925d371e8d42128aa75a0c31`。
+
+| 质量档 padded shape | 当前 profile | 当前均值 | 候选 profile | 候选均值 | 改善 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `1920x1088` | 0 | `18.6833 ms` | 1 | `9.2799 ms` | `50.331%` |
+| `2560x1472` | 0 | `34.5677 ms` | 1 | `15.9550 ms` | `53.844%` |
+| `3840x1600` | 0 | `56.7175 ms` | 2 | `29.6202 ms` | `47.776%` |
+| `3840x2176` | 1 | `37.0605 ms` | 2 | `37.8356 ms` | `-2.091%` |
+| `4096x2176` | 0 | `83.7807 ms` | 2 | `44.3481 ms` | `47.066%` |
+
+- Lite 候选使用正式
+  `9b9209ebce65b666c1f24ba9ee203bcacb1b3054b0bcc7617fbea7b6736a19b4`
+  ONNX。profile 0 为 alignment `128` 的 universal；profile 1 为
+  `128x128 + 2560x1536 + 2560x1536` 中低分辨率范围；profile 2 为
+  `128x128 + 3840x2176 + 4096x2176` 4K 范围。临时 Engine 构建耗时
+  `5.060 s`、大小 `30771292` 字节、SHA-256 为
+  `332292db800c72e6f9bdc28629554a6262bd915e476906ca25e634eafcc2d4db`。
+
+| Lite padded shape | 当前 profile | 当前均值 | 候选 profile | 候选均值 | 改善 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `1920x1152` | 0 | `13.6771 ms` | 1 | `7.1275 ms` | `47.887%` |
+| `2560x1536` | 0 | `26.3967 ms` | 1 | `14.2348 ms` | `46.074%` |
+| `3840x1664` | 0 | `42.7912 ms` | 2 | `23.4620 ms` | `45.171%` |
+| `3840x2176` | 1 | `31.1893 ms` | 2 | `31.9233 ms` | `-2.353%` |
+| `4096x2176` | 0 | `61.6007 ms` | 2 | `34.0347 ms` | `44.749%` |
+
+- 三档均证明中低范围和有界 4K 范围值得保留，但质量档与 Lite 的 UHD 范围
+  profile 相比既有 UHD fixed 分别回归 `2.091%`、`2.353%`，不能直接采用
+  三 profile 候选。下一步只为存在回归的模型构建第四套
+  `min=opt=max=3840x2176` fixed profile，确认能否同时保留 UHD 基线和其他
+  shape 收益；每个模型的最终 profile 数量由各自数据决定，不强制一致。
+- 本检查点尚不是产品验收：冻结最终集合并实现通用 profile 合同后，仍必须运行
+  原生 P010 probe、任意合法 shape universal 覆盖、Engine 构建/缓存、模型切换
+  和真实播放验证。若任一层不成立，正式集合不得切换到该候选。
 
 ### 3. 实现窗口播放的刷新率自匹配
 
