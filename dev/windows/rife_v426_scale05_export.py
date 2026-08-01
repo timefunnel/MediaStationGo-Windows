@@ -45,69 +45,24 @@ DYNAMIC_VALIDATION_CASES = (
     (384, 896, 0.75),
 )
 EXPECTED_GRID_SAMPLE_COUNT = 5
-EXPECTED_PRECISION_NODE_COUNT = 262
-EXPECTED_FP32_OPERATOR_COUNT = 129
-EXPECTED_FP32_CONVOLUTION_COUNT = 4
-EXPECTED_FP32_INITIALIZERS = frozenset(
-    {
-        "model.encode.cnn0.weight",
-        "model.encode.cnn0.bias",
-        "model.encode.cnn2.weight",
-        "model.encode.cnn2.bias",
-    }
-)
-ENCODER_FP32_WEIGHTS = frozenset(
-    {
-        "model.encode.cnn0.weight",
-        "model.encode.cnn2.weight",
-    }
-)
-PRECISION_TRACE_OPERATORS = frozenset(
-    {
-        "Add",
-        "Cast",
-        "Clip",
-        "Concat",
-        "Constant",
-        "ConstantOfShape",
-        "DepthToSpace",
-        "Div",
-        "Expand",
-        "Gather",
-        "GridSample",
-        "Mul",
-        "Reciprocal",
-        "Resize",
-        "Sigmoid",
-        "Slice",
-        "Sub",
-        "Tile",
-        "Transpose",
-        "Unsqueeze",
-    }
-)
+EXPECTED_PRECISION_NODE_COUNT = 15
+EXPECTED_FP32_OPERATOR_COUNT = 15
+EXPECTED_FP32_CONVOLUTION_COUNT = 0
+EXPECTED_FP32_OUTPUT_NODE_COUNT = 72
 EXPECTED_PRECISION_OPERATOR_COUNTS = Counter(
     {
-        "Constant": 145,
-        "Slice": 31,
-        "Concat": 11,
-        "Add": 10,
-        "Div": 10,
-        "Gather": 9,
-        "Mul": 9,
-        "DepthToSpace": 5,
+        "Add": 5,
         "GridSample": 5,
-        "Resize": 5,
         "Transpose": 5,
-        "Conv": 4,
-        "LeakyRelu": 4,
-        "Reciprocal": 2,
-        "Unsqueeze": 2,
-        "ConstantOfShape": 1,
-        "Expand": 1,
-        "Sigmoid": 1,
-        "Sub": 1,
-        "Tile": 1,
+    }
+)
+EXPECTED_FP32_OUTPUT_OPERATOR_COUNTS = Counter(
+    {
+        "Cast": 43,
+        "Resize": 14,
+        "Add": 5,
+        "GridSample": 5,
+        "Transpose": 5,
     }
 )
 
@@ -411,7 +366,7 @@ def inferred_value_types(model: onnx.ModelProto) -> dict[str, int]:
     return value_types
 
 
-def collect_mixed_precision_nodes(
+def collect_grid_precision_nodes(
     model: onnx.ModelProto,
 ) -> tuple[frozenset[str], int]:
     node_names = [node.name for node in model.graph.node]
@@ -419,7 +374,6 @@ def collect_mixed_precision_nodes(
         raise RuntimeError("Scale=0.5 ONNX nodes must have unique non-empty names")
 
     producers: dict[str, onnx.NodeProto] = {}
-    consumers: dict[str, list[onnx.NodeProto]] = {}
     for node in model.graph.node:
         for output in node.output:
             if not output:
@@ -427,26 +381,8 @@ def collect_mixed_precision_nodes(
             if output in producers:
                 raise RuntimeError(f"Scale=0.5 tensor has two producers: {output}")
             producers[output] = node
-        for input_name in node.input:
-            if input_name:
-                consumers.setdefault(input_name, []).append(node)
 
     selected: set[str] = set()
-
-    def select_ancestors(tensor_name: str, stop_at_grid_sample: bool = False) -> None:
-        node = producers.get(tensor_name)
-        if (
-            node is None
-            or node.name in selected
-            or node.op_type not in PRECISION_TRACE_OPERATORS
-        ):
-            return
-        selected.add(node.name)
-        if stop_at_grid_sample and node.op_type == "GridSample":
-            return
-        for input_name in node.input:
-            select_ancestors(input_name, stop_at_grid_sample)
-
     grid_samples = [node for node in model.graph.node if node.op_type == "GridSample"]
     if len(grid_samples) != EXPECTED_GRID_SAMPLE_COUNT:
         raise RuntimeError(
@@ -456,43 +392,25 @@ def collect_mixed_precision_nodes(
     for node in grid_samples:
         if len(node.input) != 2 or len(node.output) != 1:
             raise RuntimeError(f"Unsupported GridSample contract: {node.name}")
-        selected.add(node.name)
-        select_ancestors(node.input[1])
-
-    if len(model.graph.output) != 1:
-        raise RuntimeError("Scale=0.5 graph must have exactly one output")
-    select_ancestors(model.graph.output[0].name, stop_at_grid_sample=True)
-
-    encoder_convolutions = []
-    encoder_activations = []
-    for node in model.graph.node:
+        transpose = producers.get(node.input[1])
         if (
-            node.op_type != "Conv"
-            or len(node.input) < 2
-            or node.input[1] not in ENCODER_FP32_WEIGHTS
+            transpose is None
+            or transpose.op_type != "Transpose"
+            or len(transpose.input) != 1
+            or len(transpose.output) != 1
         ):
-            continue
-        if len(node.output) != 1:
-            raise RuntimeError(f"Unsupported encoder Conv contract: {node.name}")
-        output_consumers = consumers.get(node.output[0], [])
-        if len(output_consumers) != 1 or output_consumers[0].op_type != "LeakyRelu":
             raise RuntimeError(
-                f"Encoder Conv does not have one LeakyRelu consumer: {node.name}"
+                f"GridSample coordinate Transpose is invalid: {node.name}"
             )
-        encoder_convolutions.append(node)
-        encoder_activations.append(output_consumers[0])
-        selected.add(node.name)
-        selected.add(output_consumers[0].name)
-
-    if (
-        len(encoder_convolutions) != EXPECTED_FP32_CONVOLUTION_COUNT
-        or len(encoder_activations) != EXPECTED_FP32_CONVOLUTION_COUNT
-    ):
-        raise RuntimeError(
-            "Scale=0.5 graph does not contain both cnn0/cnn2 encoder branches: "
-            f"conv={len(encoder_convolutions)}, "
-            f"activation={len(encoder_activations)}"
-        )
+        coordinate_add = producers.get(transpose.input[0])
+        if (
+            coordinate_add is None
+            or coordinate_add.op_type != "Add"
+            or len(coordinate_add.input) != 2
+            or len(coordinate_add.output) != 1
+        ):
+            raise RuntimeError(f"GridSample coordinate Add is invalid: {node.name}")
+        selected.update((coordinate_add.name, transpose.name, node.name))
 
     selected_nodes = [node for node in model.graph.node if node.name in selected]
     operator_counts = Counter(node.op_type for node in selected_nodes)
@@ -522,11 +440,11 @@ def collect_mixed_precision_nodes(
     return frozenset(selected), fp32_operator_count
 
 
-def verify_mixed_precision_graph(
+def verify_grid_precision_graph(
     model: onnx.ModelProto,
     precision_node_names: frozenset[str],
-) -> tuple[int, int]:
-    require_fp16_contract(model, EXPECTED_FP32_INITIALIZERS)
+) -> tuple[int, int, int]:
+    require_fp16_contract(model)
     value_types = inferred_value_types(model)
     original_nodes = {
         node.name: node for node in model.graph.node if node.name in precision_node_names
@@ -549,37 +467,49 @@ def verify_mixed_precision_graph(
             f"actual={fp32_operator_count}"
         )
 
-    fp32_convolutions = []
+    fp32_output_operator_counts = Counter(
+        node.op_type
+        for node in model.graph.node
+        if any(
+            value_types.get(output) == onnx.TensorProto.FLOAT
+            for output in node.output
+        )
+    )
+    fp32_output_node_count = sum(fp32_output_operator_counts.values())
+    if (
+        fp32_output_node_count != EXPECTED_FP32_OUTPUT_NODE_COUNT
+        or fp32_output_operator_counts != EXPECTED_FP32_OUTPUT_OPERATOR_COUNTS
+    ):
+        raise RuntimeError(
+            "Scale=0.5 conversion has an unexpected FP32 output graph: "
+            f"expected={dict(EXPECTED_FP32_OUTPUT_OPERATOR_COUNTS)}, "
+            f"actual={dict(fp32_output_operator_counts)}"
+        )
+
     for node in model.graph.node:
         if node.op_type not in ("Conv", "ConvTranspose"):
             continue
         output_types = {value_types.get(output) for output in node.output}
         if None in output_types:
             raise RuntimeError(f"Could not infer convolution output type: {node.name}")
-        if onnx.TensorProto.FLOAT in output_types:
-            fp32_convolutions.append(node)
-        elif output_types != {onnx.TensorProto.FLOAT16}:
+        if output_types != {onnx.TensorProto.FLOAT16}:
             raise RuntimeError(
                 f"Scale=0.5 convolution has an invalid output type: {node.name}"
             )
 
-    if (
-        len(fp32_convolutions) != EXPECTED_FP32_CONVOLUTION_COUNT
-        or any(node.op_type != "Conv" for node in fp32_convolutions)
-        or {node.input[1] for node in fp32_convolutions} != ENCODER_FP32_WEIGHTS
-    ):
-        raise RuntimeError(
-            "Scale=0.5 conversion preserved the wrong FP32 convolutions: "
-            f"{[(node.name, node.op_type) for node in fp32_convolutions]}"
-        )
-
     grid_samples = [node for node in model.graph.node if node.op_type == "GridSample"]
     if len(grid_samples) != EXPECTED_GRID_SAMPLE_COUNT or any(
-        value_types.get(node.output[0]) != onnx.TensorProto.FLOAT
+        value_types.get(node.input[0]) != onnx.TensorProto.FLOAT
+        or value_types.get(node.input[1]) != onnx.TensorProto.FLOAT
+        or value_types.get(node.output[0]) != onnx.TensorProto.FLOAT
         for node in grid_samples
     ):
         raise RuntimeError("Scale=0.5 GridSample precision contract is invalid")
-    return fp32_operator_count, len(fp32_convolutions)
+    return (
+        fp32_operator_count,
+        EXPECTED_FP32_CONVOLUTION_COUNT,
+        fp32_output_node_count,
+    )
 
 
 def verify_dynamic_onnx_numerics(
@@ -660,19 +590,21 @@ def add_metadata(
     source_sha256: str,
     fp32_operator_count: int,
     fp32_convolution_count: int,
+    fp32_output_node_count: int,
 ) -> None:
     set_metadata(
         model,
         {
             "mediastation_model_id": MODEL_ID,
             "mediastation_scale": str(SCALE),
-            "mediastation_precision": "fp16_io_mixed_fp32_islands",
+            "mediastation_precision": "fp16_compute_fp32_grid_final",
             "mediastation_fp32_paths": (
-                "encoder_cnn0_cnn2,flow_coordinates,grid_sample,output_blend"
+                "grid_final_add,grid_transpose,grid_sample"
             ),
             "mediastation_fp32_operator_count": str(fp32_operator_count),
             "mediastation_fp32_convolution_count": str(fp32_convolution_count),
             "mediastation_fp32_grid_sample_count": str(EXPECTED_GRID_SAMPLE_COUNT),
+            "mediastation_fp32_output_node_count": str(fp32_output_node_count),
             "mediastation_input_contract": "fp16[1,11,H,W]",
             "mediastation_output_contract": "fp16[1,3,H,W]",
             "mediastation_engine_shape": "dynamic",
@@ -745,17 +677,18 @@ def main() -> None:
         )
         source_sha256 = sha256(temporary_fp32)
         precision_node_names, source_fp32_operator_count = (
-            collect_mixed_precision_nodes(source_model)
+            collect_grid_precision_nodes(source_model)
         )
         onnx_model = convert_float_to_float16(
             source_model,
             keep_io_types=False,
             node_block_list=sorted(precision_node_names),
         )
-        fp32_operator_count, fp32_convolution_count = verify_mixed_precision_graph(
-            onnx_model,
-            precision_node_names,
-        )
+        (
+            fp32_operator_count,
+            fp32_convolution_count,
+            fp32_output_node_count,
+        ) = verify_grid_precision_graph(onnx_model, precision_node_names)
         if fp32_operator_count != source_fp32_operator_count:
             raise RuntimeError(
                 "Scale=0.5 mixed conversion changed the FP32 precision node count: "
@@ -768,6 +701,7 @@ def main() -> None:
             source_sha256,
             fp32_operator_count,
             fp32_convolution_count,
+            fp32_output_node_count,
         )
         onnx.checker.check_model(onnx_model)
         onnx.save(onnx_model, str(temporary_output))
@@ -808,6 +742,7 @@ def main() -> None:
                 "fp32_precision_node_count": fp32_operator_count,
                 "fp32_convolution_count": fp32_convolution_count,
                 "fp32_grid_sample_count": EXPECTED_GRID_SAMPLE_COUNT,
+                "fp32_output_node_count": fp32_output_node_count,
                 "weight_sha256": actual_weight_sha256,
                 "upstream_commit": UPSTREAM_COMMIT,
                 "output_path": str(args.output),
