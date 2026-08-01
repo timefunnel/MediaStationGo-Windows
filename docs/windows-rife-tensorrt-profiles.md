@@ -13,14 +13,14 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
-任务 1 完成。任务 2 已开始，三档三 profile 与质量/Lite 四 profile 临时候选的
-纯 TensorRT A/B 均已完成；通用 Engine/profile 合同已实现并通过定向验证，尚未
-完成正式 mpv/播放器重建与产品验收。
+任务 1 完成。任务 2 的 profile 集合冻结、通用合同实现、正式 mpv/Release
+重建和真实 4K HDR10 播放器验收均已完成，实现提交为 `fdda0a4`。下一步只进入
+任务 3 的 VRR / 刷新率自匹配审计，不再修改三档精度图或 profile 集合。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
-| TensorRT profile 优化 | 进行中：通用合同已实现，定向测试通过，正式播放器重建待完成 | schema 4 / runtime ABI 7 / metadata schema 3 已同步；Builder、缓存键和 metadata 覆盖完整有序集合；原生 P010 探针验证三档 `4/3/4` profiles 和 universal 覆盖 | 完整重建自定义 mpv 与 Release 播放器，验证三档按需构建/缓存、切换、真实影片输出和全工作区回归 |
+| TensorRT profile 优化 | 完成：合同、构建、缓存、切换、真实播放和回归均通过 | schema 4 / runtime ABI 7 / metadata schema 3 已同步；三档各一个 Engine，profile 数为 `4/3/4`；正式 Release 在同一 3840x2160 HDR10 P010 影片中命中质量 `3`、均衡 `2`、Lite `3`，模型与 scale 均和用户选择一致 | 冻结本检查点；后续 profile 或 ABI 变化必须重新执行原生 probe、正式构建和三档真实播放验收 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -34,7 +34,7 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   真实播放和同片段逐中间帧 A/B 均已通过，任务 1 已完成。
 - 上述数据来自 RTX 5070 Ti、TensorRT-RTX 1.4.0.76、当前缓存 Engine、
   预热 30 次和测量 100 次。它们是问题定位基线，不是最终跨设备结论。
-- 当前尚未修改或验证最终 TensorRT profile 集合，也尚未验证 VRR 实际激活。
+- 最终 TensorRT profile 集合已实现并通过正式播放器验证；VRR 实际激活仍未验证。
 
 ### 进度更新规则
 
@@ -301,6 +301,38 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   仍为进行中。后续失败必须停在真实错误，不得恢复旧 Engine、Lite 或 universal
   之外的隐藏路径。
 
+#### 2026-08-01 正式播放器验收与任务 2 关闭
+
+- `build_mpv_source.ps1` 已按 ABI 7 合同完整重建自定义 mpv，正式 Release
+  `build/jellium-desktop.exe` 基于 `fdda0a4` 启动成功。启动时旧 ABI 6 缓存未被
+  误认，设置页明确显示三个模型、TensorRT-RTX 1.4.0.76 和 `0 个 Engine`。
+- 真实影片使用《阿丽塔：战斗天使》3840x2160、23.976 fps、HDR10、10-bit、
+  75.5 Mbps，解码和输出链路为 D3D11VA + gpu-next P010。每次新播放均以插帧
+  关闭开始；即使模型偏好已写入 Rust `settings.json`，也不会自动开启插帧。
+- 通过真实 UI 依次选择质量、均衡和 Lite 时，播放器分别显示“正在加载质量优先
+  插帧”“正在加载均衡优先插帧”和“正在加载流畅优先插帧”，首次构建与播放重载
+  总耗时约为 `24.3 s`、`31.4 s` 和 `19.7 s`。没有静默回退、模型自动切换或
+  状态伪成功。
+- 最终缓存恰好包含三个 Engine、三份 schema 3 metadata 和三份
+  `3840x2176.runtime-cache`，没有 `.building` 残留：
+
+| 档位 | Engine key | Engine 字节数 | profiles | 真实 UHD profile |
+| --- | --- | ---: | ---: | ---: |
+| 质量优先 | `d445a7b3cfdebb33ea054fda9ae22a50dfc6778be0aa6bf175e1b966b1525e95` | `73704708` | 4 | 3 |
+| 均衡优先 | `fbd72157394d108ed7cf13d6f90b62c79adc41e6b9d1b03667a694e1403edd4d` | `37574124` | 3 | 2 |
+| 流畅优先 | `54f191f14d4cf42fa385c124e1e925b1cd3fadaff59f736ebfc7a428302c0f61` | `68841444` | 4 | 3 |
+
+- 播放信息逐档确认实际模型分别为 `rife-v4.26`、
+  `rife-v4.26-scale0.5` 和 `rife-v4.25-lite`，精度/scale 分别为
+  `fp16/1.0`、`fp16/0.5` 和 `fp16/1.0`，后端始终为 TensorRT-RTX D3D11
+  P010，输出始终为 47.952 fps，解码丢帧为 0。
+- 三档 Engine 已存在后，再次选择质量档只需约 `2.5 s` 完成播放重载，Engine
+  数量保持 3。关闭后立即重开相同质量档时，原生日志明确为
+  `profile=3 cache=hit init-ms=0.003 reuses=1`，确认进程内 runtime 复用生效。
+- 任务 2 至此关闭。三档继续支持任意合法分辨率；超出专用 profile 范围时显式
+  使用各自 Engine 的 universal profile，不切模型、不改 scale、不生成按分辨率
+  拆分的大量 Engine。
+
 ### 3. 实现窗口播放的刷新率自匹配
 
 - 当前目标显示器支持 VRR / G-SYNC Compatible。首选方向是让显示器的实际
@@ -331,8 +363,9 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 增加 profile 不会自动带来性能收益。真正起作用的是 TensorRT Builder
   的 tactic 选择、TensorRT-RTX 的 shape specialization，以及最终运行的
   CUDA kernel。
-- 当前的“两套 profile”是可运行的最小设计，不是充分的多分辨率优化设计：
-  它只对 `3840x2176` 提供固定 shape 优化，其余尺寸主要依赖动态 profile。
+- 最终实现仍保持一个模型一个 Engine；质量和 Lite 各有 4 套 profile，均衡有
+  3 套。所有模型都保留 universal，并用中低范围和 4K 范围覆盖已验证的常用
+  shape；质量和 Lite 额外保留 UHD fixed 以避免 3840x2176 性能回归。
 
 ## 四个概念
 
@@ -394,7 +427,7 @@ profile 编号没有产品含义。`profile=1` 不代表质量更高，`profile=
 
 ## 当前 Engine 结构
 
-当前每个模型一个 Engine，Engine 内有两套 profile：
+当前每个模型一个 Engine。质量优先和 Lite 的 Engine 内有四套 profile：
 
 ```text
 profile 0 universal:
@@ -402,9 +435,21 @@ profile 0 universal:
   opt = 3840 x 2176
   max = 16384 x 16384
 
-profile 1 optimized:
+profile 1 mid-range:
+  min = alignment x alignment
+  opt = max = 2560 x 1472 (质量) / 2560 x 1536 (Lite)
+
+profile 2 4k-range:
+  min = alignment x alignment
+  opt = 3840 x 2176
+  max = 4096 x 2176
+
+profile 3 uhd-fixed:
   min = opt = max = 3840 x 2176
 ```
+
+均衡优先使用相同的 universal、mid-range 和 4k-range，但不包含 profile 3，
+因为其实测 4k-range 在 UHD 与旧 fixed 持平。
 
 运行流程为：
 
@@ -412,19 +457,18 @@ profile 1 optimized:
 选择产品档位
   -> 加载该模型 Engine
   -> 按该模型 alignment 计算 padded shape
-  -> padded shape 精确匹配固定 profile 时选择它
-  -> 否则选择 universal profile
+  -> 从所有覆盖 padded shape 的专用 profile 中选择范围最窄者
+  -> 没有专用匹配时选择 universal profile
   -> 设置实际 input shape 并推理
 ```
 
 因此当前结构的准确描述是：
 
-> 一个模型一个 Engine；Engine 内有动态通用 profile，以及一个针对
-> `3840x2160` UHD 补齐形状 `3840x2176` 的固定优化 profile。
+> 一个模型一个 Engine；Engine 内始终有动态通用 profile，并按各模型实测结果
+> 增加中低范围、4K 范围，以及必要时的 `3840x2176` UHD fixed profile。
 
-它能保证任意合法分辨率运行，但不能称为覆盖所有 4K 形状的优化方案。
-`4096x2160`、`3840x1600`、`3840x2048` 和其他超宽尺寸通常会走
-universal profile。
+它能保证任意合法分辨率运行。`4096x2160`、`3840x1600` 和常见超宽 4K
+由 4k-range 覆盖；超出专用范围的合法 shape 仍显式走 universal。
 
 ## 性能收益由谁产生
 
@@ -447,9 +491,9 @@ TensorRT 组件：
 - 端到端测量确认收益稳定覆盖额外的 Engine 构建时间、文件大小和显存
   成本。
 
-当前 profile 0 的 `opt` 已经是 `3840x2176`，与 profile 1 的固定 shape
-相同；再加上 TensorRT-RTX 的动态 shape specialization，profile 1 不保证
-一定明显快于 profile 0，必须做同一 Engine、同一 shape 的 A/B 测试。
+旧两-profile 设计中，profile 0 的 `opt` 已经是 `3840x2176`，与 profile 1
+的固定 shape 相同；因此最终集合是经过同一 Engine、同一 shape A/B 后冻结，
+不是仅凭 profile 名称或数量推断收益。
 
 ## 当前精度基线
 
@@ -466,9 +510,9 @@ profile 性能不能脱离模型精度路径比较。当前三档的精度状态
 
 ## 已有性能证据
 
-以下是当前 RTX 5070 Ti、TensorRT-RTX 1.4.0.76、当前缓存 Engine、
-`profile=1`、3840x2160、预热 30 次、测量 100 次的 probe 结果。数值用于
-说明当前基线，不代表所有 NVIDIA GPU 的固定性能：
+以下是任务 1 结束时旧两-profile Engine 在 RTX 5070 Ti、TensorRT-RTX
+1.4.0.76、`profile=1`、3840x2160、预热 30 次、测量 100 次的 probe 结果。
+它们保留为精度图性能基线，不代表当前最终 profile 编号或所有 NVIDIA GPU：
 
 | 模型 | TensorRT 平均 | 端到端平均 | 吞吐 |
 | --- | ---: | ---: | ---: |
@@ -477,9 +521,9 @@ profile 性能不能脱离模型精度路径比较。当前三档的精度状态
 | RIFE v4.25 Lite | `22.687 ms` | `23.820 ms` | `41.97 qps` |
 
 新 `scale=0.5` 图的 4K TensorRT 时间相对旧图下降约 `9.93%`，并已快于
-标准 v4.26；但真实影片画质尚未验收，且 universal profile 在 1440p、超宽
-4K 和 DCI 4K 的结果仍明显不足。因此这些数据只能作为当前实现检查点，不能
-提前当作最终的 profile 最优点或跨设备结论。
+标准 v4.26。其真实影片画质门禁和最终 profile 验收均已通过；本表仍只作为
+旧两-profile 精度图基线，最终多 shape 收益以前述候选 A/B 和正式播放器验证
+为准，不能写成跨设备固定性能。
 
 ## 后续 profile 设计规则
 
