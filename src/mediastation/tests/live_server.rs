@@ -6,6 +6,10 @@ use serde_json::json;
 use std::env;
 use url::Url;
 
+#[allow(
+    clippy::panic,
+    reason = "an explicitly requested live test must fail when required configuration is missing"
+)]
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("required environment variable {name} is missing"))
 }
