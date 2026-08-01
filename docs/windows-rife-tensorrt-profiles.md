@@ -11,17 +11,20 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
+最近更新：2026-08-02，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
 任务 1 完成。任务 2 的 profile 集合冻结、通用合同实现、正式 mpv/Release
-重建和真实 4K HDR10 播放器验收均已完成，实现提交为 `fdda0a4`。下一步只进入
-任务 3 的 VRR / 刷新率自匹配审计，不再修改三档精度图或 profile 集合。
+重建和真实 4K HDR10 播放器验收均已完成，实现提交为 `fdda0a4`。任务 3 停止交付：
+NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D11 P010
+零拷贝；`d3d11va-copy` 的 4K 实测吞吐不合格，软件解码也不满足产品约束。
+固定显示模式硬切会黑屏且不属于 VRR，已连同实验性 VRR patch、协议和设置页入口
+一起撤回。后续只在驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
 | TensorRT profile 优化 | 完成：合同、构建、缓存、切换、真实播放和回归均通过 | schema 4 / runtime ABI 7 / metadata schema 3 已同步；三档各一个 Engine，profile 数为 `4/3/4`；正式 Release 在同一 3840x2160 HDR10 P010 影片中命中质量 `3`、均衡 `2`、Lite `3`，模型与 scale 均和用户选择一致 | 冻结本检查点；后续 profile 或 ABI 变化必须重新执行原生 probe、正式构建和三档真实播放验收 |
-| 窗口刷新率自匹配 | 审计进行中 | 已确认正式播放器使用 mpv HWND flip-model swapchain；本机 DXGI `PRESENT_ALLOW_TEARING` 能力为 `TRUE`，但当前 swapchain 未请求 tearing，VRR active 尚未验证 | 使用 PresentMon 或等价 ETW 证据确认当前 DComp 覆盖下的 Present 模式；再实现并验证 requested/active 分层诊断 |
+| 窗口刷新率自匹配 | 阻塞并停止交付：当前 NVIDIA + RIFE 零拷贝合同下没有可用实现 | 最小 libmpv 软件源 60 fps 可 `active=yes`；正式 `d3d11va` 直通为 `active=no`。`d3d11va-copy` 同一 4K 样本由 `Dropped: 10` 恶化为 `Dropped: 265`；固定模式硬切会黑屏 | 不保留未完成的生产接线。只有 NVIDIA/上游解决 `d3d11va` 直通 VRR，或新的 D3D11 P010 零拷贝解码互操作通过性能与画质验收后才重启 |
 
 当前不得重复或误判的结论：
 
@@ -34,7 +37,10 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   真实播放和同片段逐中间帧 A/B 均已通过，任务 1 已完成。
 - 上述数据来自 RTX 5070 Ti、TensorRT-RTX 1.4.0.76、当前缓存 Engine、
   预热 30 次和测量 100 次。它们是问题定位基线，不是最终跨设备结论。
-- 最终 TensorRT profile 集合已实现并通过正式播放器验证；VRR 实际激活仍未验证。
+- 最终 TensorRT profile 集合已实现并通过正式播放器验证；VRR 已在独立 mpv
+  前台无边框全屏的 60 fps 软件源中实际激活，但正式播放器的 `d3d11va` 直通
+  窗口和全屏均未激活，不能开放为能力，也不能声称已证明物理刷新节奏或 LFC。
+  `47.952 fps` 本轮最小探针也未激活，进一步证明不同显示器的 VRR 下限必须实测。
 
 ### 进度更新规则
 
@@ -362,7 +368,130 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   间隔；若仍不足以证明 active，再执行有权限的 PresentMon 验收，缺失证据期间
   不得标记 VRR active。
 
-- 当前目标显示器支持 VRR / G-SYNC Compatible。首选方向是让显示器的实际
+#### 2026-08-01 第二阶段原型证据
+
+- mpv D3D11 原型已请求 `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`，并在 NVAPI 确认
+  当前 primary surface 具备 G-SYNC 能力后使用
+  `Present(0, DXGI_PRESENT_ALLOW_TEARING)`。`ResizeBuffers` 和格式切换继续保留
+  原 swapchain flags。
+- NVAPI capability/active 查询在 `Present` 前取得当前 backbuffer 的
+  `NVDX_ObjectHandle`，`Present` 完成后查询同一个 surface。active 为 false 时
+  继续保持 requested 状态并按秒复查，不再只请求一个 tearing frame 后永久
+  退回固定刷新呈现。
+- 早期合成源测试虽然得到 `capable=yes / active=no`，但测试 HWND 实际不是系统
+  前台窗口；NVIDIA 官方接口明确 active 结果只在应用处于前台时有效。通过 Win32
+  前台 PID 校验后，无边框全屏 60 fps 和 `48000/1001` fps 均稳定得到
+  `requested=yes / capable=yes / active=yes`。临时使用
+  `NvAPI_D3D_GetSleepStatus` 交叉检查时也得到 `fs-vrr=yes`；该临时查询不进入
+  正式控制状态机。
+- 使用 D3D11 device 和 immediate context 查询均能工作；正式原型保留更简单的
+  device 调用。进程退出正常，不调用会导致当前驱动退出崩溃的 `NvAPI_Unload`。
+- 前台普通窗口、最大化窗口和最大化无边框窗口在 60 fps 与 `48000/1001` fps
+  下仍为 `capable=yes / active=no`。因此当前只能确认无边框全屏 VRR 激活，不能
+  宣称窗口刷新率同步已经完成。
+- `48000/1001` fps 略低于 EDID 的 48 Hz 下限。NVAPI 的 `active=yes` 证明驱动
+  已启用 G-SYNC Compatible 路径，但尚不能单独证明物理面板使用了哪一种 LFC
+  倍频节奏；最终 LFC 结论仍需有权限的 ETW/PresentMon 或等价物理刷新证据。
+
+#### 2026-08-01 实验性正式播放器集成（已撤回）
+
+- 实验分支曾将 `d3d11-vrr=yes` 设为 Windows 必需选项；若正式 mpv 缺少
+  该选项，初始化会显式失败，不会静默退回旧呈现路径。
+- CEF 协议曾读取 mpv 的 state、requested、supported、capable、active、
+  sync interval、提交次数与平均提交间隔，并以同一个 VRR JSON 对象提供给设置页
+  与播放信息面板。提交测量只有在至少两次 Present 且间隔为有效正数时才成立。
+- 设置页与播放信息面板曾接入只读 VRR 诊断；`inactive` 明确显示为当前窗口路径
+  未激活，不能等同于 supported、requested 或 capable。
+- 该实验代码曾通过 `cargo check -p jfn-cef` 和前端语法检查；正式 mpv 与 Release
+  重建后，正式窗口播放仍为 `composed / capable=yes / active=no`。
+- 最终确认正式 RIFE 必需的 NVIDIA `d3d11va` 直通与 VRR 不兼容后，mpv patch、
+  Rust 启动选项、CEF 协议、设置页入口和失败探针全部撤回，不作为产品代码提交。
+
+#### 2026-08-01 正式 CEF/DComp 全屏实机证据
+
+- 正式 `build/jellium-desktop.exe` 播放《黑衣人2》3840x2160 HDR10，质量档实际
+  保持 RIFE v4.26 `scale=1.0`、D3D11 P010、47.952 fps、FP16 profile 3；推理
+  初始化与持续出帧正常，没有切模型或回退。
+- 全屏 HWND 实际为 `0,0,3840,2160`、style `0x140A0000`，不是最大化伪全屏。
+  CEF DComp target 和 DWM transparency 释放后，DXGI 只从 `composed` 变为
+  `overlay`，NVAPI 仍为 `capable=yes / active=no`。一像素尺寸往返触发
+  ResizeBuffers 后结果不变。
+- 一次性完整 VO 重建实验确实执行了 `uninit_video_out -> reinit_video_chain`，
+  新 swapchain 仍为 `overlay / active=no`。同时 RIFE 重建显式失败：
+  `cudaD3D11SetDirect3DDevice rejected: this process is already bound to a different D3D11 device`。
+  该实验不能解决 VRR 且会破坏插帧，相关命令和 CEF 门控已删除，不进入正式实现。
+- CEF DComp target 动态拆装同样只改变了 composition mode，没有激活 VRR；最终
+  范围审计已删除 `setOsdVisible` 接线和 DComp/DWM 动态拆装，正式合成生命周期
+  保持原实现。该失败实验仅保留本节证据，不作为生产功能提交。
+- PresentMon 仍因当前会话缺少管理员 ETW 权限而不可用。本轮证据只证明 NVIDIA
+  API 报告的 capable/active 和 DXGI composition mode，不证明物理面板刷新节奏
+  或 LFC；后续不得把该缺失证据补写成已通过。
+
+#### 2026-08-01 50 fps 阈值与无 RIFE 对照
+
+- 《低智商犯罪》25 fps 片源选择 Lite 后，正式播放器输出稳定约
+  `50.058 fps`；窗口处于真实全屏，控件隐藏且 CEF DComp target 已释放，NVAPI
+  仍为 `capable=yes / active=no`。该结果已高于显示器 EDID 声明的约 48 Hz 下限。
+- 同一片源关闭 RIFE、临时以 2 倍速度播放时，实测输出约 `49.966 fps`；全屏
+  overlay 呈现仍为 `active=no`。因此不能把正式播放器未激活归因于 RIFE GPU
+  负载、质量档性能余量或插帧滤镜本身。
+- 2026-08-01 最小 libmpv 探针在同一显示器约 `47.952 fps` 曾得到 `active=yes`。正式
+  窗口与探针 HWND 的 style、ex-style、父窗口、owner 和全屏尺寸一致；隐藏输入
+  子窗口、关闭 CEF GPU 合成、先隐藏 OSD 再全屏、释放 DComp target 和移除
+  `WS_CLIPSIBLINGS` 均未使正式播放器激活。
+- 2026-08-02 在桌面保持 `152 Hz` 的复测中，同一最小探针的 60 fps 软件源进入
+  `active=yes`，`47.952 fps` 软件源则为 `active=no`。这说明低帧率下限或驱动状态
+  会随显示器和运行环境变化，不能从单次探针外推跨设备结论。
+- CEF 覆盖层、输入子窗口和 HWND 样式均已排除为单一根因；但在确认 NVIDIA
+  `d3d11va` 直通阻塞后，不再继续隔离进程初始化或 mpv boot 参数。禁止恢复会破坏
+  CUDA-D3D11 绑定的播放中 VO 重建。
+
+#### 2026-08-01 D3D11VA copy 与 RIFE 上传实验
+
+- mpv 上游问题 [`#13304`](https://github.com/mpv-player/mpv/issues/13304) 与本机
+  现象一致：NVIDIA 下 `hwdec=d3d11va` 直通会阻断
+  VRR；本轮不再重查 CEF、DComp、窗口样式、帧率下限、RIFE 负载或 VO 重建。
+- 自定义 RIFE filter 已隔离接入 mpv 标准 `mp_autoconvert`，目标严格限定为
+  `IMGFMT_D3D11 + IMGFMT_P010`。同一 3840x2160、10-bit、24000/1001 短片使用
+  `d3d11va-copy` 时，日志确认 CPU `p010` 经 `HW-uploading to d3d11` 转为
+  `d3d11[p010]`；质量档保持 RIFE v4.26 `scale=1.0` 并命中 profile 3。
+- 功能链路通过：`191/191` 对帧完成推理、`0` 次失败，平均推理 `33.524 ms`、
+  p95 `35.050 ms`，mpv 正常播放到 EOF。没有切换模型、改写 `scale`、禁用滤镜、
+  NVOF 或透传回退。
+- 实时性能未通过：同样本零拷贝质量档累计 `Dropped: 10`，copy 加上传累计
+  `Dropped: 265`；无 RIFE 的 copy 对照无丢帧。无节奏完整吞吐 A/B 中，两条链路
+  均完成 `191/191`，copy 的 TensorRT 平均仅比直通多约 `0.6 ms`，因此额外压力
+  来自 D3D11VA 解码纹理的 GPU 到 CPU 回读及随后 CPU 到 GPU 上传，而不是模型、
+  Engine 或 profile 退化。
+- 本轮 copy 探针仍为 `capable=yes / active=no`。NVAPI 状态已知会随 NVIDIA/Windows
+  运行环境漂移，单次结果不能证明跨设备 VRR；本次更不能宣称刷新率自匹配已完成。
+- 当前决定：`d3d11va-copy` 只保留为已验证的失败证据，正式源码已移除为该实验
+  增加的 `mp_autoconvert` 自动上传接线。正式路径继续严格使用 `d3d11va` 的
+  D3D11 P010 输入；不把软件解码加上传隐藏成可用路径，也不以 Lite、关闭插帧或
+  其他静默回退掩盖失败。不得再用固定显示模式切换冒充 VRR。
+- 同一样本继续否决了当前 mpv 内三个硬件候选。`nvdec` 和 `d3d12va` 均先报告
+  `Could not create device`、`DR failed - disabling`，实际退化为软件 P010 后再上传；
+  其最终 RIFE 成功不代表硬件链路成立。`dxva2` 能保持 `dxva2_vld[p010]` 硬解码，
+  但 `dxva2_vld -> d3d11[p010]` 设备间上传失败，mpv 随后自动禁用 RIFE。
+- mpv 现有 DXVA2 到 D3D11 互操作只供 VO 渲染，输出为 `BGR0`，不满足 RIFE 的
+  P010 输入合同；标准硬件映射表也没有 CUDA/D3D12 到 D3D11 P010 的零拷贝映射。
+  因此不继续手写未经成熟项目验证的跨 API 同步和资源共享层。解码替代候选和
+  当前 VRR 交付路线同时关闭，不再继续调整宿主或解码参数。
+
+#### 2026-08-02 固定显示模式方案淘汰
+
+- `SetDisplayConfig` 将桌面从 `152 Hz` 切到 `100 Hz` 时会触发显示链路重新同步和黑屏；
+  这属于固定显示模式切换，不是 VRR 的无缝扫描节奏调整。
+- 该方案虽然曾通过切换、恢复和生命周期测试，但不再计入任务 3 的验收，相关
+  Windows 实现、Platform ABI、CEF 协调、设置页字段和测试均从正式代码撤回。
+- 实验性 DXGI/NVIDIA VRR 请求与 `requested/supported/capable/active` 诊断也已撤回，
+  不在设置页暴露无法交付的功能。禁止用固定模式切换或其他旁路改写为成功。
+- 若未来重启，实机验收仍要求桌面显示模式保持不变、没有黑屏，并由正式 Release
+  的 `d3d11va` 零拷贝路径报告 `active=yes`。
+
+#### 未来重启条件
+
+- 若未来重启任务 3，首选方向仍是让显示器的实际
   刷新节奏跟随播放器提交帧的节奏，而不是把视频补帧到一个错误的固定整数帧率。
 - 使用真实源帧率和插帧后的输出帧率驱动呈现节奏，例如
   `23.976 -> 47.952`、`24 -> 48`、`25 -> 50`、`29.97 -> 59.94`。
@@ -393,6 +522,8 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 最终实现仍保持一个模型一个 Engine；质量和 Lite 各有 4 套 profile，均衡有
   3 套。所有模型都保留 universal，并用中低范围和 4K 范围覆盖已验证的常用
   shape；质量和 Lite 额外保留 UHD fixed 以避免 3840x2176 性能回归。
+- 刷新率自匹配未交付：固定显示模式硬切和实验性 VRR 接线均已撤回。当前
+  NVIDIA `d3d11va` 直通与 VRR 的冲突没有满足 RIFE 零拷贝及实时性能合同的解法。
 
 ## 四个概念
 
