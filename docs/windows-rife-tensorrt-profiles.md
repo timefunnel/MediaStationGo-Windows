@@ -21,7 +21,7 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
 | TensorRT profile 优化 | 完成：合同、构建、缓存、切换、真实播放和回归均通过 | schema 4 / runtime ABI 7 / metadata schema 3 已同步；三档各一个 Engine，profile 数为 `4/3/4`；正式 Release 在同一 3840x2160 HDR10 P010 影片中命中质量 `3`、均衡 `2`、Lite `3`，模型与 scale 均和用户选择一致 | 冻结本检查点；后续 profile 或 ABI 变化必须重新执行原生 probe、正式构建和三档真实播放验收 |
-| 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
+| 窗口刷新率自匹配 | 审计进行中 | 已确认正式播放器使用 mpv HWND flip-model swapchain；本机 DXGI `PRESENT_ALLOW_TEARING` 能力为 `TRUE`，但当前 swapchain 未请求 tearing，VRR active 尚未验证 | 使用 PresentMon 或等价 ETW 证据确认当前 DComp 覆盖下的 Present 模式；再实现并验证 requested/active 分层诊断 |
 
 当前不得重复或误判的结论：
 
@@ -334,6 +334,33 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   拆分的大量 Engine。
 
 ### 3. 实现窗口播放的刷新率自匹配
+
+#### 2026-08-01 第一阶段审计证据
+
+- 正式播放器没有设置 `d3d11-output-mode=composition`。mpv 保持默认 `auto`，
+  Windows 宿主也从 `window-id` 取得并使用 mpv HWND，因此视频链路实际通过
+  `CreateSwapChainForHwnd` 创建 flip-model swapchain；
+  `src/windows/src/compositor.rs` 的 `CreateSwapChainForComposition` 只用于 CEF
+  透明界面，不是 mpv 视频 swapchain。
+- 本机 `IDXGIFactory5::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING)`
+  返回 `S_OK` 且结果为 `TRUE`。这只证明操作系统、驱动和 DXGI factory 支持
+  标准窗口化 tearing 请求，不证明当前应用已请求或实际进入 VRR。
+- 当前活动输出为 `G28XR`，模式是 `3840x2160 @ 152 Hz`。EDID range-limits
+  descriptor 声明的垂直扫描范围为 `48-152 Hz`；它是显示器能力线索，不单独
+  证明 Windows/NVIDIA 已激活 VRR。`47.952 fps` 略低于该下限，真实呈现若要
+  保持该节奏需要驱动 LFC 或其他经验证机制，不能假定自动成立。
+- 当前 mpv swapchain 描述未包含 `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`，呈现调用
+  仍为 `Present(1, 0)`。当前状态必须准确记录为
+  `supported=true / requested=false / active=unknown`。
+- mpv HWND 上方还存在透明 DirectComposition CEF visual。该覆盖是否阻止
+  Independent Flip 或 VRR 必须通过 PresentMon/ETW 实测，不能只根据 flip-model
+  或 G-SYNC Compatible 标志推断。
+- PresentMon `2.5.1` 便携版已用于尝试基线采集，SHA-256 为
+  `9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191`；
+  当前非管理员会话启动 ETW trace 被系统以 `access denied` 拒绝。后续先在 mpv
+  swapchain 内采集 `IDXGISwapChainMedia` 帧统计、composition mode 和 Present
+  间隔；若仍不足以证明 active，再执行有权限的 PresentMon 验收，缺失证据期间
+  不得标记 VRR active。
 
 - 当前目标显示器支持 VRR / G-SYNC Compatible。首选方向是让显示器的实际
   刷新节奏跟随播放器提交帧的节奏，而不是把视频补帧到一个错误的固定整数帧率。
