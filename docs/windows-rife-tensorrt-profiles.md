@@ -18,7 +18,8 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D11 P010
 零拷贝；`d3d11va-copy` 的 4K 实测吞吐不合格，软件解码也不满足产品约束。
 固定显示模式硬切会黑屏且不属于 VRR，已连同实验性 VRR patch、协议和设置页入口
-一起撤回。后续只在驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
+一起撤回；撤回后的自定义 mpv 与 Release 已干净重建并通过启动烟测。后续只在
+驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
@@ -488,6 +489,24 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
   不在设置页暴露无法交付的功能。禁止用固定模式切换或其他旁路改写为成功。
 - 若未来重启，实机验收仍要求桌面显示模式保持不变、没有黑屏，并由正式 Release
   的 `d3d11va` 零拷贝路径报告 `active=yes`。
+
+#### 2026-08-02 VRR 撤回后的最终产物重建
+
+- 撤回实验代码后重新执行 `dev/windows/build_mpv_source.ps1`，自定义 mpv 构建成功；
+  `third_party/mpv-install/lib/libmpv-2.dll` 的 SHA-256 为
+  `c6b78c30fede6262338045d898ad476b0f8c0b5a13c840894d7f6a795b9f490f`，不再包含
+  `d3d11-vrr`、`display-vrr-state` 或 `VRR state=` 字符串。
+- 随后执行 `dev/windows/build.ps1 -Clean`，完整 Release 重建成功。最终
+  `build/libmpv-2.dll` 与 staged DLL 的 SHA-256 完全相同；manifest 为 schema 4、
+  runtime ABI 7、TensorRT-RTX 1.4.0.76，三个 ONNX 的实际 hash 均与 manifest
+  一致，三档 profile 数仍为 `4/3/4`。
+- 最终 `build/jellium-desktop.exe` 启动烟测日志标识提交 `2111dac`，并报告
+  `RIFE v4.26`、`RIFE v4.26 (scale=0.5)`、`RIFE v4.25 Lite`、`engines=3`、
+  `TensorRT-RTX D3D11 P010`，主循环和本地 MediaStation 页面均成功就绪。
+- 烟测期间 NVIDIA 输出始终为 `152 Hz`，Release 日志没有 VRR、固定显示模式切换
+  或撤回实验字段。该项只证明没有再次硬切显示模式，不替代真实 VRR 或黑屏视觉验收。
+- 自动化 `CloseMainWindow()` 不会关闭该自绘/CEF 主窗口；测试进程已按 PID 清理并
+  确认无残留。因此本轮不伪报自动化正常退出，启动与运行组件烟测结论不受影响。
 
 #### 未来重启条件
 
