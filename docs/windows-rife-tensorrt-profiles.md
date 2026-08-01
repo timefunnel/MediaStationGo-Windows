@@ -11,13 +11,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`，文档检查点
-`2ae088a`。
+最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
+实现检查点 `aa760f2` 已推送；本节同步记录其验证结果和仍未完成的画质验收。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
-| `scale=0.5` FP32 性能 | 进行中 | 已完成三档 ONNX/Engine 精度审计、1080p/3840x2160 同机 probe 和 `scale=0.5` 的 4K Engine 逐层归因；5 个含 `GridSample` 的融合层合计占诊断 Engine 图内时间 `44.46%` | 建立只修改该模型的候选 FP16 精度图，并依次跑 PyTorch/ONNX、ONNX/Engine、probe 和播放器验证 |
-| TensorRT profile 优化 | 未开始，等待任务 1 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则 | 等 `scale=0.5` 精度和性能基线冻结后，再设计并实测多 shape profile |
+| `scale=0.5` FP32 性能 | 实现、数值、探针和真实播放烟测通过，等待三档逐中间帧 A/B | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32，三层数值验证和 3840x2160 HDR10 真实播放通过，TensorRT 探针降至 `26.342 ms` | 对同一真实影片基准片段导出三档的逐中间帧结果，检查复杂运动、遮挡、细纹理和切镜并完成主观 A/B |
+| TensorRT profile 优化 | 未开始，等待任务 1 最终画质验收 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则；新图已取得四种 universal shape 的可用性/性能证据 | 任务 1 三档逐中间帧 A/B 通过后，针对 universal profile 在 1440p、超宽 4K、DCI 4K 的性能设计并实测候选 profile |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -26,8 +26,9 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   3840x2160 probe 为 TensorRT `30.373 ms`、端到端 `31.516 ms`。
 - 流畅优先 RIFE v4.25 Lite 已完成主计算图 FP16 转换；当前 3840x2160
   probe 为 TensorRT `22.687 ms`、端到端 `23.820 ms`。
-- 均衡优先 `scale=0.5` 当前仍是 `fp16_io_mixed_fp32_islands`；3840x2160
-  probe 为 TensorRT `29.247 ms`、端到端 `30.396 ms`，尚未完成性能修复。
+- 均衡优先 `scale=0.5` 的新图为 `fp16_compute_fp32_grid_final`；3840x2160
+  probe 为 TensorRT `26.342 ms`、端到端 `27.498 ms`。导出、数值和原生探针
+  已通过，但真实影片逐帧画质仍未验收，因此任务 1 尚未完成。
 - 上述数据来自 RTX 5070 Ti、TensorRT-RTX 1.4.0.76、当前缓存 Engine、
   预热 30 次和测量 100 次。它们是问题定位基线，不是最终跨设备结论。
 - 当前尚未完成真实影片逐帧主观画质验收，也尚未验证 VRR 实际激活。
@@ -51,9 +52,9 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   直接相关的测试和 probe。
 - 不修改质量优先的 RIFE v4.26 `scale=1.0`，也不修改流畅优先的
   RIFE v4.25 Lite；不得改变这两档的 ONNX、Engine 契约、模型映射或产品行为。
-- 当前 `scale=0.5` 虽然是 FP16 IO，但仍保留 129 个 FP32 精度节点、
+- 修复前的 `scale=0.5` 图虽然是 FP16 IO，但仍保留 129 个 FP32 精度节点、
   4 个 FP32 编码器卷积和 5 个 FP32 GridSample。manifest 的 `fp16` 标签不能
-  代替内部计算精度检查。
+  代替内部计算精度检查；该旧图只作为修复前基线，不得再描述成当前实现。
 - 必须先定位 FP32 islands 对 1080p、2K、UHD 4K、DCI 4K 和超宽输入的实际
   耗时，再缩小或消除性能关键的 FP32 路径。不能为了提速而跳过数值一致性。
 - 至少验证：官方 vs-rife PyTorch 输出对 ONNX、ONNX 对 TensorRT Engine、
@@ -79,6 +80,59 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 逐层 profiler 会插入同步并禁用 CUDA Graph，本组总时间只用于图内成本归因，
   不替代播放器 probe 的正式 TensorRT/端到端基准。正式性能结论仍使用相同
   warmup、迭代次数、runtime cache 和后台负载条件下的非 profiler A/B 数据。
+
+#### 2026-08-01 均衡档精度图实现与验证检查点
+
+- 全 FP16 候选通过 PyTorch/ONNX 比较，但在 `256x384` 的 ONNX/TensorRT 比较中
+  得到 `max=0.05957`、`mean=0.00234`，超过数值合同，已显式淘汰。
+- “图像输入 FP16、GridSample 坐标 FP32”候选符合 ONNX 16 类型规则，但
+  TensorRT-RTX 要求 GridSample 两个输入类型一致，解析时显式失败，已淘汰。
+  没有删除 vs-mlrt 对非 1.0 scale 的限制，也没有把 vs-rife/PyTorch 引入
+  播放器运行时。
+- 最终图只为每次 warp 的最终 `Add + Transpose + GridSample` 保持 FP32，共
+  `15` 个精度保护节点：`Add 5 + Transpose 5 + GridSample 5`。FP32 卷积为
+  `0`；静态类型审计得到 `72` 个 FP32 输出节点：`Cast 43 + Resize 14 +
+  Add 5 + Transpose 5 + GridSample 5`。其余主计算使用 FP16，IO 合同仍为
+  `FP16 [1,11,H,W] -> [1,3,H,W]`。
+- 正式 ONNX SHA-256 为
+  `212696b5befa040ab1989003dcc89b90903fbbdce21f46e0883cd5ab1bf91ca4`。
+  PyTorch/ONNX 为 `max=0.002815`、`mean=0.0001885`；动态 FP32 ONNX/新 ONNX
+  为 `max=0.006071`、`mean=0.0001869`；ONNX/TensorRT 为 `max=0.004394`、
+  `mean=0.0002193`。三层数值比较均通过既定阈值。
+- 3840x2160 原生 D3D11 P010 探针选择 `3840x2176` 固定 profile：TensorRT
+  `26.342 ms`、端到端 `27.498 ms`、`36.36 qps`，相对旧图分别改善约
+  `9.93%`、`9.53%` 和 `10.55%`。探针无推理失败、模型切换或回退。
+- 新图在 universal profile 下的多 shape 结果如下。所有输入均显式运行成功，
+  但这些数字是 profile 优化的待解决证据，不是多 shape 已优化的结论。
+
+| 原始输入 | 实际 padded shape | TensorRT 平均 | 吞吐 |
+| --- | --- | ---: | ---: |
+| `1920x1080` | `1920x1152` | `16.509 ms` | `53.76 qps` |
+| `2560x1440` | `2560x1536` | `28.777 ms` | `31.51 qps` |
+| `3840x1600` | `3840x1664` | `46.606 ms` | `19.50 qps` |
+| `4096x2160` | `4096x2176` | `65.418 ms` | `13.91 qps` |
+
+- 质量档 ONNX hash 仍为
+  `534aeae1a47bd7585defc6902fd6135b71545f85522626197eb109888ab7dfc2`，Lite
+  档仍为 `9b9209ebce65b666c1f24ba9ee203bcacb1b3054b0bcc7617fbea7b6736a19b4`；
+  本轮没有修改这两档。
+- 刷新 hash 后启动 `build/jellium-desktop.exe` 时只识别到另外两档的既有
+  Engine；选择均衡档后，UI 明确显示“正在加载均衡优先插帧”，并为新 hash
+  构建独立 Engine。Engine key 为
+  `919db79501b058b8cd5939c889c143cf0108537249eeeb3554740c3633694c32`，
+  SHA-256 为
+  `a94bac99a667033525f2734928640759ee849d4cbe242a44e5cdf8b827539525`。
+- 真实播放使用《阿丽塔：战斗天使》3840x2160 HDR10、
+  `24000/1001 -> 47.952 fps`、D3D11 P010 和固定 profile 1。冷启动 summary
+  为 `5272` 对帧、`5233` 次推理、`39` 次切镜复制、`0` 次失败、`2` 次
+  seek reset，runtime 推理平均 `27.819 ms`、p95 `29.425 ms`；没有模型切换
+  或回退。
+- 原生窗口屏幕采样覆盖机械臂遮挡、皮肤/机械细纹理及切镜，未发现空白输出、
+  整帧破坏或切镜混合。但屏幕采样间隔为 250 ms，不能锁定每个 RIFE 中间帧，
+  也不能替代三档相同输入的逐中间帧 A/B。
+- 尚未完成同一真实片段下 v4.26 `scale=1.0`、v4.26 `scale=0.5` 和 Lite 的
+  逐中间帧主观画质验收。完成之前，不得把任务 1 标记完成，也不得据此开放
+  最终 profile 设计。
 
 ### 2. 完成 TensorRT profile 优化
 
@@ -251,8 +305,8 @@ profile 性能不能脱离模型精度路径比较。当前三档的精度状态
 - v4.26 `scale=1.0`：主计算图已转换为 FP16，仅保留少量 Resize 形状/标量
   Cast；不再是整图 FP32 计算。
 - v4.25 Lite：主计算图已转换为 FP16，同样只保留少量非图像数据 Cast。
-- v4.26 `scale=0.5`：FP16 IO，但为保持导出图的数值路径，仍保留混合
-  FP32 islands，包括编码器卷积、坐标路径、GridSample 和输出混合。
+- v4.26 `scale=0.5`：FP16 IO 和主计算，只为 5 次 warp 的最终坐标 Add、
+  Transpose 和 GridSample 保留 FP32；没有 FP32 卷积。
 
 播放器当前检查的是 Engine 输入输出为 FP16，不等于检查 Engine 内部每一层
 都是 FP16。因此不能只依据 manifest 的 `precision=fp16` 判断完整计算精度。
@@ -266,12 +320,13 @@ profile 性能不能脱离模型精度路径比较。当前三档的精度状态
 | 模型 | TensorRT 平均 | 端到端平均 | 吞吐 |
 | --- | ---: | ---: | ---: |
 | RIFE v4.26 | `30.373 ms` | `31.516 ms` | `31.72 qps` |
-| RIFE v4.26 `scale=0.5` | `29.247 ms` | `30.396 ms` | `32.89 qps` |
+| RIFE v4.26 `scale=0.5` | `26.342 ms` | `27.498 ms` | `36.36 qps` |
 | RIFE v4.25 Lite | `22.687 ms` | `23.820 ms` | `41.97 qps` |
 
-当前 `scale=0.5` 仅比标准 v4.26 快约 3.7%，而 Lite 快约 25%。这说明
-`scale=0.5` 的混合 FP32 路径仍会影响 4K 性能，不能在该问题解决前把
-当前数据当作最终的 profile 最优点依据。
+新 `scale=0.5` 图的 4K TensorRT 时间相对旧图下降约 `9.93%`，并已快于
+标准 v4.26；但真实影片画质尚未验收，且 universal profile 在 1440p、超宽
+4K 和 DCI 4K 的结果仍明显不足。因此这些数据只能作为当前实现检查点，不能
+提前当作最终的 profile 最优点或跨设备结论。
 
 ## 后续 profile 设计规则
 
