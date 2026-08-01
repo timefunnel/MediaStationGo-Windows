@@ -12,13 +12,14 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 ### 进度台账
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
-实现检查点 `aa760f2` 和验证记录 `db88468` 已推送；同一 HDR10 影片片段的
-三档逐中间帧 A/B 已通过，任务 1 完成，下一步进入 TensorRT profile 优化。
+实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
+任务 1 完成。任务 2 已开始，均衡档三 profile 临时候选的纯 TensorRT A/B
+通过，尚未修改正式 Engine/profile 合同。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
-| TensorRT profile 优化 | 可以开始，尚未修改正式 profile 集合 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则；新图已取得四种 universal shape 的可用性/性能证据 | 针对 universal profile 在 1440p、超宽 4K、DCI 4K 的性能设计并实测候选 profile，只有稳定收益才保留 |
+| TensorRT profile 优化 | 进行中：均衡档三 profile 临时候选通过纯 TensorRT A/B，正式合同尚未修改 | 保持一个模型一个 Engine；以 universal + 中低分辨率范围 + 4K 范围替代逐分辨率 fixed 的候选，在均衡档非 UHD shape 上改善约 `48%` 至 `54%`，UHD 无回归 | 对质量档和 Lite 复测同一候选；通过后实现通用 profile 描述、选择、缓存键和原生 probe，并验证真实播放器 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -174,6 +175,41 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   TensorRT 时间、端到端时间和 p50/p95/p99。没有稳定收益的 profile 不保留。
 - profile 不匹配时使用 universal profile；不得切换模型、修改 `scale` 或
   隐藏失败。Engine/profile 合同变化必须同步 manifest schema、ABI 和缓存键。
+
+#### 2026-08-01 均衡档三 profile 临时候选检查点
+
+- 当前正式 Engine 仍保持两套 profile，本检查点没有修改播放器代码、manifest、
+  ABI 或正式缓存。先使用 TensorRT-RTX 自带的 `--useProfile` 对同一 ONNX 的
+  临时 Engine 做纯 TensorRT 对照，避免在候选未证实前重建三档正式 Engine。
+- 临时候选仍是一个模型一个 Engine，只包含三套 profile：profile 0 保留当前
+  `128x128 + 3840x2176 + 16384x16384` universal；profile 1 为
+  `128x128 + 2560x1536 + 2560x1536` 中低分辨率范围；profile 2 为
+  `128x128 + 3840x2176 + 4096x2176` 4K 范围。它不按分辨率切换模型，超出两个
+  有界范围的合法 shape 仍由 universal 显式覆盖。
+- 临时均衡档 Engine 使用正式
+  `212696b5befa040ab1989003dcc89b90903fbbdce21f46e0883cd5ab1bf91ca4`
+  ONNX，在 RTX 5070 Ti / TensorRT-RTX 1.4.0.76 上构建耗时 `6.997 s`，大小
+  `37574124` 字节；当前正式两 profile Engine 为 `42980052` 字节。本结果只说明
+  本机 Builder 成本，没有把构建时间或大小写成跨设备常量。
+- A/B 固定为同一 GPU 和后台状态、无 H2D/D2H、runtime allocation、eager dynamic
+  shape specialization、每个进程预热 `5000 ms`、测量 `50` 次。baseline 对非
+  UHD shape 使用当前 universal，对 UHD 使用当前 fixed；candidate 使用相应的
+  中低分辨率或 4K 范围 profile。未加载现有 runtime cache。
+
+| padded shape | 当前 profile | 当前均值 | 候选 profile | 候选均值 | 改善 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `1920x1152` | 0 | `17.1750 ms` | 1 | `8.9090 ms` | `48.128%` |
+| `2560x1536` | 0 | `30.1737 ms` | 1 | `13.8066 ms` | `54.243%` |
+| `3840x1664` | 0 | `48.7440 ms` | 2 | `25.1553 ms` | `48.393%` |
+| `3840x2176` | 1 | `31.6467 ms` | 2 | `31.6523 ms` | `-0.018%` |
+| `4096x2176` | 0 | `68.8217 ms` | 2 | `35.7948 ms` | `47.989%` |
+
+- 这组结果确认当前超大 universal 是均衡档 1440p、超宽 4K 和 DCI 4K 的主要
+  profile 性能问题；为所有分辨率增加独立 fixed profile 没有必要。候选在 UHD
+  保持现有性能，同时让一个有界 4K profile 覆盖 UHD、超宽 4K 和 DCI 4K。
+- 本检查点尚不是产品验收：还必须对质量档和 Lite 分别复测，并在实现通用
+  profile 合同后运行原生 P010 probe、任意合法 shape 兜底、Engine 构建/缓存、
+  模型切换和真实播放验证。若任一层不成立，正式集合不得切换到该候选。
 
 ### 3. 实现窗口播放的刷新率自匹配
 
