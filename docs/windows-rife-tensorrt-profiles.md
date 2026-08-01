@@ -12,12 +12,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 ### 进度台账
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
-实现检查点 `aa760f2` 已推送；本节同步记录其验证结果和仍未完成的画质验收。
+实现检查点 `aa760f2` 和验证记录 `db88468` 已推送；同一 HDR10 影片片段的
+三档逐中间帧 A/B 已通过，任务 1 完成，下一步进入 TensorRT profile 优化。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
-| `scale=0.5` FP32 性能 | 实现、数值、探针和真实播放烟测通过，等待三档逐中间帧 A/B | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32，三层数值验证和 3840x2160 HDR10 真实播放通过，TensorRT 探针降至 `26.342 ms` | 对同一真实影片基准片段导出三档的逐中间帧结果，检查复杂运动、遮挡、细纹理和切镜并完成主观 A/B |
-| TensorRT profile 优化 | 未开始，等待任务 1 最终画质验收 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则；新图已取得四种 universal shape 的可用性/性能证据 | 任务 1 三档逐中间帧 A/B 通过后，针对 universal profile 在 1440p、超宽 4K、DCI 4K 的性能设计并实测候选 profile |
+| `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
+| TensorRT profile 优化 | 可以开始，尚未修改正式 profile 集合 | 已明确当前 universal + `3840x2176` fixed profile 的真实语义、限制和 A/B 规则；新图已取得四种 universal shape 的可用性/性能证据 | 针对 universal profile 在 1440p、超宽 4K、DCI 4K 的性能设计并实测候选 profile，只有稳定收益才保留 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -27,11 +28,11 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 - 流畅优先 RIFE v4.25 Lite 已完成主计算图 FP16 转换；当前 3840x2160
   probe 为 TensorRT `22.687 ms`、端到端 `23.820 ms`。
 - 均衡优先 `scale=0.5` 的新图为 `fp16_compute_fp32_grid_final`；3840x2160
-  probe 为 TensorRT `26.342 ms`、端到端 `27.498 ms`。导出、数值和原生探针
-  已通过，但真实影片逐帧画质仍未验收，因此任务 1 尚未完成。
+  probe 为 TensorRT `26.342 ms`、端到端 `27.498 ms`。导出、数值、原生探针、
+  真实播放和同片段逐中间帧 A/B 均已通过，任务 1 已完成。
 - 上述数据来自 RTX 5070 Ti、TensorRT-RTX 1.4.0.76、当前缓存 Engine、
   预热 30 次和测量 100 次。它们是问题定位基线，不是最终跨设备结论。
-- 当前尚未完成真实影片逐帧主观画质验收，也尚未验证 VRR 实际激活。
+- 当前尚未修改或验证最终 TensorRT profile 集合，也尚未验证 VRR 实际激活。
 
 ### 进度更新规则
 
@@ -128,11 +129,37 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   seek reset，runtime 推理平均 `27.819 ms`、p95 `29.425 ms`；没有模型切换
   或回退。
 - 原生窗口屏幕采样覆盖机械臂遮挡、皮肤/机械细纹理及切镜，未发现空白输出、
-  整帧破坏或切镜混合。但屏幕采样间隔为 250 ms，不能锁定每个 RIFE 中间帧，
-  也不能替代三档相同输入的逐中间帧 A/B。
-- 尚未完成同一真实片段下 v4.26 `scale=1.0`、v4.26 `scale=0.5` 和 Lite 的
-  逐中间帧主观画质验收。完成之前，不得把任务 1 标记完成，也不得据此开放
-  最终 profile 设计。
+  整帧破坏或切镜混合。该 250 ms 屏幕采样只作为播放烟测，逐中间帧结论以下方
+  同源 P010 原生 runtime A/B 为准。
+
+#### 2026-08-01 同一 HDR10 影片逐中间帧 A/B 检查点
+
+- 输入为当前播放器实际解析的《阿丽塔：战斗天使》3840x2160 HDR10 片源，
+  从 `187.270 s` 开始提取连续 `24` 个 `24000/1001` P010 源帧，原始字节数为
+  `597196800`。解析使用播放器相同 User-Agent，经 `2` 次跳转到支持 Range 的
+  CDN；不使用旧公园素材、桌面录屏或另一分辨率代替。
+- 三档均使用当前正式缓存 Engine 和 profile 1，顺序执行原生 D3D11 P010
+  sequence probe；每档得到 `23` 个中间帧，其中 `22` 次 RIFE 推理、`1` 次
+  hard-cut F0 复制、`0` 次失败。质量、均衡、Lite 的 Engine key 分别为
+  `2911120d5bc92304903687ac70879313baa05f4df1aaf1386e1fba86b92b499c`、
+  `919db79501b058b8cd5939c889c143cf0108537249eeeb3554740c3633694c32`、
+  `ead9de84b37fc092d730d4343fb810d66221a18ed45c974d5779ba07fc6a8a58`；Engine
+  SHA-256 分别为 `f942c9b8835e23fdca1296b71302773e408dacefd3eeb46284b7fe1f1f363713`、
+  `a94bac99a667033525f2734928640759ee849d4cbe242a44e5cdf8b827539525`、
+  `dbf843d4e94f179766f16a145208d4880bba5bedbff43a916c81fa799c7645a3`。
+- hard-cut 输出与源 F0 的首帧 SHA-256 在三档中均为
+  `1abcd66183abc52dbcfb10ffe98d727b82bc20207f2a00bf85674308cc6bc225`，
+  确认没有跨切镜混合。22 个推理帧的平均 temporal imbalance 为：质量
+  `0.011926`、均衡 `0.010537`、Lite `0.031713`。
+- 对全部 23 个中间帧做一致的 BT.2020/PQ 到 BT.709 tone-map 后逐帧检查。
+  片段同时覆盖切镜、快速移动的白色袖臂和手部、前景遮挡，以及控制台按键和
+  机械结构细纹理。均衡档未发现轮廓破碎、遮挡泄漏、整块错误纹理或切镜混合；
+  相对质量档的整段 P010 比较为 `PSNR 47.137526 dB`、`SSIM 0.995136`，可见
+  差异主要是轻微平滑。Lite 在相同运动区域出现持续的袖臂/手部轮廓破碎，说明
+  该片段能够暴露真实插帧缺陷，不是弱门禁。
+- 本次逐帧 A/B 与此前 PyTorch/ONNX、ONNX/TensorRT、原生 probe 和播放器
+  长片段烟测共同关闭任务 1。测试期间播放器保持暂停，probe 开启 stage profiler；
+  该次 profiler 耗时只用于执行确认，不替代前述正式非 profiler 性能基线。
 
 ### 2. 完成 TensorRT profile 优化
 
