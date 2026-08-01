@@ -13,14 +13,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
-任务 1 完成。任务 2 已开始，三档三 profile 临时候选的纯 TensorRT A/B
-均已完成；质量档和 Lite 的 UHD 范围 profile 有约 `2%` 回归，尚未修改正式
-Engine/profile 合同。
+任务 1 完成。任务 2 已开始，三档三 profile 与质量/Lite 四 profile 临时候选的
+纯 TensorRT A/B 均已完成；候选集合已冻结，尚未修改正式 Engine/profile 合同。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
-| TensorRT profile 优化 | 进行中：三档三 profile 临时候选均已完成纯 TensorRT A/B，正式合同尚未修改 | 保持一个模型一个 Engine；三档在非 UHD shape 上改善约 `44%` 至 `54%`；均衡档 UHD 无回归，但质量档和 Lite 分别回归 `2.091%`、`2.353%` | 为质量档和 Lite 构建保留 UHD fixed 的四 profile 候选并复测；按实测冻结每模型集合后再实现通用合同、原生 probe 和真实播放器验证 |
+| TensorRT profile 优化 | 进行中：每模型候选集合已冻结，正式合同尚未修改 | 保持一个模型一个 Engine；均衡档采用 3 profiles，质量档/Lite 采用 4 profiles；非 UHD shape 改善约 `44%` 至 `54%`，额外 UHD fixed 消除约 `2%` 回归 | 实现通用 profile 描述、Builder、选择、缓存键和 metadata；同步 schema/ABI/测试后运行原生 probe、缓存与真实播放器验证 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -248,6 +247,33 @@ Engine/profile 合同。
 - 本检查点尚不是产品验收：冻结最终集合并实现通用 profile 合同后，仍必须运行
   原生 P010 probe、任意合法 shape universal 覆盖、Engine 构建/缓存、模型切换
   和真实播放验证。若任一层不成立，正式集合不得切换到该候选。
+
+#### 2026-08-01 UHD fixed 四 profile 候选检查点
+
+- 只为三 profile 候选在 UHD 有回归的质量档和 Lite 增加 profile 3：
+  `min=opt=max=3840x2176`。均衡档不增加该 profile，因为其 profile 2 在 UHD
+  仅相差 `-0.018%`。三档仍各自只有一个 Engine，profile 数量无需相同。
+- 质量档四 profile 临时 Engine 构建耗时 `6.578 s`、大小 `73702764` 字节，
+  SHA-256 为
+  `b7f793e460db6af7a08fd99593c52bf88de53b98917b0af0fef1ec0e50812005`。
+  相同无传输、runtime allocation、eager specialization、`5000 ms` 预热和
+  `50` 次测量条件下，正式 fixed 与候选 fixed 的配对均值分别为
+  `37.4265 ms`、`37.2966 ms`，候选快 `0.347%`，属于持平区间。
+- Lite 四 profile 临时 Engine 构建耗时 `5.645 s`、大小 `68838988` 字节，
+  SHA-256 为
+  `2bed63abaeb505d009c7877100719edca1b0b439d2b21f3e93c4b89baa138836`。
+  首轮正式 fixed 出现短暂的 `29.4278 ms`，但交替复测后正式 fixed 与候选 fixed
+  分别稳定为 `31.1110 ms`、`31.1117 ms`，差异 `0.002%`，不能把首轮 GPU
+  时钟/负载漂移写成 profile 收益或回归。
+- 最终候选集合冻结为：均衡档 universal + 中低范围 + 4K 范围；质量档和 Lite
+  在相同三套 profile 后追加 UHD fixed。与当前正式三档 Engine 总大小
+  `156990956` 字节相比，候选总大小为 `180115876` 字节，增加 `23124920` 字节
+  （`14.73%`）。该成本用于同时保留 UHD 基线和其他 shape 的大幅收益，不会产生
+  按分辨率拆分的大量 Engine。
+- 本检查点只冻结候选结构，不代表产品已切换。实现时 manifest 必须描述每个
+  profile 的完整 min/opt/max 合同；runtime 必须按实际 padded shape 选择最窄的
+  匹配 profile，并显式保留 universal 覆盖，不得切换模型、修改 `scale` 或隐藏
+  Engine/profile 失败。
 
 ### 3. 实现窗口播放的刷新率自匹配
 
