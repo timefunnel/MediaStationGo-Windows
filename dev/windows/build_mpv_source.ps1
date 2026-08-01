@@ -32,6 +32,23 @@ $NvofMemcPatchApplied = $false
 $NvofMemcSourceCreated = $false
 $RifeRuntimeHeaderCreated = $false
 
+function Get-MpvSourceContractHash {
+    $Material = @(
+        $NvofMemcSource,
+        $NvofMemcPatch,
+        $RifeRuntimeHeader
+    ) | ForEach-Object {
+        (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Material -join "`n")
+        ([System.BitConverter]::ToString($Hasher.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $Hasher.Dispose()
+    }
+}
+
 # MSYS2 environment based on target architecture
 if ($Arch -eq "arm64") {
     $MsysEnv = "CLANGARM64"
@@ -45,7 +62,11 @@ if ($Arch -eq "arm64") {
 
 # Check if already built
 $OutputLib = Join-Path $OutputDir "lib\mpv.lib"
-if ((Test-Path $OutputLib) -and -not $Force) {
+$SourceContractStamp = Join-Path $OutputDir "lib\mediastation-mpv-source.sha256"
+$SourceContractHash = Get-MpvSourceContractHash
+$SourceContractMatches = (Test-Path -LiteralPath $SourceContractStamp -PathType Leaf) `
+    -and ((Get-Content -LiteralPath $SourceContractStamp -Raw).Trim() -eq $SourceContractHash)
+if ((Test-Path $OutputLib) -and -not $Force -and $SourceContractMatches) {
     $OutputLibDir = Split-Path -Parent $OutputLib
     & $RifeRuntimeBuildScript -RuntimeDir $FrameInterpolationRuntimeDir `
         -OutputDir $RifeRuntimeBuildDir
@@ -58,6 +79,10 @@ if ((Test-Path $OutputLib) -and -not $Force) {
     Write-Host "mpv already built at $OutputDir" -ForegroundColor Green
     Write-Host "Use -Force to rebuild"
     exit 0
+}
+if ((Test-Path $OutputLib) -and -not $Force) {
+    Write-Host "mpv source contract changed; rebuilding the custom mpv DLL" -ForegroundColor Yellow
+    $Force = $true
 }
 
 # Verify mpv submodule exists
@@ -455,6 +480,7 @@ if (-not (Test-Path (Join-Path $LibDir "avcodec.lib"))) {
     exit 1
 }
 Write-Host "Generated avcodec.lib" -ForegroundColor Green
+[System.IO.File]::WriteAllText($SourceContractStamp, $SourceContractHash, $Utf8NoBom)
 
 Write-Host ""
 Write-Host "=== Build complete ===" -ForegroundColor Green

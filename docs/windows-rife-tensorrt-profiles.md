@@ -14,12 +14,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 最近更新：2026-08-01，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
 任务 1 完成。任务 2 已开始，三档三 profile 与质量/Lite 四 profile 临时候选的
-纯 TensorRT A/B 均已完成；候选集合已冻结，尚未修改正式 Engine/profile 合同。
+纯 TensorRT A/B 均已完成；通用 Engine/profile 合同已实现并通过定向验证，尚未
+完成正式 mpv/播放器重建与产品验收。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
 | `scale=0.5` FP32 性能 | 完成：实现、数值、探针、真实播放和三档逐中间帧 A/B 均通过 | 已淘汰两个失败候选；最终图只为 5 组最终坐标 `Add + Transpose + GridSample` 保留 FP32；三层数值验证、3840x2160 HDR10 真实播放和 23 个同片段中间帧检查通过，TensorRT 探针为 `26.342 ms` | 冻结本检查点，不再修改另外两档；后续变化必须重新经过相同质量门禁 |
-| TensorRT profile 优化 | 进行中：每模型候选集合已冻结，正式合同尚未修改 | 保持一个模型一个 Engine；均衡档采用 3 profiles，质量档/Lite 采用 4 profiles；非 UHD shape 改善约 `44%` 至 `54%`，额外 UHD fixed 消除约 `2%` 回归 | 实现通用 profile 描述、Builder、选择、缓存键和 metadata；同步 schema/ABI/测试后运行原生 probe、缓存与真实播放器验证 |
+| TensorRT profile 优化 | 进行中：通用合同已实现，定向测试通过，正式播放器重建待完成 | schema 4 / runtime ABI 7 / metadata schema 3 已同步；Builder、缓存键和 metadata 覆盖完整有序集合；原生 P010 探针验证三档 `4/3/4` profiles 和 universal 覆盖 | 完整重建自定义 mpv 与 Release 播放器，验证三档按需构建/缓存、切换、真实影片输出和全工作区回归 |
 | 窗口刷新率自匹配 | 未开始 | 已记录 VRR / G-SYNC Compatible 目标、诊断字段和验收场景 | 完成前两项后，审计 mpv、DXGI、DWM 和窗口呈现链路，先取得 VRR supported/active 的真实证据 |
 
 当前不得重复或误判的结论：
@@ -274,6 +275,31 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
   profile 的完整 min/opt/max 合同；runtime 必须按实际 padded shape 选择最窄的
   匹配 profile，并显式保留 universal 覆盖，不得切换模型、修改 `scale` 或隐藏
   Engine/profile 失败。
+
+#### 2026-08-01 通用 profile 合同实现检查点
+
+- manifest 从单个 `profile` 升级为有序 `profiles[]`，schema 升至 `4`；原生
+  runtime ABI 升至 `7`，Engine metadata schema 升至 `3`。Rust 校验三档冻结
+  集合，并把每套 profile 的 index、purpose 和完整 min/opt/max 写入 Engine
+  缓存键、TensorRT Builder 参数和 metadata，不保留旧合同的并行解析路径。
+- 原生 runtime 要求 Engine 恰好包含 `3` 或 `4` 套有序 profile，逐套校验 shape
+  合同，并在所有能覆盖实际 padded shape 的专用 profile 中选择范围最窄者；无
+  专用匹配时只选择 profile 0 universal，不切换模型或 `scale`。旧两-profile
+  Engine 被显式拒绝，错误为 `received 2`，没有隐藏兜底。
+- staging 真实生成结果为：质量档 `4` 套
+  `universal,mid-range,4k-range,uhd-fixed`；均衡档 `3` 套
+  `universal,mid-range,4k-range`；Lite `4` 套，与冻结候选一致。旧单一
+  `profile` 字段不存在。
+- ABI 7 原生 DLL 和 probe 已在 MSVC `/W4 /WX` 下编译通过；Rust 定向单测
+  `16/16` 通过。候选 Engine 的原生 D3D11 P010 probe 共验证 `11` 条路径：质量
+  `1/2/3/0`、均衡 `1/2/0`、Lite `1/2/3/0`，实际 profile 均符合预期，全部输出
+  `p010-packed=yes` 且缓存重开命中。
+- `build_mpv_source.ps1` 增加 mpv 源码合同哈希戳。哈希匹配的早退路径仍会重建
+  runtime DLL 并刷新 schema 4 三模型 manifest；ABI 头或 filter 源变化时则自动
+  完整重建，避免 ABI 7 runtime 与 ABI 6 mpv filter 被拼装到同一输出目录。
+- 本检查点尚未完成正式缓存迁移、Release 播放器构建和真实影片验证，因此任务 2
+  仍为进行中。后续失败必须停在真实错误，不得恢复旧 Engine、Lite 或 universal
+  之外的隐藏路径。
 
 ### 3. 实现窗口播放的刷新率自匹配
 

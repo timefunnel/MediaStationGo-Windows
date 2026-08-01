@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define RIFE_RUNTIME_ABI_VERSION 6u
+#define RIFE_RUNTIME_ABI_VERSION 7u
 #define RIFE_SCENE_CLASS_COUNT 5u
 #define RIFE_PROFILE_STAGE_COUNT 9u
 

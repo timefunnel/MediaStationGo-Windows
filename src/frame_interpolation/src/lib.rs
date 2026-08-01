@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-const RIFE_RUNTIME_ABI: u32 = 6;
+const RIFE_RUNTIME_ABI: u32 = 7;
+const RIFE_MANIFEST_SCHEMA: u64 = 4;
+const RIFE_ENGINE_METADATA_SCHEMA: u64 = 3;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
 const RIFE_FILTER: &str = "vf_nvofmemc (RIFE mode)";
 const RIFE_TENSORRT_VERSION: &str = "1.4.0.76";
@@ -157,8 +159,38 @@ struct EngineArtifact {
     path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineProfilePurpose {
+    Universal,
+    MidRange,
+    FourKRange,
+    UhdFixed,
+}
+
+impl EngineProfilePurpose {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "universal" => Some(Self::Universal),
+            "mid-range" => Some(Self::MidRange),
+            "4k-range" => Some(Self::FourKRange),
+            "uhd-fixed" => Some(Self::UhdFixed),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Universal => "universal",
+            Self::MidRange => "mid-range",
+            Self::FourKRange => "4k-range",
+            Self::UhdFixed => "uhd-fixed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct EngineProfile {
+    purpose: EngineProfilePurpose,
     min_width: u32,
     min_height: u32,
     opt_width: u32,
@@ -172,7 +204,7 @@ struct ModelRuntime {
     model: InterpolationModel,
     model_sha256: String,
     onnx_path: PathBuf,
-    profile: EngineProfile,
+    profiles: Vec<EngineProfile>,
     engine_key: String,
     engine: Option<EngineArtifact>,
     cached_engine_failure: Option<InterpolationError>,
@@ -358,7 +390,7 @@ fn probe_runtime(
             format!("{} is invalid JSON: {error}", manifest_path.display()),
         )
     })?;
-    if manifest.get("schema").and_then(Value::as_u64) != Some(3) {
+    if manifest.get("schema").and_then(Value::as_u64) != Some(RIFE_MANIFEST_SCHEMA) {
         return Err(InterpolationError::new(
             "frame_interpolation_manifest_invalid",
             "The RIFE runtime manifest schema is not supported",
@@ -549,26 +581,45 @@ fn parse_model_runtime(
             ),
         ));
     }
-    let profile_value = entry.get("profile").ok_or_else(|| {
-        InterpolationError::new(
-            "frame_interpolation_manifest_invalid",
-            format!("{} dynamic profile is missing", model.display_name()),
-        )
-    })?;
-    let profile = EngineProfile {
-        min_width: manifest_u32(profile_value, "minWidth")?,
-        min_height: manifest_u32(profile_value, "minHeight")?,
-        opt_width: manifest_u32(profile_value, "optWidth")?,
-        opt_height: manifest_u32(profile_value, "optHeight")?,
-        max_width: manifest_u32(profile_value, "maxWidth")?,
-        max_height: manifest_u32(profile_value, "maxHeight")?,
-    };
-    validate_profile(model, &profile)?;
+    let profile_values = entry
+        .get("profiles")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_manifest_invalid",
+                format!("{} Engine profile list is missing", model.display_name()),
+            )
+        })?;
+    let profiles = profile_values
+        .iter()
+        .map(|profile_value| {
+            let purpose = manifest_string(profile_value, "purpose")?;
+            let purpose = EngineProfilePurpose::parse(&purpose).ok_or_else(|| {
+                InterpolationError::new(
+                    "frame_interpolation_manifest_invalid",
+                    format!(
+                        "{} has an unsupported Engine profile purpose",
+                        model.display_name()
+                    ),
+                )
+            })?;
+            Ok(EngineProfile {
+                purpose,
+                min_width: manifest_u32(profile_value, "minWidth")?,
+                min_height: manifest_u32(profile_value, "minHeight")?,
+                opt_width: manifest_u32(profile_value, "optWidth")?,
+                opt_height: manifest_u32(profile_value, "optHeight")?,
+                max_width: manifest_u32(profile_value, "maxWidth")?,
+                max_height: manifest_u32(profile_value, "maxHeight")?,
+            })
+        })
+        .collect::<Result<Vec<_>, InterpolationError>>()?;
+    validate_profiles(model, &profiles)?;
     let mut provisional = ModelRuntime {
         model,
         model_sha256,
         onnx_path,
-        profile,
+        profiles,
         engine_key: String::new(),
         engine: None,
         cached_engine_failure: None,
@@ -639,56 +690,91 @@ fn engine_cache_key(
     builder_sha256: &str,
     model: &ModelRuntime,
 ) -> String {
-    let profile = &model.profile;
+    let profiles = model
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            format!(
+                "{index}:{}:{}x{}+{}x{}+{}x{}",
+                profile.purpose.as_str(),
+                profile.min_width,
+                profile.min_height,
+                profile.opt_width,
+                profile.opt_height,
+                profile.max_width,
+                profile.max_height,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
     let material = format!(
-        "gpu_uuid={}\ndriver={}\ntensorrt={tensor_rt_version}\nruntime_abi={RIFE_RUNTIME_ABI}\nbuilder_sha256={builder_sha256}\nmodel={}\nmodel_sha256={}\nscale={}\nprecision={RIFE_PRECISION}\nalignment={}\nprofiles=universal:{}x{}+{}x{}+{}x{}|optimized:{}x{}",
+        "gpu_uuid={}\ndriver={}\ntensorrt={tensor_rt_version}\nruntime_abi={RIFE_RUNTIME_ABI}\nbuilder_sha256={builder_sha256}\nmodel={}\nmodel_sha256={}\nscale={}\nprecision={RIFE_PRECISION}\nalignment={}\nprofiles={profiles}",
         gpu.uuid,
         gpu.driver,
         model.model.as_str(),
         model.model_sha256,
         model.model.scale(),
         model.model.shape_alignment(),
-        profile.min_width,
-        profile.min_height,
-        profile.opt_width,
-        profile.opt_height,
-        profile.max_width,
-        profile.max_height,
-        profile.opt_width,
-        profile.opt_height,
     );
     format!("{:x}", Sha256::digest(material.as_bytes()))
 }
 
-fn validate_profile(
-    model: InterpolationModel,
-    profile: &EngineProfile,
-) -> Result<(), InterpolationError> {
+fn expected_profiles(model: InterpolationModel) -> Vec<EngineProfile> {
     let alignment = model.shape_alignment();
-    let values = [
-        profile.min_width,
-        profile.min_height,
-        profile.opt_width,
-        profile.opt_height,
-        profile.max_width,
-        profile.max_height,
+    let mid_height = 1_440_u32.div_ceil(alignment) * alignment;
+    let mut profiles = vec![
+        EngineProfile {
+            purpose: EngineProfilePurpose::Universal,
+            min_width: alignment,
+            min_height: alignment,
+            opt_width: RIFE_PROFILE_OPT_WIDTH,
+            opt_height: RIFE_PROFILE_OPT_HEIGHT,
+            max_width: RIFE_PROFILE_MAX,
+            max_height: RIFE_PROFILE_MAX,
+        },
+        EngineProfile {
+            purpose: EngineProfilePurpose::MidRange,
+            min_width: alignment,
+            min_height: alignment,
+            opt_width: 2_560,
+            opt_height: mid_height,
+            max_width: 2_560,
+            max_height: mid_height,
+        },
+        EngineProfile {
+            purpose: EngineProfilePurpose::FourKRange,
+            min_width: alignment,
+            min_height: alignment,
+            opt_width: RIFE_PROFILE_OPT_WIDTH,
+            opt_height: RIFE_PROFILE_OPT_HEIGHT,
+            max_width: 4_096,
+            max_height: RIFE_PROFILE_OPT_HEIGHT,
+        },
     ];
-    if profile.min_width != alignment
-        || profile.min_height != alignment
-        || profile.opt_width != RIFE_PROFILE_OPT_WIDTH
-        || profile.opt_height != RIFE_PROFILE_OPT_HEIGHT
-        || profile.max_width != RIFE_PROFILE_MAX
-        || profile.max_height != RIFE_PROFILE_MAX
-        || values.iter().any(|value| value % alignment != 0)
-        || profile.min_width > profile.opt_width
-        || profile.min_height > profile.opt_height
-        || profile.opt_width > profile.max_width
-        || profile.opt_height > profile.max_height
-    {
+    if model != InterpolationModel::RifeV426Scale05 {
+        profiles.push(EngineProfile {
+            purpose: EngineProfilePurpose::UhdFixed,
+            min_width: RIFE_PROFILE_OPT_WIDTH,
+            min_height: RIFE_PROFILE_OPT_HEIGHT,
+            opt_width: RIFE_PROFILE_OPT_WIDTH,
+            opt_height: RIFE_PROFILE_OPT_HEIGHT,
+            max_width: RIFE_PROFILE_OPT_WIDTH,
+            max_height: RIFE_PROFILE_OPT_HEIGHT,
+        });
+    }
+    profiles
+}
+
+fn validate_profiles(
+    model: InterpolationModel,
+    profiles: &[EngineProfile],
+) -> Result<(), InterpolationError> {
+    if profiles != expected_profiles(model) {
         return Err(InterpolationError::new(
             "frame_interpolation_manifest_invalid",
             format!(
-                "{} has an invalid dynamic Engine profile",
+                "{} has an invalid ordered Engine profile contract",
                 model.display_name()
             ),
         ));
@@ -731,7 +817,7 @@ fn validate_cached_engine(
     let key = metadata.get("engineKey").and_then(Value::as_str);
     let file = metadata.get("engineFile").and_then(Value::as_str);
     let expected_hash = metadata.get("sha256").and_then(Value::as_str);
-    if metadata.get("schema").and_then(Value::as_u64) != Some(2)
+    if metadata.get("schema").and_then(Value::as_u64) != Some(RIFE_ENGINE_METADATA_SCHEMA)
         || key != Some(expected_key)
         || file != engine_path.file_name().and_then(|value| value.to_str())
         || expected_hash.is_none()
@@ -866,6 +952,25 @@ fn ensure_model_engine(
     build_model_engine(runtime, model, &engine_path, &metadata_path)
 }
 
+fn append_engine_profile_arguments(command: &mut Command, profiles: &[EngineProfile]) {
+    for (index, profile) in profiles.iter().enumerate() {
+        command
+            .arg(format!("--profile={index}"))
+            .arg(format!(
+                "--minShapes=input:1x11x{}x{}",
+                profile.min_height, profile.min_width
+            ))
+            .arg(format!(
+                "--optShapes=input:1x11x{}x{}",
+                profile.opt_height, profile.opt_width
+            ))
+            .arg(format!(
+                "--maxShapes=input:1x11x{}x{}",
+                profile.max_height, profile.max_width
+            ));
+    }
+}
+
 fn build_model_engine(
     runtime: &RuntimeComponents,
     model: &ModelRuntime,
@@ -888,41 +993,17 @@ fn build_model_engine(
         value.push(path);
         value
     };
-    let profile = &model.profile;
-    let output = Command::new(&runtime.engine_builder)
+    let mut command = Command::new(&runtime.engine_builder);
+    command
         .current_dir(
             runtime
                 .engine_builder
                 .parent()
                 .unwrap_or_else(|| Path::new(".")),
         )
-        .arg(path_argument("--onnx=", &model.onnx_path))
-        .arg("--profile=0")
-        .arg(format!(
-            "--minShapes=input:1x11x{}x{}",
-            profile.min_height, profile.min_width
-        ))
-        .arg(format!(
-            "--optShapes=input:1x11x{}x{}",
-            profile.opt_height, profile.opt_width
-        ))
-        .arg(format!(
-            "--maxShapes=input:1x11x{}x{}",
-            profile.max_height, profile.max_width
-        ))
-        .arg("--profile=1")
-        .arg(format!(
-            "--minShapes=input:1x11x{}x{}",
-            profile.opt_height, profile.opt_width
-        ))
-        .arg(format!(
-            "--optShapes=input:1x11x{}x{}",
-            profile.opt_height, profile.opt_width
-        ))
-        .arg(format!(
-            "--maxShapes=input:1x11x{}x{}",
-            profile.opt_height, profile.opt_width
-        ))
+        .arg(path_argument("--onnx=", &model.onnx_path));
+    append_engine_profile_arguments(&mut command, &model.profiles);
+    let output = command
         .arg(path_argument("--saveEngine=", &temporary_engine))
         .args(["--skipInference", "--useGpu"])
         .output()
@@ -961,8 +1042,25 @@ fn build_model_engine(
         "frame_interpolation_engine_build_failed",
         "frame_interpolation_engine_corrupt",
     )?;
+    let profile_metadata = model
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            serde_json::json!({
+                "index": index,
+                "purpose": profile.purpose.as_str(),
+                "minWidth": profile.min_width,
+                "minHeight": profile.min_height,
+                "optWidth": profile.opt_width,
+                "optHeight": profile.opt_height,
+                "maxWidth": profile.max_width,
+                "maxHeight": profile.max_height,
+            })
+        })
+        .collect::<Vec<_>>();
     let metadata = serde_json::json!({
-        "schema": 2,
+        "schema": RIFE_ENGINE_METADATA_SCHEMA,
         "engineKey": model.engine_key,
         "engineFile": engine_path.file_name().and_then(|value| value.to_str()),
         "sha256": engine_sha256,
@@ -971,28 +1069,7 @@ fn build_model_engine(
         "scale": model.model.scale(),
         "precision": RIFE_PRECISION,
         "shapeAlignment": model.model.shape_alignment(),
-        "profiles": [
-            {
-                "index": 0,
-                "purpose": "universal",
-                "minWidth": profile.min_width,
-                "minHeight": profile.min_height,
-                "optWidth": profile.opt_width,
-                "optHeight": profile.opt_height,
-                "maxWidth": profile.max_width,
-                "maxHeight": profile.max_height,
-            },
-            {
-                "index": 1,
-                "purpose": "optimized",
-                "minWidth": profile.opt_width,
-                "minHeight": profile.opt_height,
-                "optWidth": profile.opt_width,
-                "optHeight": profile.opt_height,
-                "maxWidth": profile.opt_width,
-                "maxHeight": profile.opt_height,
-            },
-        ],
+        "profiles": profile_metadata,
     });
     let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
         InterpolationError::new(
@@ -1457,27 +1534,17 @@ mod tests {
     use super::*;
 
     fn ready_report() -> CapabilityReport {
-        let model_runtime = |model: InterpolationModel| {
-            let alignment = model.shape_alignment();
-            ModelRuntime {
-                model,
-                model_sha256: format!("{}-sha256", model.as_str()),
-                onnx_path: PathBuf::from(format!("/runtime/{}.onnx", model.as_str())),
-                profile: EngineProfile {
-                    min_width: alignment,
-                    min_height: alignment,
-                    opt_width: RIFE_PROFILE_OPT_WIDTH,
-                    opt_height: RIFE_PROFILE_OPT_HEIGHT,
-                    max_width: RIFE_PROFILE_MAX,
-                    max_height: RIFE_PROFILE_MAX,
-                },
-                engine_key: format!("{}-dynamic", model.as_str()),
-                engine: Some(EngineArtifact {
-                    key: format!("{}-dynamic", model.as_str()),
-                    path: PathBuf::from(format!("/runtime/{}.engine", model.as_str())),
-                }),
-                cached_engine_failure: None,
-            }
+        let model_runtime = |model: InterpolationModel| ModelRuntime {
+            model,
+            model_sha256: format!("{}-sha256", model.as_str()),
+            onnx_path: PathBuf::from(format!("/runtime/{}.onnx", model.as_str())),
+            profiles: expected_profiles(model),
+            engine_key: format!("{}-dynamic", model.as_str()),
+            engine: Some(EngineArtifact {
+                key: format!("{}-dynamic", model.as_str()),
+                path: PathBuf::from(format!("/runtime/{}.engine", model.as_str())),
+            }),
+            cached_engine_failure: None,
         };
         CapabilityReport {
             ready: true,
@@ -1545,6 +1612,69 @@ mod tests {
             assert!(!model.display_name().is_empty());
         }
         assert_eq!(InterpolationModel::parse("rife-auto"), None);
+    }
+
+    #[test]
+    fn profile_contracts_are_model_specific_and_strict() {
+        let quality = expected_profiles(InterpolationModel::RifeV426);
+        let balanced = expected_profiles(InterpolationModel::RifeV426Scale05);
+        let lite = expected_profiles(InterpolationModel::RifeV425Lite);
+        assert_eq!(quality.len(), 4);
+        assert_eq!(balanced.len(), 3);
+        assert_eq!(lite.len(), 4);
+        for model in InterpolationModel::ALL {
+            assert!(validate_profiles(model, &expected_profiles(model)).is_ok());
+        }
+        assert_eq!(quality[1].opt_height, 1_472);
+        assert_eq!(balanced[1].opt_height, 1_536);
+        assert_eq!(quality[3].purpose, EngineProfilePurpose::UhdFixed);
+        assert_eq!(lite[3].purpose, EngineProfilePurpose::UhdFixed);
+
+        let mut invalid = balanced;
+        invalid[2].max_width = 3_840;
+        assert_eq!(
+            validate_profiles(InterpolationModel::RifeV426Scale05, &invalid)
+                .expect_err("changed profile contract must fail")
+                .code,
+            "frame_interpolation_manifest_invalid"
+        );
+    }
+
+    #[test]
+    fn builder_arguments_preserve_every_ordered_profile() {
+        let profiles = expected_profiles(InterpolationModel::RifeV426);
+        let mut command = Command::new("builder");
+        append_engine_profile_arguments(&mut command, &profiles);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments.len(), profiles.len() * 4);
+        assert_eq!(arguments[0], "--profile=0");
+        assert_eq!(arguments[1], "--minShapes=input:1x11x64x64");
+        assert_eq!(arguments[12], "--profile=3");
+        assert_eq!(arguments[13], "--minShapes=input:1x11x2176x3840");
+        assert_eq!(arguments[15], "--maxShapes=input:1x11x2176x3840");
+    }
+
+    #[test]
+    fn engine_cache_key_covers_the_complete_profile_contract() {
+        let gpu = GpuInfo {
+            name: "NVIDIA RTX test".to_string(),
+            uuid: "GPU-test".to_string(),
+            driver: "test-driver".to_string(),
+        };
+        let mut runtime = ready_report()
+            .runtime
+            .expect("runtime")
+            .models
+            .into_iter()
+            .next()
+            .expect("model");
+        let original = engine_cache_key(&gpu, RIFE_TENSORRT_VERSION, "builder-sha", &runtime);
+        runtime.profiles[1].max_width -= runtime.model.shape_alignment();
+        let changed = engine_cache_key(&gpu, RIFE_TENSORRT_VERSION, "builder-sha", &runtime);
+        assert_ne!(original, changed);
     }
 
     #[test]

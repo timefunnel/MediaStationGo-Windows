@@ -730,11 +730,13 @@ bool configure_shape(nvinfer1::ICudaEngine &engine,
                      char *error, size_t error_capacity)
 {
     constexpr int32_t kUniversalProfile = 0;
-    constexpr int32_t kOptimizedProfile = 1;
-    constexpr int32_t kRequiredProfiles = 2;
+    constexpr int32_t kMinimumProfiles = 3;
+    constexpr int32_t kMaximumProfiles = 4;
     constexpr int32_t kProfileMax = 16384;
-    constexpr int32_t kOptimizedHeight = 2176;
-    constexpr int32_t kOptimizedWidth = 3840;
+    constexpr int32_t kMidWidth = 2560;
+    constexpr int32_t kUhdHeight = 2176;
+    constexpr int32_t kUhdWidth = 3840;
+    constexpr int32_t kDciWidth = 4096;
     if (!padded_dimension(source_width, shape_alignment, padded_width)
         || !padded_dimension(source_height, shape_alignment, padded_height)) {
         set_error(error, error_capacity,
@@ -743,10 +745,16 @@ bool configure_shape(nvinfer1::ICudaEngine &engine,
                   source_width, source_height, shape_alignment);
         return false;
     }
-    if (!stream || engine.getNbOptimizationProfiles() != kRequiredProfiles) {
+    if (!stream) {
+        set_error(error, error_capacity, "The RIFE CUDA stream is missing");
+        return false;
+    }
+    const int32_t profile_count = engine.getNbOptimizationProfiles();
+    if (profile_count < kMinimumProfiles || profile_count > kMaximumProfiles) {
         set_error(error, error_capacity,
-                  "TensorRT engine must expose exactly two optimization "
-                  "profiles (universal and optimized)");
+                  "TensorRT engine must expose three or four ordered "
+                  "optimization profiles, received %d",
+                  profile_count);
         return false;
     }
     auto profile_shape = [&](int32_t profile,
@@ -758,41 +766,67 @@ bool configure_shape(nvinfer1::ICudaEngine &engine,
         return shape.nbDims == 4 && shape.d[0] == 1 && shape.d[1] == 11
             && shape.d[2] == height && shape.d[3] == width;
     };
-    const nvinfer1::Dims universal_min = profile_shape(
-        kUniversalProfile, nvinfer1::OptProfileSelector::kMIN);
-    const nvinfer1::Dims universal_opt = profile_shape(
-        kUniversalProfile, nvinfer1::OptProfileSelector::kOPT);
-    const nvinfer1::Dims universal_max = profile_shape(
-        kUniversalProfile, nvinfer1::OptProfileSelector::kMAX);
-    const nvinfer1::Dims optimized_min = profile_shape(
-        kOptimizedProfile, nvinfer1::OptProfileSelector::kMIN);
-    const nvinfer1::Dims optimized_opt = profile_shape(
-        kOptimizedProfile, nvinfer1::OptProfileSelector::kOPT);
-    const nvinfer1::Dims optimized_max = profile_shape(
-        kOptimizedProfile, nvinfer1::OptProfileSelector::kMAX);
-    if (!shape_matches(universal_min, static_cast<int32_t>(shape_alignment),
-                       static_cast<int32_t>(shape_alignment))
-        || !shape_matches(universal_opt, kOptimizedHeight, kOptimizedWidth)
-        || !shape_matches(universal_max, kProfileMax, kProfileMax)
-        || !shape_matches(optimized_min, kOptimizedHeight, kOptimizedWidth)
-        || !shape_matches(optimized_opt, kOptimizedHeight, kOptimizedWidth)
-        || !shape_matches(optimized_max, kOptimizedHeight, kOptimizedWidth)) {
+    std::array<nvinfer1::Dims, kMaximumProfiles> profile_mins{};
+    std::array<nvinfer1::Dims, kMaximumProfiles> profile_opts{};
+    std::array<nvinfer1::Dims, kMaximumProfiles> profile_maxs{};
+    for (int32_t profile = 0; profile < profile_count; ++profile) {
+        profile_mins[profile] = profile_shape(
+            profile, nvinfer1::OptProfileSelector::kMIN);
+        profile_opts[profile] = profile_shape(
+            profile, nvinfer1::OptProfileSelector::kOPT);
+        profile_maxs[profile] = profile_shape(
+            profile, nvinfer1::OptProfileSelector::kMAX);
+    }
+    const int32_t alignment = static_cast<int32_t>(shape_alignment);
+    const int32_t mid_height = (1440 + alignment - 1) / alignment * alignment;
+    auto contract_matches = [&](int32_t profile,
+                                int32_t min_height, int32_t min_width,
+                                int32_t opt_height, int32_t opt_width,
+                                int32_t max_height, int32_t max_width) {
+        return shape_matches(profile_mins[profile], min_height, min_width)
+            && shape_matches(profile_opts[profile], opt_height, opt_width)
+            && shape_matches(profile_maxs[profile], max_height, max_width);
+    };
+    const bool universal_valid = contract_matches(
+        kUniversalProfile, alignment, alignment, kUhdHeight, kUhdWidth,
+        kProfileMax, kProfileMax);
+    const bool mid_valid = contract_matches(
+        1, alignment, alignment, mid_height, kMidWidth,
+        mid_height, kMidWidth);
+    const bool four_k_valid = contract_matches(
+        2, alignment, alignment, kUhdHeight, kUhdWidth,
+        kUhdHeight, kDciWidth);
+    const bool uhd_fixed_valid = profile_count == 3 || contract_matches(
+        3, kUhdHeight, kUhdWidth, kUhdHeight, kUhdWidth,
+        kUhdHeight, kUhdWidth);
+    if (!universal_valid || !mid_valid || !four_k_valid || !uhd_fixed_valid) {
         set_error(error, error_capacity,
-                  "TensorRT optimization profile contract is incompatible "
-                  "universal=%dx%d+%dx%d+%dx%d "
-                  "optimized=%dx%d+%dx%d+%dx%d alignment=%u",
-                  universal_min.d[3], universal_min.d[2],
-                  universal_opt.d[3], universal_opt.d[2],
-                  universal_max.d[3], universal_max.d[2],
-                  optimized_min.d[3], optimized_min.d[2],
-                  optimized_opt.d[3], optimized_opt.d[2],
-                  optimized_max.d[3], optimized_max.d[2], shape_alignment);
+                  "TensorRT ordered optimization profile contract is "
+                  "incompatible count=%d alignment=%u",
+                  profile_count, shape_alignment);
         return false;
     }
-    const int32_t selected_profile =
-        padded_width == static_cast<uint32_t>(kOptimizedWidth)
-            && padded_height == static_cast<uint32_t>(kOptimizedHeight)
-        ? kOptimizedProfile : kUniversalProfile;
+    int32_t selected_profile = kUniversalProfile;
+    uint64_t selected_span = std::numeric_limits<uint64_t>::max();
+    for (int32_t profile = 1; profile < profile_count; ++profile) {
+        const nvinfer1::Dims &minimum = profile_mins[profile];
+        const nvinfer1::Dims &maximum = profile_maxs[profile];
+        if (padded_width < static_cast<uint32_t>(minimum.d[3])
+            || padded_height < static_cast<uint32_t>(minimum.d[2])
+            || padded_width > static_cast<uint32_t>(maximum.d[3])
+            || padded_height > static_cast<uint32_t>(maximum.d[2])) {
+            continue;
+        }
+        const uint64_t width_steps = static_cast<uint64_t>(
+            (maximum.d[3] - minimum.d[3]) / alignment + 1);
+        const uint64_t height_steps = static_cast<uint64_t>(
+            (maximum.d[2] - minimum.d[2]) / alignment + 1);
+        const uint64_t span = width_steps * height_steps;
+        if (span < selected_span) {
+            selected_profile = profile;
+            selected_span = span;
+        }
+    }
     if (!execution.setOptimizationProfileAsync(selected_profile, stream)) {
         set_error(error, error_capacity,
                   "TensorRT rejected optimization profile %d for %ux%u",

@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $RuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
 $TensorRtVersion = "1.4.0.76"
-$RuntimeAbi = 6
+$RuntimeAbi = 7
 $RuntimeBin = Join-Path $RuntimeDir "bin"
 $SourceModelDir = Join-Path $RuntimeDir "vapoursynth\plugins\models\rife"
 $Models = @(
@@ -17,10 +17,12 @@ $Models = @(
         File = "rife_v4.26_fp16_io.onnx"
         Scale = "1.0"
         Alignment = 64
-        MinWidth = 64
-        MinHeight = 64
-        OptWidth = 3840
-        OptHeight = 2176
+        Profiles = @(
+            @{ Purpose = "universal"; MinWidth = 64; MinHeight = 64; OptWidth = 3840; OptHeight = 2176; MaxWidth = 16384; MaxHeight = 16384 },
+            @{ Purpose = "mid-range"; MinWidth = 64; MinHeight = 64; OptWidth = 2560; OptHeight = 1472; MaxWidth = 2560; MaxHeight = 1472 },
+            @{ Purpose = "4k-range"; MinWidth = 64; MinHeight = 64; OptWidth = 3840; OptHeight = 2176; MaxWidth = 4096; MaxHeight = 2176 },
+            @{ Purpose = "uhd-fixed"; MinWidth = 3840; MinHeight = 2176; OptWidth = 3840; OptHeight = 2176; MaxWidth = 3840; MaxHeight = 2176 }
+        )
     },
     @{
         Id = "rife-v4.26-scale0.5"
@@ -28,10 +30,11 @@ $Models = @(
         File = "rife_v4.26_scale0.5.onnx"
         Scale = "0.5"
         Alignment = 128
-        MinWidth = 128
-        MinHeight = 128
-        OptWidth = 3840
-        OptHeight = 2176
+        Profiles = @(
+            @{ Purpose = "universal"; MinWidth = 128; MinHeight = 128; OptWidth = 3840; OptHeight = 2176; MaxWidth = 16384; MaxHeight = 16384 },
+            @{ Purpose = "mid-range"; MinWidth = 128; MinHeight = 128; OptWidth = 2560; OptHeight = 1536; MaxWidth = 2560; MaxHeight = 1536 },
+            @{ Purpose = "4k-range"; MinWidth = 128; MinHeight = 128; OptWidth = 3840; OptHeight = 2176; MaxWidth = 4096; MaxHeight = 2176 }
+        )
     },
     @{
         Id = "rife-v4.25-lite"
@@ -39,10 +42,12 @@ $Models = @(
         File = "rife_v4.25_lite_fp16_io.onnx"
         Scale = "1.0"
         Alignment = 128
-        MinWidth = 128
-        MinHeight = 128
-        OptWidth = 3840
-        OptHeight = 2176
+        Profiles = @(
+            @{ Purpose = "universal"; MinWidth = 128; MinHeight = 128; OptWidth = 3840; OptHeight = 2176; MaxWidth = 16384; MaxHeight = 16384 },
+            @{ Purpose = "mid-range"; MinWidth = 128; MinHeight = 128; OptWidth = 2560; OptHeight = 1536; MaxWidth = 2560; MaxHeight = 1536 },
+            @{ Purpose = "4k-range"; MinWidth = 128; MinHeight = 128; OptWidth = 3840; OptHeight = 2176; MaxWidth = 4096; MaxHeight = 2176 },
+            @{ Purpose = "uhd-fixed"; MinWidth = 3840; MinHeight = 2176; OptWidth = 3840; OptHeight = 2176; MaxWidth = 3840; MaxHeight = 2176 }
+        )
     }
 )
 
@@ -107,14 +112,17 @@ foreach ($Model in $Models) {
         scale = $Model.Scale
         precision = "fp16"
         shapeAlignment = $Model.Alignment
-        profile = [ordered]@{
-            minWidth = $Model.MinWidth
-            minHeight = $Model.MinHeight
-            optWidth = $Model.OptWidth
-            optHeight = $Model.OptHeight
-            maxWidth = 16384
-            maxHeight = 16384
-        }
+        profiles = @($Model.Profiles | ForEach-Object {
+            [ordered]@{
+                purpose = $_.Purpose
+                minWidth = $_.MinWidth
+                minHeight = $_.MinHeight
+                optWidth = $_.OptWidth
+                optHeight = $_.OptHeight
+                maxWidth = $_.MaxWidth
+                maxHeight = $_.MaxHeight
+            }
+        })
     }
 }
 Get-ChildItem -LiteralPath $ModelDir -Filter "*.onnx" -File | Where-Object {
@@ -122,7 +130,7 @@ Get-ChildItem -LiteralPath $ModelDir -Filter "*.onnx" -File | Where-Object {
 } | Remove-Item -Force
 
 $Manifest = [ordered]@{
-    schema = 3
+    schema = 4
     tensorRtVersion = $TensorRtVersion
     runtimeAbi = $RuntimeAbi
     runtimeDll = "rife_runtime.dll"
