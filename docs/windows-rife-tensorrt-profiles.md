@@ -508,6 +508,22 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
 - 自动化 `CloseMainWindow()` 不会关闭该自绘/CEF 主窗口；测试进程已按 PID 清理并
   确认无残留。因此本轮不伪报自动化正常退出，启动与运行组件烟测结论不受影响。
 
+#### 2026-08-02 质量档偶发花屏闪烁诊断
+
+- 《黑衣人2》3840x2160、23.976 fps、HEVC Main 10 在质量优先档命中 RIFE v4.26
+  profile 3。用户明确报告片内约 `13:50` 闪烁；日志在片内 `828.95` 秒同一时刻
+  连续三次报告 libplacebo `Peak detection usage error`，并明确提示输出可能错误。
+- 随后的多次主观闪烁期间，日志又在 `02:50:57`、`02:51:26`、`02:52:01` 和
+  `02:52:05` 逐组报告相同错误。对应时段没有 RIFE 推理失败、Engine/profile
+  切换或 D3D11 P010 输入错误，不能把问题归因于质量模型吞吐或用降档掩盖。
+- 当前 Release 打包的是 libplacebo `7.360.1`。mpv 上游问题
+  [`#17685`](https://github.com/mpv-player/mpv/issues/17685) 的 D3D11 花屏表现和日志
+  完全一致；上游确认根因是合并 shader 的 HLSL 资源寄存器碰撞，并由 libplacebo
+  [MR 816](https://code.videolan.org/videolan/libplacebo/-/merge_requests/816) 的提交
+  `82224764a98164ce9d2d9a10e4fefca934e475fb` 修复。
+- 下一步固定并打包包含该提交的 libplacebo，重建 mpv/Release 后回到同一片段复测。
+  不采用关闭 peak detection、禁用 film grain、切换 Lite 或关闭插帧作为正式修复。
+
 #### 未来重启条件
 
 - 若未来重启任务 3，首选方向仍是让显示器的实际
