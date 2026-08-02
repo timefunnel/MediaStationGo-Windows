@@ -23,6 +23,12 @@ $RifeRuntimeHeader = Join-Path $PSScriptRoot "mpv\rife_runtime.h"
 $RifeRuntimeSource = Join-Path $PSScriptRoot "mpv\rife_runtime.cpp"
 $RifeRuntimeBuildScript = Join-Path $PSScriptRoot "build_rife_runtime.ps1"
 $RifeRuntimeStageScript = Join-Path $PSScriptRoot "stage_frame_interpolation_runtime.ps1"
+$LibplaceboBuildScript = Join-Path $PSScriptRoot "build_libplacebo_source.ps1"
+$LibplaceboHdrPeakPatch = Join-Path $PSScriptRoot "libplacebo\2d0979f-hdr-peak-source-colorspace.patch"
+$LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
+$LibplaceboVersion = "7.364.0"
+$LibplaceboDllName = "libplacebo-364.dll"
+$LibplaceboInstallDir = Join-Path $RepoRoot "third_party\libplacebo-install-$LibplaceboCommit"
 $RifeRuntimeHeaderDestination = Join-Path $MpvSourceDir "video\filter\rife_runtime.h"
 $FrameInterpolationRuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
 $RifeRuntimeBuildDir = Join-Path $RepoRoot "build\rife-runtime"
@@ -36,7 +42,9 @@ function Get-MpvSourceContractHash {
     $Material = @(
         $NvofMemcSource,
         $NvofMemcPatch,
-        $RifeRuntimeHeader
+        $RifeRuntimeHeader,
+        $LibplaceboBuildScript,
+        $LibplaceboHdrPeakPatch
     ) | ForEach-Object {
         (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
     }
@@ -49,6 +57,28 @@ function Get-MpvSourceContractHash {
     }
 }
 
+function Test-GitPatchApplies {
+    param(
+        [string]$SourceDirectory,
+        [string]$PatchPath,
+        [switch]$Reverse
+    )
+    $Arguments = @("-C", $SourceDirectory, "apply")
+    if ($Reverse) {
+        $Arguments += "--reverse"
+    }
+    $Arguments += @("--check", $PatchPath)
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & git @Arguments 2>$null
+        $Succeeded = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    return $Succeeded
+}
+
 # MSYS2 environment based on target architecture
 if ($Arch -eq "arm64") {
     $MsysEnv = "CLANGARM64"
@@ -59,31 +89,7 @@ if ($Arch -eq "arm64") {
     $PkgPrefix = "mingw-w64-clang-x86_64"
     $LibMachine = "X64"
 }
-
-# Check if already built
-$OutputLib = Join-Path $OutputDir "lib\mpv.lib"
-$SourceContractStamp = Join-Path $OutputDir "lib\mediastation-mpv-source.sha256"
-$SourceContractHash = Get-MpvSourceContractHash
-$SourceContractMatches = (Test-Path -LiteralPath $SourceContractStamp -PathType Leaf) `
-    -and ((Get-Content -LiteralPath $SourceContractStamp -Raw).Trim() -eq $SourceContractHash)
-if ((Test-Path $OutputLib) -and -not $Force -and $SourceContractMatches) {
-    $OutputLibDir = Split-Path -Parent $OutputLib
-    & $RifeRuntimeBuildScript -RuntimeDir $FrameInterpolationRuntimeDir `
-        -OutputDir $RifeRuntimeBuildDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to build the RIFE runtime bridge"
-    }
-    Copy-Item -LiteralPath (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") `
-        -Destination (Join-Path $OutputLibDir "rife_runtime.dll") -Force
-    & $RifeRuntimeStageScript -OutputLibDir $OutputLibDir
-    Write-Host "mpv already built at $OutputDir" -ForegroundColor Green
-    Write-Host "Use -Force to rebuild"
-    exit 0
-}
-if ((Test-Path $OutputLib) -and -not $Force) {
-    Write-Host "mpv source contract changed; rebuilding the custom mpv DLL" -ForegroundColor Yellow
-    $Force = $true
-}
+$LibplaceboLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\libplacebo-$LibplaceboCommit"
 
 # Verify mpv submodule exists
 if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
@@ -98,6 +104,8 @@ $RequiredNvofFiles = @(
     $RifeRuntimeSource,
     $RifeRuntimeBuildScript,
     $RifeRuntimeStageScript,
+    $LibplaceboBuildScript,
+    $LibplaceboHdrPeakPatch,
     (Join-Path $FrameInterpolationRuntimeDir "bin\cudart64_12.dll"),
     (Join-Path $FrameInterpolationRuntimeDir ".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_rtx_1_4.dll"),
     (Join-Path $NvofApiIncludeDir "nvOpticalFlowCommon.h"),
@@ -138,17 +146,145 @@ if (-not (Test-Path $MsysBash)) {
     Write-Host "MSYS2 installed" -ForegroundColor Green
 }
 
+function Assert-PinnedLibplaceboInstall {
+    $PinnedDll = Join-Path $LibplaceboInstallDir "bin\$LibplaceboDllName"
+    $PkgConfigFile = Join-Path $LibplaceboInstallDir "lib\pkgconfig\libplacebo.pc"
+    if (-not (Test-Path -LiteralPath $PinnedDll -PathType Leaf)) {
+        throw "Pinned libplacebo DLL is missing: $PinnedDll"
+    }
+    if (-not (Test-Path -LiteralPath $PkgConfigFile -PathType Leaf)) {
+        throw "Pinned libplacebo pkg-config file is missing: $PkgConfigFile"
+    }
+    $VersionLine = Get-Content -LiteralPath $PkgConfigFile |
+        Where-Object { $_ -match '^Version:\s*' } |
+        Select-Object -First 1
+    if (($VersionLine -replace '^Version:\s*', '').Trim() -ne $LibplaceboVersion) {
+        throw "Pinned libplacebo version mismatch in ${PkgConfigFile}: $VersionLine"
+    }
+}
+
+function Sync-LibplaceboLinkPrefix {
+    $ManagedRoot = [System.IO.Path]::GetFullPath((Join-Path $MsysPath "mediastation")).TrimEnd('\') + '\'
+    $Target = [System.IO.Path]::GetFullPath($LibplaceboLinkDir)
+    if (-not $Target.StartsWith($ManagedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to refresh a libplacebo link prefix outside the managed MSYS2 directory: $Target"
+    }
+    if ($Target -match '[^\x00-\x7F]') {
+        throw "The MSYS2 path must be ASCII so the MinGW linker can resolve pinned libraries: $Target"
+    }
+    if (Test-Path -LiteralPath $Target) {
+        Remove-Item -LiteralPath $Target -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    Get-ChildItem -LiteralPath $LibplaceboInstallDir -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $Target -Recurse -Force
+    }
+
+    # Meson resolves MinGW import libraries through narrow paths. Keep the
+    # reproducible install in the repo, but expose an ASCII MSYS2 link prefix.
+    $PkgConfigFile = Join-Path $Target "lib\pkgconfig\libplacebo.pc"
+    $AsciiPrefix = $Target -replace '\\', '/'
+    $PkgConfig = Get-Content -LiteralPath $PkgConfigFile -Raw
+    $PkgConfig = $PkgConfig -replace '(?m)^prefix=.*$', "prefix=$AsciiPrefix"
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($PkgConfigFile, $PkgConfig, $Utf8NoBom)
+    if (-not (Test-Path -LiteralPath (Join-Path $Target "bin\$LibplaceboDllName") -PathType Leaf)) {
+        throw "Pinned libplacebo link prefix is incomplete: $Target"
+    }
+}
+
+function Assert-MpvUsesPinnedLibplacebo {
+    param([string]$OutputLibDir)
+    $MpvDll = Join-Path $OutputLibDir "libmpv-2.dll"
+    $PinnedDll = Join-Path $OutputLibDir $LibplaceboDllName
+    if (-not (Test-Path -LiteralPath $MpvDll -PathType Leaf)) {
+        throw "Packaged libmpv DLL is missing: $MpvDll"
+    }
+    if (-not (Test-Path -LiteralPath $PinnedDll -PathType Leaf)) {
+        throw "Packaged pinned libplacebo DLL is missing: $PinnedDll"
+    }
+    $UnexpectedDlls = Get-ChildItem -LiteralPath $OutputLibDir -Filter "libplacebo-*.dll" -File |
+        Where-Object { $_.Name -notin @($LibplaceboDllName, "libplacebo-360.dll") }
+    if ($UnexpectedDlls) {
+        throw "Unexpected libplacebo runtime DLLs were packaged: $($UnexpectedDlls.Name -join ', ')"
+    }
+    $Objdump = Join-Path $MsysPath "$MsysEnv\bin\objdump.exe"
+    if (-not (Test-Path -LiteralPath $Objdump -PathType Leaf)) {
+        throw "objdump is required to verify libmpv dependencies: $Objdump"
+    }
+    $Imports = (& $Objdump -p $MpvDll 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect libmpv dependencies with objdump"
+    }
+    if ($Imports -notmatch "(?im)DLL Name:\s+$([regex]::Escape($LibplaceboDllName))\s*$") {
+        throw "libmpv does not import the pinned $LibplaceboDllName"
+    }
+    if ($Imports -match "(?im)DLL Name:\s+libplacebo-(?!364\.dll)\d+\.dll\s*$") {
+        throw "libmpv imports an unpinned libplacebo runtime"
+    }
+
+    # MSYS2 FFmpeg enables its own libplacebo avfilter and still imports ABI
+    # 360. It may coexist, but the gpu-next renderer itself must import 364.
+    $LegacyDll = Join-Path $OutputLibDir "libplacebo-360.dll"
+    if (Test-Path -LiteralPath $LegacyDll -PathType Leaf) {
+        $AvfilterDll = Get-ChildItem -LiteralPath $OutputLibDir -Filter "avfilter-*.dll" -File |
+            Select-Object -First 1
+        if (-not $AvfilterDll) {
+            throw "Legacy libplacebo-360.dll was packaged without an FFmpeg avfilter dependency"
+        }
+        $AvfilterImports = (& $Objdump -p $AvfilterDll.FullName 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or
+            $AvfilterImports -notmatch '(?im)DLL Name:\s+libplacebo-360\.dll\s*$') {
+            throw "Legacy libplacebo-360.dll is not justified by the packaged FFmpeg avfilter"
+        }
+    }
+}
+
+& $LibplaceboBuildScript -MsysPath $MsysPath -Arch $Arch
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build pinned libplacebo"
+}
+Assert-PinnedLibplaceboInstall
+Sync-LibplaceboLinkPrefix
+
+# Check if already built only after refreshing and validating pinned runtime inputs.
+$OutputLib = Join-Path $OutputDir "lib\mpv.lib"
+$SourceContractStamp = Join-Path $OutputDir "lib\mediastation-mpv-source.sha256"
+$SourceContractHash = Get-MpvSourceContractHash
+$SourceContractMatches = (Test-Path -LiteralPath $SourceContractStamp -PathType Leaf) `
+    -and ((Get-Content -LiteralPath $SourceContractStamp -Raw).Trim() -eq $SourceContractHash)
+if ((Test-Path $OutputLib) -and -not $Force -and $SourceContractMatches) {
+    $OutputLibDir = Split-Path -Parent $OutputLib
+    & $RifeRuntimeBuildScript -RuntimeDir $FrameInterpolationRuntimeDir `
+        -OutputDir $RifeRuntimeBuildDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to build the RIFE runtime bridge"
+    }
+    Copy-Item -LiteralPath (Join-Path $RifeRuntimeBuildDir "rife_runtime.dll") `
+        -Destination (Join-Path $OutputLibDir "rife_runtime.dll") -Force
+    & $RifeRuntimeStageScript -OutputLibDir $OutputLibDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to refresh the dynamic RIFE runtime"
+    }
+    Assert-MpvUsesPinnedLibplacebo $OutputLibDir
+    Write-Host "mpv already built at $OutputDir" -ForegroundColor Green
+    Write-Host "Use -Force to rebuild"
+    exit 0
+}
+if ((Test-Path $OutputLib) -and -not $Force) {
+    Write-Host "mpv source contract changed; rebuilding the custom mpv DLL" -ForegroundColor Yellow
+    $Force = $true
+}
+
 try {
-    & git -C $MpvSourceDir apply --check $NvofMemcPatch 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $NvofMemcPatch) {
         & git -C $MpvSourceDir apply $NvofMemcPatch
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to apply the NVOF MEMC mpv patch"
         }
         $NvofMemcPatchApplied = $true
     } else {
-        & git -C $MpvSourceDir apply --reverse --check $NvofMemcPatch 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        if (-not (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $NvofMemcPatch -Reverse)) {
             throw "The mpv source does not match the pinned NVOF MEMC patch"
         }
     }
@@ -198,6 +334,7 @@ function ConvertTo-MsysPath($WinPath) {
 
 $MsysMpvSource = ConvertTo-MsysPath $MpvSourceDir
 $MsysNvofApiInclude = ConvertTo-MsysPath $NvofApiIncludeDir
+$MsysLibplaceboPrefix = ConvertTo-MsysPath $LibplaceboLinkDir
 
 # Run a command in MSYS2
 function Invoke-Msys2 {
@@ -218,7 +355,6 @@ pacman -S --needed --noconfirm \
     $PkgPrefix-meson \
     $PkgPrefix-pkgconf \
     $PkgPrefix-ffmpeg \
-    $PkgPrefix-libplacebo \
     $PkgPrefix-libass \
     $PkgPrefix-vulkan-headers \
     $PkgPrefix-vulkan-loader \
@@ -241,6 +377,7 @@ if (-not (Test-Path (Join-Path $MesonBuildDir "build.ninja"))) {
     Invoke-Msys2 @"
 cd '$MsysMpvSource' && \
 CFLAGS="-I$MsysNvofApiInclude" \
+PKG_CONFIG_PATH="$MsysLibplaceboPrefix/lib/pkgconfig:`$PKG_CONFIG_PATH" \
 meson setup build --default-library=shared \
     -Dlibmpv=true \
     -Dcplayer=true \
@@ -397,6 +534,7 @@ Write-Host "=== Collecting runtime dependencies ===" -ForegroundColor Cyan
 $MsysBinDir = Join-Path $MsysPath "$MsysEnv\bin"
 $MsysEnvLower = $MsysEnv.ToLower()
 $MsysLibDir = ConvertTo-MsysPath $LibDir
+$MsysLibplaceboBin = ConvertTo-MsysPath (Join-Path $LibplaceboLinkDir "bin")
 
 # mpv loads VSScript dynamically, so it does not appear in libmpv's import
 # table. Stage it explicitly under the Windows name mpv probes, then let the
@@ -413,6 +551,7 @@ Copy-Item $VsCoreSource (Join-Path $LibDir "libvapoursynth.dll")
 $DepScript = @"
 #!/bin/bash
 MSYS_BIN=/$MsysEnvLower/bin
+PINNED_BIN='$MsysLibplaceboBin'
 OUT_DIR='$MsysLibDir'
 declare -A seen
 
@@ -422,9 +561,15 @@ resolve_deps() {
     [ -n `"`${seen[`$dll]}`" ] && return
     seen[`$dll]=1
     while read -r dep; do
-        if [ -f `"`$MSYS_BIN/`$dep`" ] && [ -z `"`${seen[`$dep]}`" ]; then
-            cp -v `"`$MSYS_BIN/`$dep`" `"`$OUT_DIR/`"
-            resolve_deps `"`$dep`" `"`$MSYS_BIN/`$dep`"
+        local source=""
+        if [ -f `"`$PINNED_BIN/`$dep`" ]; then
+            source=`"`$PINNED_BIN/`$dep`"
+        elif [ -f `"`$MSYS_BIN/`$dep`" ]; then
+            source=`"`$MSYS_BIN/`$dep`"
+        fi
+        if [ -n `"`$source`" ] && [ -z `"`${seen[`$dep]}`" ]; then
+            cp -v `"`$source`" `"`$OUT_DIR/`"
+            resolve_deps `"`$dep`" `"`$source`"
         fi
     done < <(objdump -p `"`$path`" 2>/dev/null | awk '/DLL Name/ {print `$3}')
 }
@@ -480,6 +625,7 @@ if (-not (Test-Path (Join-Path $LibDir "avcodec.lib"))) {
     exit 1
 }
 Write-Host "Generated avcodec.lib" -ForegroundColor Green
+Assert-MpvUsesPinnedLibplacebo $LibDir
 [System.IO.File]::WriteAllText($SourceContractStamp, $SourceContractHash, $Utf8NoBom)
 
 Write-Host ""

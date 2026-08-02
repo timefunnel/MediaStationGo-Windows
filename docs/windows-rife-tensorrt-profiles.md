@@ -20,6 +20,8 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
 固定显示模式硬切会黑屏且不属于 VRR，已连同实验性 VRR patch、协议和设置页入口
 一起撤回；撤回后的自定义 mpv 与 Release 已干净重建并通过启动烟测。后续只在
 驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
+质量档 HDR10 偶发花屏仍在独立排查中；该问题不改变已冻结的 RIFE 三档、
+Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不得宣称质量档问题已关闭。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
@@ -516,13 +518,66 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
 - 随后的多次主观闪烁期间，日志又在 `02:50:57`、`02:51:26`、`02:52:01` 和
   `02:52:05` 逐组报告相同错误。对应时段没有 RIFE 推理失败、Engine/profile
   切换或 D3D11 P010 输入错误，不能把问题归因于质量模型吞吐或用降档掩盖。
-- 当前 Release 打包的是 libplacebo `7.360.1`。mpv 上游问题
-  [`#17685`](https://github.com/mpv-player/mpv/issues/17685) 的 D3D11 花屏表现和日志
-  完全一致；上游确认根因是合并 shader 的 HLSL 资源寄存器碰撞，并由 libplacebo
-  [MR 816](https://code.videolan.org/videolan/libplacebo/-/merge_requests/816) 的提交
-  `82224764a98164ce9d2d9a10e4fefca934e475fb` 修复。
-- 下一步固定并打包包含该提交的 libplacebo，重建 mpv/Release 后回到同一片段复测。
-  不采用关闭 peak detection、禁用 film grain、切换 Lite 或关闭插帧作为正式修复。
+- 原 Release 打包的是 libplacebo `7.360.1`。首次固定到
+  `82224764a98164ce9d2d9a10e4fefca934e475fb`、关闭 delayed peak detection 并重建
+  libplacebo `7.362.0`、mpv 和 Release 后，同一影片仍在持续播放一段时间后成组报告
+  `Peak detection usage error`，因此 mpv `#17685` 不能作为本轮 HEVC HDR10 场景的
+  已确认根因，`8222476` 也不是完整修复。
+- libplacebo 后继提交 `c43baa7a0cff623ef416c60d5b926342903279e6` 确实修复了
+  `8222476` 引入的 raster pass UAV 重复偏移；但固定并打包该提交、完整重建
+  libplacebo/mpv/Release 后，真实播放《黑衣人2》质量档仍在 `15:13:49`、`15:13:54`、
+  `15:14:07`、`15:14:35`、`15:14:42`、`15:15:07`、`15:19:10`、`15:20:47` 和
+  `15:23:46` 成组报告相同 peak detection usage error。实际合同为 3840x2160
+  HEVC Main 10 HDR10、23.976 fps、RIFE v4.26 scale=1.0、profile=3、D3D11 P010、
+  TensorRT-RTX FP16；同期没有 TensorRT 推理失败、D3D11 device lost 或 gpu-next
+  render failure。因此 `c43baa7` 也不是完整修复。
+- `c43baa7` 同时包含 libplacebo `27aa71a97f4daed84916936572fa6a2e1c3eedb7`
+  的第一版线性光帧混合。mpv 上游问题
+  [`#17847`](https://github.com/mpv-player/mpv/issues/17847) 明确记录该版本会在播放中
+  随机亮闪，问题 [`#17899`](https://github.com/mpv-player/mpv/issues/17899) 也将闪烁
+  回归指向 `27aa71a9`。上游先回退该实现，再由
+  `1733c8601edec161b714e4a799c72a9f5e5aa2f0` 以不缓存线性光帧的第二版实现修复，
+  该提交明确关闭 `#17847/#17899`。
+- 固定 libplacebo `1733c860`、版本/ABI `7.364.0` 并完整重建后，旧修复版在
+  `15:36:55`、`15:36:58`、`15:38:24` 和 `15:38:32` 各出现 3 条 peak usage
+  error，共 12 条；因此它只解决上游 `27aa71a9` 的随机亮闪回归，不能单独关闭
+  本轮问题。
+- 继续叠加上游 `2d0979fb54e025e904c7372666fffbf5dae40f66` 后，已确认补丁真实
+  应用于源码并重建 libplacebo、mpv 和 Release；同片质量档从 `16:17:38`
+  开始实播，在 `16:18:02` 和 `16:18:10` 各出现 3 条相同错误。该提交修复的是
+  线性缩放时 peak detection 读取错误颜色状态，不是当前未执行 peak 缓冲区的完整修复。
+- 把非延迟 peak detection 立即落到独立 FBO 的候选已完整重建，但质量档从
+  `16:39:18` 开始播放后仍在 `16:40:37` 连续出现 3 条相同错误，因此该候选已证伪并
+  撤回。检测 pass 确实单独提交，错误仍表示其 SSBO 计数偶发为 0，不能继续把问题
+  简化为 libplacebo 缺少 FBO 边界。
+- 当前根因候选转向共享 D3D11 immediate context 的管线状态竞争。libplacebo 的一次
+  compute pass 由多条 `CSSet*`、`Dispatch` 和解绑调用组成；`ID3D10Multithread` 的
+  内建保护只逐 API 串行化，而 RIFE 原有的显式 `Enter/Leave` 只能保证 RIFE 自己的
+  命令块不被打断，仍可能完整插入 libplacebo 的绑定与 `Dispatch` 之间并改写 compute
+  状态。Windows 插帧滤镜现已实现独立 `ID3DDeviceContextState`，在每个 RIFE D3D11
+  命令块前后原子交换并恢复调用方状态；不支持 D3D11.1 状态隔离时显式初始化失败。
+- 首轮状态隔离 Release 在 `17:01:20` 确认启用
+  `D3D11 context state isolation`，命中 RIFE v4.26 `scale=1.0`、profile 3；从片内
+  `3960` 秒连续播放约 5 分 30 秒，`Peak detection usage error`、RIFE/TensorRT
+  failure、D3D11 device lost、gpu-next/render failure 均为 0。源码审计随后发现动态
+  `caller_context_state` 断言必须位于 `ID3D10Multithread_Enter` 之后，避免并发调用者
+  在等待锁前误触断言；修正后重新完整构建 mpv 并打包 Release。
+- 最终滤镜源码 SHA-256 为
+  `AB113262220F60E7A34A995498C62F469007BA123D7491064F65A22F17DBD02F`，编译副本一致；
+  `libmpv-2.dll` 为
+  `183CCF83B0A39DDC59256DEB734322B00BDEE83AD3D0104579FD2DCC824F5A92`，打包副本一致；
+  `libplacebo-364.dll` 仍为
+  `E5BA3D8A9F35ECA86CD2B283051ECBC96BA914197DF5DECC41C7B9BDAD53CD01`。
+  规范化补丁空白前的等价 Release 在 `17:10:50` 再次确认状态隔离、质量模型和
+  profile 3，`17:11:00` 跳到片内 `3960` 秒后连续覆盖至 `17:14:38`，上述六类目标
+  错误仍全部为 0。补丁只移除无语义尾随空格，但源码合同按设计触发 libplacebo、
+  mpv 和 Release 干净重建；最终精确产物在 `17:26:04` 再次确认 3840x2160 P010、
+  状态隔离、RIFE v4.26 `scale=1.0` 和 profile 3，从片内 `3960` 秒继续播放至
+  `17:28:07`，目标错误仍全部为 0。
+- 该候选已通过此前稳定复现强度下的构建和日志门禁，但尚未完成用户视觉验收，不能
+  宣称偶发花屏已彻底关闭。仍不采用关闭 peak detection、禁用 film grain、切换
+  Lite、关闭插帧或启用 delayed 掩盖问题；下一步由用户在同片质量档确认画面，若仍
+  闪烁则继续按真实时间点取证。
 
 #### 未来重启条件
 

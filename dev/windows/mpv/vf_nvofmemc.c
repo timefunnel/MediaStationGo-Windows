@@ -406,7 +406,10 @@ struct priv {
     AVBufferRef *av_device_ref;
     ID3D11Device *device;
     ID3D11DeviceContext *context;
+    ID3D11DeviceContext1 *context1;
     ID3D10Multithread *multithread;
+    ID3DDeviceContextState *rife_context_state;
+    ID3DDeviceContextState *caller_context_state;
     struct texture_pool *pool;
     struct nvof_state nvof;
     struct rife_state rife;
@@ -458,14 +461,64 @@ static bool nvof_analysis_enabled(const struct priv *p)
 
 static void lock_d3d11_context(struct priv *p)
 {
-    mp_assert(p->multithread);
+    mp_assert(p->multithread && p->context1 && p->rife_context_state);
     ID3D10Multithread_Enter(p->multithread);
+    mp_assert(!p->caller_context_state);
+    ID3D11DeviceContext1_SwapDeviceContextState(
+        p->context1, p->rife_context_state, &p->caller_context_state);
+    mp_assert(p->caller_context_state);
 }
 
 static void unlock_d3d11_context(struct priv *p)
 {
-    mp_assert(p->multithread);
+    mp_assert(p->multithread && p->context1 && p->caller_context_state);
+    ID3D11DeviceContext1_SwapDeviceContextState(
+        p->context1, p->caller_context_state, NULL);
+    ID3DDeviceContextState_Release(p->caller_context_state);
+    p->caller_context_state = NULL;
     ID3D10Multithread_Leave(p->multithread);
+}
+
+static bool create_d3d11_context_state_isolation(struct mp_filter *f)
+{
+    struct priv *p = f->priv;
+    ID3D11Device1 *device1 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        p->device, &IID_ID3D11Device1, (void **)&device1);
+    if (FAILED(hr) || !device1) {
+        MP_ERR(f, "Frame interpolation requires ID3D11Device1 for "
+                  "D3D11 context state isolation hr=0x%08lx\n",
+               (unsigned long)hr);
+        return false;
+    }
+
+    hr = ID3D11DeviceContext_QueryInterface(
+        p->context, &IID_ID3D11DeviceContext1, (void **)&p->context1);
+    if (FAILED(hr) || !p->context1) {
+        MP_ERR(f, "Frame interpolation requires ID3D11DeviceContext1 for "
+                  "D3D11 context state isolation hr=0x%08lx\n",
+               (unsigned long)hr);
+        ID3D11Device1_Release(device1);
+        return false;
+    }
+
+    D3D_FEATURE_LEVEL feature_level = ID3D11Device_GetFeatureLevel(p->device);
+    D3D_FEATURE_LEVEL chosen_level = 0;
+    hr = ID3D11Device1_CreateDeviceContextState(
+        device1, 0, &feature_level, 1, D3D11_SDK_VERSION,
+        &IID_ID3D11Device, &chosen_level, &p->rife_context_state);
+    ID3D11Device1_Release(device1);
+    if (FAILED(hr) || !p->rife_context_state || chosen_level != feature_level) {
+        MP_ERR(f, "Frame interpolation could not create an isolated D3D11 "
+                  "context state hr=0x%08lx requested=0x%04x chosen=0x%04x\n",
+               (unsigned long)hr, (unsigned int)feature_level,
+               (unsigned int)chosen_level);
+        return false;
+    }
+
+    MP_INFO(f, "Frame interpolation D3D11 context state isolation ready "
+               "feature-level=0x%04x\n", (unsigned int)chosen_level);
+    return true;
 }
 
 static wchar_t *utf8_to_wide(void *parent, const char *value)
@@ -7125,6 +7178,13 @@ static void destroy(struct mp_filter *f)
     p->pool = NULL;
     destroy_nvof(f);
     av_buffer_unref(&p->av_device_ref);
+    mp_assert(!p->caller_context_state);
+    if (p->rife_context_state)
+        ID3DDeviceContextState_Release(p->rife_context_state);
+    p->rife_context_state = NULL;
+    if (p->context1)
+        ID3D11DeviceContext1_Release(p->context1);
+    p->context1 = NULL;
     if (p->multithread)
         ID3D10Multithread_Release(p->multithread);
     p->multithread = NULL;
@@ -7272,7 +7332,10 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         goto fail;
     }
     ID3D10Multithread_SetMultithreadProtected(p->multithread, TRUE);
-    MP_INFO(f, "Frame interpolation D3D11 context block locking enabled\n");
+    if (!create_d3d11_context_state_isolation(f))
+        goto fail;
+    MP_INFO(f, "Frame interpolation D3D11 context block locking and state "
+               "isolation enabled\n");
     if (p->opts->rife && !load_rife_bridge(f))
         goto fail;
     if (!queue_rife_prewarm(f))
