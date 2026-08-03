@@ -376,6 +376,11 @@ fn handle_message(message: BrowserMessage) -> bool {
             }
         }
         "playerStop" => {
+            // Leaving the player must also leave OS fullscreen; mpv's
+            // fullscreen property is window-global and does not reset when
+            // the file is unloaded, so without this the window stays
+            // fullscreen after returning home and the user has to press Esc.
+            jfn_platform_abi::get().set_fullscreen(false);
             jfn_mpv_stop();
             crate::mediastation_runtime::release_playback_resources();
             true
