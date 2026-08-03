@@ -605,7 +605,7 @@
         }
     }
 
-    function scheduleHomeRefresh() {
+    function scheduleHomeRefresh(delayMs = homeRefreshDelayMs) {
         window.clearTimeout(homeRefreshTimer);
         const generation = ++homeRefreshGeneration;
         const expectedSession = session;
@@ -632,7 +632,7 @@
                 console.error(`首页后台同步失败：${friendlyError(error)}`);
                 showToast(`首页同步失败，当前显示缓存内容：${friendlyError(error)}`);
             }
-        }, homeRefreshDelayMs);
+        }, delayMs);
     }
 
     function imageWidthFor(ref, landscape, hero = false) {
@@ -1796,6 +1796,13 @@
     }
 
     function handlePlaybackEvent(event) {
+        // The stopped-session report has landed server-side; refresh the home
+        // catalog so Continue Watching progress is current. Must run before
+        // the !player guard below because it arrives after the player closed.
+        if (event.kind === 'home_stale') {
+            scheduleHomeRefresh(200);
+            return;
+        }
         if (!player) return;
         if (event.kind === 'canceled' && player.interpolationChanging) return;
         if (Number.isFinite(event.positionMs) && !player.scrubbing) player.positionMs = event.positionMs;
@@ -2389,6 +2396,24 @@
 
     function finishPlayer(stopNative = true) {
         if (stopNative && player && window.jmpNative) window.jmpNative.playerStop();
+        // Optimistically update Continue Watching with the position we last
+        // saw and move the just-ended item to the front, so it reflects the
+        // playback immediately; the network refresh (and the home_stale
+        // fallback) then reconciles with the authoritative server value.
+        if (player && player.positionMs > 0 && homeData && Array.isArray(homeData.resume)) {
+            const id = player.card?.id;
+            const index = id ? homeData.resume.findIndex((item) => item.id === id) : -1;
+            if (index >= 0) {
+                const item = homeData.resume[index];
+                if (player.positionMs > (item.resumePositionMs || 0)) {
+                    item.resumePositionMs = player.positionMs;
+                }
+                if (index !== 0) {
+                    homeData.resume.splice(index, 1);
+                    homeData.resume.unshift(item);
+                }
+            }
+        }
         window.clearTimeout(playerClickTimer);
         playerClickTimer = 0;
         playerClickAt = 0;
@@ -2403,6 +2428,17 @@
         refreshPlayerCursor();
         setPlayerMode(false);
         appShell.classList.remove('hidden');
+        // Re-render the home view immediately with the optimistically updated
+        // Continue Watching progress, then refresh the catalog right away so
+        // the server value lands; the "home_stale" event refreshes again as
+        // the authoritative fallback.
+        if (currentView?.kind === 'home' && homeData) {
+            const saved = captureView();
+            currentView = { ...currentView, data: homeData };
+            renderHome(homeData);
+            if (saved) restoreScroll(saved);
+        }
+        scheduleHomeRefresh(300);
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
     }
 

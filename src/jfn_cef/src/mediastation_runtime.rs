@@ -242,8 +242,28 @@ fn playback_report_worker(api: MediaStationApiClient, shared: Arc<ReporterShared
                 job.generation,
                 api_error_code(&error)
             ));
+        } else if matches!(job.kind, ReportKind::Stopped) {
+            // The stopped position is now persisted server-side; tell the
+            // renderer so it can refresh Continue Watching without guessing
+            // when the async report landed.
+            notify_home_stale();
         }
     }
+}
+
+fn notify_home_stale() {
+    log_debug("MediaStation notifying renderer that the home catalog is stale");
+    let Some(layer) = crate::business_web::active_web_layer() else {
+        log_error("MediaStation home_stale notify skipped: no active web layer");
+        return;
+    };
+    dispatch_response(
+        &layer,
+        "",
+        "playback_event",
+        true,
+        json!({ "kind": "home_stale" }),
+    );
 }
 
 const fn report_kind_label(kind: ReportKind) -> &'static str {
