@@ -3494,14 +3494,12 @@ fn reconcile_runtime_track_preference_inner(
                         }
                     }
                     Err(_) => {
-                        correction.subtitle_enabled = Some(false);
-                        if baseline.subtitle_enabled == Some(true) {
-                            let _ = runtime.apply_track_selection(
-                                &reconcile.snapshot,
-                                &reconcile.source.media_id,
-                                TrackSelection::SubtitleOff,
-                            );
-                        }
+                        // The saved subtitle key no longer matches the live
+                        // track catalog (stream indexes can shift between
+                        // loads). Keep whatever mpv has selected — the load
+                        // plan already fell back to the container default —
+                        // and correct the preference to the actual state.
+                        correction_from_subtitle_baseline(&mut correction, &baseline);
                         log_error(&format!(
                             "MediaStation saved subtitle unavailable: media_id={} key={}",
                             reconcile.source.media_id, key

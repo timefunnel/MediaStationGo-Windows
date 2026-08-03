@@ -35,15 +35,13 @@ pub fn build_playback_track_plan(
         .as_deref()
         .and_then(|key| source.subtitles.iter().position(|track| track.key == key));
     let subtitle_index = if preference.subtitle_enabled {
+        // A saved key that no longer matches this container falls back to
+        // the default/forced track instead of silently disabling subtitles.
         preferred_subtitle.or_else(|| {
-            (!preference.configured)
-                .then(|| {
-                    source
-                        .subtitles
-                        .iter()
-                        .position(|track| track.is_default || track.is_forced)
-                })
-                .flatten()
+            source
+                .subtitles
+                .iter()
+                .position(|track| track.is_default || track.is_forced)
         })
     } else {
         None
@@ -197,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_saved_tracks_produce_explicit_correction() {
+    fn stale_saved_subtitle_falls_back_to_container_default() {
         let preference = PlaybackTrackPreference {
             configured: true,
             subtitle_enabled: true,
@@ -210,10 +208,37 @@ mod tests {
             .preference_correction
             .expect("invalid preferences should be corrected");
 
+        // The stale audio key falls back to the first audio track.
         assert_eq!(plan.audio_track, 1);
-        assert_eq!(plan.subtitle_track, TRACK_DISABLE);
-        assert_eq!(TRACK_DISABLE, 0);
         assert_eq!(correction.audio_track_key.as_deref(), Some("stream:1"));
+        // The stale subtitle key falls back to the container default track
+        // (stream:2, internal eng) instead of disabling subtitles entirely.
+        assert_eq!(plan.subtitle_track, 1);
+        assert_eq!(plan.subtitle_track_key.as_deref(), Some("stream:2"));
+        assert_eq!(plan.external_subtitle_url, None);
+        assert_eq!(correction.subtitle_track_key.as_deref(), Some("stream:2"));
+        assert_eq!(correction.subtitle_enabled, None);
+    }
+
+    #[test]
+    fn stale_saved_subtitle_with_no_default_disables_subtitles() {
+        let mut source = source();
+        source.subtitles[0].is_default = false;
+        source.subtitles[0].is_forced = false;
+        let preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("missing-subtitle".to_string()),
+            audio_track_key: None,
+        };
+
+        let plan = build_playback_track_plan(&source, &preference);
+        let correction = plan
+            .preference_correction
+            .expect("invalid preferences should be corrected");
+
+        assert_eq!(plan.subtitle_track, TRACK_DISABLE);
+        assert_eq!(plan.subtitle_track_key, None);
         assert_eq!(correction.subtitle_enabled, Some(false));
     }
 }
