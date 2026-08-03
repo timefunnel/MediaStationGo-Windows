@@ -90,6 +90,7 @@ wrap_app! {
                 ("google-api-key", ""),
                 ("google-default-client-id", ""),
                 ("google-default-client-secret", ""),
+                ("enable-features", "SmoothScrolling"),
             ] {
                 cl.append_switch_with_value(
                     Some(&CefString::from(name)),

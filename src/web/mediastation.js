@@ -2722,12 +2722,20 @@
 
     content.addEventListener('wheel', (event) => {
         const row = event.target.closest?.('.media-row');
-        if (!row) return;
         const deltaX = wheelPixels(event.deltaX, event.deltaMode, content.clientWidth);
         const deltaY = wheelPixels(event.deltaY, event.deltaMode, content.clientHeight);
-        if ((event.shiftKey && deltaY) || (deltaX && Math.abs(deltaX) >= Math.abs(deltaY))) {
-            event.preventDefault();
+        if (row) {
+            // Horizontal media row: keep native behavior, but steer vertical
+            // leftover deltas into the row's own horizontal scroll.
+            if ((event.shiftKey && deltaY) || (deltaX && Math.abs(deltaX) >= Math.abs(deltaY))) {
+                event.preventDefault();
+            }
+            return;
         }
+        // Vertical main-content scrolling is left to the native Chromium
+        // engine. Custom rAF smoothing proved unstable in the CEF offscreen
+        // render path, so native scrolling with the SmoothScrolling feature
+        // is the reliable baseline.
     }, { passive: false });
 
     const rowScrollIdleTimers = new WeakMap();
