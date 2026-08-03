@@ -59,6 +59,7 @@
     let contentTransitionTimer = 0;
     let homeRefreshTimer = 0;
     let homeRefreshGeneration = 0;
+    let homeRefreshFailures = 0;
     let heroRotationTimer = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
     let preferredInterpolationModel = 'rife-v4.26';
@@ -621,6 +622,7 @@
                     console.error('首页同步完成，但首页快照写入失败');
                 }
                 homeData = refreshed;
+                homeRefreshFailures = 0;
                 if (currentView?.kind === 'home') {
                     const saved = captureView();
                     currentView = { ...currentView, data: homeData };
@@ -629,8 +631,13 @@
                 }
             } catch (error) {
                 if (generation !== homeRefreshGeneration || session !== expectedSession) return;
+                // A background refresh failure should not disturb the user;
+                // log it and retry a few times before giving up.
+                homeRefreshFailures += 1;
                 console.error(`首页后台同步失败：${friendlyError(error)}`);
-                showToast(`首页同步失败，当前显示缓存内容：${friendlyError(error)}`);
+                if (homeRefreshFailures < 3) {
+                    window.setTimeout(() => scheduleHomeRefresh(), 4000);
+                }
             }
         }, delayMs);
     }

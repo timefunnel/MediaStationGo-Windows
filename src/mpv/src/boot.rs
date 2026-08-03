@@ -167,6 +167,12 @@ fn apply_defaults(
     set("force-window", "yes")?;
     set("idle", "yes")?;
 
+    // Disable ffmpeg's HTTP multi-connection prefetch. The 115 cloud CDN
+    // serving MediaStationGo media returns HTTP 403 when a file is requested
+    // through several concurrent range connections, so a single connection
+    // keeps playback from tripping the CDN's rate limit.
+    set("stream-lavf-o", "http_multiple=0")?;
+
     Ok(())
 }
 
@@ -267,6 +273,7 @@ pub unsafe fn jfn_mpv_handle_init(boot: *const JfnMpvBoot) -> *mut sys::mpv_hand
     }
 
     let raw = handle.raw();
+    crate::stream_cb::register_protocol(raw);
     *handle_slot().lock() = Some(handle);
     raw
 }

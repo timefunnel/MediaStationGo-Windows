@@ -25,6 +25,7 @@ pub mod boot;
 pub mod capabilities;
 pub mod color;
 pub mod probe;
+pub mod stream_cb;
 
 pub use command::Command;
 pub use error::{Error, Result};

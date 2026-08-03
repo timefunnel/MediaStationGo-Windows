@@ -2420,6 +2420,7 @@ dependencies = [
  "parking_lot",
  "pkg-config",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

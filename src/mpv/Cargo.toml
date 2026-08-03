@@ -13,6 +13,7 @@ path = "src/lib.rs"
 parking_lot.workspace = true
 jfn-color = { path = "../color" }
 tracing.workspace = true
+ureq.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

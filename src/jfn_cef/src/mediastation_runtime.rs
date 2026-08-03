@@ -3844,10 +3844,22 @@ fn execute_load(
         .request_headers
         .to_mpv_http_header_fields()
         .map_err(header_encoding_failure)?;
-    let playback_url = CString::new(playback.resolved_url.as_str()).map_err(|_| {
+    // Serve the resolved CDN URL through the ureq-backed mediastation://
+    // protocol instead of handing ffmpeg the direct CDN URL. The 115 cloud
+    // CDN 403s ffmpeg's TLS fingerprint, so mpv reads the stream from ureq.
+    let media_user_agent = playback
+        .request_headers
+        .get("user-agent")
+        .unwrap_or("MediaStationGoWindows/0.1.0-dev");
+    let playback_url = CString::new(jfn_mpv::stream_cb::build_uri(
+        playback.resolved_url.as_str(),
+        media_user_agent,
+        playback.content_length,
+    ))
+    .map_err(|_| {
         LoadFailure::new(
             "invalid_playback_url",
-            "The resolved playback URL contains an invalid byte",
+            "The source playback URL contains an invalid byte",
         )
     })?;
     let header_fields = CString::new(header_fields).map_err(|_| {
