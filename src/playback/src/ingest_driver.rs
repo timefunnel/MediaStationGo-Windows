@@ -328,6 +328,30 @@ fn invoke_shutdown_handler() {
     }
 }
 
+fn ingest_event_before_platform_sync<F>(
+    event: &Event,
+    ingest_state: &IngestState,
+    ctx: &CallerCtx,
+    mut fullscreen_handler: F,
+) -> Vec<IngestOut>
+where
+    F: FnMut(bool),
+{
+    let observed_fullscreen = match event {
+        Event::PropertyChange {
+            id,
+            value: PropertyValue::Flag(fullscreen),
+            ..
+        } if *id == crate::ingest::observe_id::FULLSCREEN => Some(*fullscreen),
+        _ => None,
+    };
+    let outs = ingest_event_for_ffi(event, ingest_state, ctx);
+    if let Some(fullscreen) = observed_fullscreen {
+        fullscreen_handler(fullscreen);
+    }
+    outs
+}
+
 /// Spawn the Rust-owned mpv event thread. The thread blocks in
 /// `mpv_wait_event(-1)` on the handle returned by
 /// `jfn_mpv::boot::current_raw_handle()`, decodes each event into
@@ -389,20 +413,17 @@ fn event_loop(handle_addr: usize, stop: std::sync::Arc<AtomicBool>) {
                 jfn_mpv::forward_log_to_tracing(m);
                 continue;
             }
-            Event::PropertyChange { id, ref value, .. } => {
-                if id == crate::ingest::observe_id::FULLSCREEN
-                    && let PropertyValue::Flag(f) = value
-                {
-                    invoke_fullscreen_handler(*f);
-                }
-            }
             _ => {}
         }
         let scale = snapshot_scale();
         let mac = snapshot_macos_logical();
         let ctx = CallerCtx { scale, mac };
         log_playback_signal(&event);
-        let outs = ingest_event_for_ffi(&event, state(), &ctx);
+        // Commit the observed property before asking the platform to reconcile
+        // it. Windows and X11 use the committed state to avoid writing the
+        // already-applied fullscreen value back into mpv.
+        let outs =
+            ingest_event_before_platform_sync(&event, state(), &ctx, invoke_fullscreen_handler);
         let flags = dispatch(outs);
         if flags & INGEST_FLAG_SHUTDOWN != 0 {
             invoke_shutdown_handler();
@@ -442,5 +463,42 @@ fn property_flag(value: &PropertyValue) -> &'static str {
         PropertyValue::Flag(false) => "false",
         PropertyValue::None => "none",
         _ => "unexpected",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn fullscreen_platform_sync_observes_committed_state() {
+        let ingest_state = IngestState::new();
+        let ctx = CallerCtx {
+            scale: 1.0,
+            mac: None,
+        };
+        let callback_called = Cell::new(false);
+        let event = Event::PropertyChange {
+            id: crate::ingest::observe_id::FULLSCREEN,
+            name: "fullscreen".to_string(),
+            value: PropertyValue::Flag(true),
+        };
+
+        let outs = ingest_event_before_platform_sync(&event, &ingest_state, &ctx, |fullscreen| {
+            callback_called.set(true);
+            assert!(fullscreen);
+            assert!(ingest_state.fullscreen());
+        });
+
+        assert!(callback_called.get());
+        assert!(matches!(
+            outs.as_slice(),
+            [IngestOut::Input(crate::Input::Fullscreen {
+                fullscreen: true,
+                ..
+            })]
+        ));
     }
 }

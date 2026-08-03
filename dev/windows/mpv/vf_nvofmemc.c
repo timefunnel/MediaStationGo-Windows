@@ -6291,7 +6291,6 @@ static bool write_rife_frame(struct mp_filter *f,
     }
     char error[1024] = {0};
     struct rife_frame_diagnostics diagnostics = {0};
-    lock_d3d11_context(p);
     int status = p->rife.process(
         p->rife.runtime,
         (ID3D11Texture2D *)frame0->planes[0],
@@ -6301,7 +6300,6 @@ static bool write_rife_frame(struct mp_filter *f,
         (ID3D11Texture2D *)out->planes[0],
         (uint32_t)(uintptr_t)out->planes[1],
         frame0->pts, frame1->pts, &diagnostics, error, sizeof(error));
-    unlock_d3d11_context(p);
     if (status != RIFE_RUNTIME_OK) {
         MP_ERR(f, "RIFE midpoint inference failed status=%d detail=%s\n",
                status, error[0] ? error : "unknown");

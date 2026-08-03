@@ -4,6 +4,7 @@
 
 #include "rife_runtime.h"
 
+#include <d3d10.h>
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -41,6 +42,7 @@ constexpr unsigned int kCudaStreamNonBlocking = 1;
 constexpr unsigned int kCudaEventDefault = 0;
 constexpr size_t kInferenceHistogramBuckets = 4001;
 constexpr double kInferenceHistogramBucketMs = 0.025;
+constexpr DWORD kD3D11WaitTimeoutMs = 2000;
 constexpr uint32_t kSceneRegionColumns = 3;
 constexpr uint32_t kSceneRegionRows = 3;
 constexpr uint32_t kSceneRegionCount =
@@ -1502,6 +1504,49 @@ double symmetric_kl(double left, double right)
                 + right * std::log2(right / left));
 }
 
+class D3D11ContextBlock {
+public:
+    D3D11ContextBlock(ID3D10Multithread *multithread,
+                      ID3D11DeviceContext1 *context,
+                      ID3DDeviceContextState *runtime_state,
+                      char *error, size_t error_capacity)
+        : multithread_(multithread), context_(context)
+    {
+        multithread_->Enter();
+        ID3DDeviceContextState *caller_state = nullptr;
+        context_->SwapDeviceContextState(runtime_state, &caller_state);
+        caller_state_.Attach(caller_state);
+        if (!caller_state_) {
+            context_->SwapDeviceContextState(nullptr, nullptr);
+            multithread_->Leave();
+            set_error(error, error_capacity,
+                      "RIFE could not preserve the caller D3D11 context state");
+            return;
+        }
+        active_ = true;
+    }
+
+    ~D3D11ContextBlock()
+    {
+        if (!active_)
+            return;
+        context_->SwapDeviceContextState(caller_state_.Get(), nullptr);
+        caller_state_.Reset();
+        multithread_->Leave();
+    }
+
+    D3D11ContextBlock(const D3D11ContextBlock &) = delete;
+    D3D11ContextBlock &operator=(const D3D11ContextBlock &) = delete;
+
+    explicit operator bool() const { return active_; }
+
+private:
+    ID3D10Multithread *multithread_ = nullptr;
+    ID3D11DeviceContext1 *context_ = nullptr;
+    ComPtr<ID3DDeviceContextState> caller_state_;
+    bool active_ = false;
+};
+
 class Runtime {
 public:
     ~Runtime()
@@ -1549,6 +1594,8 @@ public:
                       "RIFE requires ID3D11Device3 planar views");
             return false;
         }
+        if (!create_context_state_isolation(error, error_capacity))
+            return false;
         prewarm_state_ = find_prewarm_state(
             config.engine_path, config.cuda_runtime_path,
             config.source_width, config.source_height,
@@ -1756,14 +1803,39 @@ public:
         diagnostics->classification = scene.classification;
 
         if (scene.classification == RIFE_SCENE_HARD_CUT) {
-            D3D11_TEXTURE2D_DESC source_desc{};
-            frame0->GetDesc(&source_desc);
-            D3D11_BOX box{};
-            box.right = source_desc.Width;
-            box.bottom = source_desc.Height;
-            box.back = 1;
-            context_->CopySubresourceRegion(
-                output, output_slice, 0, 0, 0, frame0, frame0_slice, &box);
+            // The copy must be flushed before the caller hands the output
+            // frame to the VO; otherwise the copy command sits in the
+            // CPU-side queue and races the present thread's reads.
+            bool copy_submitted = false;
+            {
+                D3D11ContextBlock context_block(
+                    multithread_.Get(), context1_.Get(),
+                    runtime_context_state_.Get(), error, error_capacity);
+                if (!context_block) {
+                    stats_.failures++;
+                    return RIFE_RUNTIME_D3D11_FAILED;
+                }
+                D3D11_TEXTURE2D_DESC source_desc{};
+                frame0->GetDesc(&source_desc);
+                D3D11_BOX box{};
+                box.right = source_desc.Width;
+                box.bottom = source_desc.Height;
+                box.back = 1;
+                context_->CopySubresourceRegion(
+                    output, output_slice, 0, 0, 0, frame0, frame0_slice, &box);
+                context_->End(completion_query_.Get());
+                context_->Flush();
+                copy_submitted = true;
+            }
+            // Wait outside the lock block so the present thread is not
+            // blocked while the GPU finishes the copy.
+            if (copy_submitted
+                && !wait_for_d3d11_query(
+                    completion_query_.Get(), "RIFE hard-cut copy",
+                    error, error_capacity)) {
+                stats_.failures++;
+                return RIFE_RUNTIME_D3D11_FAILED;
+            }
             stats_.scene_cuts++;
             diagnostics->scene_cut = 1;
             return RIFE_RUNTIME_OK;
@@ -1845,6 +1917,49 @@ public:
     }
 
 private:
+    bool create_context_state_isolation(char *error, size_t error_capacity)
+    {
+        HRESULT status = device_.As(&multithread_);
+        if (FAILED(status) || !multithread_) {
+            set_error(error, error_capacity,
+                      "RIFE requires ID3D10Multithread (hr=0x%08lx)",
+                      static_cast<unsigned long>(status));
+            return false;
+        }
+        status = context_.As(&context1_);
+        if (FAILED(status) || !context1_) {
+            set_error(error, error_capacity,
+                      "RIFE requires ID3D11DeviceContext1 (hr=0x%08lx)",
+                      static_cast<unsigned long>(status));
+            return false;
+        }
+        ComPtr<ID3D11Device1> device1;
+        status = device_.As(&device1);
+        if (FAILED(status) || !device1) {
+            set_error(error, error_capacity,
+                      "RIFE requires ID3D11Device1 context state isolation "
+                      "(hr=0x%08lx)", static_cast<unsigned long>(status));
+            return false;
+        }
+        multithread_->SetMultithreadProtected(TRUE);
+        const D3D_FEATURE_LEVEL requested_level = device_->GetFeatureLevel();
+        D3D_FEATURE_LEVEL chosen_level{};
+        status = device1->CreateDeviceContextState(
+            0, &requested_level, 1, D3D11_SDK_VERSION,
+            __uuidof(ID3D11Device), &chosen_level, &runtime_context_state_);
+        if (FAILED(status) || !runtime_context_state_
+            || chosen_level != requested_level) {
+            set_error(error, error_capacity,
+                      "RIFE could not create an isolated D3D11 context state "
+                      "(hr=0x%08lx requested=0x%04x chosen=0x%04x)",
+                      static_cast<unsigned long>(status),
+                      static_cast<unsigned int>(requested_level),
+                      static_cast<unsigned int>(chosen_level));
+            return false;
+        }
+        return true;
+    }
+
     bool validate_engine(char *error, size_t error_capacity)
     {
         if (!find_engine_io(*engine_, input_name_, output_name_,
@@ -1985,38 +2100,43 @@ private:
                       SceneMetrics &metrics,
                       char *error, size_t error_capacity)
     {
-        const UINT clear[4] = {0, 0, 0, 0};
-        context_->ClearUnorderedAccessViewUint(scene_uav_.Get(), clear);
-        ID3D11Buffer *constants[] = {
-            constants_buffer_.Get(), scene_constants_buffer_.Get(),
-        };
-        ID3D11UnorderedAccessView *uavs[3] = {nullptr, nullptr,
-                                             scene_uav_.Get()};
-        context_->CSSetShader(scene_shader_.Get(), nullptr, 0);
-        context_->CSSetConstantBuffers(0, 2, constants);
-        context_->CSSetShaderResources(0, 4, input_srvs);
-        context_->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-        const UINT sampled_width =
-            (config_.source_width + config_.scene_sample_stride - 1)
-            / config_.scene_sample_stride;
-        const UINT sampled_height =
-            (config_.source_height + config_.scene_sample_stride - 1)
-            / config_.scene_sample_stride;
-        context_->Dispatch((sampled_width + 7) / 8,
-                           (sampled_height + 7) / 8, 1);
-        ID3D11ShaderResourceView *null_srvs[4]{};
-        ID3D11UnorderedAccessView *null_uavs[3]{};
-        context_->CSSetShaderResources(0, 4, null_srvs);
-        context_->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
-        context_->CSSetShader(nullptr, nullptr, 0);
-        context_->CopyResource(scene_readback_.Get(), scene_buffer_.Get());
+        {
+            D3D11ContextBlock context_block(
+                multithread_.Get(), context1_.Get(),
+                runtime_context_state_.Get(), error, error_capacity);
+            if (!context_block)
+                return false;
+            const UINT clear[4] = {0, 0, 0, 0};
+            context_->ClearUnorderedAccessViewUint(scene_uav_.Get(), clear);
+            ID3D11Buffer *constants[] = {
+                constants_buffer_.Get(), scene_constants_buffer_.Get(),
+            };
+            ID3D11UnorderedAccessView *uavs[3] = {nullptr, nullptr,
+                                                 scene_uav_.Get()};
+            context_->CSSetShader(scene_shader_.Get(), nullptr, 0);
+            context_->CSSetConstantBuffers(0, 2, constants);
+            context_->CSSetShaderResources(0, 4, input_srvs);
+            context_->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+            const UINT sampled_width =
+                (config_.source_width + config_.scene_sample_stride - 1)
+                / config_.scene_sample_stride;
+            const UINT sampled_height =
+                (config_.source_height + config_.scene_sample_stride - 1)
+                / config_.scene_sample_stride;
+            context_->Dispatch((sampled_width + 7) / 8,
+                               (sampled_height + 7) / 8, 1);
+            ID3D11ShaderResourceView *null_srvs[4]{};
+            ID3D11UnorderedAccessView *null_uavs[3]{};
+            context_->CSSetShaderResources(0, 4, null_srvs);
+            context_->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+            context_->CSSetShader(nullptr, nullptr, 0);
+            context_->CopyResource(scene_readback_.Get(), scene_buffer_.Get());
+            context_->Flush();
+        }
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT status = context_->Map(scene_readback_.Get(), 0,
-                                             D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(status)) {
-            set_error(error, error_capacity,
-                      "Scene detector readback failed (hr=0x%08lx)",
-                      static_cast<unsigned long>(status));
+        if (!map_d3d11_readback(scene_readback_.Get(), mapped,
+                                "Scene detector readback",
+                                error, error_capacity)) {
             return false;
         }
         const auto *values = static_cast<const uint32_t *>(mapped.pData);
@@ -2156,16 +2276,54 @@ private:
     bool wait_for_d3d11_query(ID3D11Query *query, const char *label,
                               char *error, size_t error_capacity)
     {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(kD3D11WaitTimeoutMs);
         BOOL complete = FALSE;
         for (;;) {
             const HRESULT status = context_->GetData(
-                query, &complete, sizeof(complete), 0);
+                query, &complete, sizeof(complete),
+                D3D11_ASYNC_GETDATA_DONOTFLUSH);
             if (status == S_OK && complete)
                 return true;
             if (FAILED(status)) {
                 set_error(error, error_capacity,
                           "%s wait failed (hr=0x%08lx)", label,
                           static_cast<unsigned long>(status));
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                set_error(error, error_capacity,
+                          "%s timed out after %lu ms", label,
+                          static_cast<unsigned long>(kD3D11WaitTimeoutMs));
+                return false;
+            }
+            SwitchToThread();
+        }
+    }
+
+    bool map_d3d11_readback(ID3D11Resource *resource,
+                            D3D11_MAPPED_SUBRESOURCE &mapped,
+                            const char *label,
+                            char *error, size_t error_capacity)
+    {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(kD3D11WaitTimeoutMs);
+        for (;;) {
+            const HRESULT status = context_->Map(
+                resource, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT,
+                &mapped);
+            if (status == S_OK)
+                return true;
+            if (status != DXGI_ERROR_WAS_STILL_DRAWING) {
+                set_error(error, error_capacity,
+                          "%s failed (hr=0x%08lx)", label,
+                          static_cast<unsigned long>(status));
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                set_error(error, error_capacity,
+                          "%s timed out after %lu ms", label,
+                          static_cast<unsigned long>(kD3D11WaitTimeoutMs));
                 return false;
             }
             SwitchToThread();
@@ -2180,53 +2338,87 @@ private:
         char *error, size_t error_capacity)
     {
         const bool profiling = config_.profiling_enabled != 0;
+        ID3D11Buffer *constants[] = {constants_buffer_.Get()};
+        CudaGraphicsResource resources[] = {input_resource_, output_resource_};
+        bool mapped = false;
         const auto input_conversion_started = profiling
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        ID3D11Buffer *constants[] = {constants_buffer_.Get()};
-        ID3D11UnorderedAccessView *input_uavs[] = {input_tensor_uav_.Get()};
-        context_->CSSetShader(prepare_shader_.Get(), nullptr, 0);
-        context_->CSSetConstantBuffers(0, 1, constants);
-        context_->CSSetShaderResources(0, 4, input_srvs);
-        context_->CSSetUnorderedAccessViews(0, 1, input_uavs, nullptr);
-        context_->Dispatch((padded_width_ / 2 + 7) / 8,
-                           (padded_height_ + 7) / 8, 1);
-        ID3D11ShaderResourceView *null_input_srvs[4]{};
-        ID3D11UnorderedAccessView *null_input_uavs[1]{};
-        context_->CSSetShaderResources(0, 4, null_input_srvs);
-        context_->CSSetUnorderedAccessViews(0, 1, null_input_uavs, nullptr);
-        context_->CSSetShader(nullptr, nullptr, 0);
+        {
+            D3D11ContextBlock context_block(
+                multithread_.Get(), context1_.Get(),
+                runtime_context_state_.Get(), error, error_capacity);
+            if (!context_block)
+                return false;
+            ID3D11UnorderedAccessView *input_uavs[] = {input_tensor_uav_.Get()};
+            context_->CSSetShader(prepare_shader_.Get(), nullptr, 0);
+            context_->CSSetConstantBuffers(0, 1, constants);
+            context_->CSSetShaderResources(0, 4, input_srvs);
+            context_->CSSetUnorderedAccessViews(0, 1, input_uavs, nullptr);
+            context_->Dispatch((padded_width_ / 2 + 7) / 8,
+                               (padded_height_ + 7) / 8, 1);
+            ID3D11ShaderResourceView *null_input_srvs[4]{};
+            ID3D11UnorderedAccessView *null_input_uavs[1]{};
+            context_->CSSetShaderResources(0, 4, null_input_srvs);
+            context_->CSSetUnorderedAccessViews(0, 1, null_input_uavs, nullptr);
+            context_->CSSetShader(nullptr, nullptr, 0);
+            // The input conversion must complete before CUDA maps the shared
+            // D3D11 buffer; the probe always synced here, the product path
+            // skipped it and raced the present thread into a GPU hang.
+            if (profiling) {
+                context_->End(input_completion_query_.Get());
+                context_->Flush();
+            } else {
+                context_->End(completion_query_.Get());
+                context_->Flush();
+            }
+        }
         if (profiling) {
-            context_->End(input_completion_query_.Get());
             if (!wait_for_d3d11_query(
                     input_completion_query_.Get(),
                     "RIFE input conversion", error, error_capacity))
                 return false;
             profile_ms[RIFE_PROFILE_INPUT_CONVERSION] =
                 elapsed_ms(input_conversion_started);
+        } else if (!wait_for_d3d11_query(
+                       completion_query_.Get(),
+                       "RIFE input conversion", error, error_capacity)) {
+            return false;
         }
 
-        CudaGraphicsResource resources[] = {input_resource_, output_resource_};
         const auto cuda_map_started = profiling
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        if (!cuda_ok(cuda_, cuda_.map_resources(2, resources, stream_),
-                     "cudaGraphicsMapResources", error, error_capacity))
-            return false;
-        bool mapped = true;
-        if (profiling) {
-            if (!cuda_ok(cuda_, cuda_.event_record(
-                                   profile_event_end_, stream_),
-                         "cudaEventRecord(map)", error, error_capacity)
-                || !cuda_ok(cuda_, cuda_.event_synchronize(
-                                       profile_event_end_),
-                            "cudaEventSynchronize(map)", error,
-                            error_capacity)) {
-                cuda_.unmap_resources(2, resources, stream_);
+        // cudaGraphicsMapResources internally touches the D3D11 immediate
+        // context without locking it; while mapped, another thread using the
+        // same context (the VO/present thread) can corrupt it. Serialize the
+        // map against the present thread, but keep TensorRT inference outside
+        // the lock so it does not re-block presentation.
+        {
+            D3D11ContextBlock context_block(
+                multithread_.Get(), context1_.Get(),
+                runtime_context_state_.Get(), error, error_capacity);
+            if (!context_block)
                 return false;
+            if (!cuda_ok(cuda_, cuda_.map_resources(2, resources, stream_),
+                         "cudaGraphicsMapResources", error, error_capacity))
+                return false;
+            if (profiling) {
+                if (!cuda_ok(cuda_, cuda_.event_record(
+                                       profile_event_end_, stream_),
+                             "cudaEventRecord(map)", error, error_capacity)
+                    || !cuda_ok(cuda_, cuda_.event_synchronize(
+                                           profile_event_end_),
+                                "cudaEventSynchronize(map)", error,
+                                error_capacity)) {
+                    cuda_.unmap_resources(2, resources, stream_);
+                    return false;
+                }
             }
-            profile_ms[RIFE_PROFILE_CUDA_MAP] = elapsed_ms(cuda_map_started);
         }
+        mapped = true;
+        if (profiling)
+            profile_ms[RIFE_PROFILE_CUDA_MAP] = elapsed_ms(cuda_map_started);
 
         const auto tensor_bind_started = profiling
             ? std::chrono::steady_clock::now()
@@ -2295,6 +2487,13 @@ private:
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         if (mapped) {
+            // cudaGraphicsUnmapResources also touches the immediate context
+            // without locking; serialize against the present thread like map.
+            D3D11ContextBlock context_block(
+                multithread_.Get(), context1_.Get(),
+                runtime_context_state_.Get(), error, error_capacity);
+            if (!context_block)
+                return false;
             if (!cuda_ok(cuda_, cuda_.unmap_resources(
                                    2, resources, stream_),
                          "cudaGraphicsUnmapResources", error,
@@ -2321,22 +2520,30 @@ private:
         const auto output_conversion_started = profiling
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        ID3D11ShaderResourceView *output_srvs[5]{};
-        output_srvs[4] = output_tensor_srv_.Get();
-        ID3D11UnorderedAccessView *output_uavs[] = {output_y, output_uv};
-        context_->CSSetShader(output_shader_.Get(), nullptr, 0);
-        context_->CSSetConstantBuffers(0, 1, constants);
-        context_->CSSetShaderResources(0, 5, output_srvs);
-        context_->CSSetUnorderedAccessViews(0, 2, output_uavs, nullptr);
-        const UINT pair_width = (config_.source_width + 1) / 2;
-        context_->Dispatch((pair_width + 7) / 8,
-                           (config_.source_height + 7) / 8, 1);
-        ID3D11ShaderResourceView *null_output_srvs[5]{};
-        ID3D11UnorderedAccessView *null_output_uavs[2]{};
-        context_->CSSetShaderResources(0, 5, null_output_srvs);
-        context_->CSSetUnorderedAccessViews(0, 2, null_output_uavs, nullptr);
-        context_->CSSetShader(nullptr, nullptr, 0);
-        context_->End(completion_query_.Get());
+        {
+            D3D11ContextBlock context_block(
+                multithread_.Get(), context1_.Get(),
+                runtime_context_state_.Get(), error, error_capacity);
+            if (!context_block)
+                return false;
+            ID3D11ShaderResourceView *output_srvs[5]{};
+            output_srvs[4] = output_tensor_srv_.Get();
+            ID3D11UnorderedAccessView *output_uavs[] = {output_y, output_uv};
+            context_->CSSetShader(output_shader_.Get(), nullptr, 0);
+            context_->CSSetConstantBuffers(0, 1, constants);
+            context_->CSSetShaderResources(0, 5, output_srvs);
+            context_->CSSetUnorderedAccessViews(0, 2, output_uavs, nullptr);
+            const UINT pair_width = (config_.source_width + 1) / 2;
+            context_->Dispatch((pair_width + 7) / 8,
+                               (config_.source_height + 7) / 8, 1);
+            ID3D11ShaderResourceView *null_output_srvs[5]{};
+            ID3D11UnorderedAccessView *null_output_uavs[2]{};
+            context_->CSSetShaderResources(0, 5, null_output_srvs);
+            context_->CSSetUnorderedAccessViews(0, 2, null_output_uavs, nullptr);
+            context_->CSSetShader(nullptr, nullptr, 0);
+            context_->End(completion_query_.Get());
+            context_->Flush();
+        }
         if (!wait_for_d3d11_query(
                 completion_query_.Get(), "RIFE output conversion",
                 error, error_capacity))
@@ -2407,6 +2614,9 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Device3> device3_;
+    ComPtr<ID3D10Multithread> multithread_;
+    ComPtr<ID3D11DeviceContext1> context1_;
+    ComPtr<ID3DDeviceContextState> runtime_context_state_;
     ComPtr<ID3D11Buffer> input_buffer_;
     ComPtr<ID3D11Buffer> output_buffer_;
     ComPtr<ID3D11UnorderedAccessView> input_tensor_uav_;

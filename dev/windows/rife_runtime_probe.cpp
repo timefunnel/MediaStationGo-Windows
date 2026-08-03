@@ -88,6 +88,29 @@ bool create_p010_texture(ID3D11Device *device, uint32_t width,
     return SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture));
 }
 
+bool create_caller_context_sentinel(
+    ID3D11Device *device, ID3D11DeviceContext *context,
+    ComPtr<ID3D11Buffer> &sentinel)
+{
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = 16;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &sentinel)))
+        return false;
+    ID3D11Buffer *buffer = sentinel.Get();
+    context->CSSetConstantBuffers(0, 1, &buffer);
+    return true;
+}
+
+bool caller_context_sentinel_preserved(
+    ID3D11DeviceContext *context, ID3D11Buffer *sentinel)
+{
+    ComPtr<ID3D11Buffer> observed;
+    context->CSGetConstantBuffers(0, 1, &observed);
+    return observed.Get() == sentinel;
+}
+
 bool initialize_p010_gradient(ID3D11DeviceContext *context,
                               ID3D11Texture2D *texture, uint32_t width,
                               uint32_t height, uint32_t horizontal_shift)
@@ -720,6 +743,14 @@ int wmain(int argc, wchar_t **argv)
         FreeLibrary(module);
         return 10;
     }
+    ComPtr<ID3D11Buffer> caller_context_sentinel;
+    if (!create_caller_context_sentinel(
+            device.Get(), context.Get(), caller_context_sentinel)) {
+        std::fprintf(stderr, "RIFE_RUNTIME_PROBE_CONTEXT_SENTINEL_FAILED\n");
+        destroy(runtime);
+        FreeLibrary(module);
+        return 10;
+    }
 
     if (switch_mode) {
         destroy(runtime);
@@ -754,6 +785,14 @@ int wmain(int argc, wchar_t **argv)
             FreeLibrary(module);
             return 11;
         }
+        if (!caller_context_sentinel_preserved(
+                context.Get(), caller_context_sentinel.Get())) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_CONTEXT_STATE_NOT_PRESERVED\n");
+            destroy(runtime);
+            FreeLibrary(module);
+            return 11;
+        }
         destroy(runtime);
         runtime = create(&config, error, sizeof(error));
         if (!runtime) {
@@ -767,8 +806,15 @@ int wmain(int argc, wchar_t **argv)
             frame0.Get(), frame1.Get(), output.Get(), width, height,
             fps_numerator, fps_denominator, start_pts, argv[10], argv[11],
             argv[12]);
+        const bool context_preserved = caller_context_sentinel_preserved(
+            context.Get(), caller_context_sentinel.Get());
         destroy(runtime);
         FreeLibrary(module);
+        if (!context_preserved) {
+            std::fprintf(stderr,
+                         "RIFE_SEQUENCE_CONTEXT_STATE_NOT_PRESERVED\n");
+            return 11;
+        }
         return result;
     }
 
@@ -778,7 +824,9 @@ int wmain(int argc, wchar_t **argv)
         ok = process(runtime, frame0.Get(), 0, frame1.Get(), 0,
                      output.Get(), 0, index / 24.0, (index + 1) / 24.0,
                      &diagnostics, error, sizeof(error))
-             == RIFE_RUNTIME_OK && !diagnostics.scene_cut;
+             == RIFE_RUNTIME_OK && !diagnostics.scene_cut
+             && caller_context_sentinel_preserved(
+                    context.Get(), caller_context_sentinel.Get());
     }
     if (ok) {
         destroy(runtime);
@@ -792,7 +840,9 @@ int wmain(int argc, wchar_t **argv)
         ok = process(runtime, frame0.Get(), 0, frame1.Get(), 0,
                      output.Get(), 0, index / 24.0, (index + 1) / 24.0,
                      &diagnostics, error, sizeof(error))
-             == RIFE_RUNTIME_OK && !diagnostics.scene_cut;
+             == RIFE_RUNTIME_OK && !diagnostics.scene_cut
+             && caller_context_sentinel_preserved(
+                    context.Get(), caller_context_sentinel.Get());
         const auto ended = std::chrono::steady_clock::now();
         samples.push_back(std::chrono::duration<double, std::milli>(
             ended - started).count());
@@ -833,6 +883,7 @@ int wmain(int argc, wchar_t **argv)
         "prewarm=%.2fms cache-reopen=%s cold-init=%.2fms cached-init=%.2fms "
         "stages=cuda:%.2f,bind:%.2f,read:%.2f,trt:%.2f,deserialize:%.2f,"
         "context:%.2f,validate:%.2f,d3d:%.2f "
+        "context-state=preserved "
         "scene-class=%u average-delta=%.3f changed-ratio=%.4f "
         "average-kl=%.5f "
         "unique-luma=%u non-8bit-luma=%llu p010-packed=%s\n",

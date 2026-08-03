@@ -579,6 +579,138 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   Lite、关闭插帧或启用 delayed 掩盖问题；下一步由用户在同片质量档确认画面，若仍
   闪烁则继续按真实时间点取证。
 
+#### 2026-08-02 插帧播放卡顿与全屏重复驱动诊断
+
+- 调试日志实际记录了两次全屏切换。每次都先执行按钮触发的
+  `cycle fullscreen`，然后 mpv `fullscreen` 属性回调又写入同一个
+  `fullscreen=true/false`。这证明播放事件层在状态消化前调用平台同步，
+  Windows 因而将 mpv 已经完成的属性变化再次写回。
+- 同一复现中，质量档为 3840x2160 P010、RIFE v4.26 `scale=1.0`、
+  profile 3；无 TensorRT failure、D3D11 device lost 或 gpu-next render failure。第二段
+  `413` 对帧的推理均值为 `33.622 ms`、P95 `44.350 ms`、最大 `57.739 ms`，
+  其中尾延迟已超过 23.976 fps 每对帧约 `41.708 ms` 的实时预算。这是独立的
+  持续卡顿候选，不得用全屏重复驱动一项直接解释全部现象。
+- 本轮修复只调整事件顺序：先把 mpv 属性落到 `IngestState`，再调用平台同步。
+  Windows 将在已提交状态上判定值未变，不再回写 mpv；未修改模型、Engine、
+  profile、scale、解码或刷新率。`jfn-playback` 54 项测试、定向严格 Clippy、增量
+  Release 构建均已通过；新构建实播确认每次真实动作只出现一次
+  `Set property: fullscreen -> 1`，不再出现旧版后续属性回写。该项已关闭。
+- 独立卡顿在同一新构建上完整复现：3840x2160 P010、RIFE v4.26 `scale=1.0`、
+  profile 3 共处理 `6099` 对帧，推理 `6062` 次、failure `0`；平均
+  `35.249 ms`、P95 `44.925 ms`、最大 `235.334 ms`。现场 GPU 利用率约
+  `83-97%`、核心约 `2.79-2.805 GHz`、`66-72 C`，没有热降频；日志仍没有
+  TensorRT failure、D3D11 device lost 或 gpu-next render failure。
+- 源码审计确认 `write_rife_frame()` 在整个 `rife.process()` 期间持有共享
+  `ID3D10Multithread` 锁；约 `35-45 ms` 的 TensorRT/CUDA 计算因此会阻塞同一
+  immediate context 上的 libplacebo 呈现线程。修复严格限于同步边界：runtime 为
+  场景检测、输入转换至 `cudaGraphicsMapResources`、输出转换分别获取锁并切换独立
+  `ID3DDeviceContextState`；TensorRT/CUDA 计算和 unmap 不持 D3D11 锁，滤镜删除
+  包住整个 `rife.process()` 的外层锁。runtime ABI 升为 8，旧 DLL 将显式不兼容。
+- ABI 8 runtime 与 probe 已通过 MSVC `/W4 /WX` 编译。真实质量档 4K Engine 的
+  8 次探针测量为平均 `35.72 ms`、P95 `36.05 ms`，profile 3、P010 输出有效、
+  caller CS context state 每次均恢复；未修改模型、Engine、profile、scale、解码或
+  回退规则。当前状态为“runtime/probe 已验证，待完整重建 mpv、Release 和同片实播
+  长测”，不得提前宣称视觉卡顿已关闭。
+
+#### 2026-08-02 19:28 卡死现场与 D3D11 查询锁修复
+
+- 质量档再次播放到片内 `3491.008` 秒后日志停在 `19:28:07`，没有 runtime
+  summary、TensorRT failure、D3D11 device lost 或 gpu-next failure。主进程 PID `8676`
+  仍被 Windows 标记为可响应，但播放管线已停止前进。
+- 在 `19:32:23` 和 `19:42:52` 保存了两份轻量原生转储，两次栈一致。mpv
+  `core` 线程 TID `0x53c0` 停在
+  `d3d11!CContext::TID3D11DeviceContext_GetData_<2> -> rife_runtime+0xf98b ->`
+  `rife_runtime+0xdb23 -> write_rife_frame`，对应源码中的
+  `ID3D11DeviceContext::GetData` 轮询。该线程 5 秒内消耗 `4812.5 ms` CPU，
+  确认为持续自旋，不是一次短暂尾延迟。
+- 同时 mpv `vo` 线程 TID `0x3704` 停在
+  `RtlEnterCriticalSection -> d3d11!CDevice::CondObjectLock -> DiscardView ->`
+  `libplacebo -> draw_frame`。根因是 GPU 查询轮询位于 `D3D11ContextBlock` 内：
+  `core` 线程在 `GetData` 不返回时始终持有共享 `ID3D10Multithread` 锁，
+  呈现线程因此永久无法进入 D3D11。这次卡死与模型、Engine、profile 或
+  算力不足无关。
+- 修复后，显式 D3D11 锁只覆盖 compute 状态设置、命令提交和 caller context
+  state 恢复。场景读回 `Map`、输入转换查询、`cudaGraphicsMapResources` 和
+  输出转换查询全部在锁外等待。D3D11 命令块只显式 `Flush` 一次；
+  `GetData` 使用 `D3D11_ASYNC_GETDATA_DONOTFLUSH`，读回 `Map` 使用
+  `D3D11_MAP_FLAG_DO_NOT_WAIT`，两者都有 `2000 ms` 硬超时并返回真实错误。
+  没有自动切换模型、降到 Lite、改 `scale` 或继续播放的隐藏回退。接口未变，
+  runtime ABI 保持 `8`。
+- 修复后 runtime 和 probe 通过 MSVC `/W4 /WX`。真实质量档 4K Engine 先跑
+  `30 + 100` 次，再跑 `30 + 1000` 次压力探针；后者平均 `36.17 ms`、
+  P95 `36.99 ms`、最大 `37.87 ms`，profile 3、P010 和 caller context state 均正确，
+  无卡死或超时。mpv 早退路径已重编 runtime 并刷新 schema 4 / ABI 8 三模型
+  manifest，Release 已重新打包；三处 runtime DLL 的 SHA-256 均为
+  `57478937D6C2E46A80AEDCA0F1548B3205DBEA417DEF2E1B6B84EDEBB09959B3`。
+  `jfn-frame-interpolation` `16/16`、`jfn-playback` `54/54` 和两包严格 Clippy
+  全部通过。
+- 转储证据已闭合卡死的因果链，但修复后尚未完成同片真实长时播放，
+  不得把压力探针写成实播或视觉验收。
+
+#### 2026-08-03 质量档 HDR10 实播 GPU TDR 四次复现（同步修复后）
+
+- 在 `c1d98a16`（输入转换同步修复）和 `df08c5c6`（硬切同步修复）之后，
+  质量档《黑衣人2》3840x2160 HDR10、23.976 fps、RIFE v4.26 `scale=1.0`、
+  profile 3、D3D11 P010 实播仍稳定触发 GPU TDR，四次独立复现：
+
+| 复现 | 启动时刻 | 挂起时刻 | 播放时长 | 挂起时片内位置 | 触发特征 |
+| --- | --- | --- | ---: | ---: | --- |
+| 1 | 15:49:51 | 首帧后 | ~10 s | ~748 s | 输入转换竞态（`c1d98a16` 已修） |
+| 2 | 16:00:48 | 16:04:34 | ~3 m 46 s | ~3725 s | 密集硬切段 + Peak detection WARN |
+| 3 | 16:28:42 | 16:32:17 | ~3 m 35 s | ~3580 s | 无硬切、无 Peak detection WARN |
+| 4 | 16:56:47 | 16:59:48 | ~3 m 01 s | 未知 | 无硬切、无 Peak detection WARN |
+
+- 四次挂起的错误链首见点都是 `vo/gpu-next/libplacebo: Device lost!`，
+  RIFE 随后报 `RIFE output conversion wait failed (hr=0x887a0005)`
+  （`DEVICE_REMOVED`），filter 被禁用，进程停滞但主界面存活。
+  系统日志 `nvlddmkm` Provider 在每次挂起时刻都有 Id=153 内核事件，
+  确认为 NVIDIA 驱动检测到 GPU 命令队列错误，不是纯应用层 D3D11 检测。
+- 系统日志无标准 TDR 事件（Event 4101 / Display provider），说明本次
+  未触发驱动级 TDR 重置，而是 D3D11 命令队列层面的停滞。
+- 挂起后转储分析（132 线程）显示 124 个在 `ntdll.dll`、8 个在
+  `win32u.dll`，零个在 mpv/rife/d3d11/tensorrt/libplacebo——所有 mpv
+  播放线程已退出，进程只剩 CEF 主界面线程，这是“画面定格但进程存活”
+  的直接原因。与 19:28 的 GetData 自旋死锁（线程卡在 rife_runtime 内）
+  本质不同。
+- 关键归因实验（关插帧对照）：同一《黑衣人2》关闭插帧后播放超过
+  `6.5 分钟` GPU 完全稳定，显存 `2388 -> 2369 MiB` 平稳，无任何错误；
+  开插帧必在 `3.0-3.8 分钟` 挂起。因此挂起根因在 RIFE 插帧路径，
+  与 libplacebo 呈现/HDR tone-mapping/解码路径无关。
+- 开插帧显存趋势（每 30 s 采样）：挂起前 `4547 -> 4541 MiB` 完全平稳，
+  无单调增长，排除显存或资源句柄泄漏。GPU 利用率持续 `95%`（满载）、
+  温度 `70-73 C`，无过热。挂起后 GPU util 骤降至 `12%`。
+- 推断：显存平稳但必在满载 ~3 分钟挂起，指向 RIFE 每帧在 D3D11 命令
+  队列/状态层的累积（每帧创建 6 个视图：`create_input_views` x2 +
+  `create_output_views`；以及 ABI 8 引入的多次 `SwapDeviceContextState`），
+  而非资源分配泄漏。ABI 7 曾实播 6099 对帧（约 4 分 14 秒）无 device
+  lost 但严重卡顿（P95 44.9 ms），ABI 8 锁重构消除卡顿后却引入或暴露了
+  该时间累积挂起。
+- 本问题不改变已冻结的 RIFE 三档、Engine/profile 或场景阈值，但同片
+  长测和视觉验收仍未通过，不得宣称质量档问题已关闭。
+
+#### 2026-08-03 map/unmap 加锁修复与 11 分钟实播验证（GPU TDR 根因关闭）
+
+- 根因确定为 CUDA 互操作竞态：`cudaGraphicsMapResources` 和
+  `cudaGraphicsUnmapResources` 内部会使用 D3D11 immediate context 但
+  不加锁（NVIDIA 社区实践验证，
+  [forums.developer.nvidia.com](https://forums.developer.nvidia.com/t/d3d11-device-context-in-a-separate-thread-gets-corrupted-when-cuda-graphics-resource-mapping-is-used/232326/2)）。
+  ABI 8 锁重构把 map/unmap 移出锁块后，libplacebo 呈现线程与 CUDA 映射
+  并发访问同一 immediate context，长时间运行损坏 context 状态，触发
+  GPU 挂起（nvlddmkm Id=153 / `DXGI_ERROR_DEVICE_HUNG`）。
+- 修复（DLL SHA-256 `588f125b9d1586a51a654ed5a0f0c1d7ebf65875e5a221fa0c6141165fe92cae`）：
+  把 `cudaGraphicsMapResources` 和 `cudaGraphicsUnmapResources` 放回
+  `D3D11ContextBlock` 锁内，与呈现线程串行化；TensorRT 推理（约 33 ms）
+  保持锁外，不重新阻塞 libplacebo 呈现。错误路径中的 unmap 也在锁内执行。
+- 修复后同一《黑衣人2》3840x2160 HDR10 质量档实播 **11 分 11 秒** 无任何
+  `Device lost` / `DEVICE_HUNG` / `DEVICE_REMOVED` / `Disabling filter` /
+  `Failed presenting`；GPU 利用率持续 73-89%（满载）、温度 68-73 C、
+  显存 4534-4577 MiB 平稳。此前四次挂起全部在 3.0-3.8 分钟，本次稳定
+  播放时长为修复前的约 3.2 倍。
+- 至此，质量档开插帧 GPU TDR 的根因（CUDA map/unmap 与 D3D11 immediate
+  context 并发竞争）已修复并经实播验证。输入转换同步（`c1d98a16`）和
+  硬切同步（`df08c5c6`）修复保持有效。仍不改变已冻结的 RIFE 三档、
+  Engine/profile 或场景阈值。
+
 #### 未来重启条件
 
 - 若未来重启任务 3，首选方向仍是让显示器的实际

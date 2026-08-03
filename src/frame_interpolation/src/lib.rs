@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-const RIFE_RUNTIME_ABI: u32 = 7;
+const RIFE_RUNTIME_ABI: u32 = 8;
 const RIFE_MANIFEST_SCHEMA: u64 = 4;
 const RIFE_ENGINE_METADATA_SCHEMA: u64 = 3;
 const RIFE_BACKEND: &str = "TensorRT-RTX D3D11 P010";
