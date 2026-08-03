@@ -580,6 +580,35 @@ button:focus-visible, input:focus-visible {
 .player-view { position: fixed; z-index: 100; inset: 0; background: transparent; }
 .player-view.preparing { background: #080a0b; }
 .player-view.preparing .player-bottom { opacity: 0; pointer-events: none; }
+.player-poster {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  overflow: hidden;
+  background: #080a0b;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 400ms linear;
+}
+.player-view.preparing .player-poster { opacity: 1; }
+.player-poster img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  filter: blur(22px) saturate(1.06);
+  transform: scale(1.12);
+}
+.player-poster::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background:
+    linear-gradient(180deg, rgba(8,10,11,0.5), rgba(8,10,11,0.28) 42%, rgba(8,10,11,0.72) 82%, #080a0b),
+    radial-gradient(120% 90% at 50% 12%, transparent 44%, rgba(8,10,11,0.42));
+}
+.player-poster img.image-ready { opacity: 1; }
 .player-view.cursor-hidden, .player-view.cursor-hidden * { cursor: none !important; }
 .player-controls { position: absolute; inset: 0; opacity: 0; transition: opacity 160ms ease; pointer-events: none; }
 .player-controls.visible { opacity: 1; pointer-events: auto; }

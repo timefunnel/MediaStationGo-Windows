@@ -1795,6 +1795,7 @@
         byId('player-title').textContent = cardTitle(card, true);
         byId('player-subtitle').textContent = card.type === 'Episode' ? episodePosition(card) : cardSubtitle(card);
         byId('player-loading-title').textContent = cardTitle(card, true);
+        setPlayerPoster(card);
         setPlayerLoading(true, '正在准备播放');
         updatePlayerProgress();
         playerPanel.classList.add('hidden');
@@ -1908,7 +1909,19 @@
     function setPlayerLoading(visible, label = '') {
         if (label) byId('player-loading-label').textContent = label;
         byId('player-loading').classList.toggle('hidden', !visible);
-        playerView.classList.toggle('preparing', visible && !player?.started);
+        const covered = visible && (!player?.started || player?.interpolationChanging);
+        playerView.classList.toggle('preparing', covered);
+    }
+
+    function setPlayerPoster(card) {
+        const img = byId('player-poster').firstElementChild;
+        const ref = card.backdropImage || card.landscapeImage || card.primaryImage;
+        if (!ref) return;
+        img.removeAttribute('src');
+        img.classList.remove('image-ready', 'image-error');
+        requestImage(ref, 640)
+            .then((src) => { if (img.isConnected) setImageSource(img, src); })
+            .catch(() => {});
     }
 
     function waitForPlayerPaint() {
@@ -2449,6 +2462,9 @@
         closePlayerPanel(false);
         player = null;
         playerView.classList.remove('preparing');
+        const posterImg = byId('player-poster').firstElementChild;
+        posterImg.removeAttribute('src');
+        posterImg.classList.remove('image-ready', 'image-error');
         updatePlayerProgress();
         refreshPlayerTools();
         window.clearTimeout(controlsTimer);
