@@ -2305,7 +2305,6 @@
             appendInfoRow(interpolation.list, '后端 / 运行库', `${activeInterpolation.backend} · ${activeInterpolation.runtimeVersion}`);
             appendInfoRow(interpolation.list, '模型 / Engine', `${activeInterpolation.model} · ${activeInterpolation.engineKey}`);
             appendInfoRow(interpolation.list, '精度 / Scale', `${activeInterpolation.precision} · ${activeInterpolation.scale}`);
-            appendInfoRow(interpolation.list, '原生滤镜', infoValue(activeInterpolation.videoFilter));
             appendInfoRow(interpolation.list, '硬件解码', infoValue(diagnostics.hwdecCurrent || activeInterpolation.hwdec));
         } else {
             appendInfoRow(interpolation.list, '状态', '关闭');
