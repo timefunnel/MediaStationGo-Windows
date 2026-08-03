@@ -333,6 +333,10 @@ struct ActivePlaybackReport {
     session: MediaStationSession,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    /// Incremented whenever the user explicitly saves a track preference, so
+    /// the first-frame reconcile worker can tell whether the user changed the
+    /// tracks after playback loaded and must not override that choice.
+    preference_revision: u64,
     runtime_tracks_reconciled: bool,
     started: bool,
     paused: bool,
@@ -344,6 +348,10 @@ struct RuntimeTrackReconcile {
     snapshot: SessionSnapshot,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    /// Track preference revision captured when the session started. The
+    /// reconcile worker skips overriding the runtime tracks if this is stale,
+    /// meaning the user changed the selection after playback loaded.
+    preference_revision: u64,
 }
 
 struct PreparedExternalSubtitle {
@@ -709,6 +717,7 @@ impl MediaStationRuntime {
                         },
                         source: active.source.clone(),
                         preference: active.preference.clone(),
+                        preference_revision: active.preference_revision,
                     })
                 })
             } else {
@@ -1045,6 +1054,33 @@ impl MediaStationRuntime {
         Ok(active.source.clone())
     }
 
+    fn active_preference_revision(
+        &self,
+        snapshot: &SessionSnapshot,
+    ) -> Result<u64, LoadFailure> {
+        let state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        let active = state.active_report.as_ref().ok_or_else(|| {
+            LoadFailure::new(
+                "playback_unavailable",
+                "No active playback can change tracks",
+            )
+        })?;
+        Ok(active.preference_revision)
+    }
+
+    fn bump_preference_revision(&self, snapshot: &SessionSnapshot) {
+        let mut state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return;
+        }
+        if let Some(active) = state.active_report.as_mut() {
+            active.preference_revision = active.preference_revision.wrapping_add(1);
+        }
+    }
+
     fn apply_track_selection(
         &self,
         snapshot: &SessionSnapshot,
@@ -1202,6 +1238,7 @@ fn activate_playback_report(
         session: snapshot.session.clone(),
         source: source.clone(),
         preference: preference.clone(),
+        preference_revision: 0,
         runtime_tracks_reconciled: false,
         started: false,
         paused: false,
@@ -3288,6 +3325,9 @@ fn execute_track_selection(
         .update_playback_preference(&snapshot.session, &request.media_id, &update)
         .map_err(|error| api_failure("preference_update_failed", &error))?;
     runtime.ensure_generation(snapshot.generation)?;
+    // Record that the user explicitly changed the track preference so the
+    // first-frame reconcile worker will not re-apply or correct it.
+    runtime.bump_preference_revision(snapshot);
     match runtime.apply_track_selection(snapshot, &request.media_id, selection) {
         Ok(payload) => Ok(payload),
         Err(failure) => {
@@ -3353,6 +3393,12 @@ fn reconcile_runtime_track_preference_inner(
     reconcile: &RuntimeTrackReconcile,
 ) -> Result<(), LoadFailure> {
     runtime.active_playback_source(&reconcile.snapshot, &reconcile.source.media_id)?;
+    // If the user saved a track preference after playback loaded, the
+    // reconcile worker must not re-apply the load-time preference or write a
+    // correction over the user's explicit choice.
+    if runtime.active_preference_revision(&reconcile.snapshot)? != reconcile.preference_revision {
+        return Ok(());
+    }
     let catalog = current_runtime_track_catalog(&reconcile.source)?;
     let baseline = runtime_preference_update(&catalog);
     let mut correction = PlaybackTrackPreferenceUpdate::default();
