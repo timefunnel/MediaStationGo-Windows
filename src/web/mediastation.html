@@ -56,9 +56,17 @@
 
   <section id="player-view" class="player-view hidden" aria-label="播放器">
     <div id="player-loading" class="player-loading">
-      <span aria-hidden="true"></span>
-      <strong id="player-loading-title"></strong>
-      <p id="player-loading-label">正在准备播放</p>
+      <div class="player-loading-emblem" aria-hidden="true">
+        <span class="player-loading-glow"></span>
+        <span class="player-loading-orbit"></span>
+        <span class="player-loading-orbit player-loading-orbit-inner"></span>
+        <span class="player-loading-core"></span>
+      </div>
+      <div class="player-loading-copy">
+        <strong id="player-loading-title"></strong>
+        <p id="player-loading-label">正在准备播放</p>
+      </div>
+      <div class="player-loading-track"><span class="player-loading-bar"></span></div>
     </div>
     <div id="player-controls" class="player-controls visible">
       <div class="player-topline">
