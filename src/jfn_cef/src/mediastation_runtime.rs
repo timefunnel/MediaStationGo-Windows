@@ -1074,10 +1074,7 @@ impl MediaStationRuntime {
         Ok(active.source.clone())
     }
 
-    fn active_preference_revision(
-        &self,
-        snapshot: &SessionSnapshot,
-    ) -> Result<u64, LoadFailure> {
+    fn active_preference_revision(&self, snapshot: &SessionSnapshot) -> Result<u64, LoadFailure> {
         let state = self.state.lock();
         if state.generation != snapshot.generation || state.session.is_none() {
             return Err(session_changed());
