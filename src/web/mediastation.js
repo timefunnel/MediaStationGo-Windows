@@ -1253,7 +1253,7 @@
     function renderLibraries(libraries) {
         content.replaceChildren();
         const header = element('div', 'page-header');
-        const back = element('button', 'icon-button', '←');
+        const back = element('button', 'back-button', '←');
         back.type = 'button'; back.title = '返回'; back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', '媒体库'));
         const grid = element('div', 'grid-view library-grid');
@@ -1289,7 +1289,7 @@
         libraryPageObserver.disconnect();
         content.replaceChildren();
         const header = element('div', 'page-header');
-        const back = element('button', 'icon-button', '←');
+        const back = element('button', 'back-button', '←');
         back.type = 'button'; back.title = '返回'; back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', data.library.title));
         const grid = element('div', 'grid-view');
@@ -1470,7 +1470,7 @@
             await openLibrary(card);
             return;
         }
-        renderLoading();
+        renderDetailLoading();
         try {
             const detail = await nativeRequest('mediaStationCatalog', 'detail', ['detail', JSON.stringify({ mediaId: card.id })]);
             setCurrentView({ kind: 'detail', data: detail });
@@ -1478,6 +1478,28 @@
             goBack();
             showToast(friendlyError(error));
         }
+    }
+
+    function renderDetailLoading() {
+        content.replaceChildren();
+        const view = element('div', 'detail-view');
+        const backdrop = element('div', 'detail-backdrop placeholder-art');
+        backdrop.style.height = 'min(72vh, 720px)';
+        const body = element('div', 'detail-content');
+        body.append(element('button', 'icon-button detail-back placeholder-back', '←'));
+        const layout = element('div', 'detail-layout');
+        const poster = element('div', 'detail-poster placeholder-art');
+        const copy = element('div', 'detail-copy');
+        copy.append(
+            element('div', 'placeholder-title detail-title-ph'),
+            element('div', 'placeholder-subtitle detail-meta-ph'),
+            element('div', 'placeholder-subtitle detail-overview-ph'),
+        );
+        layout.append(poster, copy);
+        body.append(layout);
+        view.append(backdrop, body);
+        view.setAttribute('aria-hidden', 'true');
+        content.append(view);
     }
 
     function renderDetail(detail) {
@@ -1643,7 +1665,7 @@
         content.replaceChildren();
         const root = element('section', 'search-view');
         const header = element('div', 'page-header search-header');
-        const back = element('button', 'icon-button', '←');
+        const back = element('button', 'back-button', '←');
         back.type = 'button';
         back.title = '返回';
         back.setAttribute('aria-label', '返回');

@@ -244,10 +244,13 @@ button:focus-visible, input:focus-visible {
 }
 
 .content { height: 100%; overflow: auto; outline: none; scrollbar-color: rgba(255,255,255,0.24) transparent; scrollbar-width: thin; will-change: scroll-position; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; }
-.content-enter-forward { animation: content-enter-forward 270ms cubic-bezier(0.22, 0.72, 0.2, 1) both; will-change: transform, opacity; }
-.content-enter-back { animation: content-enter-back 270ms cubic-bezier(0.22, 0.72, 0.2, 1) both; will-change: transform, opacity; }
-@keyframes content-enter-forward { from { opacity: 0.58; transform: translateX(28px); } }
-@keyframes content-enter-back { from { opacity: 0.58; transform: translateX(-28px); } }
+.content-enter-forward { animation: content-enter-forward 260ms cubic-bezier(0.22, 0.72, 0.2, 1) both; will-change: transform, opacity; }
+.content-enter-back { animation: content-enter-back 260ms cubic-bezier(0.22, 0.72, 0.2, 1) both; will-change: transform, opacity; }
+/* Forward: content arrives from the right (deeper into the stack).
+   Back: content arrives from the left (previous level). Opposite
+   directions make navigation feel like traversing a stack. */
+@keyframes content-enter-forward { from { opacity: 0.5; transform: translateX(28px); } }
+@keyframes content-enter-back { from { opacity: 0.5; transform: translateX(-28px); } }
 .home-hero {
   isolation: isolate;
   position: relative;
@@ -387,8 +390,32 @@ button:focus-visible, input:focus-visible {
 .media-row.is-scrolling .resume-card:focus-visible .card-progress { height: 5px; background: rgba(0,0,0,0.72); transition: none; }
 
 .page-header { display: flex; align-items: center; gap: 14px; padding: calc(var(--topbar-height) + 28px) 5.2% 20px; }
-.page-header .icon-button { width: 36px; height: 36px; background: rgba(255,255,255,0.05); }
 .page-header h1 { margin: 0; font-size: 25px; font-weight: 650; }
+/* Unified back button: capsule icon with hover lift, shared by list and
+   detail views so navigation feels consistent across the app. */
+.back-button {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  flex: 0 0 auto;
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.05);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  transition: background 150ms ease, border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+}
+.back-button:hover, .back-button:focus-visible {
+  background: rgba(255,255,255,0.1);
+  border-color: rgba(255,255,255,0.28);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.24);
+}
+.back-button:active { transform: translateY(0); }
 .grid-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 24px 15px; padding: 8px 5.2% 56px; }
 .grid-view .media-card { max-width: 230px; }
 .library-grid { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 18px; }
@@ -405,11 +432,28 @@ button:focus-visible, input:focus-visible {
 .placeholder-subtitle { width: 42%; opacity: 0.7; }
 @keyframes placeholder-pulse { to { background-color: #202629; } }
 
+/* Detail-page skeleton: mirrors renderDetail layout so the load state
+   does not flash the media-library card grid. */
+.placeholder-back { width: 40px; height: 40px; margin-bottom: 24px; background: rgba(255,255,255,0.06); border: 0; cursor: default; }
+.detail-title-ph { width: 46%; height: 38px; margin: 0 0 12px; }
+.detail-meta-ph { width: 58%; height: 13px; margin: 0 0 18px; }
+.detail-overview-ph { width: 84%; height: 16px; }
+
 .detail-view { position: relative; min-height: 100vh; padding: 0 0 64px; overflow: hidden; }
 .detail-backdrop { position: absolute; inset: 0 0 auto; height: min(72vh, 720px); background: #15191b center 20% / cover no-repeat; filter: saturate(0.9); }
 .detail-backdrop::after { position: absolute; inset: 0; content: ""; background: linear-gradient(90deg, rgba(7,9,10,0.94) 0 18%, rgba(7,9,10,0.66) 50%, rgba(7,9,10,0.18) 78%), linear-gradient(0deg, var(--bg) 1%, rgba(9,11,12,0.2) 58%, rgba(9,11,12,0.34)); }
 .detail-content { position: relative; z-index: 1; width: min(1320px, 90%); margin: 0 auto; padding-top: calc(var(--topbar-height) + 30px); }
-.detail-back { margin-bottom: 24px; background: rgba(5,7,8,0.48); backdrop-filter: blur(10px); }
+.detail-back {
+  margin-bottom: 24px;
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.22);
+  background: rgba(5,7,8,0.5);
+  backdrop-filter: blur(10px);
+}
+.detail-back:hover, .detail-back:focus-visible {
+  background: rgba(5,7,8,0.72);
+  border-color: rgba(255,255,255,0.4);
+}
 .detail-layout { display: grid; grid-template-columns: clamp(164px, 18vw, 236px) minmax(0, 690px); align-items: end; gap: clamp(28px, 4vw, 56px); min-height: min(50vh, 520px); }
 .detail-poster { position: relative; width: 100%; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid rgba(255,255,255,0.16); border-radius: 6px; background: var(--surface); box-shadow: 0 22px 56px rgba(0,0,0,0.42); }
 .detail-copy { min-width: 0; padding-bottom: 6px; }
