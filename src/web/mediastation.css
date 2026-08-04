@@ -192,17 +192,17 @@ button:focus-visible, input:focus-visible {
   width: calc(100% + 160px);
   height: calc(100% + 160px);
   background: center center / cover no-repeat;
-  filter: blur(150px) saturate(130%) contrast(160%);
+  filter: blur(110px) saturate(150%) contrast(130%);
   opacity: 0;
   pointer-events: none;
   transition: opacity 900ms ease;
 }
-.app-backdrop.ready { opacity: 0.42; }
+.app-backdrop.ready { opacity: 0.52; }
 .app-backdrop::after {
   position: absolute;
   inset: 0;
   content: "";
-  background: linear-gradient(180deg, rgba(10, 13, 15, 0.82), rgba(10, 13, 15, 0.68));
+  background: linear-gradient(180deg, rgba(10, 13, 15, 0.68), rgba(10, 13, 15, 0.54));
 }
 .topbar {
   position: fixed;
