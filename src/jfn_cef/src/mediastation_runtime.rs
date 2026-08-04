@@ -40,16 +40,21 @@ use crate::APP_VERSION;
 use crate::client::{Inner, RendererValue, post_renderer_message};
 use crate::ipc::list_string;
 use crate::mediastation_cache::{HomeSnapshotCache, ImageDiskCache, image_cache_key};
-use crate::mediastation_credentials::{StoredSession, WindowsCredentialStore};
+use crate::mediastation_credentials::{
+    CredentialError, SavedAccount, StoredSession, WindowsCredentialStore,
+};
 
 const OPERATION_LOAD: &str = "load";
 const OPERATION_AUTHENTICATE: &str = "authenticate";
 const OPERATION_SESSION_STATUS: &str = "session_status";
 const OPERATION_LOGOUT: &str = "logout";
+const OPERATION_LIST_ACCOUNTS: &str = "list_accounts";
+const OPERATION_SWITCH_ACCOUNT: &str = "switch_account";
 const OPERATION_IMAGE: &str = "image";
 const OPERATION_TRACKS: &str = "tracks";
 const OPERATION_TRACK_SELECTION: &str = "track_selection";
 const MAX_REQUEST_ID_LEN: usize = 128;
+const ACCOUNT_ID_LEN: usize = 64;
 const MAX_MEDIA_ID_LEN: usize = 256;
 const MAX_SERVER_URL_LEN: usize = 2_048;
 const MAX_USERNAME_LEN: usize = 256;
@@ -969,7 +974,26 @@ impl MediaStationRuntime {
     fn logout_persisted_session(&self) -> Result<bool, LoadFailure> {
         let (deleted, stopped) = {
             let mut state = self.state.lock();
-            let deleted = WindowsCredentialStore::active().delete().map_err(|error| {
+            let active_store = WindowsCredentialStore::active();
+            let active_stored = active_store.load().map_err(|error| {
+                log_error(&format!(
+                    "MediaStation active credential read before logout failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(
+                    error.code(),
+                    "The persisted MediaStation session could not be read",
+                )
+            })?;
+            if let (Some(active), Some(session)) = (active_stored.as_ref(), state.session.as_ref())
+                && (active.base_url != session.base_url || active.user_id != session.user_id)
+            {
+                return Err(LoadFailure::new(
+                    "credential_active_mismatch",
+                    "The persisted account no longer matches the active session",
+                ));
+            }
+            let active_deleted = active_store.delete().map_err(|error| {
                 log_error(&format!(
                     "MediaStation credential deletion failed: code={}",
                     error.code()
@@ -979,16 +1003,104 @@ impl MediaStationRuntime {
                     "The persisted MediaStation session could not be removed",
                 )
             })?;
+            let account_deleted = if let Some(session) = state.session.as_ref() {
+                let account_store =
+                    WindowsCredentialStore::account(&session.base_url, &session.user_id);
+                match account_store.delete() {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        if active_deleted
+                            && let Some(stored) = active_stored.as_ref()
+                            && let Err(rollback) = active_store.save(stored)
+                        {
+                            log_error(&format!(
+                                "MediaStation logout rollback failed: delete_code={} rollback_code={}",
+                                error.code(),
+                                rollback.code()
+                            ));
+                            return Err(LoadFailure::new(
+                                "credential_logout_rollback_failed",
+                                "The account could not be removed and the active credential could not be restored",
+                            ));
+                        }
+                        log_error(&format!(
+                            "MediaStation saved account deletion failed: code={}",
+                            error.code()
+                        ));
+                        return Err(LoadFailure::new(
+                            error.code(),
+                            "The saved MediaStation account could not be removed",
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
             let stopped = take_stopped_report(&mut state);
             state.generation = state.generation.wrapping_add(1);
             state.session = None;
             state.session_profile = None;
             state.active_subtitle = None;
             state.active_interpolation = None;
-            (deleted, stopped)
+            (active_deleted || account_deleted, stopped)
         };
         self.enqueue_report(stopped);
         Ok(deleted)
+    }
+
+    fn switch_to_saved_account(&self, account_id: &str) -> Result<Value, LoadFailure> {
+        let store = WindowsCredentialStore::account_by_id(account_id).map_err(|error| {
+            LoadFailure::new(error.code(), "The selected account identifier is invalid")
+        })?;
+        let stored = store
+            .load()
+            .map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account read during switch failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(error.code(), "The selected account could not be read")
+            })?
+            .ok_or_else(|| {
+                LoadFailure::new(
+                    "account_not_found",
+                    "The selected account is no longer available",
+                )
+            })?;
+        if stored.account_id() != account_id {
+            return Err(LoadFailure::new(
+                "credential_account_mismatch",
+                "The selected credential does not match its account identifier",
+            ));
+        }
+        let authorization = native_authorization_header(Some(stored.access_token_secret()))?;
+        let session = stored.to_session(authorization).map_err(|error| {
+            log_error(&format!(
+                "MediaStation saved account could not be configured: code={}",
+                api_error_code(&error)
+            ));
+            LoadFailure::new(
+                "saved_account_invalid",
+                "The saved account could not be configured",
+            )
+        })?;
+        let user_name = stored.user_name.clone();
+        let (payload, stopped) = {
+            let mut state = self.state.lock();
+            persist_active_session(&stored)?;
+            let stopped = take_stopped_report(&mut state);
+            state.generation = state.generation.wrapping_add(1);
+            state.session = Some(session);
+            state.session_profile = Some(SessionProfile {
+                user_name,
+                persisted: true,
+            });
+            state.active_subtitle = None;
+            state.active_interpolation = None;
+            (session_status_payload(&state), stopped)
+        };
+        self.enqueue_report(stopped);
+        Ok(payload)
     }
 
     fn ensure_generation(&self, generation: u64) -> Result<(), LoadFailure> {
@@ -1441,6 +1553,15 @@ pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
     if configured_url != stored.base_url {
         return Err("credential_server_mismatch".to_string());
     }
+    let account_store = WindowsCredentialStore::account(&stored.base_url, &stored.user_id);
+    let saved = account_store
+        .load()
+        .map_err(|error| error.code().to_string())?;
+    if saved.as_ref() != Some(&stored) {
+        account_store
+            .save(&stored)
+            .map_err(|error| error.code().to_string())?;
+    }
     let authorization = native_authorization_header(Some(stored.access_token_secret()))
         .map_err(|failure| failure.code.to_string())?;
     let session = stored
@@ -1631,6 +1752,107 @@ pub(crate) fn handle_logout_message(layer: Option<Arc<Inner>>, args: Option<&Lis
             &layer,
             &request_id,
             OPERATION_LOGOUT,
+            false,
+            failure.payload(),
+        ),
+    }
+    true
+}
+
+pub(crate) fn handle_list_accounts_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("MediaStation account list rejected: web layer unavailable");
+        return true;
+    };
+    let request_id = match parse_request_id(args) {
+        Ok(request_id) => request_id,
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_LIST_ACCOUNTS,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    match WindowsCredentialStore::list_saved_accounts() {
+        Ok(accounts) => {
+            log_debug(&format!(
+                "MediaStation saved accounts listed: count={}",
+                accounts.len()
+            ));
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_LIST_ACCOUNTS,
+                true,
+                saved_accounts_payload(&accounts),
+            )
+        }
+        Err(error) => {
+            log_error(&format!(
+                "MediaStation saved account enumeration failed: code={}",
+                error.code()
+            ));
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_LIST_ACCOUNTS,
+                false,
+                json!({ "code": error.code(), "message": "The saved accounts could not be listed" }),
+            )
+        }
+    }
+    true
+}
+
+pub(crate) fn handle_switch_account_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("MediaStation account switch rejected: web layer unavailable");
+        return true;
+    };
+    let (request_id, account_id) = match parse_switch_account_request(args) {
+        Ok((request_id, account_id)) => (request_id, account_id),
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_SWITCH_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_SWITCH_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    match runtime.switch_to_saved_account(&account_id) {
+        Ok(payload) => {
+            dispatch_response(&layer, &request_id, OPERATION_SWITCH_ACCOUNT, true, payload)
+        }
+        Err(failure) => dispatch_response(
+            &layer,
+            &request_id,
+            OPERATION_SWITCH_ACCOUNT,
             false,
             failure.payload(),
         ),
@@ -2421,6 +2643,69 @@ fn parse_request_id(args: Option<&ListValue>) -> Result<String, (String, LoadFai
     Ok(request_id)
 }
 
+fn parse_switch_account_request(
+    args: Option<&ListValue>,
+) -> Result<(String, String), (String, LoadFailure)> {
+    let Some(args) = args else {
+        return Err((
+            String::new(),
+            LoadFailure::new("invalid_request", "Request arguments are missing"),
+        ));
+    };
+    let request_id =
+        if args.size() > 0 && args.get_type(0).as_ref() == &sys::cef_value_type_t::VTYPE_STRING {
+            list_string(args, 0)
+        } else {
+            String::new()
+        };
+    if !valid_identifier(&request_id, MAX_REQUEST_ID_LEN) {
+        return Err((
+            request_id,
+            LoadFailure::new(
+                "invalid_request_id",
+                "The request identifier is empty or invalid",
+            ),
+        ));
+    }
+    let account_id =
+        if args.size() > 1 && args.get_type(1).as_ref() == &sys::cef_value_type_t::VTYPE_STRING {
+            list_string(args, 1)
+        } else {
+            return Err((
+                request_id,
+                LoadFailure::new(
+                    "invalid_account_id",
+                    "The account identifier is missing or invalid",
+                ),
+            ));
+        };
+    if account_id.len() != ACCOUNT_ID_LEN
+        || !account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err((
+            request_id,
+            LoadFailure::new("invalid_account_id", "The account identifier is invalid"),
+        ));
+    }
+    Ok((request_id, account_id))
+}
+
+fn saved_accounts_payload(accounts: &[SavedAccount]) -> Value {
+    json!({
+        "accounts": accounts
+            .iter()
+            .map(|account| json!({
+                "accountId": account.account_id,
+                "baseUrl": account.session.base_url.as_str(),
+                "userId": account.session.user_id,
+                "userName": account.session.user_name,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn execute_authentication(
     runtime: &MediaStationRuntime,
     expected_generation: u64,
@@ -2470,31 +2755,141 @@ fn execute_authentication(
 }
 
 fn persist_active_session(stored: &StoredSession) -> Result<(), LoadFailure> {
-    let previous_server_url = jfn_config::server_url();
-    jfn_config::set_server_url(stored.base_url.as_str());
-    if !jfn_config::settings_save() {
-        jfn_config::set_server_url(&previous_server_url);
-        log_error("MediaStation server URL persistence failed");
+    let account_store = WindowsCredentialStore::account(&stored.base_url, &stored.user_id);
+    let active_store = WindowsCredentialStore::active();
+    let previous_account = account_store.load().map_err(|error| {
+        log_error(&format!(
+            "MediaStation account credential snapshot failed: code={}",
+            error.code()
+        ));
+        LoadFailure::new(
+            error.code(),
+            "The existing MediaStation account could not be read securely",
+        )
+    })?;
+    if previous_account
+        .as_ref()
+        .is_some_and(|session| session.account_id() != stored.account_id())
+    {
         return Err(LoadFailure::new(
-            "settings_write_failed",
-            "The server selection could not be persisted",
+            "credential_account_mismatch",
+            "The saved account credential does not match its identifier",
         ));
     }
-    if let Err(error) = WindowsCredentialStore::active().save(stored) {
-        jfn_config::set_server_url(&previous_server_url);
+    let previous_active = active_store.load().map_err(|error| {
+        log_error(&format!(
+            "MediaStation active credential snapshot failed: code={}",
+            error.code()
+        ));
+        LoadFailure::new(
+            error.code(),
+            "The existing MediaStation session could not be read securely",
+        )
+    })?;
+    let previous_server_url = jfn_config::server_url();
+    let server_changed = previous_server_url != stored.base_url.as_str();
+    if server_changed {
+        jfn_config::set_server_url(stored.base_url.as_str());
         if !jfn_config::settings_save() {
-            log_error("MediaStation server URL rollback failed after credential write failure");
+            jfn_config::set_server_url(&previous_server_url);
+            log_error("MediaStation server URL persistence failed");
+            return Err(LoadFailure::new(
+                "settings_write_failed",
+                "The server selection could not be persisted",
+            ));
         }
+    }
+
+    let account_changed = previous_account.as_ref() != Some(stored);
+    if account_changed && let Err(error) = account_store.save(stored) {
+        log_error(&format!(
+            "MediaStation account credential persistence failed: code={}",
+            error.code()
+        ));
+        if rollback_active_session_persistence(
+            server_changed.then_some(previous_server_url.as_str()),
+            Some((&account_store, previous_account.as_ref())),
+            None,
+        ) {
+            return Err(persistence_rollback_failure());
+        }
+        return Err(LoadFailure::new(
+            error.code(),
+            "The MediaStation account could not be persisted securely",
+        ));
+    }
+
+    if previous_active.as_ref() != Some(stored)
+        && let Err(error) = active_store.save(stored)
+    {
         log_error(&format!(
             "MediaStation credential persistence failed: code={}",
             error.code()
         ));
+        if rollback_active_session_persistence(
+            server_changed.then_some(previous_server_url.as_str()),
+            account_changed.then_some((&account_store, previous_account.as_ref())),
+            Some((&active_store, previous_active.as_ref())),
+        ) {
+            return Err(persistence_rollback_failure());
+        }
         return Err(LoadFailure::new(
             error.code(),
             "The MediaStation session could not be persisted securely",
         ));
     }
     Ok(())
+}
+
+fn rollback_active_session_persistence(
+    previous_server_url: Option<&str>,
+    account: Option<(&WindowsCredentialStore, Option<&StoredSession>)>,
+    active: Option<(&WindowsCredentialStore, Option<&StoredSession>)>,
+) -> bool {
+    let mut failed = false;
+    if let Some((store, previous)) = active
+        && let Err(error) = restore_credential(store, previous)
+    {
+        failed = true;
+        log_error(&format!(
+            "MediaStation active credential rollback failed: code={}",
+            error.code()
+        ));
+    }
+    if let Some((store, previous)) = account
+        && let Err(error) = restore_credential(store, previous)
+    {
+        failed = true;
+        log_error(&format!(
+            "MediaStation account credential rollback failed: code={}",
+            error.code()
+        ));
+    }
+    if let Some(previous_server_url) = previous_server_url {
+        jfn_config::set_server_url(previous_server_url);
+        if !jfn_config::settings_save() {
+            failed = true;
+            log_error("MediaStation server URL rollback failed");
+        }
+    }
+    failed
+}
+
+fn restore_credential(
+    store: &WindowsCredentialStore,
+    previous: Option<&StoredSession>,
+) -> Result<(), CredentialError> {
+    match previous {
+        Some(previous) => store.save(previous),
+        None => store.delete().map(|_| ()),
+    }
+}
+
+fn persistence_rollback_failure() -> LoadFailure {
+    LoadFailure::new(
+        "credential_persist_rollback_failed",
+        "The account update failed and its previous persisted state could not be restored",
+    )
 }
 
 fn parse_server_url(raw: &str) -> Result<Url, LoadFailure> {
@@ -4800,6 +5195,35 @@ mod tests {
         assert_eq!(payload["userId"], "user-1");
         assert_eq!(payload["userName"], "Test User");
         assert!(!text.contains("test-token"));
+        assert!(!text.to_ascii_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn saved_accounts_payload_contains_only_public_identity_fields() {
+        let stored = StoredSession::new(
+            Url::parse("https://media.example/base").expect("URL should parse"),
+            "saved-user",
+            "Saved User",
+            "saved-account-secret",
+        )
+        .expect("stored session should be valid");
+        let account_id = stored.account_id();
+        let payload = saved_accounts_payload(&[SavedAccount {
+            account_id: account_id.clone(),
+            session: stored,
+        }]);
+        let account = payload["accounts"][0]
+            .as_object()
+            .expect("account payload should be an object");
+        let text = payload.to_string();
+
+        assert_eq!(account.len(), 4);
+        assert_eq!(account["accountId"], account_id);
+        assert_eq!(account["baseUrl"], "https://media.example/base");
+        assert_eq!(account["userId"], "saved-user");
+        assert_eq!(account["userName"], "Saved User");
+        assert!(!text.contains("saved-account-secret"));
+        assert!(!text.to_ascii_lowercase().contains("token"));
         assert!(!text.to_ascii_lowercase().contains("authorization"));
     }
 

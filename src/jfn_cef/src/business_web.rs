@@ -331,6 +331,12 @@ fn handle_message(message: BrowserMessage) -> bool {
     if message.name() == "mediaStationLogout" {
         return crate::mediastation_runtime::handle_logout_message(web_layer(), args);
     }
+    if message.name() == "mediaStationListAccounts" {
+        return crate::mediastation_runtime::handle_list_accounts_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationSwitchAccount" {
+        return crate::mediastation_runtime::handle_switch_account_message(web_layer(), args);
+    }
     if message.name() == "mediaStationCatalog" {
         return crate::mediastation_runtime::handle_catalog_message(web_layer(), args);
     }

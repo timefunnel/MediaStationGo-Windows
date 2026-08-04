@@ -73,6 +73,8 @@ pub(crate) enum NativeFunction {
     MediaStationTracks,
     MediaStationSelectTrack,
     MediaStationFrameInterpolation,
+    MediaStationListAccounts,
+    MediaStationSwitchAccount,
 }
 
 impl NativeFunction {
@@ -132,6 +134,8 @@ impl NativeFunction {
             "mediaStationTracks" => Self::MediaStationTracks,
             "mediaStationSelectTrack" => Self::MediaStationSelectTrack,
             "mediaStationFrameInterpolation" => Self::MediaStationFrameInterpolation,
+            "mediaStationListAccounts" => Self::MediaStationListAccounts,
+            "mediaStationSwitchAccount" => Self::MediaStationSwitchAccount,
             _ => return None,
         })
     }
@@ -192,6 +196,8 @@ impl NativeFunction {
             Self::MediaStationTracks => "mediaStationTracks",
             Self::MediaStationSelectTrack => "mediaStationSelectTrack",
             Self::MediaStationFrameInterpolation => "mediaStationFrameInterpolation",
+            Self::MediaStationListAccounts => "mediaStationListAccounts",
+            Self::MediaStationSwitchAccount => "mediaStationSwitchAccount",
         }
     }
 }
@@ -292,6 +298,8 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::MediaStationTracks,
     NativeFunction::MediaStationSelectTrack,
     NativeFunction::MediaStationFrameInterpolation,
+    NativeFunction::MediaStationListAccounts,
+    NativeFunction::MediaStationSwitchAccount,
 ];
 
 const WEB_SCRIPTS: &[InjectedScript] = &[

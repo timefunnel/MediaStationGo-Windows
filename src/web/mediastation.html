@@ -104,7 +104,12 @@
     <header><h2>账号</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
     <div class="drawer-body">
       <div class="account-summary"><span id="drawer-avatar" aria-hidden="true">M</span><div><strong id="drawer-user"></strong><p id="drawer-server"></p></div></div>
-      <button id="change-account-button" class="secondary-command drawer-command" type="button">新增或切换用户</button>
+      <section id="saved-accounts" class="saved-accounts" aria-label="已保存账号">
+        <h3>已保存账号</h3>
+        <p id="saved-accounts-state" class="saved-accounts-state" role="status" aria-live="polite">正在读取账号...</p>
+        <div id="saved-accounts-list" class="saved-accounts-list"></div>
+      </section>
+      <button id="change-account-button" class="secondary-command drawer-command" type="button">添加账号</button>
       <button id="logout-button" class="danger-command" type="button">退出当前账号</button>
     </div>
   </aside>

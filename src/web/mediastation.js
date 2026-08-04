@@ -309,6 +309,18 @@
             playback_unavailable: '当前没有可切换轨道的播放项目',
             authentication_in_progress: '登录请求正在处理中',
             session_changed: '账号状态已变化，请重试',
+            account_not_found: '所选账号已不存在，请刷新列表',
+            invalid_account_id: '所选账号标识无效',
+            saved_account_invalid: '所选账号凭据无效',
+            credential_enumerate_failed: '无法读取 Windows 中保存的账号',
+            credential_read_failed: '无法读取 Windows 中保存的账号凭据',
+            credential_write_failed: '无法安全保存账号凭据',
+            credential_delete_failed: '无法删除 Windows 中保存的账号凭据',
+            credential_account_invalid: '已保存账号凭据无效',
+            credential_account_target_invalid: '已保存账号标识无效',
+            credential_account_mismatch: '已保存账号标识与凭据不一致',
+            credential_persist_rollback_failed: '账号保存失败，且无法恢复之前的账号状态',
+            settings_write_failed: '无法保存当前服务器设置',
             frame_interpolation_runtime_unavailable: 'RIFE 插帧组件不可用',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
             frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
@@ -1766,6 +1778,99 @@
         }
     }
 
+    async function loadSavedAccounts() {
+        const list = byId('saved-accounts-list');
+        const state = byId('saved-accounts-state');
+        list.replaceChildren();
+        state.textContent = '正在读取账号...';
+        state.classList.remove('hidden', 'error');
+        try {
+            const result = await nativeRequest('mediaStationListAccounts', 'list_accounts');
+            const accounts = Array.isArray(result.accounts) ? result.accounts : [];
+            if (!accounts.length) {
+                state.textContent = '暂无已保存账号';
+                return;
+            }
+            if (accounts.some((account) => (
+                typeof account.accountId !== 'string'
+                || !/^[0-9a-f]{64}$/.test(account.accountId)
+                || typeof account.baseUrl !== 'string'
+                || !account.baseUrl
+                || typeof account.userId !== 'string'
+                || !account.userId
+                || typeof account.userName !== 'string'
+            ))) {
+                throw new Error('已保存账号数据无效');
+            }
+            const isCurrent = (account) => Boolean(
+                session
+                && account.baseUrl === session.baseUrl
+                && account.userId === session.userId
+            );
+            accounts.sort((left, right) => {
+                const leftActive = isCurrent(left);
+                const rightActive = isCurrent(right);
+                if (leftActive !== rightActive) return leftActive ? -1 : 1;
+                return String(left.userName || left.userId).localeCompare(
+                    String(right.userName || right.userId),
+                    'zh-CN',
+                ) || String(left.baseUrl).localeCompare(String(right.baseUrl));
+            });
+            state.classList.add('hidden');
+            for (const account of accounts) {
+                const active = isCurrent(account);
+                const button = element('button', 'saved-account-item' + (active ? ' active' : ''), '');
+                button.type = 'button';
+                if (active) button.setAttribute('aria-current', 'true');
+                const avatar = element('span', 'avatar', (account.userName || '?').slice(0, 1).toUpperCase());
+                const body = element('div', 'saved-account-copy', null);
+                body.append(element('strong', '', account.userName || account.userId));
+                body.append(element('span', '', account.baseUrl.replace(/^https?:\/\//, '')));
+                button.append(avatar, body);
+                if (active) button.append(element('span', 'saved-account-current', '当前'));
+                button.addEventListener('click', () => switchAccount(account, active, button));
+                list.append(button);
+            }
+        } catch (error) {
+            const message = friendlyError(error);
+            state.textContent = `账号列表加载失败：${message}`;
+            state.classList.add('error');
+            state.classList.remove('hidden');
+            console.error(`账户列表加载失败：${message}`);
+        }
+    }
+
+    async function switchAccount(account, alreadyActive, selectedButton) {
+        if (alreadyActive) {
+            closeDrawer();
+            return;
+        }
+        const list = byId('saved-accounts-list');
+        const state = byId('saved-accounts-state');
+        list.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+        state.textContent = `正在切换到 ${account.userName || account.userId}...`;
+        state.classList.remove('hidden', 'error');
+        selectedButton?.setAttribute('aria-busy', 'true');
+        try {
+            const status = await nativeRequest(
+                'mediaStationSwitchAccount',
+                'switch_account',
+                [account.accountId],
+            );
+            closeDrawer(false);
+            resetCatalogState();
+            await showApp(status);
+        } catch (error) {
+            const message = friendlyError(error);
+            state.textContent = `账号切换失败：${message}`;
+            state.classList.add('error');
+            showToast(message);
+            list.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+        } finally {
+            selectedButton?.removeAttribute('aria-busy');
+        }
+    }
+
     async function startPlayback(card, startMs = 0) {
         if (!card?.id || !card.playable) {
             showToast('该项目不能直接播放');
@@ -2555,7 +2660,10 @@
     byId('nav-home').addEventListener('click', goHome);
     byId('nav-library').addEventListener('click', () => homeData && setCurrentView({ kind: 'libraries', data: homeData.libraries }));
     byId('search-open').addEventListener('click', openSearch);
-    byId('account-open').addEventListener('click', (event) => openDrawer(byId('account-drawer'), event.currentTarget));
+    byId('account-open').addEventListener('click', (event) => {
+        openDrawer(byId('account-drawer'), event.currentTarget);
+        loadSavedAccounts();
+    });
     byId('settings-open').addEventListener('click', (event) => {
         openDrawer(byId('settings-drawer'), event.currentTarget);
         refreshFrameInterpolationStatus();

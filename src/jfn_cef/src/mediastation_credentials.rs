@@ -4,8 +4,52 @@ use std::fmt;
 use url::Url;
 
 const ACTIVE_CREDENTIAL_TARGET: &str = "MediaStationGo.Windows.ActiveSession.v1";
+const ACCOUNT_CREDENTIAL_PREFIX: &str = "MediaStationGo.Windows.Account.";
+const ACCOUNT_CREDENTIAL_SUFFIX: &str = ".v1";
+const ACCOUNT_CREDENTIAL_FILTER: &str = "MediaStationGo.Windows.Account.*";
+const ACCOUNT_ID_LEN: usize = 64;
 const CREDENTIAL_SCHEMA_VERSION: u64 = 1;
 const MAX_CREDENTIAL_BYTES: usize = 2_560;
+const MAX_CREDENTIAL_TARGET_UNITS: usize = 256;
+
+/// Stable, hash-based credential target for a saved account. Derived from
+/// (server, user id) so re-logging-in to the same account reuses its entry.
+pub(crate) fn account_credential_target(base_url: &Url, user_id: &str) -> String {
+    let digest = account_credential_id(base_url, user_id);
+    format!("{ACCOUNT_CREDENTIAL_PREFIX}{digest}{ACCOUNT_CREDENTIAL_SUFFIX}")
+}
+
+fn account_credential_id(base_url: &Url, user_id: &str) -> String {
+    let identity = format!("{}|{}", base_url.as_str(), user_id);
+    sha256_hex(&identity)
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn valid_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn account_id_from_target(target: &str) -> Result<&str, CredentialError> {
+    let account_id = target
+        .strip_prefix(ACCOUNT_CREDENTIAL_PREFIX)
+        .and_then(|value| value.strip_suffix(ACCOUNT_CREDENTIAL_SUFFIX))
+        .ok_or_else(|| CredentialError::new("credential_account_target_invalid"))?;
+    if !valid_account_id(account_id) {
+        return Err(CredentialError::new("credential_account_target_invalid"));
+    }
+    Ok(account_id)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct StoredSession {
@@ -53,6 +97,10 @@ impl StoredSession {
         &self.access_token
     }
 
+    pub(crate) fn account_id(&self) -> String {
+        account_credential_id(&self.base_url, &self.user_id)
+    }
+
     fn encode(&self) -> Result<Vec<u8>, CredentialError> {
         let bytes = serde_json::to_vec(&json!({
             "version": CREDENTIAL_SCHEMA_VERSION,
@@ -86,6 +134,25 @@ impl StoredSession {
             required_string(&value, "userName")?,
             required_string(&value, "accessToken")?,
         )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedAccount {
+    pub(crate) account_id: String,
+    pub(crate) session: StoredSession,
+}
+
+impl SavedAccount {
+    fn from_target(target: &str, session: StoredSession) -> Result<Self, CredentialError> {
+        let account_id = account_id_from_target(target)?;
+        if session.account_id() != account_id {
+            return Err(CredentialError::new("credential_account_mismatch"));
+        }
+        Ok(Self {
+            account_id: account_id.to_string(),
+            session,
+        })
     }
 }
 
@@ -162,6 +229,7 @@ fn validate_field(
     Ok(())
 }
 
+#[derive(Debug)]
 pub(crate) struct WindowsCredentialStore {
     target_name: String,
 }
@@ -173,6 +241,23 @@ impl WindowsCredentialStore {
         }
     }
 
+    pub(crate) fn account(base_url: &Url, user_id: &str) -> Self {
+        Self {
+            target_name: account_credential_target(base_url, user_id),
+        }
+    }
+
+    pub(crate) fn account_by_id(account_id: &str) -> Result<Self, CredentialError> {
+        if !valid_account_id(account_id) {
+            return Err(CredentialError::new("credential_account_id_invalid"));
+        }
+        Ok(Self {
+            target_name: format!(
+                "{ACCOUNT_CREDENTIAL_PREFIX}{account_id}{ACCOUNT_CREDENTIAL_SUFFIX}"
+            ),
+        })
+    }
+
     #[cfg(test)]
     fn with_target(target_name: String) -> Self {
         Self { target_name }
@@ -181,18 +266,29 @@ impl WindowsCredentialStore {
 
 #[cfg(windows)]
 mod platform {
-    use super::{CredentialError, MAX_CREDENTIAL_BYTES, StoredSession, WindowsCredentialStore};
+    use super::{
+        ACCOUNT_CREDENTIAL_FILTER, CredentialError, MAX_CREDENTIAL_BYTES,
+        MAX_CREDENTIAL_TARGET_UNITS, SavedAccount, StoredSession, WindowsCredentialStore,
+    };
     use std::ptr;
     use std::slice;
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND};
     use windows_sys::Win32::Security::Credentials::{
-        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
-        CredReadW, CredWriteW,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredEnumerateW,
+        CredFree, CredReadW, CredWriteW,
     };
 
     struct CredentialBuffer(*mut CREDENTIALW);
 
     impl Drop for CredentialBuffer {
+        fn drop(&mut self) {
+            unsafe { CredFree(self.0.cast()) };
+        }
+    }
+
+    struct CredentialListBuffer(*mut *mut CREDENTIALW);
+
+    impl Drop for CredentialListBuffer {
         fn drop(&mut self) {
             unsafe { CredFree(self.0.cast()) };
         }
@@ -252,6 +348,71 @@ mod platform {
                 _ => Err(CredentialError::new("credential_delete_failed")),
             }
         }
+
+        pub(crate) fn list_saved_accounts() -> Result<Vec<SavedAccount>, CredentialError> {
+            let filter = wide_string(ACCOUNT_CREDENTIAL_FILTER)?;
+            let mut count = 0_u32;
+            let mut buffer: *mut *mut CREDENTIALW = ptr::null_mut();
+            let ok = unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut buffer) };
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                return match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND) => Ok(Vec::new()),
+                    _ => Err(CredentialError::new("credential_enumerate_failed")),
+                };
+            }
+            if buffer.is_null() {
+                return if count == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err(CredentialError::new("credential_enumerate_empty"))
+                };
+            }
+            let buffer = CredentialListBuffer(buffer);
+            let entries = unsafe { slice::from_raw_parts(buffer.0, count as usize) };
+            let mut accounts = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if entry.is_null() {
+                    return Err(CredentialError::new("credential_entry_empty"));
+                }
+                let credential = unsafe { &**entry };
+                if credential.Type != CRED_TYPE_GENERIC
+                    || credential.CredentialBlob.is_null()
+                    || credential.CredentialBlobSize == 0
+                {
+                    return Err(CredentialError::new("credential_account_invalid"));
+                }
+                let target = credential_target(credential.TargetName)?;
+                let length = credential.CredentialBlobSize as usize;
+                if length > MAX_CREDENTIAL_BYTES {
+                    return Err(CredentialError::new("credential_size_invalid"));
+                }
+                let bytes = unsafe { slice::from_raw_parts(credential.CredentialBlob, length) };
+                let session = StoredSession::decode(bytes)?;
+                accounts.push(SavedAccount::from_target(&target, session)?);
+            }
+            accounts.sort_by(|left, right| {
+                left.session
+                    .base_url
+                    .as_str()
+                    .cmp(right.session.base_url.as_str())
+                    .then_with(|| left.session.user_name.cmp(&right.session.user_name))
+                    .then_with(|| left.session.user_id.cmp(&right.session.user_id))
+            });
+            Ok(accounts)
+        }
+    }
+
+    fn credential_target(target: *mut u16) -> Result<String, CredentialError> {
+        if target.is_null() {
+            return Err(CredentialError::new("credential_account_target_invalid"));
+        }
+        let length = (0..MAX_CREDENTIAL_TARGET_UNITS)
+            .find(|index| unsafe { *target.add(*index) == 0 })
+            .ok_or_else(|| CredentialError::new("credential_account_target_invalid"))?;
+        let units = unsafe { slice::from_raw_parts(target, length) };
+        String::from_utf16(units)
+            .map_err(|_| CredentialError::new("credential_account_target_invalid"))
     }
 
     fn wide_string(value: &str) -> Result<Vec<u16>, CredentialError> {
@@ -273,6 +434,10 @@ impl WindowsCredentialStore {
     }
 
     pub(crate) fn delete(&self) -> Result<bool, CredentialError> {
+        Err(CredentialError::new("credential_store_unsupported"))
+    }
+
+    pub(crate) fn list_saved_accounts() -> Result<Vec<SavedAccount>, CredentialError> {
         Err(CredentialError::new("credential_store_unsupported"))
     }
 }
@@ -310,6 +475,68 @@ mod tests {
         let error = StoredSession::decode(encoded).expect_err("unknown schema must fail");
 
         assert_eq!(error.code(), "credential_version_unsupported");
+    }
+
+    #[test]
+    fn account_targets_are_stable_and_bound_to_the_stored_identity() {
+        let session = session();
+        let account_id = session.account_id();
+        let target = account_credential_target(&session.base_url, &session.user_id);
+        let saved = SavedAccount::from_target(&target, session.clone())
+            .expect("matching account target should be accepted");
+
+        assert_eq!(account_id.len(), ACCOUNT_ID_LEN);
+        assert_eq!(
+            account_id,
+            "f5d0166a364b76b02949fd68fa1ef3ef43a76596eb786ad1fb2bb5c189d29d77"
+        );
+        assert_eq!(saved.account_id, account_id);
+        assert_eq!(saved.session, session);
+
+        let other_target = account_credential_target(&saved.session.base_url, "other-user");
+        let error = SavedAccount::from_target(&other_target, saved.session)
+            .expect_err("a target for another identity must fail");
+        assert_eq!(error.code(), "credential_account_mismatch");
+    }
+
+    #[test]
+    fn saved_account_targets_reject_invalid_names() {
+        let session = session();
+        let invalid_targets = [
+            "MediaStationGo.Windows.Account.short.v1".to_string(),
+            format!("MediaStationGo.Windows.Account.{}.v2", session.account_id()),
+            format!("MediaStationGo.Windows.Other.{}.v1", session.account_id()),
+        ];
+        for target in invalid_targets {
+            let error = SavedAccount::from_target(&target, session.clone())
+                .expect_err("an invalid account target must fail");
+            assert_eq!(error.code(), "credential_account_target_invalid");
+        }
+    }
+
+    #[test]
+    fn account_store_rejects_renderer_supplied_invalid_ids() {
+        for invalid in [
+            "",
+            "abcd",
+            &"g".repeat(ACCOUNT_ID_LEN),
+            &"A".repeat(ACCOUNT_ID_LEN),
+        ] {
+            let error = WindowsCredentialStore::account_by_id(invalid)
+                .expect_err("invalid account id must fail");
+            assert_eq!(error.code(), "credential_account_id_invalid");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "reads MediaStationGo account entries from Windows Credential Manager"]
+    fn windows_saved_account_enumeration_uses_prefix_filter() {
+        let accounts = WindowsCredentialStore::list_saved_accounts()
+            .expect("prefix-filtered account enumeration should succeed");
+        for account in accounts {
+            assert_eq!(account.account_id, account.session.account_id());
+        }
     }
 
     #[cfg(windows)]

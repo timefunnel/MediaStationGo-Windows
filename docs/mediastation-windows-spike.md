@@ -50,41 +50,59 @@ resulting token or authorization header. The native API calls
 the authenticated header, and configures playback only after persistence has
 succeeded.
 
-The current spike persists one active account in Windows Credential Manager
-under `MediaStationGo.Windows.ActiveSession.v1`. The regular JSON settings file
-contains no account secret; its only account-related value is the selected
-server URL. Startup restores the credential only when its exact normalized
-server URL matches the selected server, so a saved token cannot be applied to
-another origin. Malformed, unreadable, or mismatched credentials fail
-explicitly and are not silently deleted.
+The spike persists the active session in Windows Credential Manager under
+`MediaStationGo.Windows.ActiveSession.v1` and keeps one credential per saved
+account under `MediaStationGo.Windows.Account.<accountId>.v1`. `accountId` is a
+stable lowercase SHA-256 digest of the normalized server URL and user ID. It is
+only an opaque selector; the renderer cannot derive or receive the token from
+it. The regular JSON settings file contains no account secret; its only
+account-related value is the selected server URL.
 
-The account drawer can start a replacement login while retaining the active
-native session. Cancel returns to the original account, page, and focus target;
-only a successful authentication replaces the Credential Manager entry and
-reloads the catalog. This remains a single persisted active-account model, not
-a hidden local list of account tokens.
+Startup restores the active credential only when its exact normalized server
+URL matches the selected server. It also creates or refreshes that account's
+per-account credential as a migration step, so installations with the former
+single-account credential become selectable without another login. Malformed,
+unreadable, mismatched, or target/content-inconsistent credentials fail
+explicitly and are not silently deleted or skipped.
 
-Login commits and logout are serialized under the native session generation.
-If logout or another account change happens while a login request is in
-flight, the late login result receives `session_changed` and cannot write the
-credential or reactivate the account. Logout deletes the secure credential
-before clearing the in-memory session; a credential deletion failure leaves
-the current session intact and returns an explicit error.
+The account drawer enumerates the per-account Credential Manager entries with a
+target-prefix filter and receives only `accountId`, `baseUrl`, `userId`, and
+`userName`. Selecting an account reads that exact credential by stable ID,
+revalidates its identity, updates the active session, invalidates in-flight
+native work, and reloads the catalog. There is no renderer-side account store,
+token cache, fallback account, or list-index identity.
+
+The drawer can also start a new login while retaining the active native
+session. Cancel returns to the original account, page, and focus target. A
+successful authentication upserts that account's secure entry and makes it
+active; it does not remove the other saved accounts.
+
+Login commits, saved-account switches, and logout are serialized under the
+native session generation. If logout or another account change happens while a
+login request is in flight, the late login result receives `session_changed`
+and cannot write a credential or reactivate the account. Updating the server
+setting, per-account credential, and active credential is transactional: a
+later failure restores every earlier changed value, and a failed rollback is
+reported separately. Logout deletes both the current per-account credential
+and active credential before clearing the in-memory session; deletion failure
+leaves the current session intact and restores a deleted active credential.
+Other saved accounts remain available.
 
 The renderer-facing account calls are:
 
 ```javascript
 window.jmpNative.mediaStationAuthenticate(requestId, baseUrl, username, password);
 window.jmpNative.mediaStationSessionStatus(requestId);
+window.jmpNative.mediaStationListAccounts(requestId);
+window.jmpNative.mediaStationSwitchAccount(requestId, accountId);
 window.jmpNative.mediaStationLogout(requestId);
 ```
 
 They respond through `_onMediaStationResponse` with operations
-`authenticate`, `session_status`, and `logout`. Account status payloads contain
-only `configured`, `persisted`, `baseUrl`, `userId`, and `userName`; logout also
-reports whether a stored credential was deleted. The current spike
-intentionally supports one active account; multi-account selection belongs to
-the later account-drawer UI phase.
+`authenticate`, `session_status`, `list_accounts`, `switch_account`, and
+`logout`. Account status payloads contain only `configured`, `persisted`,
+`baseUrl`, `userId`, and `userName`; the list adds only the opaque `accountId`.
+Logout also reports whether a stored credential was deleted.
 
 ## Native Async Load IPC
 
