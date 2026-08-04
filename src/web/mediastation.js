@@ -5,6 +5,7 @@
     const splash = byId('splash');
     const loginView = byId('login-view');
     const appShell = byId('app-shell');
+    const appBackdrop = byId('app-backdrop');
     const content = byId('content');
     const playerView = byId('player-view');
     const playerControls = byId('player-controls');
@@ -681,6 +682,14 @@
         if (img.complete && img.naturalWidth > 0) img.classList.add('image-ready');
     }
 
+    // Blur the current hero backdrop across the whole app background so the
+    // page has the ambient, colored glow Blink achieves with its app-backdrop.
+    function setAppBackdrop(src) {
+        if (!appBackdrop) return;
+        appBackdrop.style.backgroundImage = `url("${src}")`;
+        appBackdrop.classList.add('ready');
+    }
+
     function loadObservedImage(img) {
         const raw = img.dataset.imageRef;
         if (!raw) return;
@@ -1103,6 +1112,7 @@
             });
             layers[nextIndex].style.backgroundImage = `url("${src}")`;
             lastHeroBackdropSrc = src;
+            setAppBackdrop(src);
             if (activeIndex < 0) {
                 layers[nextIndex].style.transform = 'translateX(0)';
                 layers[nextIndex].classList.add('active');
