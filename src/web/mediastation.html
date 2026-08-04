@@ -38,18 +38,21 @@
   </section>
 
   <div id="app-shell" class="app-shell hidden">
-    <div id="app-backdrop" class="app-backdrop" aria-hidden="true"></div>
+    <div id="app-backdrop" class="app-backdrop" aria-hidden="true">
+      <span class="app-backdrop-layer"></span>
+      <span class="app-backdrop-layer"></span>
+    </div>
     <header class="topbar">
-      <button id="brand-home" class="brand brand-button" type="button" title="返回首页"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></button>
-      <button id="topbar-home-shortcut" class="icon-button topbar-home-shortcut hidden" type="button" title="返回首页" aria-label="返回首页"><span aria-hidden="true">⌂</span></button>
+      <button id="brand-home" class="brand brand-button" type="button" title="返回首页" data-focus-key="top:brand"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></button>
+      <button id="topbar-home-shortcut" class="icon-button topbar-home-shortcut hidden" type="button" title="返回首页" aria-label="返回首页" data-focus-key="top:home-shortcut"><span aria-hidden="true">⌂</span></button>
       <nav class="top-nav" aria-label="主导航">
-        <button id="nav-home" class="nav-command active" type="button">首页</button>
-        <button id="nav-library" class="nav-command" type="button">媒体库</button>
+        <button id="nav-home" class="nav-command active" type="button" data-focus-key="top:nav-home">首页</button>
+        <button id="nav-library" class="nav-command" type="button" data-focus-key="top:nav-library">媒体库</button>
       </nav>
       <div class="top-actions">
-        <button id="search-open" class="icon-button" type="button" title="搜索" aria-label="搜索"><span class="symbol-icon" aria-hidden="true">&#x1F50D;&#xFE0E;</span></button>
-        <button id="account-open" class="account-button" type="button" title="账号"><span id="account-avatar" aria-hidden="true">M</span><span id="account-name"></span></button>
-        <button id="settings-open" class="icon-button" type="button" title="设置" aria-label="设置"><span class="symbol-icon" aria-hidden="true">&#x2699;&#xFE0E;</span></button>
+        <button id="search-open" class="icon-button" type="button" title="搜索" aria-label="搜索" data-focus-key="top:search"><span class="symbol-icon" aria-hidden="true">&#x1F50D;&#xFE0E;</span></button>
+        <button id="account-open" class="account-button" type="button" title="账号" data-focus-key="top:account"><span id="account-avatar" aria-hidden="true">M</span><span id="account-name"></span></button>
+        <button id="settings-open" class="icon-button" type="button" title="设置" aria-label="设置" data-focus-key="top:settings"><span class="symbol-icon" aria-hidden="true">&#x2699;&#xFE0E;</span></button>
       </div>
     </header>
     <main id="content" class="content" tabindex="-1"></main>

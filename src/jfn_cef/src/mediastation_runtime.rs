@@ -2029,7 +2029,9 @@ pub(crate) fn handle_image_message(layer: Option<Arc<Inner>>, args: Option<&List
 enum CatalogOperation {
     Home,
     Items,
+    Filters,
     Detail,
+    PersonItems,
     Search,
     CacheStats,
     ClearImageCache,
@@ -2040,7 +2042,9 @@ impl CatalogOperation {
         match self {
             Self::Home => "home",
             Self::Items => "items",
+            Self::Filters => "filters",
             Self::Detail => "detail",
+            Self::PersonItems => "person_items",
             Self::Search => "search",
             Self::CacheStats => "cache_stats",
             Self::ClearImageCache => "clear_image_cache",
@@ -2086,7 +2090,9 @@ fn parse_catalog_request(
     let operation = match raw_operation.as_str() {
         "home" => CatalogOperation::Home,
         "items" => CatalogOperation::Items,
+        "filters" => CatalogOperation::Filters,
         "detail" => CatalogOperation::Detail,
+        "person_items" => CatalogOperation::PersonItems,
         "search" => CatalogOperation::Search,
         "cache_stats" => CatalogOperation::CacheStats,
         "clear_image_cache" => CatalogOperation::ClearImageCache,
@@ -2200,6 +2206,7 @@ fn parse_image_descriptor(
         "primary" => MediaImageType::Primary,
         "thumb" => MediaImageType::Thumb,
         "backdrop" => MediaImageType::Backdrop,
+        "logo" => MediaImageType::Logo,
         _ => {
             return Err(LoadFailure::new(
                 "invalid_image_request",
@@ -2289,12 +2296,33 @@ fn execute_catalog_request(
             let parent_id = required_param(&request.params, "parentId")?;
             let start_index = usize_param(&request.params, "startIndex", 0)?;
             let limit = usize_param(&request.params, "limit", 60)?;
+            let item_type = optional_param(&request.params, "itemType")?;
+            let genre = optional_param(&request.params, "genre")?;
             page_payload(
                 &runtime
                     .api
-                    .load_library_page(&snapshot.session, &parent_id, start_index, limit)
+                    .load_library_page_filtered(
+                        &snapshot.session,
+                        &parent_id,
+                        start_index,
+                        limit,
+                        item_type.as_deref(),
+                        genre.as_deref(),
+                    )
                     .map_err(|error| catalog_failure(request.operation, &error))?,
             )
+        }
+        CatalogOperation::Filters => {
+            let parent_id = required_param(&request.params, "parentId")?;
+            let collection_type = optional_param(&request.params, "collectionType")?;
+            let filters = runtime
+                .api
+                .load_library_filters(&snapshot.session, &parent_id, collection_type.as_deref())
+                .map_err(|error| catalog_failure(request.operation, &error))?;
+            json!({
+                "itemTypes": filters.item_types,
+                "genres": filters.genres,
+            })
         }
         CatalogOperation::Detail => {
             let media_id = required_param(&request.params, "mediaId")?;
@@ -2302,6 +2330,17 @@ fn execute_catalog_request(
                 &runtime
                     .api
                     .load_media_detail(&snapshot.session, &media_id)
+                    .map_err(|error| catalog_failure(request.operation, &error))?,
+            )
+        }
+        CatalogOperation::PersonItems => {
+            let person_id = required_param(&request.params, "personId")?;
+            let start_index = usize_param(&request.params, "startIndex", 0)?;
+            let limit = usize_param(&request.params, "limit", 60)?;
+            page_payload(
+                &runtime
+                    .api
+                    .load_person_page(&snapshot.session, &person_id, start_index, limit)
                     .map_err(|error| catalog_failure(request.operation, &error))?,
             )
         }
@@ -2406,6 +2445,29 @@ fn required_param(params: &Value, field: &'static str) -> Result<String, LoadFai
         .filter(|value| !value.is_empty() && value.len() <= 512)
         .map(str::to_string)
         .ok_or_else(|| LoadFailure::new("invalid_request", "A required request field is invalid"))
+}
+
+fn optional_param(params: &Value, field: &'static str) -> Result<Option<String>, LoadFailure> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else if value.len() <= 512 {
+                Ok(Some(value.to_string()))
+            } else {
+                Err(LoadFailure::new(
+                    "invalid_request",
+                    "An optional request field is too large",
+                ))
+            }
+        }
+        Some(_) => Err(LoadFailure::new(
+            "invalid_request",
+            "An optional request field has an invalid type",
+        )),
+    }
 }
 
 fn bool_param(params: &Value, field: &'static str, default: bool) -> Result<bool, LoadFailure> {
@@ -2513,6 +2575,13 @@ fn detail_payload(detail: &MediaDetail) -> Value {
     json!({
         "item": media_card_payload(&detail.item),
         "episodes": detail.episodes.iter().map(media_card_payload).collect::<Vec<_>>(),
+        "people": detail.people.iter().map(|person| json!({
+            "id": person.id,
+            "name": person.name,
+            "role": person.role,
+            "type": person.person_type,
+            "primaryImage": person.primary_image.as_ref().map(image_ref_payload),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -2545,6 +2614,7 @@ fn media_card_payload(card: &MediaCard) -> Value {
         "primaryImage": card.primary_image.as_ref().map(image_ref_payload),
         "landscapeImage": card.landscape_image.as_ref().map(image_ref_payload),
         "backdropImage": card.backdrop_image.as_ref().map(image_ref_payload),
+        "logoImage": card.logo_image.as_ref().map(image_ref_payload),
     })
 }
 
@@ -2553,6 +2623,7 @@ fn image_ref_payload(image: &MediaImageRef) -> Value {
         MediaImageType::Primary => "primary",
         MediaImageType::Thumb => "thumb",
         MediaImageType::Backdrop => "backdrop",
+        MediaImageType::Logo => "logo",
     };
     let index = image.image_index.unwrap_or(0);
     json!({
@@ -5268,9 +5339,17 @@ mod tests {
     }
 
     #[test]
-    fn image_request_rejects_unsupported_type_and_width() {
-        let type_error = parse_image_descriptor(
+    fn image_request_accepts_logo_and_rejects_unsupported_type_and_width() {
+        let (_, logo, width) = parse_image_descriptor(
             r#"{"key":"item:logo:tag","itemId":"item","type":"logo","tag":"tag"}"#,
+            360,
+        )
+        .expect("logo image type should be accepted");
+        assert_eq!(logo.image_type, MediaImageType::Logo);
+        assert_eq!(width, 360);
+
+        let type_error = parse_image_descriptor(
+            r#"{"key":"item:banner:tag","itemId":"item","type":"banner","tag":"tag"}"#,
             360,
         )
         .expect_err("unsupported image type should fail");
@@ -5321,6 +5400,7 @@ mod tests {
             primary_image: Some(image),
             landscape_image: None,
             backdrop_image: None,
+            logo_image: None,
         };
 
         let text = media_card_payload(&card).to_string().to_ascii_lowercase();

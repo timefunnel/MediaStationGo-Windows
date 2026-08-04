@@ -6,6 +6,8 @@
     const loginView = byId('login-view');
     const appShell = byId('app-shell');
     const appBackdrop = byId('app-backdrop');
+    const appBackdropLayers = [...appBackdrop.querySelectorAll('.app-backdrop-layer')];
+    const topbar = document.querySelector('.topbar');
     const content = byId('content');
     const playerView = byId('player-view');
     const playerControls = byId('player-controls');
@@ -42,6 +44,8 @@
     let session = null;
     let homeData = null;
     let heroRevision = 0;
+    let appBackdropRevision = 0;
+    let appBackdropSrc = '';
     let heroSlideTimer = 0;
     let heroCopyTimer = 0;
     let lastHeroBackdropSrc = '';
@@ -62,6 +66,10 @@
     let homeRefreshGeneration = 0;
     let homeRefreshFailures = 0;
     let heroRotationTimer = 0;
+    let heroCarouselController = null;
+    let libraryFilterRevision = 0;
+    let personPageRevision = 0;
+    let searchRevision = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
     let preferredInterpolationModel = 'rife-v4.26';
 
@@ -76,6 +84,10 @@
     const libraryPageObserver = new IntersectionObserver((entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
         if (currentView?.kind === 'library') loadMoreLibrary(currentView.data);
+    }, { root: content, rootMargin: '900px 0px' });
+    const personPageObserver = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        if (currentView?.kind === 'person') loadMorePerson(currentView.data);
     }, { root: content, rootMargin: '900px 0px' });
 
     function nextRequestId(prefix) {
@@ -435,16 +447,19 @@
         currentView = null;
         history.length = 0;
         heroRevision += 1;
+        appBackdropRevision += 1;
         window.clearTimeout(heroSlideTimer);
         heroSlideTimer = 0;
         window.clearTimeout(heroCopyTimer);
         heroCopyTimer = 0;
         stopSmoothScroll(content);
         lastHeroBackdropSrc = '';
+        clearAppBackdrop(appBackdropRevision);
         imageCache.clear();
         imagePending.clear();
         libraryCache.clear();
         libraryPageObserver.disconnect();
+        personPageObserver.disconnect();
         while (imageQueue.length) {
             imageQueue.shift().reject(new Error('账号状态已变化'));
         }
@@ -514,14 +529,46 @@
         content.querySelectorAll('.media-row[data-row-key]').forEach((row) => {
             rows[row.dataset.rowKey] = row.scrollLeft;
         });
-        return { ...currentView, scrollTop: content.scrollTop, rows, focusKey: '' };
+        const active = document.activeElement;
+        const focusKey = active instanceof Element
+            ? active.closest('[data-focus-key]')?.dataset.focusKey || ''
+            : '';
+        return { ...currentView, scrollTop: content.scrollTop, rows, focusKey };
     }
 
-    function setCurrentView(view, pushHistory = true) {
-        const captured = captureView();
+    function setCurrentView(view, pushHistory = true, capturedOverride) {
+        const captured = capturedOverride === undefined ? captureView() : capturedOverride;
         if (pushHistory && captured) history.push(captured);
         currentView = { ...view, scrollTop: 0, rows: {}, focusKey: '' };
+        content.scrollTop = 0;
         renderCurrentView(captured ? 'forward' : '');
+    }
+
+    function beginLoadingView(kind, captured, render) {
+        if (captured) history.push(captured);
+        const loadingView = { kind, data: null, scrollTop: 0, rows: {}, focusKey: '' };
+        currentView = loadingView;
+        content.scrollTop = 0;
+        appBackdropRevision += 1;
+        updateNavState();
+        render();
+        playContentTransition('forward');
+        return loadingView;
+    }
+
+    function restoreLoadingSource(loadingView, captured) {
+        if (currentView !== loadingView) return false;
+        const previous = history.pop();
+        if (previous) {
+            currentView = previous;
+            renderCurrentView('back');
+            restoreViewState(previous);
+        } else if (captured) {
+            currentView = captured;
+            renderCurrentView('back');
+            restoreViewState(captured);
+        }
+        return true;
     }
 
     function playContentTransition(direction) {
@@ -535,11 +582,32 @@
         }, 300);
     }
 
-    function restoreScroll(view) {
+    function focusTargetForView(view) {
+        if (view.focusKey) {
+            const target = [...document.querySelectorAll('[data-focus-key]')]
+                .find((node) => node.dataset.focusKey === view.focusKey);
+            if (target && !target.disabled && target.getClientRects().length) return target;
+            console.warn(`无法恢复焦点目标：${view.focusKey}`);
+        }
+        return [...content.querySelectorAll('.search-field input, .back-button, .detail-back, .person-card, .media-card, button:not(:disabled)')]
+            .find((node) => !node.disabled && node.getClientRects().length)
+            || content;
+    }
+
+    function restoreViewState(view) {
         requestAnimationFrame(() => {
             content.scrollTop = view.scrollTop || 0;
             content.querySelectorAll('.media-row[data-row-key]').forEach((row) => {
                 row.scrollLeft = view.rows?.[row.dataset.rowKey] || 0;
+            });
+            requestAnimationFrame(() => {
+                const target = focusTargetForView(view);
+                if (target === content) {
+                    content.focus({ preventScroll: true });
+                } else {
+                    focusElement(target, true);
+                }
+                content.scrollTop = view.scrollTop || 0;
             });
         });
     }
@@ -560,18 +628,21 @@
         }
         currentView = previous;
         renderCurrentView('back');
-        restoreScroll(previous);
+        restoreViewState(previous);
     }
 
     function renderCurrentView(transition = '') {
         stopSmoothScroll(content);
         if (currentView?.kind !== 'home') stopHeroCarousel();
+        appBackdropRevision += 1;
+        topbar.classList.toggle('scrolled', content.scrollTop > 20);
         updateNavState();
         switch (currentView?.kind) {
             case 'home': renderHome(currentView.data); break;
             case 'libraries': renderLibraries(currentView.data); break;
             case 'library': renderLibrary(currentView.data); break;
             case 'detail': renderDetail(currentView.data); break;
+            case 'person': renderPerson(currentView.data); break;
             case 'search': renderSearch(currentView.data); break;
             default: renderEmpty('没有可显示的内容');
         }
@@ -640,7 +711,7 @@
                     const saved = captureView();
                     currentView = { ...currentView, data: homeData };
                     renderHome(homeData);
-                    if (saved) restoreScroll(saved);
+                    if (saved) restoreViewState(saved);
                 }
             } catch (error) {
                 if (generation !== homeRefreshGeneration || session !== expectedSession) return;
@@ -682,12 +753,48 @@
         if (img.complete && img.naturalWidth > 0) img.classList.add('image-ready');
     }
 
-    // Blur the current hero backdrop across the whole app background so the
-    // page has the ambient, colored glow Blink achieves with its app-backdrop.
-    function setAppBackdrop(src) {
-        if (!appBackdrop) return;
-        appBackdrop.style.backgroundImage = `url("${src}")`;
+    function setAppBackdrop(src, revision = appBackdropRevision) {
+        if (!src || revision !== appBackdropRevision || appBackdropLayers.length !== 2) return;
+        if (src === appBackdropSrc) return;
+        const activeIndex = Number(appBackdrop.dataset.activeLayer ?? -1);
+        const nextIndex = activeIndex === 0 ? 1 : 0;
+        const next = appBackdropLayers[nextIndex];
+        const previous = appBackdropLayers[activeIndex];
+        next.dataset.revision = String(revision);
+        next.style.backgroundImage = `url("${src}")`;
+        void next.offsetWidth;
+        next.classList.add('active');
+        previous?.classList.remove('active');
+        appBackdrop.dataset.activeLayer = String(nextIndex);
+        appBackdropSrc = src;
         appBackdrop.classList.add('ready');
+        window.setTimeout(() => {
+            if (next.dataset.revision !== String(revision) || previous?.classList.contains('active')) return;
+            if (previous) previous.style.backgroundImage = '';
+        }, 1300);
+    }
+
+    function clearAppBackdrop(revision = appBackdropRevision) {
+        if (revision !== appBackdropRevision) return;
+        appBackdropLayers.forEach((layer) => layer.classList.remove('active'));
+        appBackdrop.classList.remove('ready');
+        appBackdropSrc = '';
+        delete appBackdrop.dataset.activeLayer;
+    }
+
+    function loadViewBackdrop(ref, revision = appBackdropRevision, expectedView = currentView) {
+        if (!ref) {
+            clearAppBackdrop(revision);
+            return;
+        }
+        requestImage(ref, imageWidthFor(ref, true, true)).then((src) => {
+            if (revision !== appBackdropRevision || currentView !== expectedView) return;
+            setAppBackdrop(src, revision);
+        }).catch((error) => {
+            if (revision !== appBackdropRevision || currentView !== expectedView) return;
+            console.error(`环境背景加载失败：${friendlyError(error)}`);
+            clearAppBackdrop(revision);
+        });
     }
 
     function loadObservedImage(img) {
@@ -893,7 +1000,7 @@
         return button;
     }
 
-    function createRowCarousel(row, title) {
+    function createRowCarousel(row, title, controlsHost = null) {
         row.classList.add('carousel-row');
         const rowShell = element('div', 'media-row-carousel');
         if (row.classList.contains('episode-row')) rowShell.classList.add('episode-row-carousel');
@@ -907,6 +1014,10 @@
         next.title = '向右滚动';
         next.setAttribute('aria-label', `${title}向右滚动`);
         next.append(element('span', 'hero-carousel-chevron'));
+        const controls = element('div', 'row-carousel-controls');
+        controls.setAttribute('role', 'group');
+        controls.setAttribute('aria-label', `${title}分页`);
+        controls.append(previous, next);
 
         let pageDistance = 0;
         let cardStride = 0;
@@ -1022,7 +1133,8 @@
             const cardsPerPage = Math.max(1, Math.round(pageDistance / cardStride));
             moveToPage(Math.floor(cardIndex / cardsPerPage));
         };
-        rowShell.append(row, previous, next);
+        rowShell.append(row);
+        (controlsHost || rowShell).append(controls);
         window.requestAnimationFrame(alignEndToPage);
         return rowShell;
     }
@@ -1032,17 +1144,20 @@
         const section = element('section', 'media-section');
         const heading = element('div', 'section-heading');
         heading.append(element('h2', '', title));
+        const headingActions = element('div', 'section-heading-actions');
         if (options.more) {
             const more = element('button', '', '查看全部');
             more.type = 'button';
             more.addEventListener('click', options.more);
-            heading.append(more);
+            headingActions.append(more);
         }
         const row = element('div', `media-row home-media-row${options.landscape ? ' landscape' : ''}`);
         row.dataset.rowKey = options.key || title;
         row.dataset.rowIndex = String(options.rowIndex ?? 0);
         cards.forEach((card, index) => row.append(createMediaCard(card, { ...options, index })));
-        section.append(heading, createRowCarousel(row, title));
+        const carousel = createRowCarousel(row, title, headingActions);
+        heading.append(headingActions);
+        section.append(heading, carousel);
         return section;
     }
 
@@ -1060,6 +1175,7 @@
         const actions = element('div', 'hero-actions');
         const primary = element('button', 'primary-command hero-primary');
         primary.type = 'button';
+        primary.dataset.focusKey = `hero:primary:${card.id}`;
         if (card.type === 'CollectionFolder') {
             primary.append(element('span', '', '→'), element('span', '', '打开媒体库'));
             primary.addEventListener('click', () => openLibrary(card));
@@ -1075,6 +1191,7 @@
         if (card.playable && card.type !== 'CollectionFolder' && card.type !== 'Episode') {
             const detail = element('button', 'secondary-command hero-secondary', '查看详情');
             detail.type = 'button';
+            detail.dataset.focusKey = `hero:detail:${card.id}`;
             detail.addEventListener('click', () => openDetail(card));
             actions.append(detail);
         }
@@ -1095,7 +1212,7 @@
             }, 340);
         };
         const ref = card.backdropImage || card.landscapeImage;
-        if (!copy.childElementCount || !ref) applyCopy(false);
+        applyCopy(copy.childElementCount > 0);
         if (!ref) return;
         requestImage(ref, imageWidthFor(ref, true, true)).then((src) => {
             if (revision !== heroRevision || !hero.isConnected) return;
@@ -1144,6 +1261,11 @@
     function stopHeroCarousel() {
         window.clearTimeout(heroRotationTimer);
         heroRotationTimer = 0;
+        if (heroCarouselController) {
+            const controller = heroCarouselController;
+            heroCarouselController = null;
+            controller.destroy();
+        }
     }
 
     function shuffledHeroCards(data, latestSections) {
@@ -1173,30 +1295,98 @@
             return { select: () => {}, previous: () => {}, next: () => {} };
         }
         let index = 0;
-        const schedule = () => {
-            stopHeroCarousel();
-            if (cards.length < 2) return;
+        let remainingMs = heroRotationIntervalMs;
+        let startedAt = 0;
+        let destroyed = false;
+        const pauseReasons = new Set();
+        const indicator = element('div', 'hero-carousel-progress');
+        const indicatorText = element('span', 'hero-carousel-progress-label');
+        const progressTrack = element('span', 'hero-carousel-progress-track');
+        const progressFill = element('span', 'hero-carousel-progress-fill');
+        progressTrack.append(progressFill);
+        indicator.append(indicatorText, progressTrack);
+        hero.append(indicator);
+
+        const updateIndicator = (restart = false) => {
+            indicatorText.textContent = `${index + 1} / ${cards.length}`;
+            if (!restart) return;
+            progressFill.style.animation = 'none';
+            void progressFill.offsetWidth;
+            progressFill.style.animation = `hero-carousel-progress ${remainingMs}ms linear forwards`;
+            progressFill.style.animationPlayState = pauseReasons.size ? 'paused' : 'running';
+        };
+        const schedule = (reset = true) => {
+            window.clearTimeout(heroRotationTimer);
+            heroRotationTimer = 0;
+            if (destroyed || cards.length < 2) return;
+            if (reset) remainingMs = heroRotationIntervalMs;
+            updateIndicator(reset);
+            if (pauseReasons.size) {
+                progressFill.style.animationPlayState = 'paused';
+                return;
+            }
+            progressFill.style.animationPlayState = 'running';
+            startedAt = performance.now();
             heroRotationTimer = window.setTimeout(() => {
-                if (!hero.isConnected || currentView?.kind !== 'home') return;
-                if (document.hidden || !playerView.classList.contains('hidden')) {
-                    schedule();
-                    return;
-                }
+                heroRotationTimer = 0;
+                if (destroyed || !hero.isConnected || currentView?.kind !== 'home') return;
                 index = (index + 1) % cards.length;
                 updateHero(hero, cards[index]);
-                schedule();
-            }, heroRotationIntervalMs);
+                schedule(true);
+            }, remainingMs);
+        };
+        const pause = (reason) => {
+            if (destroyed || pauseReasons.has(reason)) return;
+            pauseReasons.add(reason);
+            if (heroRotationTimer) {
+                remainingMs = Math.max(80, remainingMs - (performance.now() - startedAt));
+                window.clearTimeout(heroRotationTimer);
+                heroRotationTimer = 0;
+            }
+            progressFill.style.animationPlayState = 'paused';
+        };
+        const resume = (reason) => {
+            if (destroyed || !pauseReasons.delete(reason) || pauseReasons.size) return;
+            schedule(false);
         };
         const select = (card) => {
             const selectedIndex = cards.findIndex((candidate) => candidate.id === card?.id);
             if (selectedIndex >= 0) index = selectedIndex;
             updateHero(hero, card);
-            schedule();
+            schedule(true);
         };
         const step = (offset) => {
             index = (index + offset + cards.length) % cards.length;
             updateHero(hero, cards[index]);
-            schedule();
+            schedule(true);
+        };
+        const onPointerEnter = () => pause('pointer');
+        const onPointerLeave = () => resume('pointer');
+        const onFocusIn = () => pause('focus');
+        const onFocusOut = (event) => {
+            if (!hero.contains(event.relatedTarget)) resume('focus');
+        };
+        const onVisibilityChange = () => document.hidden ? pause('hidden') : resume('hidden');
+        hero.addEventListener('pointerenter', onPointerEnter);
+        hero.addEventListener('pointerleave', onPointerLeave);
+        hero.addEventListener('focusin', onFocusIn);
+        hero.addEventListener('focusout', onFocusOut);
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        if (document.hidden) pauseReasons.add('hidden');
+        if (!playerView.classList.contains('hidden')) pauseReasons.add('player');
+        heroCarouselController = {
+            pause,
+            resume,
+            destroy: () => {
+                destroyed = true;
+                window.clearTimeout(heroRotationTimer);
+                heroRotationTimer = 0;
+                hero.removeEventListener('pointerenter', onPointerEnter);
+                hero.removeEventListener('pointerleave', onPointerLeave);
+                hero.removeEventListener('focusin', onFocusIn);
+                hero.removeEventListener('focusout', onFocusOut);
+                document.removeEventListener('visibilitychange', onVisibilityChange);
+            },
         };
         select(cards[0]);
         return {
@@ -1232,6 +1422,11 @@
             ? startHeroCarousel(hero, heroCards)
             : { select: (card) => updateHero(hero, card), previous: () => {}, next: () => {} };
         if (!heroCards.length && fallback) carousel.select(fallback);
+        const restoreHeroId = currentView?.focusKey?.startsWith('hero:')
+            ? currentView.focusKey.split(':').at(-1)
+            : '';
+        const restoreHeroCard = heroCards.find((card) => card.id === restoreHeroId);
+        if (restoreHeroCard) carousel.select(restoreHeroCard);
         if (heroCards.length > 1) {
             const controls = element('div', 'hero-carousel-controls');
             const previous = element('button', 'icon-button hero-carousel-button hero-carousel-previous');
@@ -1274,9 +1469,11 @@
 
     function renderLibraries(libraries) {
         content.replaceChildren();
+        const backdropCard = libraries.find((library) => library.backdropImage || library.landscapeImage || library.primaryImage);
+        loadViewBackdrop(backdropCard && (backdropCard.backdropImage || backdropCard.landscapeImage || backdropCard.primaryImage), appBackdropRevision, currentView);
         const header = element('div', 'page-header');
         const back = element('button', 'back-button', '←');
-        back.type = 'button'; back.title = '返回'; back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
+        back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', '媒体库'));
         const grid = element('div', 'grid-view library-grid');
         libraries.forEach((library, index) => grid.append(createMediaCard(library, { landscape: true, library: true, index, onClick: openLibrary })));
@@ -1284,44 +1481,213 @@
     }
 
     async function openLibrary(library) {
-        const cached = getLibraryCache(library);
+        const captured = captureView();
+        const filter = { itemType: '', genre: '' };
+        const cached = getLibraryCache(library, filter);
         if (cached) {
-            const data = { library, ...cached, items: cached.items.slice(), syncing: true };
+            const data = {
+                library,
+                filter,
+                ...cached,
+                items: cached.items.slice(),
+                syncing: true,
+                filterLoading: false,
+                filterError: '',
+                filterRevision: ++libraryFilterRevision,
+            };
             setCurrentView({ kind: 'library', data });
             syncLibraryFirstPage(data);
             return;
         }
-        renderLoading();
+        const loadingView = beginLoadingView('library-loading', captured, renderLoading);
         try {
-            const response = await nativeRequest('mediaStationCatalog', 'items', [
-                'items',
-                JSON.stringify({ parentId: library.id, startIndex: 0, limit: libraryPageSize }),
+            const [response, filterResponse] = await Promise.all([
+                nativeRequest('mediaStationCatalog', 'items', [
+                    'items', JSON.stringify(libraryRequestParams({ library, filter }, 0)),
+                ]),
+                nativeRequest('mediaStationCatalog', 'filters', [
+                    'filters', JSON.stringify({ parentId: library.id, collectionType: library.collectionType || null }),
+                ]),
             ]);
             const page = validateLibraryPage(response, 0);
-            const data = { library, ...page, syncing: false, isLoadingMore: false };
+            const filters = validateLibraryFilters(filterResponse);
+            if (currentView !== loadingView) return;
+            const data = {
+                library,
+                filter,
+                filters,
+                ...page,
+                syncing: false,
+                isLoadingMore: false,
+                filterLoading: false,
+                filterError: '',
+                filterRevision: ++libraryFilterRevision,
+            };
             putLibraryCache(data);
-            setCurrentView({ kind: 'library', data });
+            currentView = { kind: 'library', data, scrollTop: 0, rows: {}, focusKey: '' };
+            renderCurrentView('forward');
         } catch (error) {
-            goBack();
-            showToast(friendlyError(error));
+            if (restoreLoadingSource(loadingView, captured)) showToast(friendlyError(error));
         }
+    }
+
+    function libraryRequestParams(data, startIndex) {
+        const params = { parentId: data.library.id, startIndex, limit: libraryPageSize };
+        if (data.filter?.itemType) params.itemType = data.filter.itemType;
+        if (data.filter?.genre) params.genre = data.filter.genre;
+        return params;
+    }
+
+    function libraryFilterIdentity(filter) {
+        return JSON.stringify([filter?.itemType || '', filter?.genre || '']);
+    }
+
+    function isLibraryRequestCurrent(data, revision, filterIdentity) {
+        return data.filterRevision === revision
+            && libraryFilterIdentity(data.filter) === filterIdentity;
+    }
+
+    function validateLibraryFilters(filters) {
+        if (!filters || !Array.isArray(filters.itemTypes) || !Array.isArray(filters.genres)) {
+            throw new Error('媒体库筛选响应无效');
+        }
+        const itemTypes = [...new Set(filters.itemTypes.filter((value) => typeof value === 'string' && value))];
+        const genres = [...new Set(filters.genres.filter((value) => typeof value === 'string' && value))];
+        if (itemTypes.length !== filters.itemTypes.length || genres.length !== filters.genres.length) {
+            throw new Error('媒体库筛选包含无效或重复值');
+        }
+        return { itemTypes, genres };
+    }
+
+    function mediaTypeLabel(type) {
+        return ({ Movie: '电影', Series: '剧集', Video: '视频', MusicVideo: '音乐视频', BoxSet: '合集' })[type] || type;
+    }
+
+    function createFilterGroup(label, values, selected, onSelect, valueLabel = (value) => value) {
+        const group = element('div', 'library-filter-group');
+        group.append(element('span', 'library-filter-label', label));
+        const controls = element('div', 'library-filter-options');
+        controls.setAttribute('role', 'group');
+        controls.setAttribute('aria-label', label);
+        ['', ...values].forEach((value) => {
+            const button = element('button', 'library-filter-button', value ? valueLabel(value) : '全部');
+            button.type = 'button';
+            button.dataset.filterValue = value;
+            button.dataset.focusKey = `filter:${label}:${value || 'all'}`;
+            button.setAttribute('aria-pressed', String(value === selected));
+            button.addEventListener('click', () => onSelect(value));
+            controls.append(button);
+        });
+        group.append(controls);
+        return group;
+    }
+
+    function renderLibraryFilters(data) {
+        const bar = element('section', 'library-filters');
+        bar.setAttribute('aria-label', '媒体库筛选');
+        bar.append(createFilterGroup('类型', data.filters.itemTypes, data.filter.itemType, (itemType) => {
+            applyLibraryFilter(data, { itemType, genre: data.filter.genre });
+        }, mediaTypeLabel));
+        if (data.filters.genres.length) {
+            bar.append(createFilterGroup('题材', data.filters.genres, data.filter.genre, (genre) => {
+                applyLibraryFilter(data, { itemType: data.filter.itemType, genre });
+            }));
+        }
+        return bar;
     }
 
     function renderLibrary(data) {
         libraryPageObserver.disconnect();
         content.replaceChildren();
+        loadViewBackdrop(data.library.backdropImage || data.library.landscapeImage, appBackdropRevision, currentView);
         const header = element('div', 'page-header');
         const back = element('button', 'back-button', '←');
-        back.type = 'button'; back.title = '返回'; back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
+        back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', data.library.title));
+        content.append(header, renderLibraryFilters(data));
+        if (data.filterLoading) {
+            content.append(element('div', 'library-state', '正在加载筛选结果…'));
+            return;
+        }
+        if (data.filterError) {
+            const state = element('div', 'library-state error-state');
+            state.append(element('p', '', data.filterError));
+            const retry = element('button', 'secondary-command', '重试');
+            retry.type = 'button';
+            retry.addEventListener('click', () => applyLibraryFilter(data, { ...data.filter }, true));
+            state.append(retry);
+            content.append(state);
+            return;
+        }
+        if (!data.items.length) {
+            content.append(element('div', 'empty-state', '当前筛选没有结果'));
+            return;
+        }
         const grid = element('div', 'grid-view');
-        data.items.forEach((card, index) => grid.append(createMediaCard(card, { index, onClick: openDetail })));
-        content.append(header, grid);
+        data.items.forEach((card, index) => grid.append(createMediaCard(card, {
+            index,
+            onClick: openDetail,
+            onFocus: updateBackdropForCard,
+        })));
+        content.append(grid);
         if (data.syncError) {
             content.append(element('div', 'library-sync-error', `同步失败，当前显示缓存内容：${data.syncError}`));
         }
         content.append(element('div', 'library-page-sentinel'));
         updateLibraryPaginationUi(data);
+    }
+
+    function updateBackdropForCard(card) {
+        const revision = ++appBackdropRevision;
+        loadViewBackdrop(card.backdropImage || card.landscapeImage || card.primaryImage, revision, currentView);
+    }
+
+    async function applyLibraryFilter(data, filter, force = false) {
+        if (currentView?.kind !== 'library' || currentView.data !== data || data.filterLoading) return;
+        if (!force && filter.itemType === data.filter.itemType && filter.genre === data.filter.genre) return;
+        const revision = ++libraryFilterRevision;
+        const filterIdentity = libraryFilterIdentity(filter);
+        const focusKey = filter.itemType !== data.filter.itemType
+            ? `filter:类型:${filter.itemType || 'all'}`
+            : `filter:题材:${filter.genre || 'all'}`;
+        data.filter = filter;
+        data.filterRevision = revision;
+        data.items = [];
+        data.startIndex = 0;
+        data.nextStartIndex = 0;
+        data.totalRecordCount = 0;
+        data.isLoadingMore = false;
+        data.loadMoreError = '';
+        data.syncError = '';
+        data.syncing = false;
+        data.filterLoading = true;
+        data.filterError = '';
+        content.scrollTop = 0;
+        renderLibrary(data);
+        requestAnimationFrame(() => focusElement([...content.querySelectorAll('[data-focus-key]')]
+            .find((node) => node.dataset.focusKey === focusKey)));
+        try {
+            const requestParams = libraryRequestParams(data, 0);
+            const response = await nativeRequest('mediaStationCatalog', 'items', [
+                'items', JSON.stringify(requestParams),
+            ]);
+            const page = validateLibraryPage(response, 0);
+            if (!isLibraryRequestCurrent(data, revision, filterIdentity)
+                || currentView?.kind !== 'library' || currentView.data !== data) return;
+            Object.assign(data, page, { filterLoading: false, filterError: '' });
+            putLibraryCache(data);
+            renderLibrary(data);
+            requestAnimationFrame(() => focusElement([...content.querySelectorAll('[data-focus-key]')]
+                .find((node) => node.dataset.focusKey === focusKey)));
+        } catch (error) {
+            if (!isLibraryRequestCurrent(data, revision, filterIdentity)
+                || currentView?.kind !== 'library' || currentView.data !== data) return;
+            data.filterLoading = false;
+            data.filterError = `筛选加载失败：${friendlyError(error)}`;
+            renderLibrary(data);
+            requestAnimationFrame(() => focusElement([...content.querySelectorAll('[data-focus-key]')]
+                .find((node) => node.dataset.focusKey === focusKey)));
+        }
     }
 
     function updateLibraryPaginationUi(data) {
@@ -1348,44 +1714,56 @@
     async function loadMoreLibrary(data) {
         if (data.isLoadingMore || data.syncing || data.nextStartIndex >= data.totalRecordCount) return;
         if (currentView?.kind !== 'library' || currentView.data !== data) return;
+        const requestView = currentView;
+        const requestRevision = data.filterRevision;
+        const filterIdentity = libraryFilterIdentity(data.filter);
+        const requestedStart = data.nextStartIndex;
+        const requestParams = libraryRequestParams(data, requestedStart);
         data.isLoadingMore = true;
         data.loadMoreError = '';
         updateLibraryPaginationUi(data);
-        const requestedStart = data.nextStartIndex;
         try {
             const response = await nativeRequest('mediaStationCatalog', 'items', [
                 'items',
-                JSON.stringify({ parentId: data.library.id, startIndex: requestedStart, limit: libraryPageSize }),
+                JSON.stringify(requestParams),
             ]);
-            const page = validateLibraryPage(response, requestedStart);
-            const stillCurrent = currentView?.kind === 'library' && currentView.data === data;
-            const grid = stillCurrent ? content.querySelector('.grid-view') : null;
-            if (stillCurrent && !grid) throw new Error('媒体库网格已不可用');
-            appendLibraryPage(data, page);
+            if (!isLibraryRequestCurrent(data, requestRevision, filterIdentity)) return;
             data.isLoadingMore = false;
+            if (currentView !== requestView) return;
+            const page = validateLibraryPage(response, requestedStart);
+            const grid = content.querySelector('.grid-view');
+            if (!grid) throw new Error('媒体库网格已不可用');
+            appendLibraryPage(data, page);
             putLibraryCache(data);
-            if (!stillCurrent) return;
             const firstIndex = data.items.length - page.items.length;
-            page.items.forEach((card, index) => grid.append(createMediaCard(card, { index: firstIndex + index, onClick: openDetail })));
+            page.items.forEach((card, index) => grid.append(createMediaCard(card, {
+                index: firstIndex + index,
+                onClick: openDetail,
+                onFocus: updateBackdropForCard,
+            })));
             updateLibraryPaginationUi(data);
         } catch (error) {
+            if (!isLibraryRequestCurrent(data, requestRevision, filterIdentity)) return;
             data.isLoadingMore = false;
+            if (currentView !== requestView) return;
             data.loadMoreError = friendlyError(error);
-            if (currentView?.kind === 'library' && currentView.data === data) {
-                updateLibraryPaginationUi(data);
-                showToast(`继续加载失败：${data.loadMoreError}`);
-            }
+            updateLibraryPaginationUi(data);
+            showToast(`继续加载失败：${data.loadMoreError}`);
         }
     }
 
     async function syncLibraryFirstPage(data) {
         const scrollTop = content.scrollTop;
+        const requestRevision = data.filterRevision;
+        const filterIdentity = libraryFilterIdentity(data.filter);
+        const requestParams = libraryRequestParams(data, 0);
         let needsRender = false;
         try {
             const response = await nativeRequest('mediaStationCatalog', 'items', [
                 'items',
-                JSON.stringify({ parentId: data.library.id, startIndex: 0, limit: libraryPageSize }),
+                JSON.stringify(requestParams),
             ]);
+            if (!isLibraryRequestCurrent(data, requestRevision, filterIdentity)) return;
             const page = validateLibraryPage(response, 0);
             const cachedPrefix = data.items.slice(0, page.items.length).map((item) => item.id);
             const refreshedIds = page.items.map((item) => item.id);
@@ -1404,6 +1782,7 @@
             data.loadMoreError = '';
             putLibraryCache(data);
         } catch (error) {
+            if (!isLibraryRequestCurrent(data, requestRevision, filterIdentity)) return;
             data.syncing = false;
             data.syncError = friendlyError(error);
             console.error(`媒体库后台同步失败：${data.syncError}`);
@@ -1411,33 +1790,33 @@
         if (currentView?.kind === 'library' && currentView.data === data) {
             if (needsRender || data.syncError) {
                 renderLibrary(data);
-                restoreScroll({ scrollTop, rows: {} });
+                restoreViewState({ scrollTop, rows: {}, focusKey: '' });
             } else {
                 updateLibraryPaginationUi(data);
             }
         }
     }
 
-    function validateLibraryPage(page, requestedStart) {
-        if (!page || !Array.isArray(page.items)) throw new Error('媒体库分页响应缺少项目列表');
+    function validateLibraryPage(page, requestedStart, label = '媒体库') {
+        if (!page || !Array.isArray(page.items)) throw new Error(`${label}分页响应缺少项目列表`);
         const startIndex = Number(page.startIndex);
         const totalRecordCount = Number(page.totalRecordCount);
         const nextStartIndex = Number(page.nextStartIndex);
         if (!Number.isInteger(startIndex) || startIndex !== requestedStart) {
-            throw new Error('媒体库分页起始位置与请求不一致');
+            throw new Error(`${label}分页起始位置与请求不一致`);
         }
         if (!Number.isInteger(totalRecordCount) || totalRecordCount < 0) {
-            throw new Error('媒体库分页总数无效');
+            throw new Error(`${label}分页总数无效`);
         }
         if (!Number.isInteger(nextStartIndex) || nextStartIndex !== startIndex + page.items.length) {
-            throw new Error('媒体库下一页位置无效');
+            throw new Error(`${label}下一页位置无效`);
         }
         if (nextStartIndex > totalRecordCount || (nextStartIndex < totalRecordCount && page.items.length === 0)) {
-            throw new Error('媒体库分页提前结束或超出总数');
+            throw new Error(`${label}分页提前结束或超出总数`);
         }
         const ids = new Set();
         for (const item of page.items) {
-            if (!item?.id || ids.has(item.id)) throw new Error('媒体库分页包含无效或重复项目');
+            if (!item?.id || ids.has(item.id)) throw new Error(`${label}分页包含无效或重复项目`);
             ids.add(item.id);
         }
         return { items: page.items, startIndex, nextStartIndex, totalRecordCount };
@@ -1454,12 +1833,12 @@
         data.nextStartIndex = page.nextStartIndex;
     }
 
-    function libraryCacheKey(library) {
-        return [session?.baseUrl || '', session?.userId || '', library.id, 'DateCreated', 'Descending'].join('\n');
+    function libraryCacheKey(library, filter = {}) {
+        return [session?.baseUrl || '', session?.userId || '', library.id, filter.itemType || '', filter.genre || '', 'DateCreated', 'Descending'].join('\n');
     }
 
-    function getLibraryCache(library) {
-        const key = libraryCacheKey(library);
+    function getLibraryCache(library, filter) {
+        const key = libraryCacheKey(library, filter);
         const cached = libraryCache.get(key);
         if (!cached) return null;
         libraryCache.delete(key);
@@ -1468,13 +1847,14 @@
     }
 
     function putLibraryCache(data) {
-        const key = libraryCacheKey(data.library);
+        const key = libraryCacheKey(data.library, data.filter);
         libraryCache.delete(key);
         libraryCache.set(key, {
             items: data.items.slice(),
             startIndex: 0,
             nextStartIndex: data.nextStartIndex,
             totalRecordCount: data.totalRecordCount,
+            filters: data.filters,
         });
         while (libraryCache.size > maximumLibraryCacheEntries) {
             libraryCache.delete(libraryCache.keys().next().value);
@@ -1492,13 +1872,15 @@
             await openLibrary(card);
             return;
         }
-        renderDetailLoading();
+        const captured = captureView();
+        const loadingView = beginLoadingView('detail-loading', captured, renderDetailLoading);
         try {
             const detail = await nativeRequest('mediaStationCatalog', 'detail', ['detail', JSON.stringify({ mediaId: card.id })]);
-            setCurrentView({ kind: 'detail', data: detail });
+            if (currentView !== loadingView) return;
+            currentView = { kind: 'detail', data: detail, scrollTop: 0, rows: {}, focusKey: '' };
+            renderCurrentView('forward');
         } catch (error) {
-            goBack();
-            showToast(friendlyError(error));
+            if (restoreLoadingSource(loadingView, captured)) showToast(friendlyError(error));
         }
     }
 
@@ -1508,7 +1890,7 @@
         const backdrop = element('div', 'detail-backdrop placeholder-art');
         backdrop.style.height = 'min(72vh, 720px)';
         const body = element('div', 'detail-content');
-        body.append(element('button', 'icon-button detail-back placeholder-back', '←'));
+        body.append(element('button', 'back-button detail-back placeholder-back', '←'));
         const layout = element('div', 'detail-layout');
         const poster = element('div', 'detail-poster placeholder-art');
         const copy = element('div', 'detail-copy');
@@ -1530,8 +1912,8 @@
         const view = element('article', 'detail-view');
         const backdrop = element('div', 'detail-backdrop');
         const body = element('div', 'detail-content');
-        const back = element('button', 'icon-button detail-back', '←');
-        back.type = 'button'; back.title = '返回'; back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
+        const back = element('button', 'back-button detail-back', '←');
+        back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         const layout = element('div', 'detail-layout');
         const poster = element('div', 'detail-poster');
         const posterFallback = element('span', 'art-fallback', initials(card.title));
@@ -1542,7 +1924,31 @@
         const posterRef = card.primaryImage || card.landscapeImage;
         observeImage(posterImage, posterRef, imageWidthFor(posterRef, false));
         const copy = element('div', 'detail-copy');
-        copy.append(element('h1', '', card.title));
+        const title = element('h1', 'detail-title', card.title);
+        copy.append(title);
+        if (card.logoImage) {
+            const logo = document.createElement('img');
+            logo.className = 'detail-logo';
+            logo.alt = card.title;
+            logo.hidden = true;
+            copy.prepend(logo);
+            requestImage(card.logoImage, 720).then((src) => {
+                if (!logo.isConnected || currentView?.data !== detail) return;
+                logo.onload = () => {
+                    if (!logo.isConnected || currentView?.data !== detail) return;
+                    logo.hidden = false;
+                    title.classList.add('logo-title-fallback');
+                };
+                logo.onerror = () => {
+                    logo.hidden = true;
+                    title.classList.remove('logo-title-fallback');
+                    console.error(`Logo 解码失败：${card.title}`);
+                };
+                logo.src = src;
+            }).catch((error) => {
+                if (currentView?.data === detail) console.error(`Logo 加载失败：${friendlyError(error)}`);
+            });
+        }
         const meta = element('div', 'hero-meta');
         [card.year, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.dynamicRange]
             .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
@@ -1579,10 +1985,173 @@
         layout.append(poster, copy);
         body.append(back, layout);
         view.append(backdrop, body);
+        if (detail.people?.length) view.append(createPeopleSection(detail.people));
         if (detail.episodes?.length) view.append(createEpisodes(detail.episodes));
         content.append(view);
         const ref = card.backdropImage || card.landscapeImage;
-        if (ref) requestImage(ref, 1600).then((src) => { if (backdrop.isConnected) backdrop.style.backgroundImage = `url("${src}")`; }).catch((error) => console.error(`Detail image failed: ${friendlyError(error)}`));
+        const backdropRevision = appBackdropRevision;
+        loadViewBackdrop(ref, backdropRevision, currentView);
+        if (ref) requestImage(ref, 1600).then((src) => {
+            if (!backdrop.isConnected || currentView?.data !== detail) return;
+            backdrop.style.backgroundImage = `url("${src}")`;
+        }).catch((error) => console.error(`详情背景加载失败：${friendlyError(error)}`));
+    }
+
+    function createPeopleSection(people) {
+        const uniquePeople = [...new Map(people.filter((person) => person?.id && person?.name).map((person) => [person.id, person])).values()];
+        const section = element('section', 'people-section');
+        const heading = element('div', 'people-heading');
+        heading.append(element('h2', '', '演职员'));
+        const controls = element('div', 'people-heading-controls');
+        heading.append(controls);
+        const row = element('div', 'media-row people-row');
+        row.dataset.rowKey = 'people';
+        row.dataset.rowIndex = '0';
+        uniquePeople.forEach((person, index) => {
+            const button = element('button', 'media-card person-card');
+            button.type = 'button';
+            button.dataset.cardIndex = String(index);
+            button.dataset.focusKey = `person:${person.id}`;
+            const portrait = element('span', 'person-portrait');
+            const fallback = element('span', 'art-fallback', initials(person.name));
+            const image = document.createElement('img');
+            image.alt = '';
+            image.decoding = 'async';
+            portrait.append(fallback, image);
+            observeImage(image, person.primaryImage, 260);
+            button.append(
+                portrait,
+                element('span', 'card-title', person.name),
+                element('span', 'card-subtitle', [person.role, person.type].filter(Boolean).join(' · ')),
+            );
+            button.addEventListener('focus', () => {
+                if (person.primaryImage) updateBackdropForCard({ primaryImage: person.primaryImage });
+            });
+            button.addEventListener('click', () => openPerson(person));
+            row.append(button);
+        });
+        section.append(heading, createRowCarousel(row, '演职员', controls));
+        return section;
+    }
+
+    async function openPerson(person) {
+        const captured = captureView();
+        const revision = ++personPageRevision;
+        const loadingView = beginLoadingView('person-loading', captured, renderLoading);
+        try {
+            const response = await nativeRequest('mediaStationCatalog', 'person_items', [
+                'person_items', JSON.stringify({ personId: person.id, startIndex: 0, limit: libraryPageSize }),
+            ]);
+            if (revision !== personPageRevision || currentView !== loadingView) return;
+            const page = validateLibraryPage(response, 0, '演员作品');
+            const data = { person, ...page, isLoadingMore: false, loadMoreError: '' };
+            currentView = { kind: 'person', data, scrollTop: 0, rows: {}, focusKey: '' };
+            renderCurrentView('forward');
+        } catch (error) {
+            if (revision !== personPageRevision) return;
+            if (restoreLoadingSource(loadingView, captured)) showToast(friendlyError(error));
+        }
+    }
+
+    function renderPerson(data) {
+        personPageObserver.disconnect();
+        content.replaceChildren();
+        loadViewBackdrop(data.person.primaryImage, appBackdropRevision, currentView);
+        const header = element('div', 'page-header person-page-header');
+        const back = element('button', 'back-button', '←');
+        back.type = 'button';
+        back.title = '返回';
+        back.setAttribute('aria-label', '返回');
+        back.dataset.focusKey = 'person:back';
+        back.addEventListener('click', goBack);
+        const identity = element('div', 'person-identity');
+        if (data.person.primaryImage) {
+            const portrait = element('span', 'person-page-portrait');
+            const image = document.createElement('img');
+            image.alt = '';
+            image.decoding = 'async';
+            portrait.append(element('span', 'art-fallback', initials(data.person.name)), image);
+            observeImage(image, data.person.primaryImage, 260);
+            identity.append(portrait);
+        }
+        const copy = element('div');
+        copy.append(element('h1', '', data.person.name));
+        const role = [data.person.role, data.person.type].filter(Boolean).join(' · ');
+        if (role) copy.append(element('p', '', role));
+        identity.append(copy);
+        header.append(back, identity);
+        content.append(header);
+        if (data.items.length) {
+            const count = element('div', 'person-results-heading', `${data.totalRecordCount} 部相关作品`);
+            const grid = element('div', 'grid-view person-grid');
+            data.items.forEach((card, index) => grid.append(createMediaCard(card, {
+                index,
+                onClick: openDetail,
+                onFocus: updateBackdropForCard,
+            })));
+            content.append(count, grid);
+        } else {
+            content.append(element('div', 'empty-state', '没有找到该演职员的相关作品'));
+        }
+        content.append(element('div', 'person-page-sentinel'));
+        updatePersonPaginationUi(data);
+    }
+
+    function updatePersonPaginationUi(data) {
+        personPageObserver.disconnect();
+        if (currentView?.kind !== 'person' || currentView.data !== data) return;
+        const sentinel = content.querySelector('.person-page-sentinel');
+        if (!sentinel) return;
+        sentinel.replaceChildren();
+        if (data.nextStartIndex >= data.totalRecordCount) return;
+        if (data.loadMoreError) {
+            const retry = element('button', 'secondary-command', '重试加载');
+            retry.type = 'button';
+            retry.addEventListener('click', () => loadMorePerson(data));
+            sentinel.append(element('span', '', data.loadMoreError), retry);
+        } else if (data.isLoadingMore) {
+            sentinel.textContent = '正在加载…';
+        } else {
+            personPageObserver.observe(sentinel);
+        }
+    }
+
+    async function loadMorePerson(data) {
+        if (data.isLoadingMore || data.nextStartIndex >= data.totalRecordCount) return;
+        if (currentView?.kind !== 'person' || currentView.data !== data) return;
+        const requestView = currentView;
+        data.isLoadingMore = true;
+        data.loadMoreError = '';
+        updatePersonPaginationUi(data);
+        const requestedStart = data.nextStartIndex;
+        try {
+            const response = await nativeRequest('mediaStationCatalog', 'person_items', [
+                'person_items', JSON.stringify({ personId: data.person.id, startIndex: requestedStart, limit: libraryPageSize }),
+            ]);
+            data.isLoadingMore = false;
+            if (currentView !== requestView) return;
+            const page = validateLibraryPage(response, requestedStart, '演员作品');
+            const existingIds = new Set(data.items.map((item) => item.id));
+            if (page.totalRecordCount !== data.totalRecordCount || page.items.some((item) => existingIds.has(item.id))) {
+                throw new Error('演员作品分页状态已变化，请重新进入');
+            }
+            const firstIndex = data.items.length;
+            data.items.push(...page.items);
+            data.nextStartIndex = page.nextStartIndex;
+            const grid = content.querySelector('.person-grid');
+            if (!grid) throw new Error('演员作品网格已不可用');
+            page.items.forEach((card, index) => grid.append(createMediaCard(card, {
+                index: firstIndex + index,
+                onClick: openDetail,
+                onFocus: updateBackdropForCard,
+            })));
+            updatePersonPaginationUi(data);
+        } catch (error) {
+            data.isLoadingMore = false;
+            if (currentView !== requestView) return;
+            data.loadMoreError = friendlyError(error);
+            updatePersonPaginationUi(data);
+        }
     }
 
     function createEpisodes(episodes) {
@@ -1601,6 +2170,8 @@
         let selectedSeason = resumable?.parentIndexNumber || seasons[0];
         const heading = element('div', 'episodes-heading');
         heading.append(element('h2', '', '选集'));
+        const headingControls = element('div', 'episodes-heading-controls');
+        const pagingControls = element('div', 'episodes-paging-controls');
         const seasonTabs = element('div', 'segmented-control season-tabs');
         seasonTabs.setAttribute('role', 'tablist');
         const stage = element('div', 'episode-stage');
@@ -1633,7 +2204,8 @@
                     index,
                     onClick: (item) => startPlayback(item, item.resumePositionMs),
                 })));
-                rowHost.replaceChildren(createRowCarousel(row, '选集'));
+                pagingControls.replaceChildren();
+                rowHost.replaceChildren(createRowCarousel(row, '选集', pagingControls));
             };
 
             if (chunks.length > 1) {
@@ -1661,7 +2233,9 @@
             button.addEventListener('click', () => renderSeason(season));
             seasonTabs.append(button);
         });
-        if (seasons.length > 1) heading.append(seasonTabs);
+        if (seasons.length > 1) headingControls.append(seasonTabs);
+        headingControls.append(pagingControls);
+        heading.append(headingControls);
         root.append(heading, stage);
         renderSeason(selectedSeason);
         return root;
@@ -1683,8 +2257,13 @@
         focusElement(trigger);
     }
 
-    function renderSearch(data = { query: '', items: null }) {
+    function renderSearch(data = { query: '', draft: '', items: null, status: 'idle', error: '' }) {
         content.replaceChildren();
+        if (data.items?.[0]) {
+            loadViewBackdrop(data.items[0].backdropImage || data.items[0].landscapeImage, appBackdropRevision, currentView);
+        } else if (data.status === 'idle') {
+            clearAppBackdrop(appBackdropRevision);
+        }
         const root = element('section', 'search-view');
         const header = element('div', 'page-header search-header');
         const back = element('button', 'back-button', '←');
@@ -1698,7 +2277,7 @@
         const field = element('div', 'search-field');
         field.append(element('span', 'search-leading', '⌕'));
         const input = document.createElement('input');
-        input.type = 'search'; input.placeholder = '搜索电影、剧集'; input.value = data.query || '';
+        input.type = 'search'; input.placeholder = '搜索电影、剧集'; input.value = data.draft ?? data.query ?? '';
         input.setAttribute('aria-label', '搜索媒体');
         input.dataset.focusKey = 'search:input';
         const clear = element('button', 'icon-button search-clear', '×');
@@ -1707,37 +2286,69 @@
         clear.setAttribute('aria-label', '清除搜索');
         clear.classList.toggle('hidden', !input.value);
         clear.addEventListener('click', () => {
-            input.value = '';
-            clear.classList.add('hidden');
-            input.focus();
+            searchRevision += 1;
+            Object.assign(data, { query: '', draft: '', items: null, status: 'idle', error: '' });
+            renderSearch(data);
         });
-        input.addEventListener('input', () => clear.classList.toggle('hidden', !input.value));
+        input.addEventListener('input', () => {
+            data.draft = input.value;
+            clear.classList.toggle('hidden', !input.value);
+            if (data.status === 'loading') {
+                searchRevision += 1;
+                data.status = 'idle';
+                submit.disabled = false;
+                root.querySelector('.search-state[role="status"]')?.remove();
+            }
+        });
         const submit = element('button', 'primary-command', '搜索');
         submit.type = 'submit';
+        submit.disabled = data.status === 'loading';
         field.append(input, clear);
         form.append(field, submit);
         form.addEventListener('submit', async (event) => {
             event.preventDefault();
+            if (data.status === 'loading') return;
             const query = input.value.trim();
-            if (!query) return;
-            submit.disabled = true;
+            if (!query) {
+                Object.assign(data, { draft: input.value, status: 'invalid', error: '请输入搜索内容' });
+                renderSearch(data);
+                return;
+            }
+            const revision = ++searchRevision;
+            Object.assign(data, { query, draft: query, items: null, status: 'loading', error: '' });
+            renderSearch(data);
             try {
                 const result = await nativeRequest('mediaStationCatalog', 'search', ['search', JSON.stringify({ query, limit: 60 })]);
-                currentView.data = { query, items: result.items };
-                renderSearch(currentView.data);
+                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
+                if (!result || !Array.isArray(result.items)) throw new Error('搜索响应缺少结果列表');
+                Object.assign(data, { items: result.items, status: 'success', error: '' });
+                renderSearch(data);
             } catch (error) {
-                showToast(friendlyError(error));
-                submit.disabled = false;
+                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
+                Object.assign(data, { items: null, status: 'error', error: `搜索失败：${friendlyError(error)}` });
+                renderSearch(data);
             }
         });
         root.append(header, form);
-        if (Array.isArray(data.items)) {
+        if (data.status === 'loading') {
+            const state = element('div', 'search-state', '正在搜索…');
+            state.setAttribute('role', 'status');
+            root.append(state);
+        } else if (data.error) {
+            const state = element('div', `search-state${data.status === 'error' ? ' error-state' : ''}`, data.error);
+            state.setAttribute('role', 'alert');
+            root.append(state);
+        } else if (Array.isArray(data.items)) {
             if (data.items.length) {
                 const resultsHeading = element('div', 'search-results-heading');
-                resultsHeading.append(element('h2', '', `${data.items.length} 个结果`));
+                resultsHeading.append(element('h2', '', `本页 ${data.items.length} 个结果`));
                 if (data.query) resultsHeading.append(element('span', '', `“${data.query}”`));
                 const grid = element('div', 'grid-view search-grid');
-                data.items.forEach((card, index) => grid.append(createMediaCard(card, { index, onClick: openDetail })));
+                data.items.forEach((card, index) => grid.append(createMediaCard(card, {
+                    index,
+                    onClick: openDetail,
+                    onFocus: updateBackdropForCard,
+                })));
                 root.append(resultsHeading, grid);
             } else {
                 root.append(element('div', 'empty-state', '没有找到相关内容'));
@@ -1748,7 +2359,7 @@
     }
 
     function openSearch() {
-        setCurrentView({ kind: 'search', data: { query: '', items: null } });
+        setCurrentView({ kind: 'search', data: { query: '', draft: '', items: null, status: 'idle', error: '' } });
     }
 
     function openDrawer(drawer, trigger) {
@@ -1925,6 +2536,7 @@
         refreshPlayerTools();
         hidePlayerFeedback();
         playerView.classList.remove('hidden');
+        heroCarouselController?.pause('player');
         setPlayerMode(true);
         showPlayerControls();
         try {
@@ -2591,6 +3203,7 @@
         window.clearTimeout(controlsTimer);
         hidePlayerFeedback();
         playerView.classList.add('hidden');
+        heroCarouselController?.resume('player');
         refreshPlayerCursor();
         setPlayerMode(false);
         appShell.classList.remove('hidden');
@@ -2602,7 +3215,7 @@
             const saved = captureView();
             currentView = { ...currentView, data: homeData };
             renderHome(homeData);
-            if (saved) restoreScroll(saved);
+            if (saved) restoreViewState(saved);
         }
         scheduleHomeRefresh(300);
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
@@ -2721,7 +3334,7 @@
             };
             imageCache.clear();
             renderCurrentView();
-            restoreScroll(currentView);
+            restoreViewState(currentView);
             updateImageCacheStatus();
             showToast('图片缓存已清除');
         } catch (error) {
@@ -2830,7 +3443,41 @@
             else goBack();
             return;
         }
-        if (inputActive || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+        if (inputActive) {
+            if (event.key === 'ArrowDown' && document.activeElement?.matches('.search-field input')) {
+                const firstResult = content.querySelector('.search-grid .media-card');
+                if (firstResult) {
+                    event.preventDefault();
+                    focusAndReveal(firstResult, 'center', 'nearest');
+                }
+            } else if (event.key === 'ArrowUp' && document.activeElement?.matches('.search-field input')) {
+                event.preventDefault();
+                focusElement(content.querySelector('.search-header .back-button'));
+            }
+            return;
+        }
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+        if (document.activeElement?.matches('.back-button') && event.key === 'ArrowDown') {
+            event.preventDefault();
+            const target = content.querySelector('.search-field input, .library-filter-button[aria-pressed="true"], .detail-actions button, .detail-overview, .grid-view .media-card, .people-row .media-card');
+            focusAndReveal(target, 'center', 'nearest');
+            return;
+        }
+        const heroControls = document.activeElement?.closest?.('.hero-actions, .hero-carousel-controls, .detail-actions, .row-carousel-controls');
+        if (heroControls) {
+            event.preventDefault();
+            const buttons = [...heroControls.querySelectorAll('button:not(:disabled)')];
+            const index = buttons.indexOf(document.activeElement);
+            if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                focusElement(buttons[clamp(index + (event.key === 'ArrowRight' ? 1 : -1), 0, buttons.length - 1)]);
+            } else if (event.key === 'ArrowDown') {
+                const scopedRow = heroControls.classList.contains('row-carousel-controls')
+                    ? heroControls.closest('section')?.querySelector('.media-row .media-card')
+                    : content.querySelector('.media-row .media-card');
+                focusAndReveal(scopedRow, 'center', 'center');
+            }
+            return;
+        }
         const segmented = document.activeElement?.closest?.('.segmented-control');
         if (segmented) {
             event.preventDefault();
@@ -2847,8 +3494,47 @@
             }
             return;
         }
+        const filterOptions = document.activeElement?.closest?.('.library-filter-options');
+        if (filterOptions) {
+            event.preventDefault();
+            const buttons = [...filterOptions.querySelectorAll('button')];
+            const index = buttons.indexOf(document.activeElement);
+            if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                const next = buttons[clamp(index + (event.key === 'ArrowRight' ? 1 : -1), 0, buttons.length - 1)];
+                focusAndReveal(next, 'nearest', 'nearest');
+            } else if (event.key === 'ArrowDown') {
+                focusAndReveal(content.querySelector('.grid-view .media-card'), 'center', 'nearest');
+            } else {
+                const groups = [...content.querySelectorAll('.library-filter-options')];
+                const previousGroup = groups[groups.indexOf(filterOptions) - 1];
+                focusAndReveal(previousGroup?.querySelector('[aria-pressed="true"]') || content.querySelector('.back-button'), 'nearest', 'nearest');
+            }
+            return;
+        }
         const card = document.activeElement?.closest?.('.media-card');
         if (!card) return;
+        const grid = card.closest('.grid-view');
+        if (grid) {
+            event.preventDefault();
+            const cards = [...grid.querySelectorAll('.media-card')];
+            const index = cards.indexOf(card);
+            const firstTop = cards[0]?.offsetTop;
+            const wrapIndex = cards.findIndex((candidate) => Math.abs(candidate.offsetTop - firstTop) > 2);
+            const columnCount = wrapIndex < 1 ? cards.length : wrapIndex;
+            let nextIndex = index;
+            if (event.key === 'ArrowLeft') nextIndex -= 1;
+            if (event.key === 'ArrowRight') nextIndex += 1;
+            if (event.key === 'ArrowUp') nextIndex -= columnCount;
+            if (event.key === 'ArrowDown') nextIndex += columnCount;
+            if (event.key === 'ArrowUp' && nextIndex < 0) {
+                const target = content.querySelector('.search-field input, .library-filter-button[aria-pressed="true"], .back-button');
+                focusAndReveal(target, 'nearest', 'nearest');
+                return;
+            }
+            nextIndex = clamp(nextIndex, 0, cards.length - 1);
+            focusAndReveal(cards[nextIndex], 'center', 'nearest');
+            return;
+        }
         const row = card.closest('.media-row');
         if (!row) return;
         event.preventDefault();
@@ -2861,9 +3547,12 @@
             const rowIndex = rows.indexOf(row) + (event.key === 'ArrowDown' ? 1 : -1);
             const targetRow = rows[rowIndex];
             if (!targetRow) {
-                if (event.key === 'ArrowUp' && row.classList.contains('episode-row')) {
-                    const target = content.querySelector('.episode-ranges [aria-selected="true"]')
-                        || content.querySelector('.season-tabs [aria-selected="true"]');
+                if (event.key === 'ArrowUp') {
+                    const target = row.classList.contains('episode-row')
+                        ? content.querySelector('.episode-ranges [aria-selected="true"], .season-tabs [aria-selected="true"]')
+                        : row.classList.contains('people-row')
+                            ? content.querySelector('.detail-actions button, .detail-overview, .detail-back')
+                            : content.querySelector('.hero-actions button');
                     focusElement(target);
                 }
                 return;
@@ -2903,6 +3592,10 @@
     const rowScrollIdleTimers = new WeakMap();
     content.addEventListener('scroll', (event) => {
         const row = event.target;
+        if (row === content) {
+            topbar.classList.toggle('scrolled', content.scrollTop > 20);
+            return;
+        }
         if (!(row instanceof Element) || !row.classList.contains('media-row')) return;
         row.classList.add('is-scrolling');
         window.clearTimeout(rowScrollIdleTimers.get(row));

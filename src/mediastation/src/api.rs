@@ -13,7 +13,7 @@ const HEADER_CONTENT_TYPE: &str = "content-type";
 const HEADER_LOCATION: &str = "location";
 const HEADER_USER_AGENT: &str = "user-agent";
 const MAX_EXTERNAL_RESOURCE_REDIRECTS: usize = 6;
-const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber";
+const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,People,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber";
 const MAX_CATALOG_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 
@@ -117,6 +117,7 @@ pub enum MediaImageType {
     Primary,
     Thumb,
     Backdrop,
+    Logo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub struct MediaCard {
     pub primary_image: Option<MediaImageRef>,
     pub landscape_image: Option<MediaImageRef>,
     pub backdrop_image: Option<MediaImageRef>,
+    pub logo_image: Option<MediaImageRef>,
 }
 
 impl MediaCard {
@@ -191,6 +193,22 @@ pub struct MediaPage {
 pub struct MediaDetail {
     pub item: MediaCard,
     pub episodes: Vec<MediaCard>,
+    pub people: Vec<MediaPerson>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaPerson {
+    pub id: String,
+    pub name: String,
+    pub role: Option<String>,
+    pub person_type: Option<String>,
+    pub primary_image: Option<MediaImageRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaLibraryFilters {
+    pub item_types: Vec<String>,
+    pub genres: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,15 +416,99 @@ impl MediaStationApiClient {
         start_index: usize,
         limit: usize,
     ) -> Result<MediaPage, ApiError> {
+        self.load_library_page_filtered(session, parent_id, start_index, limit, None, None)
+    }
+
+    pub fn load_library_page_filtered(
+        &self,
+        session: &MediaStationSession,
+        parent_id: &str,
+        start_index: usize,
+        limit: usize,
+        item_type: Option<&str>,
+        genre: Option<&str>,
+    ) -> Result<MediaPage, ApiError> {
         validate_identifier("parent_id", parent_id)?;
         validate_page(start_index, limit)?;
+        if let Some(item_type) = item_type {
+            validate_catalog_item_type(item_type)?;
+        }
+        if let Some(genre) = genre {
+            validate_filter_value("genre", genre)?;
+        }
         let mut url = endpoint(&session.base_url, &["Items"])?;
-        url.query_pairs_mut()
+        let mut query = url.query_pairs_mut();
+        query
             .append_pair("UserId", &session.user_id)
             .append_pair("ParentId", parent_id)
             .append_pair("StartIndex", &start_index.to_string())
             .append_pair("Limit", &limit.to_string())
             .append_pair("SortBy", "DateCreated")
+            .append_pair("SortOrder", "Descending")
+            .append_pair("Fields", CATALOG_FIELDS);
+        if let Some(item_type) = item_type {
+            query.append_pair("IncludeItemTypes", item_type);
+        }
+        if let Some(genre) = genre {
+            query.append_pair("Genres", genre.trim());
+        }
+        drop(query);
+        parse_media_page(&self.get_json(session, &url)?, start_index)
+    }
+
+    pub fn load_library_filters(
+        &self,
+        session: &MediaStationSession,
+        parent_id: &str,
+        collection_type: Option<&str>,
+    ) -> Result<MediaLibraryFilters, ApiError> {
+        validate_identifier("parent_id", parent_id)?;
+        let item_types = library_item_types(collection_type);
+        let mut url = endpoint(&session.base_url, &["Genres"])?;
+        url.query_pairs_mut()
+            .append_pair("UserId", &session.user_id)
+            .append_pair("ParentId", parent_id)
+            .append_pair("Recursive", "true")
+            .append_pair("IncludeItemTypes", &item_types.join(","));
+        let payload = self.get_json(session, &url)?;
+        let items = payload
+            .get("Items")
+            .and_then(Value::as_array)
+            .ok_or(ApiError::MissingField { field: "Items" })?;
+        let genres = items
+            .iter()
+            .map(|item| {
+                item.get("Name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .ok_or(ApiError::MissingField {
+                        field: "Genre.Name",
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MediaLibraryFilters { item_types, genres })
+    }
+
+    pub fn load_person_page(
+        &self,
+        session: &MediaStationSession,
+        person_id: &str,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<MediaPage, ApiError> {
+        validate_identifier("person_id", person_id)?;
+        validate_page(start_index, limit)?;
+        let mut url = endpoint(&session.base_url, &["Items"])?;
+        url.query_pairs_mut()
+            .append_pair("UserId", &session.user_id)
+            .append_pair("PersonIds", person_id)
+            .append_pair("Recursive", "true")
+            .append_pair("IncludeItemTypes", "Movie,Series,Video,MusicVideo")
+            .append_pair("StartIndex", &start_index.to_string())
+            .append_pair("Limit", &limit.to_string())
+            .append_pair("SortBy", "ProductionYear,SortName")
             .append_pair("SortOrder", "Descending")
             .append_pair("Fields", CATALOG_FIELDS);
         parse_media_page(&self.get_json(session, &url)?, start_index)
@@ -430,7 +532,7 @@ impl MediaStationApiClient {
             .append_pair("UserId", &session.user_id)
             .append_pair("SearchTerm", query.trim())
             .append_pair("Recursive", "true")
-            .append_pair("IncludeItemTypes", "Movie,Series,Episode,Video")
+            .append_pair("IncludeItemTypes", "Movie,Series,Episode,Video,MusicVideo")
             .append_pair("Limit", &limit.to_string())
             .append_pair("Fields", CATALOG_FIELDS);
         parse_media_cards(&self.get_json(session, &url)?)
@@ -446,7 +548,9 @@ impl MediaStationApiClient {
         url.query_pairs_mut()
             .append_pair("UserId", &session.user_id)
             .append_pair("Fields", CATALOG_FIELDS);
-        let item = parse_media_card(&self.get_json(session, &url)?)?;
+        let detail_payload = self.get_json(session, &url)?;
+        let item = parse_media_card(&detail_payload)?;
+        let people = parse_media_people(&detail_payload)?;
         let episodes = if item.media_type == "Series" {
             let mut episodes_url = endpoint(&session.base_url, &["Items"])?;
             episodes_url
@@ -463,7 +567,11 @@ impl MediaStationApiClient {
         } else {
             Vec::new()
         };
-        Ok(MediaDetail { item, episodes })
+        Ok(MediaDetail {
+            item,
+            episodes,
+            people,
+        })
     }
 
     pub fn download_media_image(
@@ -491,6 +599,7 @@ impl MediaStationApiClient {
             MediaImageType::Primary => "Primary".to_string(),
             MediaImageType::Thumb => "Thumb".to_string(),
             MediaImageType::Backdrop => format!("Backdrop/{}", image.image_index.unwrap_or(0)),
+            MediaImageType::Logo => "Logo".to_string(),
         };
         let mut url = endpoint_from_path(
             &session.base_url,
@@ -1060,6 +1169,8 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
     let image_tags = item.get("ImageTags").and_then(Value::as_object);
     let primary_tag = image_tags.and_then(|tags| optional_string(tags.get("Primary")));
     let thumb_tag = image_tags.and_then(|tags| optional_string(tags.get("Thumb")));
+    let own_logo_tag = image_tags.and_then(|tags| optional_string(tags.get("Logo")));
+    let parent_logo_tag = optional_string(item.get("ParentLogoImageTag"));
     let image_owner_id =
         optional_string(item.get("PrimaryImageItemId")).unwrap_or_else(|| id.clone());
     let primary_image = primary_tag.map(|tag| MediaImageRef {
@@ -1091,6 +1202,19 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
     let thumb_image = thumb_tag.map(|tag| MediaImageRef {
         item_id: image_owner_id,
         image_type: MediaImageType::Thumb,
+        image_index: None,
+        tag,
+    });
+    let logo_owner_id = if own_logo_tag.is_some() {
+        id.clone()
+    } else {
+        optional_string(item.get("ParentLogoItemId"))
+            .or_else(|| optional_string(item.get("SeriesId")))
+            .unwrap_or_else(|| id.clone())
+    };
+    let logo_image = own_logo_tag.or(parent_logo_tag).map(|tag| MediaImageRef {
+        item_id: logo_owner_id,
+        image_type: MediaImageType::Logo,
         image_index: None,
         tag,
     });
@@ -1149,7 +1273,78 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
         primary_image,
         landscape_image,
         backdrop_image,
+        logo_image,
     })
+}
+
+fn parse_media_people(payload: &Value) -> Result<Vec<MediaPerson>, ApiError> {
+    let Some(people) = payload.get("People") else {
+        return Ok(Vec::new());
+    };
+    let people = people
+        .as_array()
+        .ok_or(ApiError::MissingField { field: "People" })?;
+    people
+        .iter()
+        .map(|value| {
+            let person = value
+                .as_object()
+                .ok_or(ApiError::MissingField { field: "Person" })?;
+            let id = required_string(person.get("Id"), "Person.Id")?;
+            let name = required_string(person.get("Name"), "Person.Name")?;
+            let primary_image =
+                optional_string(person.get("PrimaryImageTag")).map(|tag| MediaImageRef {
+                    item_id: id.clone(),
+                    image_type: MediaImageType::Primary,
+                    image_index: None,
+                    tag,
+                });
+            Ok(MediaPerson {
+                id,
+                name,
+                role: optional_string(person.get("Role")),
+                person_type: optional_string(person.get("Type")),
+                primary_image,
+            })
+        })
+        .collect()
+}
+
+fn library_item_types(collection_type: Option<&str>) -> Vec<String> {
+    let types: &[&str] = match collection_type
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "movies" => &["Movie"],
+        "tvshows" => &["Series"],
+        "musicvideos" => &["MusicVideo"],
+        "homevideos" => &["Video"],
+        "boxsets" => &["BoxSet"],
+        _ => &["Movie", "Series", "Video", "MusicVideo"],
+    };
+    types.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn validate_catalog_item_type(value: &str) -> Result<(), ApiError> {
+    match value {
+        "Movie" | "Series" | "Video" | "MusicVideo" | "BoxSet" => Ok(()),
+        _ => Err(ApiError::InvalidInput {
+            field: "item_type",
+            reason: "is not a supported video catalog item type".to_string(),
+        }),
+    }
+}
+
+fn validate_filter_value(field: &'static str, value: &str) -> Result<(), ApiError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(ApiError::InvalidInput {
+            field,
+            reason: "must contain 1 to 128 visible characters".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn first_catalog_video_stream(item: &Map<String, Value>) -> Option<&Map<String, Value>> {
@@ -1839,7 +2034,8 @@ mod tests {
                 "Played": false
             },
             "ImageTags": {
-                "Primary": "primary-tag"
+                "Primary": "primary-tag",
+                "Logo": "logo-tag"
             },
             "ParentBackdropImageTags": ["backdrop-tag"],
             "ParentBackdropItemId": "series-1",
@@ -1874,7 +2070,98 @@ mod tests {
             })
         );
         assert!(card.is_playable());
+        assert_eq!(
+            card.logo_image,
+            Some(MediaImageRef {
+                item_id: "episode-1".to_string(),
+                image_type: MediaImageType::Logo,
+                image_index: None,
+                tag: "logo-tag".to_string(),
+            })
+        );
         assert!(!format!("{card:?}").contains("api_key"));
+    }
+
+    #[test]
+    fn detail_people_keep_roles_and_primary_image_references() {
+        let payload = json!({
+            "People": [{
+                "Id": "person-1",
+                "Name": "Example Actor",
+                "Role": "Lead",
+                "Type": "Actor",
+                "PrimaryImageTag": "person-image"
+            }]
+        });
+
+        let people = parse_media_people(&payload).expect("people should parse");
+
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].role.as_deref(), Some("Lead"));
+        assert_eq!(people[0].person_type.as_deref(), Some("Actor"));
+        assert_eq!(
+            people[0].primary_image,
+            Some(MediaImageRef {
+                item_id: "person-1".to_string(),
+                image_type: MediaImageType::Primary,
+                image_index: None,
+                tag: "person-image".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn library_page_sends_server_side_type_and_genre_filters() {
+        let body = json!({
+            "StartIndex": 0,
+            "TotalRecordCount": 0,
+            "Items": []
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base_url, server) = serve_once(response);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        client
+            .load_library_page_filtered(
+                &session(base_url),
+                "library-1",
+                0,
+                48,
+                Some("Movie"),
+                Some("科幻 动作"),
+            )
+            .expect("filtered library page should load");
+        let request = server.join().expect("server thread should finish");
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request target should exist");
+        let parsed =
+            Url::parse(&format!("http://localhost{target}")).expect("request target should parse");
+        let params = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie")
+        );
+        assert_eq!(
+            params.get("Genres").map(|value| value.as_ref()),
+            Some("科幻 动作")
+        );
+        assert_eq!(
+            params.get("StartIndex").map(|value| value.as_ref()),
+            Some("0")
+        );
+        assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("48"));
     }
 
     #[test]

@@ -371,6 +371,7 @@ pub(crate) fn image_cache_key(
         MediaImageType::Primary => "primary",
         MediaImageType::Thumb => "thumb",
         MediaImageType::Backdrop => "backdrop",
+        MediaImageType::Logo => "logo",
     };
     let source = format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
