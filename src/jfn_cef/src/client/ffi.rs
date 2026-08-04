@@ -2,7 +2,11 @@
 //! from a raw `JfnCefLayer*` and forwards to the corresponding `Inner`
 //! method. Caller-visible state lives in `Inner`; this layer holds no logic.
 
-use cef::{ImplBrowser, ImplBrowserHost, KeyEvent, MouseButtonType, MouseEvent, sys};
+use cef::{
+    CefString, CompositionUnderline, ImplBrowser, ImplBrowserHost, KeyEvent, MouseButtonType,
+    MouseEvent, Range, sys,
+};
+use jfn_platform_abi::{ImeTextRange, ImeUnderline};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Arc;
@@ -129,6 +133,64 @@ pub(crate) unsafe fn jfn_cef_layer_go_forward(h: *const JfnCefLayer) {
 pub(crate) unsafe fn jfn_cef_layer_set_focus(h: *const JfnCefLayer, focus: bool) {
     if let Some(host) = unsafe { arc(h) }.host() {
         host.set_focus(if focus { 1 } else { 0 });
+    }
+}
+
+fn invalid_ime_range() -> Range {
+    Range {
+        from: u32::MAX,
+        to: u32::MAX,
+    }
+}
+
+pub(crate) unsafe fn jfn_cef_layer_ime_set_composition(
+    h: *const JfnCefLayer,
+    text: &str,
+    underlines: &[ImeUnderline],
+    selection: ImeTextRange,
+) {
+    let Some(host) = unsafe { arc(h) }.host() else {
+        return;
+    };
+    let text = CefString::from(text);
+    let underlines: Vec<CompositionUnderline> = underlines
+        .iter()
+        .map(|underline| CompositionUnderline {
+            range: Range {
+                from: underline.from,
+                to: underline.to,
+            },
+            color: 0xFF00_0000,
+            background_color: 0,
+            thick: i32::from(underline.thick),
+            ..CompositionUnderline::default()
+        })
+        .collect();
+    let replacement = invalid_ime_range();
+    let selection = Range {
+        from: selection.from,
+        to: selection.to,
+    };
+    host.ime_set_composition(
+        Some(&text),
+        Some(&underlines),
+        Some(&replacement),
+        Some(&selection),
+    );
+}
+
+pub(crate) unsafe fn jfn_cef_layer_ime_commit_text(h: *const JfnCefLayer, text: &str) {
+    let Some(host) = unsafe { arc(h) }.host() else {
+        return;
+    };
+    let text = CefString::from(text);
+    let replacement = invalid_ime_range();
+    host.ime_commit_text(Some(&text), Some(&replacement), 0);
+}
+
+pub(crate) unsafe fn jfn_cef_layer_ime_cancel_composition(h: *const JfnCefLayer) {
+    if let Some(host) = unsafe { arc(h) }.host() {
+        host.ime_cancel_composition();
     }
 }
 

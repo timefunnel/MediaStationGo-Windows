@@ -24,7 +24,7 @@ pub use compositor::{
 pub use input::{
     jfn_input_windows_focus, jfn_input_windows_resize_to_parent,
     jfn_input_windows_run_input_thread, jfn_input_windows_set_cursor,
-    jfn_input_windows_stop_input_thread,
+    jfn_input_windows_set_ime_composition_range, jfn_input_windows_stop_input_thread,
 };
 pub use platform::{
     jfn_win_get_hwnd, win_clamp_window_geometry, win_cleanup, win_early_init,
@@ -477,6 +477,14 @@ impl Platform for WindowsPlatform {
 
     fn set_cursor(&self, shape: jfn_platform_abi::cursor::CursorShape) {
         jfn_input_windows_set_cursor(shape.as_raw());
+    }
+
+    fn ime_composition_range_changed(
+        &self,
+        selected_range: jfn_platform_abi::ImeTextRange,
+        character_bounds: &[JfnRect],
+    ) {
+        jfn_input_windows_set_ime_composition_range(selected_range, character_bounds);
     }
 
     fn set_idle_inhibit(&self, level: IdleInhibitLevel) {

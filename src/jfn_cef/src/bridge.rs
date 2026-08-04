@@ -6,15 +6,16 @@
 
 use std::os::raw::c_int;
 
-use jfn_platform_abi::BrowserBridge;
+use jfn_platform_abi::{BrowserBridge, ImeTextRange, ImeUnderline};
 
 use crate::browsers::jfn_browsers_active;
 use crate::client::{
     jfn_cef_layer_can_go_back, jfn_cef_layer_can_go_forward, jfn_cef_layer_copy, jfn_cef_layer_cut,
-    jfn_cef_layer_go_back, jfn_cef_layer_go_forward, jfn_cef_layer_paste, jfn_cef_layer_redo,
-    jfn_cef_layer_select_all, jfn_cef_layer_send_key_event, jfn_cef_layer_send_mouse_click,
-    jfn_cef_layer_send_mouse_move, jfn_cef_layer_send_mouse_wheel, jfn_cef_layer_set_focus,
-    jfn_cef_layer_undo,
+    jfn_cef_layer_go_back, jfn_cef_layer_go_forward, jfn_cef_layer_ime_cancel_composition,
+    jfn_cef_layer_ime_commit_text, jfn_cef_layer_ime_set_composition, jfn_cef_layer_paste,
+    jfn_cef_layer_redo, jfn_cef_layer_select_all, jfn_cef_layer_send_key_event,
+    jfn_cef_layer_send_mouse_click, jfn_cef_layer_send_mouse_move, jfn_cef_layer_send_mouse_wheel,
+    jfn_cef_layer_set_focus, jfn_cef_layer_undo,
 };
 
 pub struct CefBrowserBridge;
@@ -86,6 +87,32 @@ impl BrowserBridge for CefBrowserBridge {
         let l = jfn_browsers_active();
         if !l.is_null() {
             unsafe { jfn_cef_layer_set_focus(l, focus) };
+        }
+    }
+
+    fn ime_set_composition(
+        &self,
+        text: &str,
+        underlines: &[ImeUnderline],
+        selection: ImeTextRange,
+    ) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_ime_set_composition(l, text, underlines, selection) };
+        }
+    }
+
+    fn ime_commit_text(&self, text: &str) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_ime_commit_text(l, text) };
+        }
+    }
+
+    fn ime_cancel_composition(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_ime_cancel_composition(l) };
         }
     }
 

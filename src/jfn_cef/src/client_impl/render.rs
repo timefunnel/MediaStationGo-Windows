@@ -38,6 +38,34 @@ wrap_render_handler! {
             let Some(r) = rect else { return };
             self.inner.on_popup_size(r.x, r.y, r.width, r.height);
         }
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            let (Some(selected_range), Some(character_bounds), Some(platform)) =
+                (selected_range, character_bounds, platform_ops::ops())
+            else {
+                return;
+            };
+            let bounds: Vec<platform_ops::JfnRect> = character_bounds
+                .iter()
+                .map(|rect| platform_ops::JfnRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
+                })
+                .collect();
+            platform.ime_composition_range_changed(
+                platform_ops::ImeTextRange {
+                    from: selected_range.from,
+                    to: selected_range.to,
+                },
+                &bounds,
+            );
+        }
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,

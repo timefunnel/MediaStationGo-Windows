@@ -3,7 +3,7 @@
 //! [`jfn_platform_abi::browser_bridge`].
 
 use jfn_platform_abi::event_flags::EVENTFLAG_PRECISION_SCROLLING_DELTA;
-use jfn_platform_abi::{BrowserBridge, browser_bridge};
+use jfn_platform_abi::{BrowserBridge, ImeTextRange, ImeUnderline, browser_bridge};
 use jfn_playback::hotkey::jfn_hotkey_classify_keydown;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 use parking_lot::Mutex;
@@ -120,6 +120,22 @@ pub fn jfn_input_dispatch_history_nav(forward: c_int) {
 
 pub fn jfn_input_dispatch_keyboard_focus(gained: c_int) {
     with_bridge(|b| b.set_focus(gained != 0));
+}
+
+pub fn jfn_input_dispatch_ime_set_composition(
+    text: &str,
+    underlines: &[ImeUnderline],
+    selection: ImeTextRange,
+) {
+    with_bridge(|b| b.ime_set_composition(text, underlines, selection));
+}
+
+pub fn jfn_input_dispatch_ime_commit_text(text: &str) {
+    with_bridge(|b| b.ime_commit_text(text));
+}
+
+pub fn jfn_input_dispatch_ime_cancel_composition() {
+    with_bridge(|bridge| bridge.ime_cancel_composition());
 }
 
 /// Char event with explicit is_system_key (for WM_SYSCHAR on Windows). The

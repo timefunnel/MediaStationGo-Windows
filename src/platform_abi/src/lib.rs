@@ -337,11 +337,27 @@ impl DecorationOptions {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct JfnRect {
     pub x: c_int,
     pub y: c_int,
     pub w: c_int,
     pub h: c_int,
+}
+
+/// UTF-16 code-unit range used by CEF's IME APIs.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImeTextRange {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// One underline segment in an active IME composition.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImeUnderline {
+    pub from: u32,
+    pub to: u32,
+    pub thick: bool,
 }
 
 /// Idle-inhibit level.
@@ -553,6 +569,12 @@ pub trait Platform: Send + Sync {
     }
 
     fn set_cursor(&self, _shape: cursor::CursorShape) {}
+    fn ime_composition_range_changed(
+        &self,
+        _selected_range: ImeTextRange,
+        _character_bounds: &[JfnRect],
+    ) {
+    }
     fn set_idle_inhibit(&self, _level: IdleInhibitLevel) {}
     fn set_theme_color(&self, _rgb: u32) {}
 
@@ -695,6 +717,9 @@ pub trait BrowserBridge: Send + Sync {
     fn send_mouse_move(&self, x: i32, y: i32, modifiers: u32, leave: bool);
     fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
     fn set_focus(&self, focus: bool);
+    fn ime_set_composition(&self, text: &str, underlines: &[ImeUnderline], selection: ImeTextRange);
+    fn ime_commit_text(&self, text: &str);
+    fn ime_cancel_composition(&self);
     fn navigate_history(&self, forward: bool);
     fn undo(&self);
     fn redo(&self);
