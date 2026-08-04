@@ -541,27 +541,79 @@ button:focus-visible, input:focus-visible {
 .saved-accounts-state { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .saved-accounts-state.error { color: var(--danger); }
 .saved-accounts-state.hidden + .saved-accounts-list { margin-top: 0; }
-.saved-accounts-list { display: grid; gap: 6px; }
+.saved-accounts-list { display: grid; gap: 8px; }
 .saved-account-item {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 11px 13px;
+  overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: transparent;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
   color: inherit;
   text-align: left;
   cursor: pointer;
+  opacity: 0;
+  transform: translateY(6px);
+  animation: account-item-in 300ms cubic-bezier(0.22, 0.72, 0.2, 1) forwards;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease;
 }
-.saved-account-item:hover { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.04); }
-.saved-account-item.active { border-color: var(--accent); }
-.saved-account-item:disabled { cursor: wait; opacity: 0.58; }
+@keyframes account-item-in { to { opacity: 1; transform: translateY(0); } }
+.saved-account-item::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  content: "";
+  background: transparent;
+  transition: background 160ms ease;
+}
+.saved-account-item:hover { border-color: rgba(255,255,255,0.22); background: rgba(255,255,255,0.06); transform: translateX(2px); }
+.saved-account-item.active { border-color: rgba(50, 205, 183, 0.45); background: rgba(50, 205, 183, 0.08); box-shadow: 0 2px 14px rgba(50, 205, 183, 0.12); }
+.saved-account-item.active::before { background: var(--accent); }
+.saved-account-item:disabled { cursor: wait; }
+.saved-account-item.switching { opacity: 0.62; }
+.saved-account-item .avatar {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: #08221d;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  font-size: 15px;
+  font-weight: 750;
+  transition: transform 160ms ease;
+}
+.saved-account-item:hover .avatar { transform: scale(1.06); }
 .saved-account-copy { min-width: 0; flex: 1; }
 .saved-account-copy strong { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .saved-account-copy span { display: block; margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.saved-account-current { flex: none; color: var(--accent); font-size: 11px; font-weight: 650; }
+.saved-account-current {
+  flex: none;
+  padding: 2px 8px;
+  color: var(--accent);
+  border: 1px solid rgba(50, 205, 183, 0.4);
+  border-radius: 999px;
+  background: rgba(50, 205, 183, 0.1);
+  font-size: 11px;
+  font-weight: 650;
+}
+.saved-account-spinner {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 2px solid rgba(255, 255, 255, 0.22);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: account-switch-spin 700ms linear infinite;
+}
+@keyframes account-switch-spin { to { transform: rotate(360deg); } }
 .settings-list section { padding: 18px 0 22px; border-bottom: 1px solid var(--line); }
 .settings-list section:first-child { padding-top: 0; }
 .settings-list h3 { margin: 0 0 7px; font-size: 15px; }

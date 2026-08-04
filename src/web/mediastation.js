@@ -1817,7 +1817,7 @@
                 ) || String(left.baseUrl).localeCompare(String(right.baseUrl));
             });
             state.classList.add('hidden');
-            for (const account of accounts) {
+            accounts.forEach((account, index) => {
                 const active = isCurrent(account);
                 const button = element('button', 'saved-account-item' + (active ? ' active' : ''), '');
                 button.type = 'button';
@@ -1828,9 +1828,10 @@
                 body.append(element('span', '', account.baseUrl.replace(/^https?:\/\//, '')));
                 button.append(avatar, body);
                 if (active) button.append(element('span', 'saved-account-current', '当前'));
+                button.style.animationDelay = `${Math.min(index * 30, 240)}ms`;
                 button.addEventListener('click', () => switchAccount(account, active, button));
                 list.append(button);
-            }
+            });
         } catch (error) {
             const message = friendlyError(error);
             state.textContent = `账号列表加载失败：${message}`;
@@ -1848,15 +1849,19 @@
         const list = byId('saved-accounts-list');
         const state = byId('saved-accounts-state');
         list.querySelectorAll('button').forEach((button) => { button.disabled = true; });
-        state.textContent = `正在切换到 ${account.userName || account.userId}...`;
-        state.classList.remove('hidden', 'error');
+        selectedButton?.classList.add('switching');
         selectedButton?.setAttribute('aria-busy', 'true');
+        const spinner = element('span', 'saved-account-spinner', '');
+        selectedButton?.append(spinner);
+        // Keep the switching animation visible for at least this long even if
+        // the native switch completes instantly, so the transition reads as
+        // deliberate instead of flashing.
+        const minimumVisible = new Promise((resolve) => window.setTimeout(resolve, 700));
         try {
-            const status = await nativeRequest(
-                'mediaStationSwitchAccount',
-                'switch_account',
-                [account.accountId],
-            );
+            const [status] = await Promise.all([
+                nativeRequest('mediaStationSwitchAccount', 'switch_account', [account.accountId]),
+                minimumVisible,
+            ]);
             closeDrawer(false);
             resetCatalogState();
             await showApp(status);
@@ -1866,6 +1871,8 @@
             state.classList.add('error');
             showToast(message);
             list.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+            selectedButton?.classList.remove('switching');
+            spinner.remove();
         } finally {
             selectedButton?.removeAttribute('aria-busy');
         }
