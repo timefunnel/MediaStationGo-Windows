@@ -17,6 +17,11 @@ use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    ProcessPowerThrottling, SetProcessInformation,
+};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -307,7 +312,27 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
 // =====================================================================
 
 pub fn win_early_init() {
-    // Nothing needed on Windows before mpv starts.
+    // Windows 11 may ignore a fully occluded process's high-resolution timer
+    // requests. CEF's OSR BeginFrame source depends on those timers, and the
+    // policy otherwise persists for several seconds after the window returns.
+    // `early_init` runs before CEF subprocess dispatch, so every Chromium
+    // process applies the policy to itself.
+    let power_throttling = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let result = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            std::ptr::from_ref(&power_throttling).cast(),
+            std::mem::size_of_val(&power_throttling) as u32,
+        )
+    };
+    if let Err(error) = result {
+        eprintln!("[windows] failed to preserve timer resolution while occluded: {error:?}");
+    }
 }
 
 pub fn win_init(_mpv: *mut c_void) -> bool {
