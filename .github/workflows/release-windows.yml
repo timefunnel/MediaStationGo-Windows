@@ -1,0 +1,179 @@
+name: release-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful build-windows run ID to promote
+        required: true
+        type: string
+      release_tag:
+        description: Stable release tag, for example v0.1.1
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-windows-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify candidate run
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid build run ID: $BUILD_RUN_ID" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be a stable vMAJOR.MINOR.PATCH tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")"
+          workflow_path="$(jq -r '.path' <<<"$run_json")"
+          status="$(jq -r '.status' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          event="$(jq -r '.event' <<<"$run_json")"
+          head_branch="$(jq -r '.head_branch' <<<"$run_json")"
+          head_repository="$(jq -r '.head_repository.full_name' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+
+          if [[ "$workflow_path" != ".github/workflows/build-windows.yml" ]]; then
+            echo "Run $BUILD_RUN_ID belongs to $workflow_path, not build-windows.yml" >&2
+            exit 1
+          fi
+          if [[ "$head_repository" != "$GITHUB_REPOSITORY" ]]; then
+            echo "Run $BUILD_RUN_ID was built from $head_repository" >&2
+            exit 1
+          fi
+          if [[ "$status" != "completed" || "$conclusion" != "success" ]]; then
+            echo "Run $BUILD_RUN_ID is not a successful completed build" >&2
+            exit 1
+          fi
+          if [[ "$event" != "workflow_dispatch" && !( "$event" == "push" && "$head_branch" == "main" ) ]]; then
+            echo "Run $BUILD_RUN_ID is not a manual candidate or a main-branch build" >&2
+            exit 1
+          fi
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Run $BUILD_RUN_ID has an invalid head SHA: $head_sha" >&2
+            exit 1
+          fi
+
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "Candidate run $BUILD_RUN_ID verified at $head_sha"
+
+      - name: Checkout candidate commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.candidate.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Download candidate artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/public
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Validate candidate packages
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          base="MediaStationGo-${version}-windows-x64"
+          expected=(
+            "${base}-setup.exe"
+            "${base}-portable.zip"
+            "${base}-source.zip"
+            "SHA256SUMS.txt"
+          )
+
+          shopt -s nullglob
+          files=(dist/public/*)
+          if [[ ${#files[@]} -ne ${#expected[@]} ]]; then
+            echo "Expected ${#expected[@]} release files, found ${#files[@]}" >&2
+            printf '  %s\n' "${files[@]}" >&2
+            exit 1
+          fi
+          for name in "${expected[@]}"; do
+            if [[ ! -f "dist/public/$name" ]]; then
+              echo "Missing release file: $name" >&2
+              exit 1
+            fi
+          done
+
+          normalized_sums="$(mktemp)"
+          trap 'rm -f "$normalized_sums"' EXIT
+          tr -d '\r' < dist/public/SHA256SUMS.txt > "$normalized_sums"
+          if [[ $(wc -l < "$normalized_sums") -ne 3 ]]; then
+            echo "SHA256SUMS.txt must contain exactly three package hashes" >&2
+            exit 1
+          fi
+          for name in "${expected[@]:0:3}"; do
+            if ! grep -Eq "^[0-9a-f]{64}  ${name}$" "$normalized_sums"; then
+              echo "Missing pinned hash entry for $name" >&2
+              exit 1
+            fi
+          done
+          (cd dist/public && sha256sum --check --strict "$normalized_sums")
+
+      - name: Create or verify release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            tagged_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$tagged_sha" != "$CANDIDATE_SHA" ]]; then
+              echo "Tag $RELEASE_TAG points to $tagged_sha, expected $CANDIDATE_SHA" >&2
+              exit 1
+            fi
+            echo "Using existing tag $RELEASE_TAG at $tagged_sha"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" "$CANDIDATE_SHA" -m "MediaStationGo $RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/public/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$RELEASE_TAG"
