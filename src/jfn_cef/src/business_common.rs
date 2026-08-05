@@ -75,6 +75,7 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         // Pass empty platform_default — Rust setter clears when raw equals
         // the empty string. Neither caller has the live hostname handy here.
         "deviceName" => jfn_config::set_device_name(value, ""),
+        "autoUpdateCheck" => jfn_config::set_auto_update_check(value == "true"),
         _ => jfn_logging::log(
             jfn_logging::CATEGORY_CEF,
             jfn_logging::LEVEL_WARN,

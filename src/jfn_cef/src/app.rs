@@ -277,6 +277,23 @@ wrap_render_process_handler! {
                     }
                     1
                 }
+                "appUpdateStatus" => {
+                    let Some(args) = args else { return 1 };
+                    let status = userfree_to_string(&args.string(0));
+                    let payload = userfree_to_string(&args.string(1));
+                    if !call_js_global_string(
+                        frame,
+                        "_onAppUpdateStatus",
+                        &[Arg::Str(&status), Arg::Str(&payload)],
+                    ) {
+                        jfn_logging::log(
+                            jfn_logging::CATEGORY_CEF,
+                            jfn_logging::LEVEL_ERROR,
+                            "App update status reached the renderer without a response handler",
+                        );
+                    }
+                    1
+                }
                 "getPopupOptions" => {
                     let popup = collect_popup_options(frame);
                     let Some(mut reply) = process_message_create(Some(&CefString::from("popupOptions")))

@@ -358,6 +358,25 @@ fn handle_message(message: BrowserMessage) -> bool {
     }
 
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
+    if message.name() == "updateCheck" {
+        if let Some(inner) = web_layer() {
+            crate::business_update::check_for_updates(inner);
+        }
+        return true;
+    }
+    if message.name() == "updateDownload" {
+        if let Some(inner) = web_layer() {
+            crate::business_update::download_update(inner);
+        }
+        return true;
+    }
+    if message.name() == "updateInstall" {
+        if let Some(inner) = web_layer() {
+            crate::business_update::install_update(inner);
+        }
+        return true;
+    }
+
     if jfn_mpv_handle_get().is_null() {
         return false;
     }

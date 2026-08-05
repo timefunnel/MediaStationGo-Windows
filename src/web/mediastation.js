@@ -72,6 +72,10 @@
     let searchRevision = 0;
     let playbackInfoEnabled = loadPlaybackInfoSetting();
     let preferredInterpolationModel = 'rife-v4.26';
+    let autoUpdateCheckEnabled = window.jmpInfo?.settings?.advanced?.autoUpdateCheck !== false;
+    let appUpdateState = { status: 'idle', payload: {} };
+    let automaticUpdateTimer = 0;
+    let updateNotificationVersion = '';
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -434,6 +438,8 @@
         loginView.classList.add('hidden');
         appShell.classList.remove('hidden');
         byId('login-cancel').classList.add('hidden');
+        refreshUpdateControls();
+        scheduleAutomaticUpdateCheck();
         refreshImageCacheStatus();
         refreshFrameInterpolationStatus();
         await loadHome(true);
@@ -574,6 +580,77 @@
         }
         return true;
     }
+
+    function updateStatusText(status, payload) {
+        if (status === 'checking') return '正在检查更新...';
+        if (status === 'available') return `发现新版本 ${payload.version || ''}`.trim();
+        if (status === 'downloading') {
+            const percent = Number.isFinite(Number(payload.percent)) ? Number(payload.percent) : 0;
+            return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%`;
+        }
+        if (status === 'verifying') return '正在校验安装器...';
+        if (status === 'ready') return `更新 ${payload.version || ''} 已下载完成`.trim();
+        if (status === 'installing') return '正在启动安装程序，应用即将关闭...';
+        if (status === 'up_to_date') return `当前已是最新版本（${payload.currentVersion || ''}）`.trim();
+        if (status === 'error') return payload.message || '更新检查失败';
+        return '尚未检查更新';
+    }
+
+    function refreshUpdateControls() {
+        const statusNode = byId('app-update-status');
+        const checkButton = byId('check-app-update');
+        const downloadButton = byId('download-app-update');
+        const installButton = byId('install-app-update');
+        const confirm = byId('confirm-app-update');
+        if (!statusNode || !checkButton || !downloadButton || !installButton || !confirm) return;
+        const { status, payload } = appUpdateState;
+        statusNode.textContent = updateStatusText(status, payload);
+        statusNode.dataset.state = status === 'error' ? 'error' : (status === 'ready' ? 'ready' : '');
+        const busy = status === 'checking' || status === 'downloading' || status === 'verifying' || status === 'installing';
+        checkButton.disabled = busy;
+        downloadButton.disabled = busy;
+        installButton.disabled = busy;
+        checkButton.classList.toggle('hidden', status === 'installing');
+        downloadButton.classList.toggle('hidden', status !== 'available');
+        installButton.classList.toggle('hidden', status !== 'ready');
+        if (status !== 'ready') confirm.classList.add('hidden');
+    }
+
+    function requestUpdateCheck() {
+        window.clearTimeout(automaticUpdateTimer);
+        automaticUpdateTimer = 0;
+        if (!window.jmpNative?.updateCheck) {
+            appUpdateState = { status: 'error', payload: { message: '当前版本不支持自动更新' } };
+            refreshUpdateControls();
+            return;
+        }
+        appUpdateState = { status: 'checking', payload: {} };
+        refreshUpdateControls();
+        window.jmpNative.updateCheck();
+    }
+
+    function scheduleAutomaticUpdateCheck() {
+        window.clearTimeout(automaticUpdateTimer);
+        automaticUpdateTimer = 0;
+        if (!autoUpdateCheckEnabled || !window.jmpNative?.updateCheck) return;
+        automaticUpdateTimer = window.setTimeout(() => {
+            automaticUpdateTimer = 0;
+            if (appUpdateState.status === 'idle' || appUpdateState.status === 'up_to_date') {
+                requestUpdateCheck();
+            }
+        }, 5000);
+    }
+
+    window._onAppUpdateStatus = (status, payloadJson) => {
+        let payload = {};
+        try { payload = JSON.parse(payloadJson || '{}'); } catch { payload = {}; }
+        appUpdateState = { status, payload };
+        refreshUpdateControls();
+        if (status === 'available' && payload.version && payload.version !== updateNotificationVersion) {
+            updateNotificationVersion = payload.version;
+            showToast(`发现新版本 ${payload.version}，请在设置中下载`);
+        }
+    };
 
     function playContentTransition(direction) {
         window.clearTimeout(contentTransitionTimer);
@@ -3459,6 +3536,7 @@
     byId('settings-open').addEventListener('click', (event) => {
         openDrawer(byId('settings-drawer'), event.currentTarget);
         refreshFrameInterpolationStatus();
+        refreshUpdateControls();
     });
     byId('drawer-scrim').addEventListener('click', () => closeDrawer());
     document.querySelectorAll('.drawer-close').forEach((button) => button.addEventListener('click', () => closeDrawer()));
@@ -3482,6 +3560,40 @@
             console.error(`MediaStation playback info setting could not be saved: ${error}`);
             showToast('播放信息设置保存失败');
         }
+    });
+    const autoUpdateToggle = byId('auto-update-check');
+    autoUpdateToggle.checked = autoUpdateCheckEnabled;
+    autoUpdateToggle.addEventListener('change', () => {
+        autoUpdateCheckEnabled = autoUpdateToggle.checked;
+        if (window.jmpNative?.setSettingValue) {
+            window.jmpNative.setSettingValue('advanced', 'autoUpdateCheck', String(autoUpdateCheckEnabled));
+        }
+        if (autoUpdateCheckEnabled) scheduleAutomaticUpdateCheck();
+        else {
+            window.clearTimeout(automaticUpdateTimer);
+            automaticUpdateTimer = 0;
+        }
+    });
+    byId('check-app-update').addEventListener('click', requestUpdateCheck);
+    byId('download-app-update').addEventListener('click', () => {
+        if (!window.jmpNative?.updateDownload) return;
+        appUpdateState = { status: 'downloading', payload: appUpdateState.payload };
+        refreshUpdateControls();
+        window.jmpNative.updateDownload();
+    });
+    byId('install-app-update').addEventListener('click', () => {
+        byId('confirm-app-update').classList.remove('hidden');
+        byId('confirm-install-app-update').focus();
+    });
+    byId('cancel-app-update').addEventListener('click', () => {
+        byId('confirm-app-update').classList.add('hidden');
+        byId('install-app-update').focus();
+    });
+    byId('confirm-install-app-update').addEventListener('click', () => {
+        if (!window.jmpNative?.updateInstall) return;
+        appUpdateState = { status: 'verifying', payload: appUpdateState.payload };
+        refreshUpdateControls();
+        window.jmpNative.updateInstall();
     });
     byId('clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;

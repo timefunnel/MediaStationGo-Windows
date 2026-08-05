@@ -735,6 +735,10 @@ button:focus-visible, input:focus-visible {
 .settings-list .component-status { min-height: 18px; margin: 0; color: var(--muted); line-height: 1.45; }
 .settings-list .component-status[data-state="ready"] { color: #a7d8c5; }
 .settings-list .component-status[data-state="error"] { color: #efb3aa; }
+.setting-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.setting-actions button { min-height: 34px; }
+.update-confirm { display: grid; gap: 8px; padding-top: 4px; }
+.update-confirm p { margin: 0; }
 
 .modal-scrim { position: fixed; z-index: 90; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(0,0,0,0.68); }
 .reading-panel { width: min(720px, 92vw); max-height: min(76vh, 720px); overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: #14191c; box-shadow: 0 26px 76px rgba(0,0,0,0.5); }
@@ -1003,6 +1007,7 @@ body.player-mode .app-shell { display: none; }
   .episodes-heading { align-items: flex-start; }
   .episodes-heading-controls { flex-wrap: wrap; }
 }
+.player-exit-chevron { display: block; width: 11px; height: 11px; transform: translateX(2px) rotate(-135deg); border-top: 2px solid currentColor; border-right: 2px solid currentColor; }
 
 @media (max-width: 560px) {
   .login-view { padding: 24px 18px; }

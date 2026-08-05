@@ -64,6 +64,7 @@ struct SettingsData {
     window_decorations: Option<WindowDecorations>,
     hide_scrollbar: bool,
     frame_interpolation_model: String,
+    auto_update_check: bool,
 }
 
 impl Default for SettingsData {
@@ -83,6 +84,7 @@ impl Default for SettingsData {
             window_decorations: None,
             hide_scrollbar: true,
             frame_interpolation_model: String::new(),
+            auto_update_check: true,
         }
     }
 }
@@ -172,6 +174,9 @@ impl SettingsData {
                 model.to_string()
             };
         }
+        if let Some(b) = v.get("autoUpdateCheck").and_then(Value::as_bool) {
+            self.auto_update_check = b;
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -247,6 +252,9 @@ impl SettingsData {
                 Value::String(self.frame_interpolation_model.clone()),
             );
         }
+        if !self.auto_update_check {
+            o.insert("autoUpdateCheck".into(), Value::Bool(false));
+        }
         Value::Object(o)
     }
 
@@ -292,6 +300,10 @@ impl SettingsData {
         o.insert(
             "deviceNameDefault".into(),
             Value::String(default_device_name()),
+        );
+        o.insert(
+            "autoUpdateCheck".into(),
+            Value::Bool(self.auto_update_check),
         );
         let opts: Vec<Value> = hwdec_opts
             .iter()
@@ -591,6 +603,7 @@ pub fn titlebar_theme_color() -> bool {
     window_decorations_mode() == WindowDecorations::ServerThemed
 }
 bool_accessors!(hide_scrollbar, set_hide_scrollbar, hide_scrollbar);
+bool_accessors!(auto_update_check, set_auto_update_check, auto_update_check);
 
 pub fn window_geometry() -> JfnWindowGeometry {
     state().lock().data.window
@@ -765,5 +778,20 @@ mod tests {
             "frameInterpolationModel": "rife-auto"
         }));
         assert!(settings.to_json().get("frameInterpolationModel").is_none());
+    }
+
+    #[test]
+    fn automatic_update_check_defaults_on_and_persists_only_when_disabled() {
+        let mut settings = SettingsData::default();
+        assert_eq!(settings.to_json().get("autoUpdateCheck"), None);
+
+        settings.overlay_json(&json!({ "autoUpdateCheck": false }));
+        assert_eq!(
+            settings.to_json().get("autoUpdateCheck"),
+            Some(&json!(false))
+        );
+
+        settings.overlay_json(&json!({ "autoUpdateCheck": true }));
+        assert_eq!(settings.to_json().get("autoUpdateCheck"), None);
     }
 }

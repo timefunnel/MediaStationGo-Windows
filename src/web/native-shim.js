@@ -105,6 +105,7 @@
                 transparentTitlebar: _savedSettings.transparentTitlebar !== false,
                 windowDecorations: __WINDOW_DECORATIONS__,
                 hideScrollbar: _savedSettings.hideScrollbar !== false,
+                autoUpdateCheck: _savedSettings.autoUpdateCheck !== false,
                 logLevel: _savedSettings.logLevel || '',
                 deviceName: _savedSettings.deviceName || ''
             }
