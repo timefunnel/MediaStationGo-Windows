@@ -8,6 +8,7 @@ param(
     [string]$MsysPath = "C:\msys64",
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
+    [string]$MsysRepoAlias = "",
     [switch]$Force
 )
 
@@ -23,6 +24,9 @@ $RifeRuntimeHeader = Join-Path $PSScriptRoot "mpv\rife_runtime.h"
 $RifeRuntimeSource = Join-Path $PSScriptRoot "mpv\rife_runtime.cpp"
 $RifeRuntimeBuildScript = Join-Path $PSScriptRoot "build_rife_runtime.ps1"
 $RifeRuntimeStageScript = Join-Path $PSScriptRoot "stage_frame_interpolation_runtime.ps1"
+$FfmpegBuildScript = Join-Path $PSScriptRoot "build_ffmpeg_lgpl_source.ps1"
+$FfmpegCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
+$FfmpegInstallDir = Join-Path $RepoRoot "third_party\ffmpeg-install-$FfmpegCommit"
 $LibplaceboBuildScript = Join-Path $PSScriptRoot "build_libplacebo_source.ps1"
 $LibplaceboHdrPeakPatch = Join-Path $PSScriptRoot "libplacebo\2d0979f-hdr-peak-source-colorspace.patch"
 $LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
@@ -40,9 +44,11 @@ $RifeRuntimeHeaderCreated = $false
 
 function Get-MpvSourceContractHash {
     $Material = @(
+        $PSCommandPath,
         $NvofMemcSource,
         $NvofMemcPatch,
         $RifeRuntimeHeader,
+        $FfmpegBuildScript,
         $LibplaceboBuildScript,
         $LibplaceboHdrPeakPatch
     ) | ForEach-Object {
@@ -90,6 +96,7 @@ if ($Arch -eq "arm64") {
     $LibMachine = "X64"
 }
 $LibplaceboLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\libplacebo-$LibplaceboCommit"
+$FfmpegLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\ffmpeg-$FfmpegCommit"
 
 # Verify mpv submodule exists
 if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
@@ -104,6 +111,7 @@ $RequiredNvofFiles = @(
     $RifeRuntimeSource,
     $RifeRuntimeBuildScript,
     $RifeRuntimeStageScript,
+    $FfmpegBuildScript,
     $LibplaceboBuildScript,
     $LibplaceboHdrPeakPatch,
     (Join-Path $FrameInterpolationRuntimeDir "bin\cudart64_12.dll"),
@@ -119,6 +127,21 @@ foreach ($RequiredNvofFile in $RequiredNvofFiles) {
 
 # Check for MSYS2, install if missing
 $MsysBash = Join-Path $MsysPath "usr\bin\bash.exe"
+
+if ($MsysRepoAlias) {
+    $MsysRepoAlias = [System.IO.Path]::GetFullPath($MsysRepoAlias).TrimEnd('\')
+    if ($MsysRepoAlias -match '[^\x00-\x7F]') {
+        throw "The MSYS2 repository alias must be ASCII: $MsysRepoAlias"
+    }
+    if (-not (Test-Path -LiteralPath $MsysRepoAlias -PathType Container)) {
+        throw "The MSYS2 repository alias does not exist: $MsysRepoAlias"
+    }
+    $AliasItem = Get-Item -LiteralPath $MsysRepoAlias
+    if ($AliasItem.Target -and
+        ([System.IO.Path]::GetFullPath($AliasItem.Target) -ne [System.IO.Path]::GetFullPath($RepoRoot))) {
+        throw "The MSYS2 repository alias does not target this repository: $MsysRepoAlias"
+    }
+}
 if (-not (Test-Path $MsysBash)) {
     Write-Host "MSYS2 not found at $MsysPath, installing..." -ForegroundColor Yellow
 
@@ -204,7 +227,7 @@ function Assert-MpvUsesPinnedLibplacebo {
         throw "Packaged pinned libplacebo DLL is missing: $PinnedDll"
     }
     $UnexpectedDlls = Get-ChildItem -LiteralPath $OutputLibDir -Filter "libplacebo-*.dll" -File |
-        Where-Object { $_.Name -notin @($LibplaceboDllName, "libplacebo-360.dll") }
+        Where-Object { $_.Name -ne $LibplaceboDllName }
     if ($UnexpectedDlls) {
         throw "Unexpected libplacebo runtime DLLs were packaged: $($UnexpectedDlls.Name -join ', ')"
     }
@@ -223,24 +246,17 @@ function Assert-MpvUsesPinnedLibplacebo {
         throw "libmpv imports an unpinned libplacebo runtime"
     }
 
-    # MSYS2 FFmpeg enables its own libplacebo avfilter and still imports ABI
-    # 360. It may coexist, but the gpu-next renderer itself must import 364.
-    $LegacyDll = Join-Path $OutputLibDir "libplacebo-360.dll"
-    if (Test-Path -LiteralPath $LegacyDll -PathType Leaf) {
-        $AvfilterDll = Get-ChildItem -LiteralPath $OutputLibDir -Filter "avfilter-*.dll" -File |
-            Select-Object -First 1
-        if (-not $AvfilterDll) {
-            throw "Legacy libplacebo-360.dll was packaged without an FFmpeg avfilter dependency"
-        }
-        $AvfilterImports = (& $Objdump -p $AvfilterDll.FullName 2>&1) -join "`n"
-        if ($LASTEXITCODE -ne 0 -or
-            $AvfilterImports -notmatch '(?im)DLL Name:\s+libplacebo-360\.dll\s*$') {
-            throw "Legacy libplacebo-360.dll is not justified by the packaged FFmpeg avfilter"
-        }
-    }
 }
 
-& $LibplaceboBuildScript -MsysPath $MsysPath -Arch $Arch
+& $FfmpegBuildScript -MsysPath $MsysPath -Arch $Arch -MsysRepoAlias $MsysRepoAlias
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build pinned LGPL FFmpeg"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $FfmpegLinkDir "lib\pkgconfig\libavcodec.pc") -PathType Leaf)) {
+    throw "Pinned LGPL FFmpeg link prefix is incomplete: $FfmpegLinkDir"
+}
+
+& $LibplaceboBuildScript -MsysPath $MsysPath -Arch $Arch -MsysRepoAlias $MsysRepoAlias
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to build pinned libplacebo"
 }
@@ -324,7 +340,13 @@ Write-Host ""
 
 # Convert Windows path to MSYS2 path (C:\foo\bar -> /c/foo/bar)
 function ConvertTo-MsysPath($WinPath) {
-    $Resolved = (Resolve-Path $WinPath).Path -replace '\\', '/'
+    $Resolved = [System.IO.Path]::GetFullPath((Resolve-Path $WinPath).Path)
+    $RepoPrefix = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\') + '\'
+    if ($MsysRepoAlias -and $Resolved.StartsWith($RepoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $RelativePath = $Resolved.Substring($RepoPrefix.Length)
+        $Resolved = Join-Path $MsysRepoAlias $RelativePath
+    }
+    $Resolved = $Resolved -replace '\\', '/'
     if ($Resolved -match '^([A-Za-z]):(.*)') {
         '/' + $matches[1].ToLower() + $matches[2]
     } else {
@@ -334,6 +356,7 @@ function ConvertTo-MsysPath($WinPath) {
 
 $MsysMpvSource = ConvertTo-MsysPath $MpvSourceDir
 $MsysNvofApiInclude = ConvertTo-MsysPath $NvofApiIncludeDir
+$MsysFfmpegPrefix = ConvertTo-MsysPath $FfmpegLinkDir
 $MsysLibplaceboPrefix = ConvertTo-MsysPath $LibplaceboLinkDir
 
 # Run a command in MSYS2
@@ -354,13 +377,11 @@ pacman -S --needed --noconfirm \
     $PkgPrefix-cc \
     $PkgPrefix-meson \
     $PkgPrefix-pkgconf \
-    $PkgPrefix-ffmpeg \
     $PkgPrefix-libass \
     $PkgPrefix-vulkan-headers \
     $PkgPrefix-vulkan-loader \
     $PkgPrefix-shaderc \
     $PkgPrefix-spirv-cross \
-    $PkgPrefix-vapoursynth \
     $PkgPrefix-llvm \
     $PkgPrefix-tools
 "@ -Description "Installing MSYS2 dependencies"
@@ -377,10 +398,11 @@ if (-not (Test-Path (Join-Path $MesonBuildDir "build.ninja"))) {
     Invoke-Msys2 @"
 cd '$MsysMpvSource' && \
 CFLAGS="-I$MsysNvofApiInclude" \
-PKG_CONFIG_PATH="$MsysLibplaceboPrefix/lib/pkgconfig:`$PKG_CONFIG_PATH" \
+PKG_CONFIG_PATH="$MsysFfmpegPrefix/lib/pkgconfig:$MsysLibplaceboPrefix/lib/pkgconfig" \
 meson setup build --default-library=shared \
+    -Dgpl=false \
     -Dlibmpv=true \
-    -Dcplayer=true \
+    -Dcplayer=false \
     -Dlua=disabled \
     -Djavascript=disabled \
     -Dcdda=disabled \
@@ -388,7 +410,7 @@ meson setup build --default-library=shared \
     -Dlibbluray=disabled \
     -Dlibarchive=disabled \
     -Drubberband=disabled \
-    -Dvapoursynth=enabled
+    -Dvapoursynth=disabled
 "@ -Description "Configuring mpv with meson"
 } else {
     Write-Host "Meson already configured (use -Force to reconfigure)" -ForegroundColor Yellow
@@ -428,9 +450,9 @@ Copy-Item (Join-Path $MpvSourceDir "include\mpv") (Join-Path $IncludeDir "mpv") 
 # decoders for the Jellyfin device profile. Mirrors the mpv layout: headers
 # under include/, import lib under lib/ alongside mpv.lib.
 Write-Host "Copying ffmpeg headers..."
-$MsysIncludeDir = Join-Path $MsysPath "$MsysEnv\include"
+$FfmpegIncludeDir = Join-Path $FfmpegLinkDir "include"
 foreach ($pkg in @("libavcodec", "libavutil")) {
-    $src = Join-Path $MsysIncludeDir $pkg
+    $src = Join-Path $FfmpegIncludeDir $pkg
     if (Test-Path $src) {
         Copy-Item $src (Join-Path $IncludeDir $pkg) -Recurse
     } else {
@@ -534,23 +556,14 @@ Write-Host "=== Collecting runtime dependencies ===" -ForegroundColor Cyan
 $MsysBinDir = Join-Path $MsysPath "$MsysEnv\bin"
 $MsysEnvLower = $MsysEnv.ToLower()
 $MsysLibDir = ConvertTo-MsysPath $LibDir
+$MsysFfmpegBin = ConvertTo-MsysPath (Join-Path $FfmpegLinkDir "bin")
 $MsysLibplaceboBin = ConvertTo-MsysPath (Join-Path $LibplaceboLinkDir "bin")
-
-# mpv loads VSScript dynamically, so it does not appear in libmpv's import
-# table. Stage it explicitly under the Windows name mpv probes, then let the
-# dependency walker collect its Python and C++ runtime dependencies.
-$VsScriptSource = Join-Path $MsysBinDir "libvapoursynth-script-0.dll"
-$VsCoreSource = Join-Path $MsysBinDir "libvapoursynth.dll"
-if (-not (Test-Path $VsScriptSource) -or -not (Test-Path $VsCoreSource)) {
-    throw "VapourSynth R65 runtime DLLs are missing from $MsysBinDir"
-}
-Copy-Item $VsScriptSource (Join-Path $LibDir "VSScript.dll")
-Copy-Item $VsCoreSource (Join-Path $LibDir "libvapoursynth.dll")
 
 # Write a helper script to resolve deps recursively, then run it
 $DepScript = @"
 #!/bin/bash
 MSYS_BIN=/$MsysEnvLower/bin
+PINNED_FFMPEG_BIN='$MsysFfmpegBin'
 PINNED_BIN='$MsysLibplaceboBin'
 OUT_DIR='$MsysLibDir'
 declare -A seen
@@ -562,7 +575,9 @@ resolve_deps() {
     seen[`$dll]=1
     while read -r dep; do
         local source=""
-        if [ -f `"`$PINNED_BIN/`$dep`" ]; then
+        if [ -f `"`$PINNED_FFMPEG_BIN/`$dep`" ]; then
+            source=`"`$PINNED_FFMPEG_BIN/`$dep`"
+        elif [ -f `"`$PINNED_BIN/`$dep`" ]; then
             source=`"`$PINNED_BIN/`$dep`"
         elif [ -f `"`$MSYS_BIN/`$dep`" ]; then
             source=`"`$MSYS_BIN/`$dep`"
@@ -575,8 +590,6 @@ resolve_deps() {
 }
 
 resolve_deps libmpv-2.dll `"`$OUT_DIR/libmpv-2.dll`"
-resolve_deps VSScript.dll `"`$OUT_DIR/VSScript.dll`"
-resolve_deps libvapoursynth.dll `"`$OUT_DIR/libvapoursynth.dll`"
 "@
 
 $DepScriptPath = Join-Path $MesonBuildDir "resolve_deps.sh"

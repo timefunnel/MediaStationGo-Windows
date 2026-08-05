@@ -1,0 +1,17 @@
+MediaStationGo includes the following NVIDIA runtime components for RTX frame
+interpolation:
+
+- TensorRT-RTX 1.4.0.76 runtime, ONNX parser, and engine builder
+- CUDA Runtime cudart64_12.dll
+
+These components are proprietary NVIDIA software and remain subject to the
+applicable NVIDIA license terms. The upstream TensorRT-RTX package points to:
+
+https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html
+
+The CUDA Toolkit End User License Agreement and redistribution terms are at:
+
+https://docs.nvidia.com/cuda/eula/index.html
+
+TensorRT-RTX third-party acknowledgements are distributed next to this file.
+This notice does not replace or modify the NVIDIA license agreements.

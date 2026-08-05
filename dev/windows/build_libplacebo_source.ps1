@@ -2,6 +2,7 @@ param(
     [string]$MsysPath = "C:\msys64",
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
+    [string]$MsysRepoAlias = "",
     [switch]$Force
 )
 
@@ -29,6 +30,21 @@ $OutputDll = Join-Path $InstallDir "bin\$LibplaceboDllName"
 $PkgConfigFile = Join-Path $InstallDir "lib\pkgconfig\libplacebo.pc"
 $BuildStamp = Join-Path $InstallDir "lib\mediastation-libplacebo-source.sha256"
 $SourceStamp = Join-Path $SourceDir ".mediastation-libplacebo-source.sha256"
+
+if ($MsysRepoAlias) {
+    $MsysRepoAlias = [System.IO.Path]::GetFullPath($MsysRepoAlias).TrimEnd('\')
+    if ($MsysRepoAlias -match '[^\x00-\x7F]') {
+        throw "The MSYS2 repository alias must be ASCII: $MsysRepoAlias"
+    }
+    if (-not (Test-Path -LiteralPath $MsysRepoAlias -PathType Container)) {
+        throw "The MSYS2 repository alias does not exist: $MsysRepoAlias"
+    }
+    $AliasItem = Get-Item -LiteralPath $MsysRepoAlias
+    if ($AliasItem.Target -and
+        ([System.IO.Path]::GetFullPath($AliasItem.Target) -ne [System.IO.Path]::GetFullPath($RepoRoot))) {
+        throw "The MSYS2 repository alias does not target this repository: $MsysRepoAlias"
+    }
+}
 
 if ($Arch -eq "arm64") {
     $MsysEnv = "CLANGARM64"
@@ -72,7 +88,13 @@ function Test-GitPatchApplies {
 
 function ConvertTo-MsysPath {
     param([string]$Path)
-    $FullPath = [System.IO.Path]::GetFullPath($Path) -replace '\\', '/'
+    $FullPath = [System.IO.Path]::GetFullPath($Path)
+    $RepoPrefix = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\') + '\'
+    if ($MsysRepoAlias -and $FullPath.StartsWith($RepoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $RelativePath = $FullPath.Substring($RepoPrefix.Length)
+        $FullPath = Join-Path $MsysRepoAlias $RelativePath
+    }
+    $FullPath = $FullPath -replace '\\', '/'
     if ($FullPath -match '^([A-Za-z]):(.*)') {
         return '/' + $matches[1].ToLowerInvariant() + $matches[2]
     }

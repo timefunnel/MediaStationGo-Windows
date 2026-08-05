@@ -52,7 +52,12 @@ jobs:
             ${{ matrix.pkg_prefix }}-clang
             ${{ matrix.pkg_prefix }}-meson
             ${{ matrix.pkg_prefix }}-pkgconf
-            ${{ matrix.pkg_prefix }}-ffmpeg
+            ${{ matrix.pkg_prefix }}-nasm
+            ${{ matrix.pkg_prefix }}-yasm
+            ${{ matrix.pkg_prefix }}-bzip2
+            ${{ matrix.pkg_prefix }}-dav1d
+            ${{ matrix.pkg_prefix }}-libiconv
+            ${{ matrix.pkg_prefix }}-zlib
             ${{ matrix.pkg_prefix }}-libplacebo
             ${{ matrix.pkg_prefix }}-libass
             ${{ matrix.pkg_prefix }}-vulkan-headers
@@ -66,7 +71,7 @@ jobs:
         run: |
           dev\windows\build_mpv_source.ps1 -Arch ${{ matrix.arch }} -Force
 
-      - name: Build and package
+      - name: Build
         shell: cmd
         env:
           # bindgen (used by jfn-mpv's build.rs) dlopens libclang at
@@ -85,10 +90,24 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" %MATRIX_ARCH% || exit /b 1
           set "PATH=%PATH%;%MSYS_BIN%"
-          cargo xtask package --external-mpv "%CD%\third_party\mpv-install" --prefix build/install --dist dist
+          cargo xtask build --external-mpv "%CD%\third_party\mpv-install" --out build\mediastation-public-release
+
+      - name: Install public packaging tools
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo install cargo-about --locked --features cli
+          choco install innosetup --no-progress -y
+
+      - name: Package public Windows release
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          dev\windows\package_public_release.ps1 -SkipBuild
 
       - name: Upload artifact
+        if: matrix.arch == 'x64'
         uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
-          path: dist/JelliumDesktop-*.zip
+          path: dist/public/*
