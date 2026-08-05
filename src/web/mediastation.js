@@ -550,6 +550,7 @@
         currentView = loadingView;
         content.scrollTop = 0;
         appBackdropRevision += 1;
+        updateTopbarState();
         updateNavState();
         render();
         playContentTransition('forward');
@@ -635,7 +636,7 @@
         stopSmoothScroll(content);
         if (currentView?.kind !== 'home') stopHeroCarousel();
         appBackdropRevision += 1;
-        topbar.classList.toggle('scrolled', content.scrollTop > 20);
+        updateTopbarState();
         updateNavState();
         switch (currentView?.kind) {
             case 'home': renderHome(currentView.data); break;
@@ -653,6 +654,13 @@
         byId('nav-home').classList.toggle('active', currentView?.kind === 'home');
         byId('nav-library').classList.toggle('active', ['libraries', 'library'].includes(currentView?.kind));
         byId('topbar-home-shortcut').classList.toggle('hidden', currentView?.kind === 'home');
+    }
+
+    function updateTopbarState() {
+        const atTop = content.scrollTop <= 20;
+        const detailAtTop = atTop && ['detail', 'detail-loading'].includes(currentView?.kind);
+        topbar.classList.toggle('detail-transparent', detailAtTop);
+        topbar.classList.toggle('scrolled', !atTop);
     }
 
     function renderLoading() {
@@ -1911,6 +1919,8 @@
         content.replaceChildren();
         const view = element('article', 'detail-view');
         const backdrop = element('div', 'detail-backdrop');
+        const backdropImage = element('span', 'detail-backdrop-image');
+        backdrop.append(backdropImage);
         const body = element('div', 'detail-content');
         const back = element('button', 'back-button detail-back', '←');
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
@@ -1992,8 +2002,11 @@
         const backdropRevision = appBackdropRevision;
         loadViewBackdrop(ref, backdropRevision, currentView);
         if (ref) requestImage(ref, 1600).then((src) => {
-            if (!backdrop.isConnected || currentView?.data !== detail) return;
-            backdrop.style.backgroundImage = `url("${src}")`;
+            if (!backdropImage.isConnected || currentView?.data !== detail) return;
+            backdropImage.style.backgroundImage = `url("${src}")`;
+            requestAnimationFrame(() => {
+                if (backdropImage.isConnected && currentView?.data === detail) backdropImage.classList.add('image-ready');
+            });
         }).catch((error) => console.error(`详情背景加载失败：${friendlyError(error)}`));
     }
 
@@ -2265,17 +2278,12 @@
             clearAppBackdrop(appBackdropRevision);
         }
         const root = element('section', 'search-view');
-        const header = element('div', 'page-header search-header');
-        const back = element('button', 'back-button', '←');
-        back.type = 'button';
-        back.title = '返回';
-        back.setAttribute('aria-label', '返回');
-        back.dataset.focusKey = 'search:back';
-        back.addEventListener('click', goBack);
-        header.append(back, element('h1', '', '搜索'));
         const form = element('form', 'search-form');
         const field = element('div', 'search-field');
-        field.append(element('span', 'search-leading', '⌕'));
+        const leading = element('span', 'search-leading');
+        leading.setAttribute('aria-hidden', 'true');
+        leading.append(element('span', 'search-glyph'));
+        field.append(leading);
         const input = document.createElement('input');
         input.type = 'search'; input.placeholder = '搜索电影、剧集'; input.value = data.draft ?? data.query ?? '';
         input.setAttribute('aria-label', '搜索媒体');
@@ -2329,7 +2337,7 @@
                 renderSearch(data);
             }
         });
-        root.append(header, form);
+        root.append(form);
         if (data.status === 'loading') {
             const state = element('div', 'search-state', '正在搜索…');
             state.setAttribute('role', 'status');
@@ -3452,7 +3460,7 @@
                 }
             } else if (event.key === 'ArrowUp' && document.activeElement?.matches('.search-field input')) {
                 event.preventDefault();
-                focusElement(content.querySelector('.search-header .back-button'));
+                focusElement(byId('search-open'));
             }
             return;
         }
@@ -3593,7 +3601,7 @@
     content.addEventListener('scroll', (event) => {
         const row = event.target;
         if (row === content) {
-            topbar.classList.toggle('scrolled', content.scrollTop > 20);
+            updateTopbarState();
             return;
         }
         if (!(row instanceof Element) || !row.classList.contains('media-row')) return;
