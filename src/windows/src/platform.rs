@@ -25,11 +25,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
+    CWPSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HHOOK, IsIconic, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
-    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE, WM_SETFOCUS, WM_SIZE, WS_CAPTION,
-    WS_THICKFRAME,
+    UnhookWindowsHookEx, WH_CALLWNDPROC, WM_CLOSE, WM_SETFOCUS, WM_SIZE, WS_CAPTION, WS_THICKFRAME,
 };
 
 use jfn_mpv::api::{
@@ -223,7 +222,7 @@ pub fn win_toggle_fullscreen() {
 
 unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if n_code >= 0 {
-        let msg = unsafe { &*(lp.0 as *const CWPRETSTRUCT) };
+        let msg = unsafe { &*(lp.0 as *const CWPSTRUCT) };
         let target_hwnd_raw = STATE.lock().mpv_hwnd_raw;
         if (msg.hwnd.0 as usize) == target_hwnd_raw {
             if msg.message == WM_SIZE {
@@ -298,6 +297,7 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
             } else if msg.message == WM_SETFOCUS {
                 jfn_input_windows_focus();
             } else if msg.message == WM_CLOSE {
+                tracing::info!("Windows window close received; initiating application shutdown");
                 jfn_shutdown_initiate();
             }
         }
@@ -372,12 +372,15 @@ pub fn win_init(_mpv: *mut c_void) -> bool {
     }
 
     let mpv_tid = unsafe { GetWindowThreadProcessId(hwnd_from_raw(hwnd_raw), None) };
-    let hook =
-        unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(mpv_wndproc_hook), None, mpv_tid) };
+    // Observe WM_CLOSE before mpv's WndProc consumes it as CLOSE_WIN. A
+    // WH_CALLWNDPROCRET hook runs too late for that path and can leave the
+    // browser process plus its CEF helpers alive after the visible window is
+    // closed.
+    let hook = unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(mpv_wndproc_hook), None, mpv_tid) };
     match hook {
         Ok(h) => STATE.lock().wndproc_hook_raw = h.0 as usize,
         Err(e) => {
-            tracing::error!("SetWindowsHookExW(WH_CALLWNDPROCRET) failed: {e:?}");
+            tracing::error!("SetWindowsHookExW(WH_CALLWNDPROC) failed: {e:?}");
             return false;
         }
     }
