@@ -171,6 +171,7 @@ if (-not $Force -and $StampMatches) {
 
 Invoke-Msys2 @"
 pacman -S --needed --noconfirm \
+    diffutils \
     make \
     $PkgPrefix-cc \
     $PkgPrefix-pkgconf \
