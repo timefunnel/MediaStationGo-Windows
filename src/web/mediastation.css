@@ -487,12 +487,19 @@ button:focus-visible, input:focus-visible {
 .library-sync-error { margin: -28px 5.2% 30px; color: #efb3aa; font-size: 13px; }
 .library-filters { display: grid; gap: 10px; margin: 0 5.2% 22px; padding: 13px 15px; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; background: rgba(14,18,20,0.52); backdrop-filter: blur(14px); }
 .library-filter-group { display: grid; grid-template-columns: 54px minmax(0, 1fr); align-items: center; gap: 10px; }
+.library-filter-group.expanded { align-items: start; }
+.library-filter-group.expanded .library-filter-label { padding-top: 8px; }
 .library-filter-label { color: var(--muted); font-size: 12px; font-weight: 650; }
-.library-filter-options { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.library-filter-controls { display: flex; min-width: 0; align-items: flex-start; gap: 6px; }
+.library-filter-options { display: flex; min-width: 0; flex: 1; gap: 6px; overflow-x: hidden; scrollbar-width: none; }
+.library-filter-group.expanded .library-filter-options { flex-wrap: wrap; overflow-x: visible; }
 .library-filter-options::-webkit-scrollbar { display: none; }
 .library-filter-button { min-width: max-content; height: 32px; padding: 0 12px; color: var(--muted); border: 1px solid transparent; border-radius: 999px; background: transparent; cursor: pointer; }
 .library-filter-button:hover, .library-filter-button:focus-visible { color: var(--text); border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.06); }
 .library-filter-button[aria-pressed="true"] { color: #07110f; border-color: var(--accent); background: var(--accent); font-weight: 700; }
+.library-filter-toggle { min-width: max-content; height: 32px; flex: 0 0 auto; padding: 0 10px; color: var(--accent-strong); border: 1px solid rgba(92,211,185,0.28); border-radius: 999px; background: rgba(92,211,185,0.08); cursor: pointer; }
+.library-filter-toggle[hidden] { display: none; }
+.library-filter-toggle:hover, .library-filter-toggle:focus-visible { color: #d9fff6; border-color: rgba(92,211,185,0.58); background: rgba(92,211,185,0.14); }
 .library-state, .search-state { display: grid; min-height: 28vh; place-items: center; gap: 14px; padding: 36px 5.2%; color: var(--muted); text-align: center; }
 .error-state { color: #efb3aa; }
 .error-state p { margin: 0; }

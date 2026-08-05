@@ -1574,10 +1574,21 @@
         return ({ Movie: '电影', Series: '剧集', Video: '视频', MusicVideo: '音乐视频', BoxSet: '合集' })[type] || type;
     }
 
-    function createFilterGroup(label, values, selected, onSelect, valueLabel = (value) => value) {
+    function createFilterGroup({
+        key,
+        label,
+        values,
+        selected,
+        expanded,
+        onExpandedChange,
+        onSelect,
+        valueLabel = (value) => value,
+    }) {
         const group = element('div', 'library-filter-group');
         group.append(element('span', 'library-filter-label', label));
+        const container = element('div', 'library-filter-controls');
         const controls = element('div', 'library-filter-options');
+        controls.id = `library-filter-options-${key}-${libraryFilterRevision}`;
         controls.setAttribute('role', 'group');
         controls.setAttribute('aria-label', label);
         ['', ...values].forEach((value) => {
@@ -1589,21 +1600,81 @@
             button.addEventListener('click', () => onSelect(value));
             controls.append(button);
         });
-        group.append(controls);
+        const toggle = element('button', 'library-filter-toggle');
+        toggle.type = 'button';
+        toggle.hidden = true;
+        toggle.dataset.focusKey = `filter:${label}:toggle`;
+        toggle.setAttribute('aria-controls', controls.id);
+
+        const revealSelected = () => {
+            if (!group.isConnected || group.classList.contains('expanded')) return;
+            const selectedButton = controls.querySelector('[aria-pressed="true"]');
+            if (selectedButton) {
+                controls.scrollLeft = Math.max(0, revealTarget(controls, selectedButton, 'x', 'nearest'));
+            }
+        };
+        const setExpanded = (next, notify = true) => {
+            const active = next === true;
+            group.classList.toggle('expanded', active);
+            toggle.textContent = active ? '收起' : '展开';
+            toggle.setAttribute('aria-expanded', String(active));
+            toggle.setAttribute('aria-label', `${active ? '收起' : '展开'}${label}筛选`);
+            if (active) controls.scrollLeft = 0;
+            else requestAnimationFrame(revealSelected);
+            if (notify) onExpandedChange(active);
+        };
+        setExpanded(expanded, false);
+        toggle.addEventListener('click', () => {
+            setExpanded(!group.classList.contains('expanded'));
+        });
+        group._syncOverflow = () => {
+            const buttons = [...controls.querySelectorAll('.library-filter-button')];
+            const style = window.getComputedStyle(controls);
+            const gap = Number.parseFloat(style.columnGap || style.gap) || 0;
+            const requiredWidth = buttons.reduce(
+                (total, button) => total + button.getBoundingClientRect().width,
+                Math.max(0, buttons.length - 1) * gap,
+            );
+            const overflowing = requiredWidth > container.clientWidth + 0.5;
+            toggle.hidden = !overflowing;
+            group.classList.toggle('has-overflow', overflowing);
+            if (!overflowing && group.classList.contains('expanded')) setExpanded(false);
+            else if (overflowing && !group.classList.contains('expanded')) requestAnimationFrame(revealSelected);
+        };
+        container.append(controls, toggle);
+        group.append(container);
         return group;
     }
 
     function renderLibraryFilters(data) {
+        data.filterExpanded ||= { itemType: false, genre: false };
         const bar = element('section', 'library-filters');
         bar.setAttribute('aria-label', '媒体库筛选');
-        bar.append(createFilterGroup('类型', data.filters.itemTypes, data.filter.itemType, (itemType) => {
-            applyLibraryFilter(data, { itemType, genre: data.filter.genre });
-        }, mediaTypeLabel));
+        bar.append(createFilterGroup({
+            key: 'type',
+            label: '类型',
+            values: data.filters.itemTypes,
+            selected: data.filter.itemType,
+            expanded: data.filterExpanded.itemType,
+            onExpandedChange: (expanded) => { data.filterExpanded.itemType = expanded; },
+            onSelect: (itemType) => applyLibraryFilter(data, { itemType, genre: data.filter.genre }),
+            valueLabel: mediaTypeLabel,
+        }));
         if (data.filters.genres.length) {
-            bar.append(createFilterGroup('题材', data.filters.genres, data.filter.genre, (genre) => {
-                applyLibraryFilter(data, { itemType: data.filter.itemType, genre });
+            bar.append(createFilterGroup({
+                key: 'genre',
+                label: '题材',
+                values: data.filters.genres,
+                selected: data.filter.genre,
+                expanded: data.filterExpanded.genre,
+                onExpandedChange: (expanded) => { data.filterExpanded.genre = expanded; },
+                onSelect: (genre) => applyLibraryFilter(data, { itemType: data.filter.itemType, genre }),
             }));
         }
+        requestAnimationFrame(() => {
+            if (!bar.isConnected) return;
+            bar.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
+        });
         return bar;
     }
 
@@ -3571,10 +3642,10 @@
             }
             return;
         }
-        const filterOptions = document.activeElement?.closest?.('.library-filter-options');
-        if (filterOptions) {
+        const filterControls = document.activeElement?.closest?.('.library-filter-controls');
+        if (filterControls) {
             event.preventDefault();
-            const buttons = [...filterOptions.querySelectorAll('button')];
+            const buttons = [...filterControls.querySelectorAll('button:not([hidden]):not(:disabled)')];
             const index = buttons.indexOf(document.activeElement);
             if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
                 const next = buttons[clamp(index + (event.key === 'ArrowRight' ? 1 : -1), 0, buttons.length - 1)];
@@ -3582,8 +3653,8 @@
             } else if (event.key === 'ArrowDown') {
                 focusAndReveal(content.querySelector('.grid-view .media-card'), 'center', 'nearest');
             } else {
-                const groups = [...content.querySelectorAll('.library-filter-options')];
-                const previousGroup = groups[groups.indexOf(filterOptions) - 1];
+                const groups = [...content.querySelectorAll('.library-filter-controls')];
+                const previousGroup = groups[groups.indexOf(filterControls) - 1];
                 focusAndReveal(previousGroup?.querySelector('[aria-pressed="true"]') || content.querySelector('.back-button'), 'nearest', 'nearest');
             }
             return;
@@ -3684,6 +3755,7 @@
 
     window.addEventListener('resize', () => {
         content.querySelectorAll('.carousel-row').forEach((row) => row._refreshCarousel?.());
+        content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
     }, { passive: true });
 
     content.addEventListener('pointerdown', (event) => {
