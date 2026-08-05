@@ -11,7 +11,7 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-08-02，分支 `codex/mediastation-windows-spike`。均衡档精度图
+最近更新：2026-08-05，分支 `codex/mediastation-windows-spike`。均衡档精度图
 实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
 任务 1 完成。任务 2 的 profile 集合冻结、通用合同实现、正式 mpv/Release
 重建和真实 4K HDR10 播放器验收均已完成，实现提交为 `fdda0a4`。任务 3 停止交付：
@@ -22,6 +22,8 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
 驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
 质量档 HDR10 偶发花屏仍在独立排查中；该问题不改变已冻结的 RIFE 三档、
 Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不得宣称质量档问题已关闭。
+播放退出后的 UI 帧率问题已完成生命周期修复和无 RIFE 隔离验证；正式 RIFE
+片源仍因 MediaStationGo 当前返回 `transport` 而待实机复验，不能标记为完整验收。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
@@ -57,6 +59,33 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   不得用隐藏回退或伪成功推进台账。
 - 后续任务在上下文压缩或干净续接后，应先读取本文和当前工作区真实状态，
   不重新推断已经有证据的结论。
+
+### 2026-08-05 播放退出后的 UI 帧率修复
+
+- 已诊断：首页在 152 Hz 下连续 3 秒得到 `456` 帧，rAF p95/max 均约
+  `6.7 ms`，没有 `>10 ms` 间隔；强制重绘缓存首页约 `5.3 ms`，也没有掉帧。
+  公开 Sintel 样片在不启用 RIFE 时，普通 mpv/VO 停止前后仍稳定为 152 Hz。
+- 根因边界位于退出生命周期：旧 `finishPlayer(true)` 发出 `playerStop` 后立即
+  清空前端 player、恢复首页轮播和 UI 动画，但 mpv 文件、RIFE filter 与 D3D11
+  资源仍在异步卸载；随后到达的 `canceled` 因 player 已为空而被忽略。
+- 已实现：新增显式 `player.exiting` 状态。主动退出只发送一次 `playerStop`，
+  保持 player mode 和首页轮播暂停，显示“正在退出播放”，并锁住播放、seek、
+  全屏、插帧、音轨和信息操作；只有收到 `finished`、`canceled` 或终止 `error`
+  后才清理 player 并恢复首页。没有超时兜底，也不在未收到终止事件时伪装成功。
+- 静态与构建验证：`node --check src/web/mediastation.js`、`git diff --check`、
+  `cargo fmt --check` 均通过；Windows Release 增量构建成功，产物 SHA-256 为
+  `42e39680286994cc0ee99c2d459970bdc814003535e9a4bd9205a5bea9fb2038`。
+  workspace Clippy 未通过的是既有 `src/mpv/src/stream_cb.rs:167`
+  `clippy::not_unsafe_ptr_arg_deref`，与本次 JS 改动无关，未越界修改。
+- 无 RIFE 隔离验证：公开 Sintel 播放开始后连续触发两次退出，实际只调用一次
+  `playerStop`；stop 同步返回时 player layer 仍可见且保持 player mode，约
+  `2-6 ms` 后收到 `canceled` 才恢复首页。首帧前退出也已覆盖：退出遮罩立即
+  生效，等 `started` 确认可停止后只发送一次 stop，再由 `canceled` 收尾。
+  恢复后 3 秒 rAF 为 `456` 帧，
+  p95/p99/max 均约 `6.7 ms`，`>10 ms` 和 `>16.7 ms` 间隔均为 `0`。
+- 当前状态为“已诊断、已实现、无 RIFE 隔离验证通过、正式 RIFE 实机待验、
+  尚未提交/推送”。MediaStationGo 恢复后必须用真实 RIFE 片源重复主动退出，
+  确认终止事件发生在 filter destroy 之后，并复测返回首页的 152 Hz rAF。
 
 ### 1. 解决 `scale=0.5` 的 FP32 性能问题
 

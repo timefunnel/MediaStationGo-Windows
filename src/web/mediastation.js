@@ -2520,6 +2520,8 @@
             playing: true,
             started: false,
             buffering: false,
+            exiting: false,
+            stopSent: false,
             exitArmed: false,
             positionMs: startMs || 0,
             durationMs: card.durationMs || 0,
@@ -2560,13 +2562,14 @@
             );
             if (player === activePlayer) {
                 activePlayer.loadInfo = loadInfo;
+                if (activePlayer.exiting) return;
                 refreshPlayerTools();
             }
         } catch (error) {
-            if (player === activePlayer) {
-                showToast(friendlyError(error));
-                finishPlayer(false);
-            }
+            if (player !== activePlayer) return;
+            if (activePlayer.exiting && activePlayer.stopSent) return;
+            if (!activePlayer.exiting) showToast(friendlyError(error));
+            finishPlayer();
         }
     }
 
@@ -2579,10 +2582,14 @@
             return;
         }
         if (!player) return;
-        if (event.kind === 'canceled' && player.interpolationChanging) return;
+        if (event.kind === 'canceled' && player.interpolationChanging && !player.exiting) return;
         if (Number.isFinite(event.positionMs) && !player.scrubbing) player.positionMs = event.positionMs;
         if (Number.isFinite(event.durationMs) && event.durationMs > 0) player.durationMs = event.durationMs;
         updatePlayerProgress();
+        if (player.exiting && !player.stopSent && event.kind === 'started') {
+            sendPlayerStop(player);
+        }
+        if (!player || (player.exiting && !['finished', 'canceled', 'error'].includes(event.kind))) return;
         switch (event.kind) {
             case 'started':
                 {
@@ -2640,13 +2647,13 @@
                 }
                 break;
             case 'finished': case 'canceled':
-                finishPlayer(false);
+                finishPlayer();
                 break;
             case 'error':
                 showToast(event.errorCode
                     ? friendlyError({ code: event.errorCode })
                     : (player.interpolationChanging ? 'RTX 插帧切换失败' : '播放失败'));
-                finishPlayer(false);
+                finishPlayer();
                 break;
         }
     }
@@ -2654,7 +2661,7 @@
     function setPlayerLoading(visible, label = '') {
         if (label) byId('player-loading-label').textContent = label;
         byId('player-loading').classList.toggle('hidden', !visible);
-        const covered = visible && (!player?.started || player?.interpolationChanging);
+        const covered = visible && (!player?.started || player?.interpolationChanging || player?.exiting);
         playerView.classList.toggle('preparing', covered);
     }
 
@@ -2705,7 +2712,7 @@
 
     function previewProgressSeek(value) {
         const target = progressTargetMs(value);
-        if (target === null || !player) return;
+        if (target === null || !player || player.exiting) return;
         player.scrubbing = true;
         player.scrubPositionMs = target;
         updatePlayerProgress();
@@ -2713,7 +2720,7 @@
 
     function commitProgressSeek(value) {
         const target = progressTargetMs(value);
-        if (target === null || !player || !window.jmpNative) {
+        if (target === null || !player || player.exiting || !window.jmpNative) {
             cancelProgressSeek();
             return;
         }
@@ -2732,7 +2739,7 @@
     }
 
     function togglePlayback() {
-        if (!player || !window.jmpNative) return;
+        if (!player || player.exiting || !window.jmpNative) return;
         if (player.interpolationChanging) {
             player.interpolationResumePlaying = !player.interpolationResumePlaying;
             player.playing = player.interpolationResumePlaying;
@@ -2757,7 +2764,8 @@
 
     async function setFrameInterpolation(modelId) {
         const activePlayer = player;
-        if (!activePlayer?.started || !activePlayer.loadInfo || activePlayer.interpolationChanging) return;
+        if (!activePlayer?.started || !activePlayer.loadInfo
+            || activePlayer.interpolationChanging || activePlayer.exiting) return;
         if (modelId !== null && !Object.prototype.hasOwnProperty.call(interpolationModels, modelId)) {
             const error = new Error('所选 RIFE 模型无效');
             error.code = 'frame_interpolation_model_invalid';
@@ -2792,7 +2800,7 @@
                     ['frame_interpolation_set_model', requestedModel],
                     15000,
                 );
-                if (player !== activePlayer) return;
+                if (player !== activePlayer || activePlayer.exiting) return;
                 preferredInterpolationModel = requestedModel;
                 updateFrameInterpolationStatus(status);
             }
@@ -2807,7 +2815,7 @@
                 ],
                 60000,
             );
-            if (player !== activePlayer) return;
+            if (player !== activePlayer || activePlayer.exiting) return;
             const actualModel = loadInfo.frameInterpolation?.modelId || null;
             if (actualModel !== requestedModel) {
                 const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
@@ -2821,7 +2829,7 @@
             }
             refreshPlayerTools();
         } catch (error) {
-            if (player !== activePlayer) return;
+            if (player !== activePlayer || activePlayer.exiting) return;
             activePlayer.interpolationChanging = false;
             activePlayer.interpolationTargetModel = null;
             activePlayer.interpolationModel = previousModel;
@@ -2837,7 +2845,7 @@
     }
 
     function togglePlayerFullscreen() {
-        if (!player || !window.jmpNative) return;
+        if (!player || player.exiting || !window.jmpNative) return;
         window.jmpNative.toggleFullscreen();
         showPlayerControls();
     }
@@ -2847,7 +2855,7 @@
     }
 
     function seekBy(deltaMs) {
-        if (!player || !window.jmpNative || !player.durationMs) return;
+        if (!player || player.exiting || !window.jmpNative || !player.durationMs) return;
         const target = Math.max(0, Math.min(player.durationMs, player.positionMs + deltaMs));
         player.positionMs = target;
         updatePlayerProgress();
@@ -2862,22 +2870,27 @@
         const interpolation = byId('player-interpolation');
         const infoButton = byId('player-info');
         const fullscreen = byId('player-fullscreen');
+        const exit = byId('player-exit');
+        const progress = byId('player-progress');
+        const exiting = player?.exiting === true;
         const playing = player?.playing === true;
         const fullscreenActive = window._isFullscreen === true;
-        playback.disabled = !player;
+        exit.disabled = !player || exiting;
+        progress.disabled = !player || exiting;
+        playback.disabled = !player || exiting;
         playback.classList.toggle('is-playing', playing);
         playback.title = playing ? '暂停' : '播放';
         playback.setAttribute('aria-label', playback.title);
         playback.querySelector('span').textContent = playing ? pauseSymbol : playSymbol;
-        subtitles.disabled = !info || !Array.isArray(info.subtitleTracks);
-        audio.disabled = !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
+        subtitles.disabled = exiting || !info || !Array.isArray(info.subtitleTracks);
+        audio.disabled = exiting || !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
         const interpolationEnabled = player?.interpolationChanging
             ? player.interpolationTargetModel !== null
             : player?.interpolationEnabled === true;
         const interpolationModel = player?.interpolationChanging
             ? player.interpolationTargetModel
             : (player?.interpolationModel || info?.frameInterpolation?.modelId || null);
-        interpolation.disabled = !player?.started || !info || player.interpolationChanging;
+        interpolation.disabled = exiting || !player?.started || !info || player.interpolationChanging;
         interpolation.title = player?.interpolationChanging
             ? interpolationLoadingLabel(player)
             : (interpolationEnabled
@@ -2886,8 +2899,8 @@
         interpolation.setAttribute('aria-label', interpolation.title);
         interpolation.setAttribute('aria-pressed', String(interpolationEnabled));
         infoButton.classList.toggle('hidden', !playbackInfoEnabled);
-        infoButton.disabled = !playbackInfoEnabled || !info;
-        fullscreen.disabled = !player;
+        infoButton.disabled = exiting || !playbackInfoEnabled || !info;
+        fullscreen.disabled = !player || exiting;
         fullscreen.classList.toggle('is-fullscreen', fullscreenActive);
         fullscreen.title = fullscreenActive ? '退出全屏' : '进入全屏';
         fullscreen.setAttribute('aria-label', fullscreen.title);
@@ -3068,7 +3081,7 @@
 
     async function openPlayerPanel(kind, trigger) {
         const activePlayer = player;
-        if (!activePlayer?.loadInfo || activePlayer.trackRefreshing) return;
+        if (!activePlayer?.loadInfo || activePlayer.trackRefreshing || activePlayer.exiting) return;
         if (activePlayer.panelKind === kind && !playerPanel.classList.contains('hidden')) {
             closePlayerPanel(true);
             return;
@@ -3082,14 +3095,14 @@
                     [activePlayer.card.id],
                     15000,
                 );
-                if (player !== activePlayer) return;
+                if (player !== activePlayer || activePlayer.exiting) return;
                 activePlayer.loadInfo.audioTracks = tracks.audioTracks;
                 activePlayer.loadInfo.subtitleTracks = tracks.subtitleTracks;
                 activePlayer.loadInfo.audioTrackKey = tracks.audioTrackKey || null;
                 activePlayer.loadInfo.subtitleTrackKey = tracks.subtitleTrackKey || null;
                 activePlayer.loadInfo.subtitleEnabled = tracks.subtitleEnabled === true;
             } catch (error) {
-                if (player === activePlayer) showToast(friendlyError(error));
+                if (player === activePlayer && !activePlayer.exiting) showToast(friendlyError(error));
                 return;
             } finally {
                 if (player === activePlayer) activePlayer.trackRefreshing = false;
@@ -3103,16 +3116,16 @@
                     ['frame_interpolation_diagnostics', activePlayer.card.id],
                     15000,
                 );
-                if (player !== activePlayer) return;
+                if (player !== activePlayer || activePlayer.exiting) return;
                 activePlayer.loadInfo.frameInterpolation = diagnostics.active || null;
                 activePlayer.loadInfo.frameInterpolationDiagnostics = diagnostics.playback || {};
                 updateFrameInterpolationStatus(diagnostics.status);
             } catch (error) {
                 console.error(`RTX frame interpolation diagnostics failed: ${friendlyError(error)}`);
-                showToast(friendlyError(error));
+                if (!activePlayer.exiting) showToast(friendlyError(error));
             }
         }
-        if (player !== activePlayer) return;
+        if (player !== activePlayer || activePlayer.exiting) return;
         activePlayer.panelKind = kind;
         playerPanelTrigger = trigger || null;
         window.clearTimeout(controlsTimer);
@@ -3140,7 +3153,7 @@
 
     async function selectPlayerTrack(kind, key) {
         const activePlayer = player;
-        if (!activePlayer || activePlayer.trackChanging) return;
+        if (!activePlayer || activePlayer.trackChanging || activePlayer.exiting) return;
         activePlayer.trackChanging = true;
         playerPanelContent.querySelectorAll('button').forEach((button) => { button.disabled = true; });
         try {
@@ -3150,7 +3163,7 @@
                 [activePlayer.card.id, kind, key],
                 45000,
             );
-            if (player !== activePlayer) return;
+            if (player !== activePlayer || activePlayer.exiting) return;
             if (kind === 'audio') activePlayer.loadInfo.audioTrackKey = result.audioTrackKey;
             else {
                 activePlayer.loadInfo.subtitleEnabled = result.subtitleEnabled === true;
@@ -3162,8 +3175,10 @@
                 focusElement(playerPanelContent.querySelector('[aria-checked="true"]'));
             });
         } catch (error) {
-            if (player === activePlayer) showToast(friendlyError(error));
-            renderPlayerPanel();
+            if (player === activePlayer && !activePlayer.exiting) {
+                showToast(friendlyError(error));
+                renderPlayerPanel();
+            }
         } finally {
             if (player === activePlayer) activePlayer.trackChanging = false;
         }
@@ -3180,8 +3195,53 @@
         if (next) focusAndReveal(next, 'nearest', 'nearest');
     }
 
-    function finishPlayer(stopNative = true) {
-        if (stopNative && player && window.jmpNative) window.jmpNative.playerStop();
+    function requestPlayerExit() {
+        const activePlayer = player;
+        if (!activePlayer || activePlayer.exiting) return;
+        if (!window.jmpNative) {
+            showToast('播放器服务不可用，无法退出播放');
+            return;
+        }
+        activePlayer.exiting = true;
+        activePlayer.exitArmed = false;
+        activePlayer.scrubbing = false;
+        activePlayer.scrubPositionMs = null;
+        window.clearTimeout(playerClickTimer);
+        playerClickTimer = 0;
+        playerClickAt = 0;
+        window.clearTimeout(controlsTimer);
+        closePlayerPanel(false);
+        hidePlayerFeedback();
+        setPlayerLoading(true, '正在退出播放');
+        playerControls.classList.add('visible');
+        refreshPlayerTools();
+        refreshPlayerCursor();
+        if (activePlayer.started) sendPlayerStop(activePlayer);
+    }
+
+    function sendPlayerStop(activePlayer) {
+        if (player !== activePlayer || !activePlayer.exiting || activePlayer.stopSent) return;
+        activePlayer.stopSent = true;
+        try {
+            // MPV reports END_FILE only after unloading the file and its filter
+            // chain. Keep the player layer active until that terminal event so
+            // RIFE/D3D11 teardown cannot overlap the resumed home animations.
+            window.jmpNative.playerStop();
+        } catch (error) {
+            if (player !== activePlayer) return;
+            activePlayer.stopSent = false;
+            activePlayer.exiting = false;
+            const loading = !activePlayer.started || activePlayer.interpolationChanging || activePlayer.buffering;
+            const label = activePlayer.interpolationChanging
+                ? interpolationLoadingLabel(activePlayer)
+                : (activePlayer.buffering ? '正在缓冲' : '正在准备播放');
+            setPlayerLoading(loading, label);
+            refreshPlayerTools();
+            showToast(`退出播放失败：${friendlyError(error)}`);
+        }
+    }
+
+    function finishPlayer() {
         // Optimistically update Continue Watching with the position we last
         // saw and move the just-ended item to the front, so it reflects the
         // playback immediately; the network refresh (and the home_stale
@@ -3276,7 +3336,7 @@
 
     function scheduleControlsHide() {
         window.clearTimeout(controlsTimer);
-        if (!player?.playing || !player.started || player.panelKind) return;
+        if (!player?.playing || !player.started || player.panelKind || player.exiting) return;
         controlsTimer = window.setTimeout(hidePlayerControls, 3000);
     }
 
@@ -3355,7 +3415,7 @@
             button.disabled = false;
         }
     });
-    byId('player-exit').addEventListener('click', () => finishPlayer(true));
+    byId('player-exit').addEventListener('click', requestPlayerExit);
     byId('player-playback').addEventListener('click', togglePlayback);
     byId('player-interpolation').addEventListener('click', (event) => openPlayerPanel('interpolation', event.currentTarget));
     byId('player-fullscreen').addEventListener('click', togglePlayerFullscreen);
@@ -3376,7 +3436,7 @@
     byId('player-info').addEventListener('click', (event) => openPlayerPanel('info', event.currentTarget));
     playerView.addEventListener('mousemove', () => showPlayerControls(false));
     playerView.addEventListener('click', (event) => {
-        if (!player || isPlayerInteractiveTarget(event.target)) return;
+        if (!player || player.exiting || isPlayerInteractiveTarget(event.target)) return;
         const now = event.timeStamp || performance.now();
         const withinDoubleClickArea = Math.hypot(event.clientX - playerClickX, event.clientY - playerClickY) <= 24;
         const isDoubleClick = playerClickTimer && withinDoubleClickArea && now - playerClickAt <= 420;
@@ -3402,6 +3462,12 @@
     document.addEventListener('keydown', (event) => {
         const inputActive = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
         if (player) {
+            if (player.exiting) {
+                if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Enter', ' ', 'Escape', 'Backspace'].includes(event.key)) {
+                    event.preventDefault();
+                }
+                return;
+            }
             const active = document.activeElement;
             const toolButtons = [byId('player-playback'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
                 .filter((button) => !button.disabled);
@@ -3438,7 +3504,7 @@
             else if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
                 if (active === byId('player-exit') || toolButtons.includes(active)) active.click();
-                else if (playerControls.classList.contains('visible') && player.exitArmed) finishPlayer(true);
+                else if (playerControls.classList.contains('visible') && player.exitArmed) requestPlayerExit();
                 else togglePlayback();
             }
             else if (event.key === 'Escape' || event.key === 'Backspace') {
