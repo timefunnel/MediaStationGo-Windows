@@ -144,9 +144,9 @@ try {
             -Destination (Join-Path $RuntimeBin $Name) -Force
     }
     Assert-FileHash -Path (Join-Path $RuntimeBin "tensorrt_rtx.exe") `
-        -Expected $PinnedHashes[".tensorrt\\TensorRT-RTX-1.4.0.76\\bin\\tensorrt_rtx.exe"]
+        -Expected $PinnedHashes[".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_rtx.exe"]
     Assert-FileHash -Path (Join-Path $RuntimeBin "tensorrt_onnxparser_rtx_1_4.dll") `
-        -Expected $PinnedHashes[".tensorrt\\TensorRT-RTX-1.4.0.76\\bin\\tensorrt_onnxparser_rtx_1_4.dll"]
+        -Expected $PinnedHashes[".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_onnxparser_rtx_1_4.dll"]
 
     if (Test-Path -LiteralPath $RuntimeDir) {
         Remove-Item -LiteralPath $RuntimeDir -Recurse -Force
