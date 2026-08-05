@@ -22,8 +22,9 @@ NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D
 驱动/上游解决直通 VRR，或出现经验证的零拷贝替代链路时重启。
 质量档 HDR10 偶发花屏仍在独立排查中；该问题不改变已冻结的 RIFE 三档、
 Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不得宣称质量档问题已关闭。
-播放退出后的 UI 帧率问题已完成生命周期修复和无 RIFE 隔离验证；正式 RIFE
-片源仍因 MediaStationGo 当前返回 `transport` 而待实机复验，不能标记为完整验收。
+播放退出后的 UI 帧率问题已完成生命周期修复、无 RIFE 隔离验证和正式 RIFE
+实机验收；真实 4K HDR10 P010 均衡档退出后，首页 152 Hz rAF 无 `>10 ms`
+间隔，本问题已关闭。
 
 | 任务 | 状态 | 已完成 | 下一步 |
 | --- | --- | --- | --- |
@@ -83,10 +84,19 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   生效，等 `started` 确认可停止后只发送一次 stop，再由 `canceled` 收尾。
   恢复后 3 秒 rAF 为 `456` 帧，
   p95/p99/max 均约 `6.7 ms`，`>10 ms` 和 `>16.7 ms` 间隔均为 `0`。
-- 当前状态为“已诊断、已实现、无 RIFE 隔离验证通过、正式 RIFE 实机待验”；
-  实现与验证提交 `8ccf79e` 已推送。MediaStationGo 恢复后必须用真实 RIFE
-  片源重复主动退出，
-  确认终止事件发生在 filter destroy 之后，并复测返回首页的 152 Hz rAF。
+- 正式 RIFE 实机验收：MediaStation 会话已从 Windows Credential Manager 恢复，
+  真实《黑衣人2》以 CDN 直连、Range `206` 播放 3840x2160 HEVC Main 10 HDR10。
+  日志确认 `RIFE frame interpolation started`，实际为 RIFE v4.26 `scale=0.5`、
+  D3D11 P010、TensorRT-RTX 1.4.0.76、`d3d11va` 和 profile `2`；退出时 runtime
+  summary 为 `pairs=500 inferred=499 scene-cuts=1 failures=0`。
+- 正式 RIFE 主动退出验收：连续两次触发退出实际只调用一次 `playerStop`；
+  stop 返回时 player layer 仍可见、保持 player mode 并显示“正在退出播放”。
+  原生日志先记录 filter `Frame interpolation shutdown` 和 `RIFE runtime summary`，
+  然后 mpv `end-file=Canceled`，最后前端收到 `canceled` 才恢复首页。
+- 返回首页后立即采集 3 秒 rAF：`3006.1 ms` 内 `457` 帧，p95/p99/max
+  均约 `6.7 ms`，`>10 ms` 和 `>16.7 ms` 间隔均为 `0`。当前状态为
+  “已诊断、已实现、无 RIFE 隔离验证通过、正式 RIFE 实机验收通过”；
+  实现与隔离验证提交 `8ccf79e` 已推送，正式验收证据随本次台账更新提交。
 
 ### 1. 解决 `scale=0.5` 的 FP32 性能问题
 
