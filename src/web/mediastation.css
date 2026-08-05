@@ -454,8 +454,7 @@ button:focus-visible, input:focus-visible {
 
 .page-header { display: flex; align-items: center; gap: 14px; padding: calc(var(--topbar-height) + 28px) 5.2% 20px; }
 .page-header h1 { margin: 0; font-size: 25px; font-weight: 650; }
-/* Unified back button: capsule icon with hover lift, shared by list and
-   detail views so navigation feels consistent across the app. */
+/* Unified back button shared by list and detail views. */
 .back-button {
   display: inline-grid;
   place-items: center;
@@ -464,12 +463,10 @@ button:focus-visible, input:focus-visible {
   padding: 0;
   flex: 0 0 auto;
   color: var(--text);
-  border: 1px solid rgba(255,255,255,0.14);
-  border-radius: 8px;
-  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 50%;
+  background: rgba(255,255,255,0.045);
   cursor: pointer;
-  font-size: 18px;
-  line-height: 1;
   transition: background 150ms ease, border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
 }
 .back-button:hover, .back-button:focus-visible {
@@ -567,14 +564,14 @@ button:focus-visible, input:focus-visible {
 .people-section { position: relative; z-index: 1; width: min(1320px, 90%); margin: 44px auto 0; }
 .people-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .people-heading h2 { margin: 0; font-size: 20px; }
-.people-row { --row-card-width: 124px; --row-gutter: 0px; }
+.people-row { --row-card-width: 124px; --row-gutter: 0px; scroll-snap-type: x mandatory; }
 .people-row::before { display: none; }
 .people-row::after { display: block; flex-basis: var(--row-end-alignment, 0px); margin-left: calc(-1 * var(--row-gap)); }
 .person-portrait { position: relative; display: block; width: 100%; aspect-ratio: 1; overflow: hidden; border-radius: 50%; background: var(--surface); box-shadow: 0 8px 22px rgba(0,0,0,0.34); }
 .person-card:hover .person-portrait { filter: brightness(1.06); box-shadow: 0 14px 30px rgba(0,0,0,0.48), inset 0 0 0 1px rgba(255,255,255,0.18); }
 .person-portrait img, .person-page-portrait img { position: relative; z-index: 1; display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0; }
 .person-portrait img.image-ready, .person-page-portrait img.image-ready { opacity: 1; }
-.person-card { text-align: center; }
+.person-card { text-align: center; scroll-snap-align: start; }
 .person-card .card-title, .person-card .card-subtitle { text-align: center; }
 .person-page-header { align-items: center; }
 .person-identity { display: flex; min-width: 0; align-items: center; gap: 16px; }
@@ -977,7 +974,7 @@ button:focus-visible, input:focus-visible {
 .player-info-grid dt { color: rgba(255,255,255,0.62); }
 .player-info-grid dd { overflow-wrap: anywhere; color: var(--text); }
 html.player-mode, html.player-mode body { background: transparent; }
-body.player-mode .app-shell, body.player-mode .topbar { visibility: hidden; }
+body.player-mode .app-shell { display: none; }
 
 @media (max-width: 1180px) {
   .topbar { padding: 0 28px; }

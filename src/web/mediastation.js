@@ -1053,8 +1053,22 @@
             const rawGap = Number.parseFloat(window.getComputedStyle(row).columnGap) || 0;
             const rawWidth = card.getBoundingClientRect().width;
             const pixelRatio = window.devicePixelRatio || 1;
-            const cardWidth = Math.round(rawWidth * pixelRatio) / pixelRatio;
             const gap = Math.round(rawGap * pixelRatio) / pixelRatio;
+            const preferredCardWidth = Math.round(rawWidth * pixelRatio) / pixelRatio;
+            let cardWidth = preferredCardWidth;
+            if (row.classList.contains('people-row')) {
+                const cardCount = row.querySelectorAll(':scope > .media-card').length;
+                const preferredContentWidth = cardCount * preferredCardWidth + Math.max(0, cardCount - 1) * gap;
+                if (cardCount > 1 && preferredContentWidth > row.clientWidth + 0.5) {
+                    const wholeCardCount = clamp(
+                        Math.round((row.clientWidth + gap) / (preferredCardWidth + gap)),
+                        1,
+                        cardCount,
+                    );
+                    const fittedWidth = (row.clientWidth - gap * (wholeCardCount - 1)) / wholeCardCount;
+                    cardWidth = Math.max(1 / pixelRatio, Math.floor(fittedWidth * pixelRatio) / pixelRatio);
+                }
+            }
             row.style.setProperty('--row-card-width', `${cardWidth}px`);
             row.style.setProperty('--row-gap', `${gap}px`);
             cardStride = cardWidth + gap;
@@ -1483,7 +1497,8 @@
         const backdropCard = libraries.find((library) => library.backdropImage || library.landscapeImage || library.primaryImage);
         loadViewBackdrop(backdropCard && (backdropCard.backdropImage || backdropCard.landscapeImage || backdropCard.primaryImage), appBackdropRevision, currentView);
         const header = element('div', 'page-header');
-        const back = element('button', 'back-button', '←');
+        const back = element('button', 'back-button hero-carousel-previous');
+        back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', '媒体库'));
         const grid = element('div', 'grid-view library-grid');
@@ -1683,7 +1698,8 @@
         content.replaceChildren();
         loadViewBackdrop(data.library.backdropImage || data.library.landscapeImage, appBackdropRevision, currentView);
         const header = element('div', 'page-header');
-        const back = element('button', 'back-button', '←');
+        const back = element('button', 'back-button hero-carousel-previous');
+        back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         header.append(back, element('h1', '', data.library.title));
         content.append(header, renderLibraryFilters(data));
@@ -1972,7 +1988,9 @@
         const backdrop = element('div', 'detail-backdrop placeholder-art');
         backdrop.style.height = 'min(72vh, 720px)';
         const body = element('div', 'detail-content');
-        body.append(element('button', 'back-button detail-back placeholder-back', '←'));
+        const back = element('button', 'back-button hero-carousel-previous detail-back placeholder-back');
+        back.append(element('span', 'hero-carousel-chevron'));
+        body.append(back);
         const layout = element('div', 'detail-layout');
         const poster = element('div', 'detail-poster placeholder-art');
         const copy = element('div', 'detail-copy');
@@ -1996,7 +2014,8 @@
         const backdropImage = element('span', 'detail-backdrop-image');
         backdrop.append(backdropImage);
         const body = element('div', 'detail-content');
-        const back = element('button', 'back-button detail-back', '←');
+        const back = element('button', 'back-button hero-carousel-previous detail-back');
+        back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         const layout = element('div', 'detail-layout');
         const poster = element('div', 'detail-poster');
@@ -2145,7 +2164,8 @@
         content.replaceChildren();
         loadViewBackdrop(data.person.primaryImage, appBackdropRevision, currentView);
         const header = element('div', 'page-header person-page-header');
-        const back = element('button', 'back-button', '←');
+        const back = element('button', 'back-button hero-carousel-previous');
+        back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button';
         back.title = '返回';
         back.setAttribute('aria-label', '返回');
