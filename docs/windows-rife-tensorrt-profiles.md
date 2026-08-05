@@ -83,8 +83,9 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   生效，等 `started` 确认可停止后只发送一次 stop，再由 `canceled` 收尾。
   恢复后 3 秒 rAF 为 `456` 帧，
   p95/p99/max 均约 `6.7 ms`，`>10 ms` 和 `>16.7 ms` 间隔均为 `0`。
-- 当前状态为“已诊断、已实现、无 RIFE 隔离验证通过、正式 RIFE 实机待验、
-  尚未提交/推送”。MediaStationGo 恢复后必须用真实 RIFE 片源重复主动退出，
+- 当前状态为“已诊断、已实现、无 RIFE 隔离验证通过、正式 RIFE 实机待验”；
+  实现与验证提交 `8ccf79e` 已推送。MediaStationGo 恢复后必须用真实 RIFE
+  片源重复主动退出，
   确认终止事件发生在 filter destroy 之后，并复测返回首页的 152 Hz rAF。
 
 ### 1. 解决 `scale=0.5` 的 FP32 性能问题
