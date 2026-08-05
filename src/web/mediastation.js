@@ -281,9 +281,12 @@
     function focusAndReveal(node, inline = 'center', block = 'nearest') {
         if (!node) return;
         const row = node.closest('.media-row');
+        const filterOptions = node.closest('.library-filter-options');
         if (row?._revealCarouselNode) row._revealCarouselNode(node);
         else if (row) smoothScrollTo(row, { left: revealTarget(row, node, 'x', inline) });
-        smoothScrollTo(content, { top: revealTarget(content, node, 'y', block) });
+        else if (filterOptions) smoothScrollTo(filterOptions, { left: revealTarget(filterOptions, node, 'x', inline) });
+        const verticalAlignment = node.closest('.people-row .person-card') ? 'center' : block;
+        smoothScrollTo(content, { top: revealTarget(content, node, 'y', verticalAlignment) });
         focusElement(node);
     }
 
