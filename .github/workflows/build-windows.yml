@@ -83,6 +83,7 @@ jobs:
           # at it explicitly.
           LIBCLANG_PATH: C:\msys64\${{ matrix.msystem }}\bin
           MSYS_BIN: C:\msys64\${{ matrix.msystem }}\bin
+          CARGO_TARGET_DIR: ${{ runner.temp }}\mediastation-cargo
           # mingw's libclang doesn't auto-pick the MSVC target triple, so
           # MSVC's arch-specific headers (__int64, vcruntime intrinsics,
           # etc.) get parsed against the wrong default target. Pin it.
