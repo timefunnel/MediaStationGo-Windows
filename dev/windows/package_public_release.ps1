@@ -182,7 +182,14 @@ try {
     $Commit = (& git -C $RepoRoot rev-parse HEAD).Trim()
     $MpvCommit = (& git -C $MpvSource rev-parse HEAD).Trim()
     $FfmpegCommit = (& git -C $FfmpegSource rev-parse HEAD).Trim()
-    $Dirty = [bool]((& git -C $RepoRoot status --porcelain) -join '')
+    & git -C $RepoRoot diff --quiet HEAD --
+    if ($LASTEXITCODE -eq 0) {
+        $Dirty = $false
+    } elseif ($LASTEXITCODE -eq 1) {
+        $Dirty = $true
+    } else {
+        throw "Failed to inspect tracked application changes"
+    }
     $State = @"
 MediaStationGo source archive state
 applicationCommit=$Commit
