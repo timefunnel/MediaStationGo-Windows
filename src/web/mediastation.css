@@ -726,7 +726,6 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .saved-account-switch:hover .avatar { transform: scale(1.06); }
 .saved-account-copy { min-width: 0; flex: 1; }
 .saved-account-copy strong { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.saved-account-copy span { display: block; margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .saved-account-current {
   flex: none;
   padding: 2px 8px;

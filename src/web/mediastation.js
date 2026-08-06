@@ -3141,7 +3141,6 @@
                 const avatar = element('span', 'avatar', initials(user.userName || user.userId));
                 const body = element('div', 'saved-account-copy', null);
                 body.append(element('strong', '', user.userName || user.userId));
-                body.append(element('span', '', user.userId));
                 switchButton.append(avatar, body);
                 if (active) switchButton.append(element('span', 'saved-account-current', '当前'));
                 switchButton.addEventListener('click', () => switchAccount(account, active, switchButton, surface));
