@@ -25,7 +25,7 @@ jobs:
             triple: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}\mediastation-cargo
+      CARGO_TARGET_DIR: ${{ github.workspace }}\build\mediastation-cargo
 
     steps:
       - name: Checkout
@@ -39,7 +39,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ runner.temp }}\mediastation-cargo
+            build\mediastation-cargo
           key: windows-cargo-${{ matrix.arch }}-${{ hashFiles('src/Cargo.lock', 'src/**/Cargo.toml') }}
           restore-keys: |
             windows-cargo-${{ matrix.arch }}-
