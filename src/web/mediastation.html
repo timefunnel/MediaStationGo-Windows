@@ -18,9 +18,25 @@
       <div class="brand brand-large"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></div>
     </header>
     <main class="login-layout">
-      <form id="login-form" class="login-panel" autocomplete="on">
-        <p class="eyebrow">WINDOWS PLAYER</p>
-        <h1 id="login-title">登录媒体服务器</h1>
+      <section id="login-account-panel" class="login-panel login-account-panel hidden" aria-labelledby="login-account-title">
+        <div class="login-panel-heading">
+          <div>
+            <p class="eyebrow">已保存账号</p>
+            <h1 id="login-account-title">选择账号</h1>
+          </div>
+          <button id="login-add-account" class="primary-command login-add-account" type="button"><span aria-hidden="true">+</span><span>添加账号</span></button>
+        </div>
+        <p id="login-accounts-state" class="saved-accounts-state" role="status" aria-live="polite">正在读取账号...</p>
+        <div id="login-accounts-list" class="saved-accounts-list login-accounts-list"></div>
+      </section>
+      <form id="login-form" class="login-panel login-form hidden" autocomplete="on">
+        <div class="login-form-heading">
+          <button id="login-cancel" class="icon-button hero-carousel-previous login-back hidden" type="button" title="返回账号列表" aria-label="返回账号列表"><span class="hero-carousel-chevron" aria-hidden="true"></span></button>
+          <div>
+            <p class="eyebrow">Windows Player</p>
+            <h1 id="login-title">登录媒体服务器</h1>
+          </div>
+        </div>
         <label>服务器地址<input id="server-url" name="server" type="url" inputmode="url" placeholder="https://example.com" required></label>
         <fieldset class="login-connection-fieldset">
           <legend>服务器类型</legend>
@@ -44,7 +60,6 @@
         <label>用户名<input id="username" name="username" autocomplete="username" required></label>
         <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
         <div class="login-actions">
-          <button id="login-cancel" class="secondary-command hidden" type="button">取消</button>
           <button id="login-submit" class="primary-command" type="submit">
             <span class="login-submit-icon" aria-hidden="true">&#9654;</span>
             <span class="login-submit-spinner" aria-hidden="true"></span>
@@ -53,10 +68,6 @@
         </div>
         <p id="login-error" class="form-error" role="alert"></p>
       </form>
-      <div class="login-visual" aria-hidden="true">
-        <img class="login-emblem" src="mediastationgo-icon.png" alt="">
-        <div class="login-wordmark"><strong>MediaStationGo</strong><span>Windows Player</span></div>
-      </div>
     </main>
   </section>
 

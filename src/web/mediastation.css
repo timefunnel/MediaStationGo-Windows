@@ -94,30 +94,40 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   height: 100%;
   padding: 42px 56px;
   overflow: auto;
-  background: #121817;
+  background: #101415;
 }
-.login-brand { max-width: 1320px; margin: 0 auto; }
+.login-brand { max-width: 920px; margin: 0 auto; }
 .login-layout {
   display: grid;
-  grid-template-columns: minmax(330px, 430px) minmax(440px, 1fr);
-  align-items: center;
-  gap: 9%;
-  width: min(1320px, 100%);
+  place-items: start center;
+  width: min(920px, 100%);
   min-height: calc(100vh - 150px);
   margin: 0 auto;
+  padding-top: 44px;
 }
 .login-panel {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  width: 100%;
   padding: 32px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #18201f;
-  box-shadow: 0 28px 70px rgba(0,0,0,0.34);
+  background: #171c1e;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.3);
 }
+.login-form { max-width: 560px; }
+.login-account-panel { max-height: calc(100vh - 170px); gap: 24px; overflow: hidden; }
+.login-panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; }
+.login-add-account { flex: none; margin-top: 0; }
+.login-add-account > span:first-child { font-size: 20px; font-weight: 500; line-height: 1; }
+.login-accounts-list { min-height: 0; padding-right: 6px; overflow-y: auto; }
+.login-form-heading { display: flex; align-items: flex-start; gap: 14px; }
+.login-form-heading > div { min-width: 0; }
+.login-back { width: 38px; height: 38px; flex: none; margin-top: -3px; }
 .eyebrow { margin: 0; color: var(--accent); font-size: 12px; font-weight: 700; }
 .login-panel h1 { margin: 0 0 8px; font-size: 28px; font-weight: 650; }
+.login-panel-heading h1, .login-form-heading h1 { margin: 5px 0 0; }
 .login-panel label { display: grid; gap: 8px; color: var(--muted); font-size: 13px; }
 .login-panel input {
   width: 100%;
@@ -180,24 +190,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .danger-command { width: 100%; color: var(--danger); border: 1px solid rgba(255,116,111,0.38); background: transparent; }
 .danger-command:hover { background: rgba(255,116,111,0.08); }
 .form-error { min-height: 20px; margin: -6px 0 0; color: var(--danger); font-size: 13px; }
-.login-actions { display: grid; grid-template-columns: auto minmax(140px, 1fr); gap: 10px; margin-top: 8px; }
+.login-actions { display: grid; grid-template-columns: 1fr; margin-top: 8px; }
 .login-actions .primary-command { margin-top: 0; }
-.login-visual {
-  display: grid;
-  align-content: center;
-  justify-items: center;
-  min-height: 430px;
-  border-left: 1px solid rgba(255,255,255,0.08);
-}
-.login-emblem {
-  display: block;
-  width: clamp(132px, 15vw, 190px);
-  height: clamp(132px, 15vw, 190px);
-  filter: drop-shadow(0 28px 44px rgba(0,0,0,0.32));
-}
-.login-wordmark { display: grid; justify-items: center; gap: 5px; margin-top: 26px; }
-.login-wordmark strong { font-size: clamp(26px, 2.4vw, 36px); font-weight: 700; }
-.login-wordmark span { color: var(--muted); font-size: 12px; text-transform: uppercase; }
 
 .app-shell {
   position: relative;
@@ -716,7 +710,6 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .saved-account-row.busy { opacity: 0.62; }
 .saved-account-switch { display: flex; min-width: 0; flex: 1; align-items: center; gap: 12px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .saved-account-switch:hover { color: var(--text); }
-.saved-account-switch:disabled { cursor: wait; }
 .saved-account-row .avatar {
   display: inline-grid;
   flex: 0 0 auto;
@@ -1106,8 +1099,6 @@ body.player-mode .app-shell { display: none; }
 
 @media (max-width: 920px) {
   .login-view { padding: 30px; }
-  .login-layout { grid-template-columns: minmax(300px, 480px); justify-content: center; }
-  .login-visual { display: none; }
   .topbar { padding: 0 20px; }
   .top-actions { right: 20px; }
   .home-hero { min-height: 0; padding-right: 28px; padding-left: 28px; }
@@ -1131,6 +1122,8 @@ body.player-mode .app-shell { display: none; }
   .login-brand .brand { font-size: 24px; }
   .login-layout { min-height: calc(100vh - 100px); }
   .login-panel { padding: 24px 20px; }
+  .login-panel-heading { display: block; }
+  .login-add-account { width: 100%; margin-top: 20px; }
   .topbar { padding: 0 14px; }
   .top-actions { right: 14px; }
   .brand-button span:last-child { display: none; }
