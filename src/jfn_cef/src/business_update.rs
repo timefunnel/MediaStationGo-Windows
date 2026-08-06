@@ -12,9 +12,12 @@ use url::Url;
 
 use crate::client::{Inner, RendererValue, post_renderer_message};
 
-const RELEASE_API_URL: &str =
+const MIRROR_RELEASE_URL: &str = "https://cdn.timefunnel.top/mediastation/updates/stable.json";
+const GITHUB_RELEASE_API_URL: &str =
     "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/latest";
 const RELEASE_REPOSITORY_PATH: &str = "/timefunnel/MediaStationGo-Windows/releases/";
+const MIRROR_ASSET_HOST: &str = "cdn.timefunnel.top";
+const MIRROR_ASSET_PATH: &str = "/mediastation/updates/windows/x64/";
 const USER_AGENT: &str = "MediaStationGo-Windows-Updater";
 const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS.txt";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
@@ -273,8 +276,33 @@ pub(crate) fn install_update(inner: Arc<Inner>) {
 }
 
 fn fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
+    match fetch_release(MIRROR_RELEASE_URL) {
+        Ok(release) => Ok(release),
+        Err(mirror_error) => {
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_WARN,
+                &format!(
+                    "MediaStation update mirror unavailable; falling back to GitHub: {}: {}",
+                    mirror_error.code, mirror_error.message
+                ),
+            );
+            fetch_release(GITHUB_RELEASE_API_URL).map_err(|github_error| {
+                UpdateError::new(
+                    "update_sources_failed",
+                    format!(
+                        "更新镜像不可用：{}；GitHub 更新源也不可用：{}",
+                        mirror_error.message, github_error.message
+                    ),
+                )
+            })
+        }
+    }
+}
+
+fn fetch_release(metadata_url: &str) -> Result<ReleaseInfo, UpdateError> {
     let agent = github_agent(Duration::from_secs(45));
-    let metadata = get_text(&agent, RELEASE_API_URL, MAX_METADATA_BYTES)?;
+    let metadata = get_text(&agent, metadata_url, MAX_METADATA_BYTES)?;
     let mut release = parse_release_metadata(&metadata)?;
     let checksum_asset_url = checksum_asset_url(&metadata)?;
     let checksums = get_text(&agent, &checksum_asset_url, MAX_CHECKSUM_BYTES)?;
@@ -455,10 +483,15 @@ fn validate_asset_url(raw: &str, tag: &str, asset_name: &str) -> Result<(), Upda
     let url = Url::parse(raw).map_err(|error| {
         UpdateError::new("asset_url_invalid", format!("发布文件地址无效：{error}"))
     })?;
-    let expected_path = format!("{RELEASE_REPOSITORY_PATH}download/{tag}/{asset_name}");
+    let github_path = format!("{RELEASE_REPOSITORY_PATH}download/{tag}/{asset_name}");
+    let mirror_path = format!("{MIRROR_ASSET_PATH}{tag}/{asset_name}");
+    let trusted_github = url.host_str() == Some("github.com") && url.path() == github_path;
+    let trusted_mirror = url.host_str() == Some(MIRROR_ASSET_HOST) && url.path() == mirror_path;
     if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || url.path() != expected_path
+        || (!trusted_github && !trusted_mirror)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
@@ -828,5 +861,71 @@ mod tests {
         assert_eq!(release.version, "0.1.1");
         assert_eq!(release.asset_size, 123456);
         assert!(checksum_asset_url(&metadata).is_ok());
+    }
+
+    #[test]
+    fn release_metadata_accepts_exact_mirror_assets() {
+        let metadata = json!({
+            "draft": false,
+            "prerelease": false,
+            "tag_name": "v0.1.2",
+            "html_url": "https://github.com/timefunnel/MediaStationGo-Windows/releases/tag/v0.1.2",
+            "assets": [
+                {
+                    "name": "MediaStationGo-0.1.2-windows-x64-setup.exe",
+                    "browser_download_url": "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe",
+                    "size": 218412564,
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/SHA256SUMS.txt",
+                    "size": 334,
+                }
+            ]
+        })
+        .to_string();
+
+        let release = parse_release_metadata(&metadata).unwrap();
+        assert_eq!(release.version, "0.1.2");
+        assert_eq!(release.asset_size, 218412564);
+        assert!(checksum_asset_url(&metadata).is_ok());
+    }
+
+    #[test]
+    fn mirror_asset_validation_rejects_changed_origin_or_path() {
+        let tag = "v0.1.2";
+        let name = "MediaStationGo-0.1.2-windows-x64-setup.exe";
+        assert!(
+            validate_asset_url(
+                "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe",
+                tag,
+                name,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_asset_url(
+                "https://example.com/mediastation/updates/windows/x64/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe",
+                tag,
+                name,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_asset_url(
+                "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/other.exe",
+                tag,
+                name,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_asset_url(
+                "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe?source=other",
+                tag,
+                name,
+            )
+            .is_err()
+        );
     }
 }
