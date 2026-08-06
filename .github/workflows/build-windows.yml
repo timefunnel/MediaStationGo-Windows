@@ -24,12 +24,25 @@ jobs:
             pkg_prefix: mingw-w64-clang-x86_64
             triple: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}\mediastation-cargo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Cache Cargo dependencies and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}\mediastation-cargo
+          key: windows-cargo-${{ matrix.arch }}-${{ hashFiles('src/Cargo.lock', 'src/**/Cargo.toml') }}
+          restore-keys: |
+            windows-cargo-${{ matrix.arch }}-
 
       - name: Cache RIFE build asset
         uses: actions/cache@v6
@@ -49,6 +62,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
+          cache: true
           install: >-
             ${{ matrix.pkg_prefix }}-cc
             ${{ matrix.pkg_prefix }}-clang
@@ -68,10 +82,32 @@ jobs:
             ${{ matrix.pkg_prefix }}-spirv-cross
             ${{ matrix.pkg_prefix }}-llvm
 
-      - name: Build mpv from source
+      - name: Resolve native dependency cache contract
+        id: native-cache-contract
         shell: pwsh
         run: |
-          dev\windows\build_mpv_source.ps1 -Arch ${{ matrix.arch }} -Force
+          $MpvCommit = (git -C third_party/mpv rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $MpvCommit) {
+            throw "Unable to resolve the pinned mpv submodule commit"
+          }
+          "mpv_commit=$MpvCommit" >> $env:GITHUB_OUTPUT
+
+      - name: Cache native media dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/mpv-install
+            third_party/ffmpeg-38b88335f99e76ed89ff3c93f877fdefce736c13
+            third_party/ffmpeg-install-38b88335f99e76ed89ff3c93f877fdefce736c13
+            third_party/libplacebo-1733c8601edec161b714e4a799c72a9f5e5aa2f0.tar.gz
+            third_party/libplacebo-install-1733c8601edec161b714e4a799c72a9f5e5aa2f0
+          key: windows-native-deps-${{ matrix.arch }}-${{ steps.native-cache-contract.outputs.mpv_commit }}-${{ hashFiles('dev/windows/build_mpv_source.ps1', 'dev/windows/build_ffmpeg_lgpl_source.ps1', 'dev/windows/build_libplacebo_source.ps1', 'dev/windows/build_rife_runtime.ps1', 'dev/windows/stage_frame_interpolation_runtime.ps1', 'dev/windows/mpv/**', 'dev/windows/libplacebo/**', 'third_party/nvofapi/**') }}
+          restore-keys: |
+            windows-native-deps-${{ matrix.arch }}-${{ steps.native-cache-contract.outputs.mpv_commit }}-
+
+      - name: Build mpv from source
+        shell: pwsh
+        run: dev\windows\build_mpv_source.ps1 -Arch ${{ matrix.arch }}
 
       - name: Build
         shell: cmd
@@ -83,7 +119,6 @@ jobs:
           # at it explicitly.
           LIBCLANG_PATH: C:\msys64\${{ matrix.msystem }}\bin
           MSYS_BIN: C:\msys64\${{ matrix.msystem }}\bin
-          CARGO_TARGET_DIR: ${{ runner.temp }}\mediastation-cargo
           # mingw's libclang doesn't auto-pick the MSVC target triple, so
           # MSVC's arch-specific headers (__int64, vcruntime intrinsics,
           # etc.) get parsed against the wrong default target. Pin it.
