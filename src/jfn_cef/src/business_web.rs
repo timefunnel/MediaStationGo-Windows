@@ -25,8 +25,8 @@ use jfn_color::theme::{jfn_theme_color_on_color, jfn_theme_color_set_video_mode}
 use jfn_mpv::api::{
     jfn_mpv_audio_add, jfn_mpv_load_file, jfn_mpv_pause, jfn_mpv_play, jfn_mpv_seek_absolute,
     jfn_mpv_set_aspect_mode, jfn_mpv_set_audio_delay, jfn_mpv_set_audio_track, jfn_mpv_set_muted,
-    jfn_mpv_set_speed, jfn_mpv_set_subtitle_delay, jfn_mpv_set_subtitle_track, jfn_mpv_set_volume,
-    jfn_mpv_stop, jfn_mpv_sub_add,
+    jfn_mpv_set_speed, jfn_mpv_set_subtitle_delay, jfn_mpv_set_subtitle_style,
+    jfn_mpv_set_subtitle_track, jfn_mpv_set_volume, jfn_mpv_stop, jfn_mpv_sub_add,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::ingest_driver::jfn_playback_fullscreen;
@@ -35,6 +35,7 @@ use jfn_playback::{EndReason, Input as PbInput, MediaType as PbMediaType, post a
 
 use jfn_mpv::api::JfnMpvLoadOptions;
 
+use crate::mediastation_runtime::mediastation_subtitle_style_supported;
 pub use crate::mediastation_runtime::{
     jfn_web_clear_mediastation_session, jfn_web_configure_mediastation_session,
 };
@@ -291,6 +292,9 @@ fn handle_player_load(args: &ListValue) {
         http_header_fields: c"".as_ptr(),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
+        subtitle_style_override: false,
+        subtitle_font_size: 0.0,
+        subtitle_position: 100.0,
         is_infinite_stream,
     };
     if let Err(error) = unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) } {
@@ -482,6 +486,22 @@ fn handle_message(message: BrowserMessage) -> bool {
         }),
         "playerSetAudioDelay" => with_args(args, |a| jfn_mpv_set_audio_delay(a.double(0))),
         "playerSetSubtitleDelay" => with_args(args, |a| jfn_mpv_set_subtitle_delay(a.double(0))),
+        "playerSetSubtitleStyle" => with_args(args, |a| {
+            let font_size = list_int(a, 0);
+            let subtitle_position = list_int(a, 1);
+            if !mediastation_subtitle_style_supported(
+                f64::from(font_size),
+                f64::from(subtitle_position),
+            ) {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "playerSetSubtitleStyle rejected values outside the supported range",
+                );
+                return;
+            }
+            jfn_mpv_set_subtitle_style(f64::from(font_size), f64::from(subtitle_position));
+        }),
         "playerSetAspectMode" => with_args(args, |a| {
             let mode = list_string(a, 0);
             if let Some(c) = js_cstr_or_warn("playerSetAspectMode", &mode) {

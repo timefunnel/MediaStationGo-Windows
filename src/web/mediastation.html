@@ -56,6 +56,9 @@
       </div>
     </header>
     <main id="content" class="content" tabindex="-1"></main>
+    <button id="content-to-top" class="icon-button hero-carousel-button content-to-top hidden" type="button" title="回到顶部" aria-label="回到顶部">
+      <span class="hero-carousel-chevron" aria-hidden="true"></span>
+    </button>
   </div>
 
   <section id="player-view" class="player-view hidden" aria-label="播放器">
@@ -75,7 +78,7 @@
     </div>
     <div id="player-controls" class="player-controls visible">
       <div class="player-topline">
-        <button id="player-exit" class="icon-button control-button" type="button" title="退出播放" aria-label="退出播放"><span class="player-exit-chevron" aria-hidden="true"></span></button>
+        <button id="player-exit" class="icon-button hero-carousel-button hero-carousel-previous" type="button" title="退出播放" aria-label="退出播放"><span class="hero-carousel-chevron" aria-hidden="true"></span></button>
       </div>
       <div id="player-feedback" class="player-feedback hidden" aria-hidden="true"><span></span></div>
       <div class="player-bottom">
@@ -86,11 +89,20 @@
           <span id="player-duration">00:00</span>
         </div>
         <div class="player-tools" role="toolbar" aria-label="播放选项">
+          <div class="player-tools-primary">
+            <button id="player-episodes" class="icon-button control-button player-episodes hidden" type="button" title="选集" aria-label="选集" aria-pressed="false"><span aria-hidden="true"><i></i><i></i><i></i></span></button>
+            <button id="player-interpolation" class="icon-button control-button player-interpolation" type="button" title="RTX 插帧" aria-label="RTX 插帧" aria-pressed="false"><span aria-hidden="true"><i></i><i></i><i></i></span></button>
+            <div class="player-volume-control">
+              <button id="player-volume-toggle" class="icon-button control-button player-volume-toggle" type="button" title="静音" aria-label="静音" aria-pressed="false"><span class="player-volume-glyph" aria-hidden="true"></span></button>
+              <input id="player-volume" type="range" min="0" max="100" step="1" value="100" aria-label="播放器音量">
+              <output id="player-volume-value" for="player-volume">100</output>
+            </div>
+          </div>
           <button id="player-playback" class="icon-button control-button player-playback" type="button" title="暂停" aria-label="暂停"><span aria-hidden="true">&#x23F8;&#xFE0E;</span></button>
           <div class="player-tools-secondary">
+            <button id="player-speed" class="icon-button control-button player-speed" type="button" title="播放速度：1×" aria-label="播放速度：1×" aria-pressed="false"><span aria-hidden="true">1×</span></button>
             <button id="player-subtitles" class="icon-button control-button" type="button" title="字幕" aria-label="字幕"><span aria-hidden="true">CC</span></button>
             <button id="player-audio" class="icon-button control-button" type="button" title="音轨" aria-label="音轨"><span aria-hidden="true">&#9835;</span></button>
-            <button id="player-interpolation" class="icon-button control-button player-interpolation" type="button" title="RTX 插帧" aria-label="RTX 插帧" aria-pressed="false"><span aria-hidden="true"><i></i><i></i><i></i></span></button>
             <button id="player-info" class="icon-button control-button" type="button" title="播放信息" aria-label="播放信息"><span aria-hidden="true">&#9432;</span></button>
             <button id="player-fullscreen" class="icon-button control-button player-fullscreen" type="button" title="进入全屏" aria-label="进入全屏" aria-pressed="false"><span aria-hidden="true"><i></i><i></i><i></i><i></i></span></button>
           </div>
@@ -120,10 +132,6 @@
   <aside id="settings-drawer" class="drawer" aria-hidden="true">
     <header><h2>设置</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
     <div class="drawer-body settings-list">
-      <section class="setting-toggle-row">
-        <label for="playback-info-enabled">播放信息浮窗</label>
-        <input id="playback-info-enabled" type="checkbox" role="switch">
-      </section>
       <section class="setting-block update-settings">
         <div class="setting-toggle-row">
           <label for="auto-update-check">自动检查更新</label>
@@ -142,6 +150,21 @@
             <button id="confirm-install-app-update" class="danger-command" type="button">确认安装</button>
           </div>
         </div>
+      </section>
+      <section class="setting-block default-subtitle-settings">
+        <h3>默认字幕样式</h3>
+        <p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
+        <label class="setting-range-row" for="default-subtitle-font-size">
+          <span>文字大小</span>
+          <input id="default-subtitle-font-size" type="range" min="24" max="64" step="1">
+          <output id="default-subtitle-font-size-value" for="default-subtitle-font-size"></output>
+        </label>
+        <label class="setting-range-row" for="default-subtitle-bottom-offset">
+          <span>距底部</span>
+          <input id="default-subtitle-bottom-offset" type="range" min="0" max="30" step="1">
+          <output id="default-subtitle-bottom-offset-value" for="default-subtitle-bottom-offset"></output>
+        </label>
+        <button id="reset-default-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>
       </section>
       <section class="setting-block">
         <h3>RTX 插帧组件</h3>

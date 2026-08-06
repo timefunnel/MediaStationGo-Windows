@@ -551,7 +551,7 @@ impl MediaStationApiClient {
         let detail_payload = self.get_json(session, &url)?;
         let item = parse_media_card(&detail_payload)?;
         let people = parse_media_people(&detail_payload)?;
-        let episodes = if item.media_type == "Series" {
+        let mut episodes = if item.media_type == "Series" {
             let mut episodes_url = endpoint(&session.base_url, &["Items"])?;
             episodes_url
                 .query_pairs_mut()
@@ -567,6 +567,7 @@ impl MediaStationApiClient {
         } else {
             Vec::new()
         };
+        inherit_episode_landscape_images(&item, &mut episodes);
         Ok(MediaDetail {
             item,
             episodes,
@@ -978,6 +979,22 @@ impl MediaStationApiClient {
                 message: error.to_string(),
             })?;
         ensure_success(url, status_code, &body)
+    }
+}
+
+fn inherit_episode_landscape_images(series: &MediaCard, episodes: &mut [MediaCard]) {
+    let Some(fallback) = series
+        .backdrop_image
+        .clone()
+        .or_else(|| series.landscape_image.clone())
+        .or_else(|| series.primary_image.clone())
+    else {
+        return;
+    };
+    for episode in episodes {
+        if episode.landscape_image.is_none() {
+            episode.landscape_image = Some(fallback.clone());
+        }
     }
 }
 
@@ -2080,6 +2097,60 @@ mod tests {
             })
         );
         assert!(!format!("{card:?}").contains("api_key"));
+    }
+
+    #[test]
+    fn episode_landscape_fallback_uses_series_backdrop_without_overwriting_episode_art() {
+        let series = parse_media_card(&json!({
+            "Id": "series-1",
+            "Name": "Example Series",
+            "Type": "Series",
+            "ImageTags": { "Primary": "series-primary" },
+            "BackdropImageTags": ["series-backdrop"]
+        }))
+        .expect("series should parse");
+        let missing_art = parse_media_card(&json!({
+            "Id": "episode-1",
+            "Name": "Episode One",
+            "Type": "Episode"
+        }))
+        .expect("episode without art should parse");
+        let own_art = parse_media_card(&json!({
+            "Id": "episode-2",
+            "Name": "Episode Two",
+            "Type": "Episode",
+            "ImageTags": { "Primary": "episode-primary" }
+        }))
+        .expect("episode with art should parse");
+        let expected_own_art = own_art.landscape_image.clone();
+        let mut episodes = vec![missing_art, own_art];
+
+        inherit_episode_landscape_images(&series, &mut episodes);
+
+        assert_eq!(episodes[0].landscape_image, series.backdrop_image);
+        assert_eq!(episodes[1].landscape_image, expected_own_art);
+    }
+
+    #[test]
+    fn episode_landscape_fallback_uses_series_primary_when_backdrop_is_absent() {
+        let series = parse_media_card(&json!({
+            "Id": "series-1",
+            "Name": "Example Series",
+            "Type": "Series",
+            "ImageTags": { "Primary": "series-primary" }
+        }))
+        .expect("series should parse");
+        let episode = parse_media_card(&json!({
+            "Id": "episode-1",
+            "Name": "Episode One",
+            "Type": "Episode"
+        }))
+        .expect("episode should parse");
+        let mut episodes = vec![episode];
+
+        inherit_episode_landscape_images(&series, &mut episodes);
+
+        assert_eq!(episodes[0].landscape_image, series.primary_image);
     }
 
     #[test]

@@ -163,6 +163,9 @@ fn decodes_first_live_video_frame_through_native_load_path() {
         http_header_fields: header_fields.as_ptr(),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
+        subtitle_style_override: false,
+        subtitle_font_size: 0.0,
+        subtitle_position: 100.0,
         is_infinite_stream: false,
     };
     unsafe { jfn_mpv_load_file(playback_url.as_ptr(), &options) }

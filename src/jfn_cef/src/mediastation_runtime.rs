@@ -66,6 +66,10 @@ const MAX_ACTIVE_CATALOG_REQUESTS: usize = 2;
 const MAX_ACTIVE_IMAGE_REQUESTS: usize = 2;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXTERNAL_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+const MIN_SUBTITLE_FONT_SIZE: f64 = 24.0;
+const MAX_SUBTITLE_FONT_SIZE: f64 = 64.0;
+const MIN_SUBTITLE_POSITION: f64 = 70.0;
+const MAX_SUBTITLE_POSITION: f64 = 100.0;
 const SUBTITLE_CACHE_DIRECTORY: &str = "mediastation-subtitles";
 const HOME_CACHE_DIRECTORY: &str = "mediastation-home-v1";
 const IMAGE_CACHE_DIRECTORY: &str = "mediastation-images-v1";
@@ -358,6 +362,7 @@ struct ActivePlaybackReport {
     session: MediaStationSession,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    preference_scope_id: String,
     /// Incremented whenever the user explicitly saves a track preference, so
     /// the first-frame reconcile worker can tell whether the user changed the
     /// tracks after playback loaded and must not override that choice.
@@ -373,6 +378,7 @@ struct RuntimeTrackReconcile {
     snapshot: SessionSnapshot,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    preference_scope_id: String,
     /// Track preference revision captured when the session started. The
     /// reconcile worker skips overriding the runtime tracks if this is stale,
     /// meaning the user changed the selection after playback loaded.
@@ -436,6 +442,7 @@ struct NativeLoadRequest<'a> {
     snapshot: &'a SessionSnapshot,
     source: &'a PlaybackSource,
     preference: &'a PlaybackTrackPreference,
+    preference_scope_id: &'a str,
     media_id: &'a str,
     start_ms: u64,
     url: &'a CString,
@@ -742,6 +749,7 @@ impl MediaStationRuntime {
                         },
                         source: active.source.clone(),
                         preference: active.preference.clone(),
+                        preference_scope_id: active.preference_scope_id.clone(),
                         preference_revision: active.preference_revision,
                     })
                 })
@@ -1155,6 +1163,7 @@ impl MediaStationRuntime {
             load.snapshot,
             load.source,
             load.preference,
+            load.preference_scope_id,
             load.start_ms,
         );
         drop(state);
@@ -1200,6 +1209,54 @@ impl MediaStationRuntime {
         Ok(active.preference_revision)
     }
 
+    fn active_playback_preference(
+        &self,
+        snapshot: &SessionSnapshot,
+        media_id: &str,
+    ) -> Result<PlaybackTrackPreference, LoadFailure> {
+        let state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        let active = state.active_report.as_ref().ok_or_else(|| {
+            LoadFailure::new(
+                "playback_unavailable",
+                "No active playback has a track preference",
+            )
+        })?;
+        if active.source.media_id != media_id {
+            return Err(LoadFailure::new(
+                "playback_changed",
+                "The active playback item has changed",
+            ));
+        }
+        Ok(active.preference.clone())
+    }
+
+    fn active_preference_scope_id(
+        &self,
+        snapshot: &SessionSnapshot,
+        media_id: &str,
+    ) -> Result<String, LoadFailure> {
+        let state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        let active = state.active_report.as_ref().ok_or_else(|| {
+            LoadFailure::new(
+                "playback_unavailable",
+                "No active playback can change tracks",
+            )
+        })?;
+        if active.source.media_id != media_id {
+            return Err(LoadFailure::new(
+                "playback_changed",
+                "The active playback item has changed",
+            ));
+        }
+        Ok(active.preference_scope_id.clone())
+    }
+
     fn bump_preference_revision(&self, snapshot: &SessionSnapshot) {
         let mut state = self.state.lock();
         if state.generation != snapshot.generation || state.session.is_none() {
@@ -1207,6 +1264,34 @@ impl MediaStationRuntime {
         }
         if let Some(active) = state.active_report.as_mut() {
             active.preference_revision = active.preference_revision.wrapping_add(1);
+        }
+    }
+
+    fn commit_active_preference_update(
+        &self,
+        snapshot: &SessionSnapshot,
+        media_id: &str,
+        update: &PlaybackTrackPreferenceUpdate,
+    ) {
+        let mut state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return;
+        }
+        let Some(active) = state.active_report.as_mut() else {
+            return;
+        };
+        if active.source.media_id != media_id {
+            return;
+        }
+        active.preference.configured = true;
+        if let Some(enabled) = update.subtitle_enabled {
+            active.preference.subtitle_enabled = enabled;
+        }
+        if let Some(key) = &update.subtitle_track_key {
+            active.preference.subtitle_track_key = Some(key.clone());
+        }
+        if let Some(key) = &update.audio_track_key {
+            active.preference.audio_track_key = Some(key.clone());
         }
     }
 
@@ -1359,6 +1444,7 @@ fn activate_playback_report(
     snapshot: &SessionSnapshot,
     source: &PlaybackSource,
     preference: &PlaybackTrackPreference,
+    preference_scope_id: &str,
     start_ms: u64,
 ) -> Option<ReportJob> {
     let stopped = take_stopped_report(state);
@@ -1367,6 +1453,7 @@ fn activate_playback_report(
         session: snapshot.session.clone(),
         source: source.clone(),
         preference: preference.clone(),
+        preference_scope_id: preference_scope_id.to_string(),
         preference_revision: 0,
         runtime_tracks_reconciled: false,
         started: false,
@@ -3308,13 +3395,23 @@ fn execute_tracks_request(
     request: &TracksRequest,
 ) -> Result<Value, LoadFailure> {
     let source = runtime.active_playback_source(snapshot, &request.media_id)?;
-    let catalog = current_runtime_track_catalog(&source)?;
+    let mut catalog = current_runtime_track_catalog(&source)?;
+    if restore_pending_embedded_subtitle_preference(
+        runtime,
+        snapshot,
+        &source,
+        &catalog,
+        &request.media_id,
+    )? {
+        catalog = current_runtime_track_catalog(&source)?;
+    }
     runtime.active_playback_source(snapshot, &request.media_id)?;
     log_debug(&format!(
-        "MediaStation runtime tracks: media_id={} audio_count={} subtitle_count={}",
+        "MediaStation runtime tracks: media_id={} audio_count={} subtitle_count={} subtitle_selected={}",
         request.media_id,
         catalog.audio.len(),
-        catalog.subtitles.len()
+        catalog.subtitles.len(),
+        catalog.subtitles.iter().any(|track| track.selected),
     ));
     Ok(runtime_tracks_payload(&catalog))
 }
@@ -3704,6 +3801,7 @@ fn execute_track_selection(
     request: &TrackSelectionRequest,
 ) -> Result<Value, LoadFailure> {
     let source = runtime.active_playback_source(snapshot, &request.media_id)?;
+    let preference_scope_id = runtime.active_preference_scope_id(snapshot, &request.media_id)?;
     let catalog = current_runtime_track_catalog(&source)?;
     let previous_preference = runtime_preference_update(&catalog);
     let (update, selection) = match request.kind {
@@ -3747,23 +3845,33 @@ fn execute_track_selection(
                 runtime.ensure_generation(snapshot.generation)?;
                 runtime
                     .api
-                    .update_playback_preference(&snapshot.session, &request.media_id, &update)
+                    .update_playback_preference(&snapshot.session, &preference_scope_id, &update)
                     .map_err(|error| api_failure("preference_update_failed", &error))?;
                 runtime.ensure_generation(snapshot.generation)?;
-                let result = runtime.apply_track_selection(
+                runtime.bump_preference_revision(snapshot);
+                return match runtime.apply_track_selection(
                     snapshot,
                     &request.media_id,
                     TrackSelection::SubtitleOff,
-                );
-                if result.is_err() {
-                    rollback_track_preference(
-                        runtime,
-                        snapshot,
-                        &request.media_id,
-                        &previous_preference,
-                    );
-                }
-                return result;
+                ) {
+                    Ok(payload) => {
+                        runtime.commit_active_preference_update(
+                            snapshot,
+                            &request.media_id,
+                            &update,
+                        );
+                        Ok(payload)
+                    }
+                    Err(failure) => {
+                        rollback_track_preference(
+                            runtime,
+                            snapshot,
+                            &preference_scope_id,
+                            &previous_preference,
+                        );
+                        Err(failure)
+                    }
+                };
             };
             let source_track = source.subtitles.iter().find(|track| track.key == key);
             let update = PlaybackTrackPreferenceUpdate {
@@ -3805,16 +3913,24 @@ fn execute_track_selection(
     runtime.ensure_generation(snapshot.generation)?;
     runtime
         .api
-        .update_playback_preference(&snapshot.session, &request.media_id, &update)
+        .update_playback_preference(&snapshot.session, &preference_scope_id, &update)
         .map_err(|error| api_failure("preference_update_failed", &error))?;
     runtime.ensure_generation(snapshot.generation)?;
     // Record that the user explicitly changed the track preference so the
     // first-frame reconcile worker will not re-apply or correct it.
     runtime.bump_preference_revision(snapshot);
     match runtime.apply_track_selection(snapshot, &request.media_id, selection) {
-        Ok(payload) => Ok(payload),
+        Ok(payload) => {
+            runtime.commit_active_preference_update(snapshot, &request.media_id, &update);
+            Ok(payload)
+        }
         Err(failure) => {
-            rollback_track_preference(runtime, snapshot, &request.media_id, &previous_preference);
+            rollback_track_preference(
+                runtime,
+                snapshot,
+                &preference_scope_id,
+                &previous_preference,
+            );
             Err(failure)
         }
     }
@@ -3990,7 +4106,7 @@ fn reconcile_runtime_track_preference_inner(
             .api
             .update_playback_preference(
                 &reconcile.snapshot.session,
-                &reconcile.source.media_id,
+                &reconcile.preference_scope_id,
                 &correction,
             )
             .map_err(|error| api_failure("preference_correction_failed", &error))?;
@@ -4042,6 +4158,44 @@ fn runtime_subtitle_selection(
     })
 }
 
+fn pending_embedded_subtitle_preference(
+    catalog: &RuntimeTrackCatalog,
+    preference: &PlaybackTrackPreference,
+) -> Option<(i64, String)> {
+    if !preference.subtitle_enabled || catalog.subtitles.iter().any(|track| track.selected) {
+        return None;
+    }
+    let key = preference.subtitle_track_key.as_deref()?;
+    let track = catalog
+        .subtitles
+        .iter()
+        .find(|track| !track.external && track.key == key)?;
+    Some((track.mpv_id?, key.to_string()))
+}
+
+fn restore_pending_embedded_subtitle_preference(
+    runtime: &MediaStationRuntime,
+    snapshot: &SessionSnapshot,
+    source: &PlaybackSource,
+    catalog: &RuntimeTrackCatalog,
+    media_id: &str,
+) -> Result<bool, LoadFailure> {
+    let preference = runtime.active_playback_preference(snapshot, media_id)?;
+    let Some((mpv_track, key)) = pending_embedded_subtitle_preference(catalog, &preference) else {
+        return Ok(false);
+    };
+    runtime.apply_track_selection(
+        snapshot,
+        media_id,
+        TrackSelection::SubtitleEmbedded { mpv_track, key },
+    )?;
+    log_debug(&format!(
+        "MediaStation pending subtitle preference restored before track panel response: media_id={}",
+        source.media_id
+    ));
+    Ok(true)
+}
+
 fn correction_from_subtitle_baseline(
     correction: &mut PlaybackTrackPreferenceUpdate,
     baseline: &PlaybackTrackPreferenceUpdate,
@@ -4059,9 +4213,12 @@ fn preference_update_has_values(update: &PlaybackTrackPreferenceUpdate) -> bool 
 struct LoadRequest {
     request_id: String,
     media_id: String,
+    preference_scope_id: String,
     start_ms: u64,
     interpolation_mode: InterpolationMode,
     interpolation_model: InterpolationModel,
+    subtitle_font_size: f64,
+    subtitle_position: f64,
 }
 
 fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadFailure)> {
@@ -4107,13 +4264,91 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
         parse_load_interpolation_mode(args).map_err(|failure| (request_id.clone(), failure))?;
     let interpolation_model =
         parse_load_interpolation_model(args).map_err(|failure| (request_id.clone(), failure))?;
+    let preference_scope_id = parse_preference_scope_id(args, &media_id)
+        .map_err(|failure| (request_id.clone(), failure))?;
+    let (subtitle_font_size, subtitle_position) =
+        parse_subtitle_style(args).map_err(|failure| (request_id.clone(), failure))?;
     Ok(LoadRequest {
         request_id,
         media_id,
+        preference_scope_id,
         start_ms,
         interpolation_mode,
         interpolation_model,
+        subtitle_font_size,
+        subtitle_position,
     })
+}
+
+fn parse_preference_scope_id(args: &ListValue, media_id: &str) -> Result<String, LoadFailure> {
+    if args.size() < 6 {
+        return Ok(media_id.to_string());
+    }
+    if args.get_type(5).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "invalid_preference_scope_id",
+            "The playback preference scope identifier is invalid",
+        ));
+    }
+    let value = list_string(args, 5);
+    if value.is_empty() {
+        return Ok(media_id.to_string());
+    }
+    if !valid_identifier(&value, MAX_MEDIA_ID_LEN) {
+        return Err(LoadFailure::new(
+            "invalid_preference_scope_id",
+            "The playback preference scope identifier is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_subtitle_style(args: &ListValue) -> Result<(f64, f64), LoadFailure> {
+    if args.size() < 8 {
+        return Err(LoadFailure::new(
+            "subtitle_style_invalid",
+            "The MediaStation subtitle style is missing",
+        ));
+    }
+    let font_size = parse_bounded_number(args, 6, MIN_SUBTITLE_FONT_SIZE, MAX_SUBTITLE_FONT_SIZE)?;
+    let position = parse_bounded_number(args, 7, MIN_SUBTITLE_POSITION, MAX_SUBTITLE_POSITION)?;
+    Ok((font_size, position))
+}
+
+pub(crate) fn mediastation_subtitle_style_supported(
+    font_size: f64,
+    subtitle_position: f64,
+) -> bool {
+    font_size.is_finite()
+        && (MIN_SUBTITLE_FONT_SIZE..=MAX_SUBTITLE_FONT_SIZE).contains(&font_size)
+        && subtitle_position.is_finite()
+        && (MIN_SUBTITLE_POSITION..=MAX_SUBTITLE_POSITION).contains(&subtitle_position)
+}
+
+fn parse_bounded_number(
+    args: &ListValue,
+    index: usize,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f64, LoadFailure> {
+    let value_type = args.get_type(index);
+    let value = if value_type.as_ref() == &sys::cef_value_type_t::VTYPE_INT {
+        f64::from(args.int(index))
+    } else if value_type.as_ref() == &sys::cef_value_type_t::VTYPE_DOUBLE {
+        args.double(index)
+    } else {
+        return Err(LoadFailure::new(
+            "subtitle_style_invalid",
+            "The MediaStation subtitle style must contain numbers",
+        ));
+    };
+    if !value.is_finite() || value < minimum || value > maximum {
+        return Err(LoadFailure::new(
+            "subtitle_style_invalid",
+            "The MediaStation subtitle style is outside the supported range",
+        ));
+    }
+    Ok(value.round())
 }
 
 fn parse_start_ms(args: &ListValue) -> Result<u64, LoadFailure> {
@@ -4258,7 +4493,7 @@ fn execute_load(
     runtime.ensure_generation(snapshot.generation)?;
     let preference = runtime
         .api
-        .load_playback_preference(&snapshot.session, &request.media_id)
+        .load_playback_preference(&snapshot.session, &request.preference_scope_id)
         .map_err(|error| api_failure("preference_load_failed", &error))?;
     let plan = build_playback_track_plan(&source, &preference);
 
@@ -4368,12 +4603,16 @@ fn execute_load(
         hwdec: interpolation_hwdec
             .as_ref()
             .map_or(c"".as_ptr(), |value| value.as_ptr()),
+        subtitle_style_override: true,
+        subtitle_font_size: request.subtitle_font_size,
+        subtitle_position: request.subtitle_position,
         is_infinite_stream: false,
     };
     runtime.load_if_current(NativeLoadRequest {
         snapshot,
         source: &source,
         preference: &preference,
+        preference_scope_id: &request.preference_scope_id,
         media_id: &request.media_id,
         start_ms: request.start_ms,
         url: &playback_url,
@@ -4413,6 +4652,7 @@ fn execute_load(
         "subtitleRedirectCount": subtitle_redirect_count,
         "subtitleTargetHost": subtitle_target_host,
         "reportingAvailable": runtime.reporter.is_available(),
+        "preferenceScopeId": request.preference_scope_id,
         "preferenceCorrection": correction_status,
         "preferenceCorrectionErrorCode": correction_error_code,
         "frameInterpolation": interpolation.as_ref().map(frame_interpolation_payload),
@@ -5202,6 +5442,17 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_style_accepts_only_supported_mpv_positions() {
+        assert!(mediastation_subtitle_style_supported(24.0, 70.0));
+        assert!(mediastation_subtitle_style_supported(36.0, 92.0));
+        assert!(mediastation_subtitle_style_supported(64.0, 100.0));
+        assert!(!mediastation_subtitle_style_supported(23.0, 92.0));
+        assert!(!mediastation_subtitle_style_supported(36.0, 69.0));
+        assert!(!mediastation_subtitle_style_supported(36.0, 101.0));
+        assert!(!mediastation_subtitle_style_supported(f64::NAN, 92.0));
+    }
+
+    #[test]
     fn playback_interpolation_model_accepts_only_bundled_models() {
         assert_eq!(
             parse_interpolation_model_value("rife-v4.26").expect("v4.26 should be valid"),
@@ -5560,6 +5811,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_subtitle_restore_requires_enabled_matching_embedded_track() {
+        let mut catalog = RuntimeTrackCatalog {
+            subtitles: vec![RuntimeTrack {
+                kind: RuntimeTrackKind::Subtitle,
+                key: "runtime:subtitle:saved".to_string(),
+                mpv_id: Some(4),
+                codec: Some("subrip".to_string()),
+                language: Some("zho".to_string()),
+                label: Some("简体中文".to_string()),
+                channel_count: None,
+                selected: false,
+                external: false,
+                is_default: true,
+                is_forced: false,
+            }],
+            ..RuntimeTrackCatalog::default()
+        };
+        let mut preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("runtime:subtitle:saved".to_string()),
+            audio_track_key: None,
+        };
+
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((4, "runtime:subtitle:saved".to_string()))
+        );
+
+        preference.subtitle_enabled = false;
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+        preference.subtitle_enabled = true;
+        catalog.subtitles[0].selected = true;
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+        catalog.subtitles[0].selected = false;
+        catalog.subtitles[0].external = true;
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+    }
+
+    #[test]
     fn playback_event_payload_does_not_expose_native_error_or_urls() {
         let mut event = playback_event(PlaybackEventKind::Error, 42_000);
         event.error_message =
@@ -5647,7 +5947,8 @@ mod tests {
             audio_track_key: None,
         };
         assert!(
-            activate_playback_report(&mut state, &snapshot, &source, &preference, 250).is_none()
+            activate_playback_report(&mut state, &snapshot, &source, &preference, "series-1", 250,)
+                .is_none()
         );
         let now = Instant::now();
 

@@ -385,6 +385,12 @@ pub fn jfn_mpv_set_audio_delay(s: f64) {
 pub fn jfn_mpv_set_subtitle_delay(s: f64) {
     unsafe { set_double(c"sub-delay", s) };
 }
+pub fn jfn_mpv_set_subtitle_style(font_size: f64, subtitle_position: f64) {
+    unsafe {
+        set_double(c"sub-font-size", font_size);
+        set_double(c"sub-pos", subtitle_position);
+    }
+}
 pub fn jfn_mpv_set_start_position(s: f64) {
     unsafe { set_double(c"start", s) };
 }
@@ -467,6 +473,10 @@ pub struct JfnMpvLoadOptions {
     pub video_filter: *const c_char,
     /// Per-file hardware decoder mode. Empty preserves the configured mode.
     pub hwdec: *const c_char,
+    /// Apply the MediaStation text-subtitle style for this file only.
+    pub subtitle_style_override: bool,
+    pub subtitle_font_size: f64,
+    pub subtitle_position: f64,
     pub is_infinite_stream: bool,
 }
 
@@ -523,6 +533,22 @@ unsafe fn cstr_to_string(p: *const c_char) -> String {
         .unwrap_or_default()
 }
 
+fn media_station_subtitle_options(font_size: f64, subtitle_position: f64) -> Vec<(String, String)> {
+    vec![
+        ("sub-ass-override".to_string(), "force".to_string()),
+        ("sub-font".to_string(), "Microsoft YaHei UI".to_string()),
+        ("sub-font-size".to_string(), font_size.to_string()),
+        ("sub-color".to_string(), "#FFFFFF".to_string()),
+        ("sub-outline-color".to_string(), "#C0000000".to_string()),
+        ("sub-outline-size".to_string(), "2".to_string()),
+        ("sub-shadow-offset".to_string(), "0".to_string()),
+        ("sub-pos".to_string(), subtitle_position.to_string()),
+        ("sub-align-x".to_string(), "center".to_string()),
+        ("sub-align-y".to_string(), "bottom".to_string()),
+        ("sub-justify".to_string(), "center".to_string()),
+    ]
+}
+
 pub unsafe fn jfn_mpv_load_file(
     path: *const c_char,
     opts: *const JfnMpvLoadOptions,
@@ -546,6 +572,12 @@ pub unsafe fn jfn_mpv_load_file(
         ("start".to_string(), o.start_secs.to_string()),
         ("pause".to_string(), "yes".to_string()),
     ];
+    if o.subtitle_style_override {
+        load_options.extend(media_station_subtitle_options(
+            o.subtitle_font_size,
+            o.subtitle_position,
+        ));
+    }
     if defer_audio {
         // Per-file enable so mpv's demuxer picks the format-correct
         // audio track (HLS DEFAULT=YES, MPEG-TS first PMT, etc.). We
@@ -706,4 +738,18 @@ pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
         return;
     };
     unsafe { set_str(c"background-color", h) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::media_station_subtitle_options;
+
+    #[test]
+    fn media_station_subtitle_style_uses_vertical_position_not_layout_margin() {
+        let options = media_station_subtitle_options(36.0, 92.0);
+
+        assert!(options.contains(&("sub-font-size".to_string(), "36".to_string())));
+        assert!(options.contains(&("sub-pos".to_string(), "92".to_string())));
+        assert!(!options.iter().any(|(name, _)| name == "sub-margin-y"));
+    }
 }

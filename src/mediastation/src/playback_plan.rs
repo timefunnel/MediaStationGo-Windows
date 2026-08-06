@@ -3,6 +3,84 @@ use url::Url;
 
 pub const TRACK_DISABLE: i64 = 0;
 
+fn descriptor_has_code(descriptor: &str, codes: &[&str]) -> bool {
+    descriptor
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| codes.contains(&token))
+}
+
+fn chinese_subtitle_variant(track: &crate::SubtitleTrack) -> Option<u8> {
+    let language = track
+        .language
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        .replace('_', "-");
+    let label = track
+        .label
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let descriptor = format!("{language} {label}");
+    if ["zh-cn", "zh-sg", "zh-hans", "chs", "sc"]
+        .iter()
+        .any(|value| language == *value)
+        || descriptor_has_code(&descriptor, &["chs", "sc"])
+        || descriptor.contains("simplified chinese")
+        || descriptor.contains("chinese simplified")
+        || descriptor.contains("简体")
+        || descriptor.contains("简中")
+    {
+        return Some(0);
+    }
+    if ["zh-tw", "zh-hk", "zh-mo", "zh-hant", "cht", "tc"]
+        .iter()
+        .any(|value| language == *value)
+        || descriptor_has_code(&descriptor, &["cht", "tc"])
+        || descriptor.contains("traditional chinese")
+        || descriptor.contains("chinese traditional")
+        || descriptor.contains("繁体")
+        || descriptor.contains("繁中")
+    {
+        return Some(2);
+    }
+    if ["zh", "zho", "chi", "chinese", "cn"]
+        .iter()
+        .any(|value| language == *value)
+        || descriptor_has_code(&descriptor, &["zh", "zho", "chi", "cn"])
+        || descriptor.contains("chinese")
+        || descriptor.contains("中文")
+        || descriptor.contains("中字")
+    {
+        return Some(1);
+    }
+    None
+}
+
+fn preferred_chinese_subtitle(source: &PlaybackSource) -> Option<usize> {
+    source
+        .subtitles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            chinese_subtitle_variant(track).map(|variant| {
+                (
+                    index,
+                    (
+                        u8::from(track.is_forced),
+                        u8::from(!track.is_default),
+                        variant,
+                        index,
+                    ),
+                )
+            })
+        })
+        .min_by_key(|(_, rank)| *rank)
+        .map(|(index, _)| index)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaybackTrackPlan {
     pub video_track: i64,
@@ -36,13 +114,16 @@ pub fn build_playback_track_plan(
         .and_then(|key| source.subtitles.iter().position(|track| track.key == key));
     let subtitle_index = if preference.subtitle_enabled {
         // A saved key that no longer matches this container falls back to
-        // the default/forced track instead of silently disabling subtitles.
-        preferred_subtitle.or_else(|| {
-            source
-                .subtitles
-                .iter()
-                .position(|track| track.is_default || track.is_forced)
-        })
+        // Chinese before the container default instead of silently disabling
+        // subtitles or choosing a non-Chinese default on every episode.
+        preferred_subtitle
+            .or_else(|| preferred_chinese_subtitle(source))
+            .or_else(|| {
+                source
+                    .subtitles
+                    .iter()
+                    .position(|track| track.is_default || track.is_forced)
+            })
     } else {
         None
     };
@@ -195,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_saved_subtitle_falls_back_to_container_default() {
+    fn stale_saved_subtitle_falls_back_to_chinese_track() {
         let preference = PlaybackTrackPreference {
             configured: true,
             subtitle_enabled: true,
@@ -211,13 +292,49 @@ mod tests {
         // The stale audio key falls back to the first audio track.
         assert_eq!(plan.audio_track, 1);
         assert_eq!(correction.audio_track_key.as_deref(), Some("stream:1"));
-        // The stale subtitle key falls back to the container default track
-        // (stream:2, internal eng) instead of disabling subtitles entirely.
-        assert_eq!(plan.subtitle_track, 1);
-        assert_eq!(plan.subtitle_track_key.as_deref(), Some("stream:2"));
-        assert_eq!(plan.external_subtitle_url, None);
-        assert_eq!(correction.subtitle_track_key.as_deref(), Some("stream:2"));
+        // The stale subtitle key follows the Chinese track even though the
+        // container marks an English subtitle as default.
+        assert_eq!(plan.subtitle_track, TRACK_DISABLE);
+        assert_eq!(plan.subtitle_track_key.as_deref(), Some("stream:3"));
+        assert_eq!(
+            plan.external_subtitle_url.as_ref().map(Url::as_str),
+            Some("https://media.example/subtitle.srt")
+        );
+        assert_eq!(correction.subtitle_track_key.as_deref(), Some("stream:3"));
         assert_eq!(correction.subtitle_enabled, None);
+    }
+
+    #[test]
+    fn unconfigured_preference_enables_best_chinese_subtitle() {
+        let preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: true,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+
+        let plan = build_playback_track_plan(&source(), &preference);
+
+        assert_eq!(plan.subtitle_track_key.as_deref(), Some("stream:3"));
+        assert!(plan.external_subtitle_url.is_some());
+        assert_eq!(plan.preference_correction, None);
+    }
+
+    #[test]
+    fn unconfigured_preference_recognizes_chinese_label_code() {
+        let mut source = source();
+        source.subtitles[1].language = Some("und".to_string());
+        source.subtitles[1].label = Some("CHS & ENG".to_string());
+        let preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: true,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+
+        let plan = build_playback_track_plan(&source, &preference);
+
+        assert_eq!(plan.subtitle_track_key.as_deref(), Some("stream:3"));
     }
 
     #[test]
@@ -225,6 +342,7 @@ mod tests {
         let mut source = source();
         source.subtitles[0].is_default = false;
         source.subtitles[0].is_forced = false;
+        source.subtitles[1].language = Some("spa".to_string());
         let preference = PlaybackTrackPreference {
             configured: true,
             subtitle_enabled: true,
