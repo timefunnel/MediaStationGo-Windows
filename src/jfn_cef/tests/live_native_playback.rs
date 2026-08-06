@@ -1,5 +1,6 @@
 use jfn_mediastation::{
-    MediaStationApiClient, MediaStationSession, PlaybackSessionResolver, UreqTransport,
+    MediaCard, MediaStationApiClient, MediaStationClientProfile, MediaStationConnectionProfile,
+    MediaStationProxyMode, MediaStationSession, PlaybackSessionResolver, UreqTransport,
     build_playback_track_plan,
 };
 use jfn_mpv::api::{
@@ -29,6 +30,128 @@ fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("required environment variable {name} is missing"))
 }
 
+fn live_connection_profile() -> MediaStationConnectionProfile {
+    let client = match env::var("MEDIASTATION_LIVE_CLIENT_PROFILE").as_deref() {
+        Ok("senplayer") => MediaStationClientProfile::SenPlayer,
+        Ok("infuse") => MediaStationClientProfile::Infuse,
+        Ok("mediastation_go") | Err(_) => MediaStationClientProfile::MediaStationGo,
+        Ok(_) => {
+            panic!("MEDIASTATION_LIVE_CLIENT_PROFILE must be mediastation_go, senplayer, or infuse")
+        }
+    };
+    let proxy = match env::var("MEDIASTATION_LIVE_PROXY_MODE").as_deref() {
+        Ok("system") => MediaStationProxyMode::System,
+        Ok("direct") | Err(_) => MediaStationProxyMode::Direct,
+        Ok(_) => panic!("MEDIASTATION_LIVE_PROXY_MODE must be direct or system"),
+    };
+    let profile = MediaStationConnectionProfile { client, proxy };
+    assert!(profile.is_supported());
+    profile
+}
+
+fn live_authorization(
+    profile: MediaStationConnectionProfile,
+    device_id: &str,
+    token: Option<&str>,
+) -> String {
+    let client = profile.client.authorization_client();
+    let version = profile.client.authorization_version("0.1");
+    let mut authorization = format!(
+        "MediaBrowser Client=\"{client}\", Device=\"Windows\", DeviceId=\"{device_id}\", Version=\"{version}\""
+    );
+    if let Some(token) = token {
+        authorization.push_str(", Token=\"");
+        authorization.push_str(token);
+        authorization.push('"');
+    }
+    authorization
+}
+
+fn live_session(
+    client: &MediaStationApiClient,
+    profile: MediaStationConnectionProfile,
+) -> MediaStationSession {
+    let base_url = Url::parse(&required_env("MEDIASTATION_LIVE_BASE_URL"))
+        .expect("live base URL should parse");
+    if let (Ok(user_id), Ok(token), Ok(authorization)) = (
+        env::var("MEDIASTATION_LIVE_USER_ID"),
+        env::var("MEDIASTATION_LIVE_TOKEN"),
+        env::var("MEDIASTATION_LIVE_AUTHORIZATION"),
+    ) {
+        return MediaStationSession::new_with_profile(
+            base_url,
+            user_id,
+            token,
+            authorization,
+            profile,
+        )
+        .expect("live session should be valid");
+    }
+    let username = required_env("MEDIASTATION_LIVE_USERNAME");
+    let password = required_env("MEDIASTATION_LIVE_PASSWORD");
+    let device_id = "mediastation-live-native";
+    let base_authorization = live_authorization(profile, device_id, None);
+    let authenticated = client
+        .authenticate_with_profile(
+            &base_url,
+            &username,
+            &password,
+            &base_authorization,
+            profile,
+        )
+        .expect("live account should authenticate");
+    let token = authenticated.access_token_secret().to_string();
+    MediaStationSession::new_with_profile(
+        authenticated.base_url,
+        authenticated.user_id,
+        token.clone(),
+        live_authorization(profile, device_id, Some(&token)),
+        profile,
+    )
+    .expect("authenticated live session should be valid")
+}
+
+fn live_media_id(api: &MediaStationApiClient, session: &MediaStationSession) -> String {
+    if let Ok(media_id) = env::var("MEDIASTATION_LIVE_MEDIA_ID") {
+        return media_id;
+    }
+    let home = api
+        .load_home(session)
+        .expect("live home catalog should load");
+    if let Some(media_id) = home
+        .resume
+        .iter()
+        .chain(home.latest.iter())
+        .chain(
+            home.latest_by_library
+                .iter()
+                .flat_map(|section| section.items.iter()),
+        )
+        .find(|card: &&MediaCard| card.is_playable())
+        .map(|card| card.id.clone())
+    {
+        return media_id;
+    }
+    let series = home
+        .resume
+        .iter()
+        .chain(home.latest.iter())
+        .chain(
+            home.latest_by_library
+                .iter()
+                .flat_map(|section| section.items.iter()),
+        )
+        .find(|card| card.media_type == "Series")
+        .expect("live catalog should contain a playable media item or series");
+    api.load_media_detail(session, &series.id)
+        .expect("live series detail should load")
+        .episodes
+        .into_iter()
+        .find(MediaCard::is_playable)
+        .map(|card| card.id)
+        .expect("live series detail should contain a playable episode")
+}
+
 struct MpvGuard;
 
 impl Drop for MpvGuard {
@@ -49,24 +172,18 @@ struct LiveExternalSubtitle {
 #[test]
 #[ignore = "opens a native window and requires an explicitly configured live account"]
 fn decodes_first_live_video_frame_through_native_load_path() {
-    let media_id = required_env("MEDIASTATION_LIVE_MEDIA_ID");
     let user_agent = "MediaStationWindowsLivePlayback/0.1";
-    let session = MediaStationSession::new(
-        Url::parse(&required_env("MEDIASTATION_LIVE_BASE_URL"))
-            .expect("live base URL should parse"),
-        required_env("MEDIASTATION_LIVE_USER_ID"),
-        required_env("MEDIASTATION_LIVE_TOKEN"),
-        required_env("MEDIASTATION_LIVE_AUTHORIZATION"),
-    )
-    .expect("live session should be valid");
+    let profile = live_connection_profile();
     let api = MediaStationApiClient::new(user_agent).expect("API client should initialize");
+    let session = live_session(&api, profile);
+    let media_id = live_media_id(&api, &session);
     let source = api
         .load_playback_source(&session, &media_id)
         .expect("live PlaybackInfo should load");
     let preference = api
-        .load_playback_preference(&session, &media_id)
+        .load_playback_preference(&session, &media_id, &source)
         .expect("live PlaybackPreferences should load");
-    let track_plan = build_playback_track_plan(&source, &preference);
+    let track_plan = build_playback_track_plan(&source, &preference.preference);
     let external_subtitle = track_plan.external_subtitle_url.as_ref().map(|url| {
         let key = track_plan
             .subtitle_track_key
@@ -105,11 +222,19 @@ fn decodes_first_live_video_frame_through_native_load_path() {
         }
     });
     let input = session
-        .playback_resolve_input(&media_id, source.url.clone(), user_agent)
+        .playback_resolve_input(
+            &media_id,
+            source.url.clone(),
+            profile.client.user_agent(user_agent),
+        )
         .expect("live resolve input should be valid");
     let playback = PlaybackSessionResolver::new(UreqTransport::new())
         .resolve(&input)
         .expect("live playback URL should resolve and pass the Range probe");
+    let playback_proxy = api
+        .playback_proxy_url(&session)
+        .expect("live playback proxy should be available")
+        .map(|value| CString::new(value).expect("live playback proxy should not contain NUL"));
 
     let boot = JfnMpvBoot {
         display_backend: DisplayBackend::Other as u8,
@@ -161,6 +286,9 @@ fn decodes_first_live_video_frame_through_native_load_path() {
             .as_ref()
             .map_or(c"".as_ptr(), |subtitle| subtitle.path.as_ptr()),
         http_header_fields: header_fields.as_ptr(),
+        http_proxy: playback_proxy
+            .as_ref()
+            .map_or(c"".as_ptr(), |value| value.as_ptr()),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
         subtitle_style_override: false,
@@ -201,7 +329,7 @@ fn decodes_first_live_video_frame_through_native_load_path() {
         "libmpv should expose a decoded video frame within 45 seconds"
     );
 
-    let external_subtitle_loaded = if external_subtitle.is_some() {
+    let subtitle_track_selected = if track_plan.subtitle_track != 0 {
         let subtitle_deadline = Instant::now() + Duration::from_secs(5);
         let mut selected = false;
         while Instant::now() < subtitle_deadline && !selected {
@@ -213,12 +341,13 @@ fn decodes_first_live_video_frame_through_native_load_path() {
         }
         assert!(
             selected,
-            "external subtitle should be selected within 5 seconds"
+            "configured subtitle should be selected within 5 seconds"
         );
         true
     } else {
         false
     };
+    let external_subtitle_loaded = external_subtitle.is_some() && subtitle_track_selected;
     let reporting_verified = env::var("MEDIASTATION_LIVE_VERIFY_REPORTING").as_deref() == Ok("1");
     if reporting_verified {
         let restore_position_ms = required_env("MEDIASTATION_LIVE_RESTORE_POSITION_MS")
@@ -247,6 +376,7 @@ fn decodes_first_live_video_frame_through_native_load_path() {
             "decodedPrimaries": mpv_property(c"video-params/primaries"),
             "decodedTransfer": mpv_property(c"video-params/gamma"),
             "decodedColorMatrix": mpv_property(c"video-params/colormatrix"),
+            "subtitleTrackSelected": subtitle_track_selected,
             "externalSubtitleLoaded": external_subtitle_loaded,
             "externalSubtitleBytes": external_subtitle.as_ref().map(|value| value.byte_count),
             "externalSubtitleRedirectCount": external_subtitle.as_ref().map(|value| value.redirect_count),

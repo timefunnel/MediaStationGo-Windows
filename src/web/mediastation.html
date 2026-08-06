@@ -22,6 +22,25 @@
         <p class="eyebrow">WINDOWS PLAYER</p>
         <h1 id="login-title">登录媒体服务器</h1>
         <label>服务器地址<input id="server-url" name="server" type="url" inputmode="url" placeholder="https://example.com" required></label>
+        <fieldset class="login-connection-fieldset">
+          <legend>服务器类型</legend>
+          <div class="login-server-type" role="radiogroup" aria-label="服务器类型">
+            <label><input type="radio" name="server-type" value="mediastation_go" checked><span>MediaStationGo</span></label>
+            <label><input type="radio" name="server-type" value="standard_emby"><span>标准 Emby</span></label>
+          </div>
+        </fieldset>
+        <label id="emby-client-profile-field" class="hidden">客户端身份
+          <select id="emby-client-profile" name="client-profile">
+            <option value="senplayer">SenPlayer</option>
+            <option value="infuse">Infuse</option>
+          </select>
+        </label>
+        <label>代理方式
+          <select id="login-proxy-mode" name="proxy-mode">
+            <option value="direct">直连</option>
+            <option value="system">系统代理</option>
+          </select>
+        </label>
         <label>用户名<input id="username" name="username" autocomplete="username" required></label>
         <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
         <div class="login-actions">
@@ -126,9 +145,23 @@
         <div id="saved-accounts-list" class="saved-accounts-list"></div>
       </section>
       <button id="change-account-button" class="secondary-command drawer-command" type="button">添加账号</button>
-      <button id="logout-button" class="danger-command" type="button">退出当前账号</button>
     </div>
   </aside>
+  <div id="account-delete-scrim" class="modal-scrim hidden">
+    <section id="account-delete-dialog" class="account-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="account-delete-title">
+      <header>
+        <h2 id="account-delete-title">删除账号</h2>
+        <button id="account-delete-close" class="icon-button" type="button" title="关闭" aria-label="关闭">&#10005;</button>
+      </header>
+      <div class="account-delete-body">
+        <p id="account-delete-message"></p>
+        <div class="account-delete-actions">
+          <button id="account-delete-cancel" class="secondary-command" type="button">取消</button>
+          <button id="account-delete-confirm" class="danger-command" type="button">删除账号</button>
+        </div>
+      </div>
+    </section>
+  </div>
   <aside id="settings-drawer" class="drawer" aria-hidden="true">
     <header><h2>设置</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
     <div class="drawer-body settings-list">

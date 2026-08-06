@@ -49,7 +49,7 @@ sha2 = "0.10"
 slotmap = "1"
 tempfile = "3"
 tracing = "0.1"
-ureq = "=3.3.0"
+ureq = { version = "=3.3.0", features = ["win-system-proxy"] }
 url = "=2.5.8"
 windows = "0.62"
 windows-core = "0.62"

@@ -469,6 +469,8 @@ pub struct JfnMpvLoadOptions {
     pub external_sub_url: *const c_char,
     /// Comma-separated mpv `http-header-fields` string-list value.
     pub http_header_fields: *const c_char,
+    /// Per-file HTTP proxy URL. Empty keeps mpv's direct/default path.
+    pub http_proxy: *const c_char,
     /// Per-file video filter chain. Empty preserves the normal player path.
     pub video_filter: *const c_char,
     /// Per-file hardware decoder mode. Empty preserves the configured mode.
@@ -563,6 +565,7 @@ pub unsafe fn jfn_mpv_load_file(
     let ext_audio = unsafe { cstr_to_string(o.external_audio_url) };
     let ext_sub = unsafe { cstr_to_string(o.external_sub_url) };
     let http_header_fields = unsafe { cstr_to_string(o.http_header_fields) };
+    let http_proxy = unsafe { cstr_to_string(o.http_proxy) };
     let video_filter = unsafe { cstr_to_string(o.video_filter) };
     let hwdec = unsafe { cstr_to_string(o.hwdec) };
     let defer_audio =
@@ -586,6 +589,9 @@ pub unsafe fn jfn_mpv_load_file(
     }
     if !http_header_fields.is_empty() {
         load_options.push(("http-header-fields".to_string(), http_header_fields));
+    }
+    if !http_proxy.is_empty() {
+        load_options.push(("http-proxy".to_string(), http_proxy));
     }
     if !video_filter.is_empty() {
         load_options.push(("vf".to_string(), video_filter));

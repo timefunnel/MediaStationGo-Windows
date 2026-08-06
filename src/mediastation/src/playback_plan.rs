@@ -186,11 +186,14 @@ mod tests {
         PlaybackSource {
             media_id: "media-1".to_string(),
             url: Url::parse("https://media.example/video").expect("URL should parse"),
+            standard_emby_stream: false,
             server_credential_query_removed: false,
             container: Some("mkv".to_string()),
             bitrate: None,
-            media_source_id: "source-1".to_string(),
-            play_session_id: "session-1".to_string(),
+            media_source_id: Some("source-1".to_string()),
+            play_session_id: Some("session-1".to_string()),
+            default_audio_stream_index: None,
+            default_subtitle_stream_index: None,
             video: None,
             subtitles: vec![
                 SubtitleTrack {

@@ -11,23 +11,38 @@ tracked in [windows-rife-tensorrt-profiles.md](windows-rife-tensorrt-profiles.md
 
 The Spike must prove these paths before product UI work expands:
 
-1. Resolve PlaybackInfo streams through an explicit redirect chain.
-2. Reuse the final CDN URL for the playback session.
-3. Keep server credentials on the MediaStationGo origin only.
+1. Resolve standard Emby and MediaStationGo PlaybackInfo streams through an
+   explicit redirect chain.
+2. Reuse the final server or CDN URL for the playback session.
+3. Keep server credentials on the configured server origin only.
 4. Probe the final URL with `Range: bytes=0-0` and report failures explicitly.
 5. Pass session headers to libmpv without exposing tokens to JavaScript.
 6. Validate SDR and HDR10 output, subtitle composition, and track switching on a
    real Windows HDR display.
 
+Standard Emby is the baseline playback contract. The client uses
+`MediaSources[].Container`, `MediaSources[].Id`, `PlaySessionId`, and the
+default stream indexes to construct
+`/Videos/{Id}/stream?Container=...&Static=true`. The server filesystem
+`Path` is metadata only and is never exposed to mpv or the renderer.
+MediaStationGo may additionally provide `DirectStreamUrl` and
+`PlaybackPreferences`; those are optional extensions, not requirements for
+standard Emby playback. When `DirectStreamUrl` is present, it remains the
+authoritative MediaStationGo source and the standard URL constructor is not
+used.
+
 ## Ownership Boundaries
 
 Rust owns:
 
-- MediaStationGo authentication and API requests.
-- PlaybackInfo parsing and stable track identifiers.
+- MediaStationGo and standard Emby authentication and API requests.
+- Standard Emby and MediaStationGo PlaybackInfo parsing and stable track
+  identifiers.
 - Redirect handling, CDN URL expiry, Range probing, and session reuse.
 - Playing, Progress, and Stopped reports.
-- PlaybackPreferences reads and writes.
+- Optional PlaybackPreferences reads and writes. A standard Emby server without
+  that extension uses PlaybackInfo defaults and keeps track changes for the
+  current native session only.
 - Sensitive headers and the libmpv load request.
 
 The packaged CEF frontend owns:
@@ -44,8 +59,8 @@ metadata.
 ## Native Account Session
 
 Authentication is native-owned. The renderer may submit a server URL,
-username, and password to the native login IPC, but it never receives the
-resulting token or authorization header. The native API calls
+username, password, client profile, and proxy mode to the native login IPC, but
+it never receives the resulting token or authorization header. The native API calls
 `Users/AuthenticateByName`, validates the returned account fields, constructs
 the authenticated header, and configures playback only after persistence has
 succeeded.
@@ -58,6 +73,16 @@ only an opaque selector; the renderer cannot derive or receive the token from
 it. The regular JSON settings file contains no account secret; its only
 account-related value is the selected server URL.
 
+Credential payload schema v2 stores the connection profile with the secret.
+Schema v1 credentials remain readable and migrate as `mediastation_go` with
+`direct` proxy mode. Supported combinations are intentionally closed:
+MediaStationGo always uses its original client identity and defaults to
+explicit direct agents, while allowing an explicit system-proxy selection;
+standard Emby uses either the SenPlayer or Infuse identity and follows the
+same per-server proxy selection (direct by default). API requests, redirect/
+Range probes, subtitles,
+playback reporting, and mpv HTTP playback all use that per-server profile.
+
 Startup restores the active credential only when its exact normalized server
 URL matches the selected server. It also creates or refreshes that account's
 per-account credential as a migration step, so installations with the former
@@ -66,8 +91,9 @@ unreadable, mismatched, or target/content-inconsistent credentials fail
 explicitly and are not silently deleted or skipped.
 
 The account drawer enumerates the per-account Credential Manager entries with a
-target-prefix filter and receives only `accountId`, `baseUrl`, `userId`, and
-`userName`. Selecting an account reads that exact credential by stable ID,
+target-prefix filter and groups users by normalized server URL. It receives
+only `accountId`, `serverId`, `baseUrl`, `userId`, `userName`, `serverType`,
+`clientProfile`, and `proxyMode`. Selecting an account reads that exact credential by stable ID,
 revalidates its identity, updates the active session, invalidates in-flight
 native work, and reloads the catalog. There is no renderer-side account store,
 token cache, fallback account, or list-index identity.
@@ -76,6 +102,11 @@ The drawer can also start a new login while retaining the active native
 session. Cancel returns to the original account, page, and focus target. A
 successful authentication upserts that account's secure entry and makes it
 active; it does not remove the other saved accounts.
+Adding a user under an existing server inherits and locks that server's
+connection profile. Updating a user re-authenticates only that stable account
+and cannot change the server profile. Deleting an inactive account leaves the
+active session untouched; deleting the active account clears the active session
+only after both credential deletions succeed.
 
 Login commits, saved-account switches, and logout are serialized under the
 native session generation. If logout or another account change happens while a
@@ -91,18 +122,24 @@ Other saved accounts remain available.
 The renderer-facing account calls are:
 
 ```javascript
-window.jmpNative.mediaStationAuthenticate(requestId, baseUrl, username, password);
+window.jmpNative.mediaStationAuthenticate(
+  requestId, baseUrl, username, password, clientProfile, proxyMode
+);
 window.jmpNative.mediaStationSessionStatus(requestId);
 window.jmpNative.mediaStationListAccounts(requestId);
 window.jmpNative.mediaStationSwitchAccount(requestId, accountId);
+window.jmpNative.mediaStationUpdateAccount(
+  requestId, accountId, username, password, clientProfile, proxyMode
+);
+window.jmpNative.mediaStationDeleteAccount(requestId, accountId);
 window.jmpNative.mediaStationLogout(requestId);
 ```
 
 They respond through `_onMediaStationResponse` with operations
-`authenticate`, `session_status`, `list_accounts`, `switch_account`, and
-`logout`. Account status payloads contain only `configured`, `persisted`,
-`baseUrl`, `userId`, and `userName`; the list adds only the opaque `accountId`.
-Logout also reports whether a stored credential was deleted.
+`authenticate`, `session_status`, `list_accounts`, `switch_account`,
+`update_account`, `delete_account`, and `logout`. No response contains a token,
+password, or authorization header. Logout also reports whether a stored
+credential was deleted.
 
 ## Native Async Load IPC
 
@@ -116,8 +153,9 @@ The renderer starts a load with:
 window.jmpNative.mediaStationLoad(requestId, mediaId, startMilliseconds);
 ```
 
-The browser process performs PlaybackInfo, PlaybackPreferences, redirect, and
-Range work on a background thread. Only one load request may resolve at a time.
+The browser process performs PlaybackInfo, optional PlaybackPreferences,
+redirect, and Range work on a background thread. Only one load request may
+resolve at a time.
 Duplicate or concurrent requests receive explicit errors instead of spawning
 unbounded network work.
 
@@ -186,6 +224,16 @@ shows the one authoritative server track.
 - A cross-origin final URL is accepted only after the server redirect chain and
   only when byte ranges are supported.
 - Direct CDN sessions contain no private server headers.
+- Standard Emby requests require a configured Windows system proxy. Its mpv
+  HTTP loads receive the proxy as a per-file `http-proxy` option. MediaStationGo
+  defaults to explicit direct API/probe agents and the `mediastation://` stream
+  reader, preserving the existing direct MSG chain; an explicit MSG system
+  proxy profile applies to both.
+- Same-origin streams constructed from the standard Emby contract are handed
+  to mpv as ordinary HTTP URLs so `X-Emby-Token` and
+  `X-Emby-Authorization` are applied to every range request. The existing
+  MediaStationGo `DirectStreamUrl` path remains on the native
+  `mediastation://` reader, including its cross-origin CDN behavior.
 - External subtitle responses are limited to 16 MiB and use an explicit format
   allowlist. Empty, oversized, unknown-format, or insecurely redirected
   subtitles fail without silently disabling the saved subtitle preference.

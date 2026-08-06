@@ -1,6 +1,8 @@
+use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -17,10 +19,135 @@ const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropI
 const MAX_CATALOG_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaStationClientProfile {
+    MediaStationGo,
+    SenPlayer,
+    Infuse,
+}
+
+impl MediaStationClientProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaStationGo => "mediastation_go",
+            Self::SenPlayer => "senplayer",
+            Self::Infuse => "infuse",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "mediastation_go" => Some(Self::MediaStationGo),
+            "senplayer" => Some(Self::SenPlayer),
+            "infuse" => Some(Self::Infuse),
+            _ => None,
+        }
+    }
+
+    pub const fn server_type(self) -> &'static str {
+        match self {
+            Self::MediaStationGo => "mediastation_go",
+            Self::SenPlayer | Self::Infuse => "standard_emby",
+        }
+    }
+
+    pub const fn authorization_client(self) -> &'static str {
+        match self {
+            Self::MediaStationGo => "MediaStation Windows",
+            Self::SenPlayer => "SenPlayer",
+            Self::Infuse => "Infuse",
+        }
+    }
+
+    pub const fn authorization_version(self, media_station_version: &'static str) -> &'static str {
+        match self {
+            Self::MediaStationGo => media_station_version,
+            Self::SenPlayer | Self::Infuse => "1.0.0",
+        }
+    }
+
+    pub fn user_agent<'a>(self, media_station_user_agent: &'a str) -> &'a str {
+        match self {
+            Self::MediaStationGo => media_station_user_agent,
+            Self::SenPlayer => "SenPlayer/1.0.0",
+            Self::Infuse => "Infuse/1.0.0",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaStationProxyMode {
+    Direct,
+    System,
+}
+
+impl MediaStationProxyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::System => "system",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(Self::Direct),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaStationConnectionProfile {
+    pub client: MediaStationClientProfile,
+    pub proxy: MediaStationProxyMode,
+}
+
+impl MediaStationConnectionProfile {
+    pub const fn media_station_go() -> Self {
+        Self {
+            client: MediaStationClientProfile::MediaStationGo,
+            proxy: MediaStationProxyMode::Direct,
+        }
+    }
+
+    pub const fn standard_emby(client: MediaStationClientProfile) -> Option<Self> {
+        match client {
+            MediaStationClientProfile::MediaStationGo => None,
+            MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => {
+                Some(Self {
+                    client,
+                    proxy: MediaStationProxyMode::Direct,
+                })
+            }
+        }
+    }
+
+    pub const fn is_supported(self) -> bool {
+        matches!(
+            self.client,
+            MediaStationClientProfile::MediaStationGo
+                | MediaStationClientProfile::SenPlayer
+                | MediaStationClientProfile::Infuse
+        ) && matches!(
+            self.proxy,
+            MediaStationProxyMode::Direct | MediaStationProxyMode::System
+        )
+    }
+}
+
+impl Default for MediaStationConnectionProfile {
+    fn default() -> Self {
+        Self::media_station_go()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MediaStationSession {
     pub base_url: Url,
     pub user_id: String,
+    pub connection: MediaStationConnectionProfile,
     token: String,
     authorization: String,
 }
@@ -32,6 +159,28 @@ impl MediaStationSession {
         token: impl Into<String>,
         authorization: impl Into<String>,
     ) -> Result<Self, ApiError> {
+        Self::new_with_profile(
+            base_url,
+            user_id,
+            token,
+            authorization,
+            MediaStationConnectionProfile::media_station_go(),
+        )
+    }
+
+    pub fn new_with_profile(
+        base_url: Url,
+        user_id: impl Into<String>,
+        token: impl Into<String>,
+        authorization: impl Into<String>,
+        connection: MediaStationConnectionProfile,
+    ) -> Result<Self, ApiError> {
+        if !connection.is_supported() {
+            return Err(ApiError::InvalidInput {
+                field: "connection_profile",
+                reason: "client and proxy mode combination is not supported".to_string(),
+            });
+        }
         validate_http_url("base_url", &base_url)?;
         if base_url.query().is_some() || base_url.fragment().is_some() {
             return Err(ApiError::InvalidInput {
@@ -48,6 +197,7 @@ impl MediaStationSession {
         Ok(Self {
             base_url,
             user_id,
+            connection,
             token,
             authorization,
         })
@@ -66,6 +216,7 @@ impl MediaStationSession {
             server_base_url: self.base_url.clone(),
             user_agent: user_agent.into(),
             auth: ServerAuth::new(self.token.clone(), self.authorization.clone())?,
+            proxy_mode: self.connection.proxy,
         })
     }
 
@@ -80,6 +231,7 @@ impl fmt::Debug for MediaStationSession {
             .debug_struct("MediaStationSession")
             .field("base_url", &self.base_url)
             .field("user_id", &self.user_id)
+            .field("connection", &self.connection)
             .field("token", &"<redacted>")
             .field("authorization", &"<redacted>")
             .finish()
@@ -221,11 +373,14 @@ pub struct MediaImage {
 pub struct PlaybackSource {
     pub media_id: String,
     pub url: Url,
+    pub standard_emby_stream: bool,
     pub server_credential_query_removed: bool,
     pub container: Option<String>,
     pub bitrate: Option<u64>,
-    pub media_source_id: String,
-    pub play_session_id: String,
+    pub media_source_id: Option<String>,
+    pub play_session_id: Option<String>,
+    pub default_audio_stream_index: Option<i64>,
+    pub default_subtitle_stream_index: Option<i64>,
     pub video: Option<VideoStream>,
     pub subtitles: Vec<SubtitleTrack>,
     pub audio_tracks: Vec<AudioTrack>,
@@ -299,36 +454,110 @@ pub struct PlaybackTrackPreferenceUpdate {
     pub audio_track_key: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackPreferencePersistence {
+    ServerExtension,
+    SessionOnly,
+}
+
+impl PlaybackPreferencePersistence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerExtension => "server_extension",
+            Self::SessionOnly => "session_only",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackTrackPreferenceState {
+    pub preference: PlaybackTrackPreference,
+    pub persistence: PlaybackPreferencePersistence,
+}
+
 #[derive(Clone)]
 pub struct MediaStationApiClient {
-    agent: ureq::Agent,
+    direct_agent: ureq::Agent,
+    system_proxy_agent: Arc<Mutex<Option<CachedSystemProxyAgent>>>,
     user_agent: String,
+}
+
+struct CachedSystemProxyAgent {
+    proxy_url: String,
+    agent: ureq::Agent,
 }
 
 impl MediaStationApiClient {
     pub fn new(user_agent: impl Into<String>) -> Result<Self, ApiError> {
         let user_agent = user_agent.into();
         validate_non_empty("user_agent", &user_agent)?;
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(Duration::from_secs(20)))
-            .build();
         Ok(Self {
-            agent: ureq::Agent::new_with_config(config),
+            direct_agent: build_api_agent(None),
+            system_proxy_agent: Arc::new(Mutex::new(None)),
             user_agent,
         })
     }
 
-    pub fn authenticate(
+    fn agent_for_profile(
+        &self,
+        profile: MediaStationConnectionProfile,
+    ) -> Result<ureq::Agent, ApiError> {
+        match profile.proxy {
+            MediaStationProxyMode::Direct => Ok(self.direct_agent.clone()),
+            MediaStationProxyMode::System => {
+                let proxy = ureq::Proxy::try_from_env().ok_or(ApiError::SystemProxyUnavailable)?;
+                let proxy_url = proxy.uri().to_string();
+                let mut cached = self.system_proxy_agent.lock();
+                if let Some(cached) = cached.as_ref()
+                    && cached.proxy_url == proxy_url
+                {
+                    return Ok(cached.agent.clone());
+                }
+                let agent = build_api_agent(Some(proxy));
+                *cached = Some(CachedSystemProxyAgent {
+                    proxy_url,
+                    agent: agent.clone(),
+                });
+                Ok(agent)
+            }
+        }
+    }
+
+    fn agent_for_session(&self, session: &MediaStationSession) -> Result<ureq::Agent, ApiError> {
+        self.agent_for_profile(session.connection)
+    }
+
+    fn user_agent_for_profile(&self, profile: MediaStationConnectionProfile) -> &str {
+        profile.client.user_agent(&self.user_agent)
+    }
+
+    pub fn playback_proxy_url(
+        &self,
+        session: &MediaStationSession,
+    ) -> Result<Option<String>, ApiError> {
+        match session.connection.proxy {
+            MediaStationProxyMode::Direct => Ok(None),
+            MediaStationProxyMode::System => {
+                let proxy = ureq::Proxy::try_from_env().ok_or(ApiError::SystemProxyUnavailable)?;
+                Ok(Some(proxy.uri().to_string()))
+            }
+        }
+    }
+
+    pub fn authenticate_with_profile(
         &self,
         base_url: &Url,
         username: &str,
         password: &str,
         authorization: &str,
+        profile: MediaStationConnectionProfile,
     ) -> Result<AuthenticationResult, ApiError> {
+        if !profile.is_supported() {
+            return Err(ApiError::InvalidInput {
+                field: "connection_profile",
+                reason: "client and proxy mode combination is not supported".to_string(),
+            });
+        }
         validate_http_url("base_url", base_url)?;
         if base_url.query().is_some() || base_url.fragment().is_some() {
             return Err(ApiError::InvalidInput {
@@ -344,10 +573,10 @@ impl MediaStationApiClient {
             "Username": username.trim(),
             "Pw": password,
         });
-        let response = self
-            .agent
+        let agent = self.agent_for_profile(profile)?;
+        let response = agent
             .post(url.as_str())
-            .header(HEADER_USER_AGENT, &self.user_agent)
+            .header(HEADER_USER_AGENT, self.user_agent_for_profile(profile))
             .header(HEADER_EMBY_AUTHORIZATION, authorization)
             .header("content-type", "application/json; charset=utf-8")
             .send(payload.to_string())
@@ -370,11 +599,27 @@ impl MediaStationApiClient {
         })
     }
 
+    pub fn authenticate(
+        &self,
+        base_url: &Url,
+        username: &str,
+        password: &str,
+        authorization: &str,
+    ) -> Result<AuthenticationResult, ApiError> {
+        self.authenticate_with_profile(
+            base_url,
+            username,
+            password,
+            authorization,
+            MediaStationConnectionProfile::media_station_go(),
+        )
+    }
+
     pub fn load_home(&self, session: &MediaStationSession) -> Result<MediaHome, ApiError> {
         let libraries_url = endpoint(&session.base_url, &["Users", &session.user_id, "Views"])?;
         let libraries = parse_media_cards(&self.get_json(session, &libraries_url)?)?;
 
-        let mut resume_url = endpoint(&session.base_url, &["Items", "Resume"])?;
+        let mut resume_url = resume_endpoint(session)?;
         resume_url
             .query_pairs_mut()
             .append_pair("UserId", &session.user_id)
@@ -385,10 +630,10 @@ impl MediaStationApiClient {
         let latest_by_library = libraries
             .iter()
             .map(|library| {
-                self.load_library_page(session, &library.id, 0, 18)
-                    .map(|page| MediaLibrarySection {
+                self.load_latest_items(session, &library.id, 18)
+                    .map(|items| MediaLibrarySection {
                         library: library.clone(),
-                        items: page.items,
+                        items,
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -407,6 +652,30 @@ impl MediaStationApiClient {
             latest,
             latest_by_library,
         })
+    }
+
+    fn load_latest_items(
+        &self,
+        session: &MediaStationSession,
+        parent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MediaCard>, ApiError> {
+        if session.connection.client == MediaStationClientProfile::MediaStationGo {
+            return self
+                .load_library_page(session, parent_id, 0, limit)
+                .map(|page| page.items);
+        }
+        validate_identifier("parent_id", parent_id)?;
+        validate_page(0, limit)?;
+        let mut url = endpoint(
+            &session.base_url,
+            &["Users", &session.user_id, "Items", "Latest"],
+        )?;
+        url.query_pairs_mut()
+            .append_pair("ParentId", parent_id)
+            .append_pair("Limit", &limit.to_string())
+            .append_pair("Fields", CATALOG_FIELDS);
+        parse_media_cards(&self.get_json(session, &url)?)
     }
 
     pub fn load_library_page(
@@ -446,6 +715,12 @@ impl MediaStationApiClient {
             .append_pair("SortBy", "DateCreated")
             .append_pair("SortOrder", "Descending")
             .append_pair("Fields", CATALOG_FIELDS);
+        if session.connection.client != MediaStationClientProfile::MediaStationGo {
+            query.append_pair("Recursive", "true");
+            if item_type.is_none() {
+                query.append_pair("IncludeItemTypes", "Movie,Series,Video,MusicVideo,BoxSet");
+            }
+        }
         if let Some(item_type) = item_type {
             query.append_pair("IncludeItemTypes", item_type);
         }
@@ -544,25 +819,32 @@ impl MediaStationApiClient {
         media_id: &str,
     ) -> Result<MediaDetail, ApiError> {
         validate_identifier("media_id", media_id)?;
-        let mut url = endpoint(&session.base_url, &["Items", media_id])?;
-        url.query_pairs_mut()
-            .append_pair("UserId", &session.user_id)
-            .append_pair("Fields", CATALOG_FIELDS);
+        let mut url = media_detail_endpoint(session, media_id)?;
+        let mut detail_query = url.query_pairs_mut();
+        if session.connection.client == MediaStationClientProfile::MediaStationGo {
+            detail_query.append_pair("UserId", &session.user_id);
+        }
+        detail_query.append_pair("Fields", CATALOG_FIELDS);
+        drop(detail_query);
         let detail_payload = self.get_json(session, &url)?;
         let item = parse_media_card(&detail_payload)?;
         let people = parse_media_people(&detail_payload)?;
         let mut episodes = if item.media_type == "Series" {
-            let mut episodes_url = endpoint(&session.base_url, &["Items"])?;
-            episodes_url
-                .query_pairs_mut()
+            let mut episodes_url = series_episodes_endpoint(session, media_id)?;
+            let mut episodes_query = episodes_url.query_pairs_mut();
+            episodes_query
                 .append_pair("UserId", &session.user_id)
-                .append_pair("ParentId", media_id)
-                .append_pair("Recursive", "true")
-                .append_pair("IncludeItemTypes", "Episode")
                 .append_pair("Limit", &MAX_DETAIL_EPISODES.to_string())
                 .append_pair("SortBy", "ParentIndexNumber,IndexNumber,SortName")
                 .append_pair("SortOrder", "Ascending")
                 .append_pair("Fields", CATALOG_FIELDS);
+            if session.connection.client == MediaStationClientProfile::MediaStationGo {
+                episodes_query
+                    .append_pair("ParentId", media_id)
+                    .append_pair("Recursive", "true")
+                    .append_pair("IncludeItemTypes", "Episode");
+            }
+            drop(episodes_query);
             parse_media_cards(&self.get_json(session, &episodes_url)?)?
         } else {
             Vec::new()
@@ -610,10 +892,13 @@ impl MediaStationApiClient {
             .append_pair("tag", &image.tag)
             .append_pair("maxWidth", &max_width.to_string())
             .append_pair("quality", "86");
-        let mut response = self
-            .agent
+        let agent = self.agent_for_session(session)?;
+        let mut response = agent
             .get(url.as_str())
-            .header(HEADER_USER_AGENT, &self.user_agent)
+            .header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            )
             .header(HEADER_EMBY_TOKEN, &session.token)
             .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
             .call()
@@ -732,13 +1017,26 @@ impl MediaStationApiClient {
         &self,
         session: &MediaStationSession,
         media_id: &str,
-    ) -> Result<PlaybackTrackPreference, ApiError> {
+        source: &PlaybackSource,
+    ) -> Result<PlaybackTrackPreferenceState, ApiError> {
         validate_non_empty("media_id", media_id)?;
         let url = endpoint(
             &session.base_url,
             &["Items", media_id, "PlaybackPreferences"],
         )?;
-        parse_preference(&self.get_json(session, &url)?)
+        match self.get_json(session, &url) {
+            Ok(payload) => Ok(PlaybackTrackPreferenceState {
+                preference: parse_preference(&payload)?,
+                persistence: PlaybackPreferencePersistence::ServerExtension,
+            }),
+            Err(ApiError::HttpStatus {
+                status_code: 404, ..
+            }) => Ok(PlaybackTrackPreferenceState {
+                preference: standard_emby_preference(source),
+                persistence: PlaybackPreferencePersistence::SessionOnly,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn update_playback_preference(
@@ -790,12 +1088,13 @@ impl MediaStationApiClient {
 
         let mut current = url.clone();
         let mut redirect_count = 0;
+        let agent = self.agent_for_session(session)?;
         loop {
             reject_cross_origin_private_query(session, &current)?;
-            let mut request = self
-                .agent
-                .get(current.as_str())
-                .header(HEADER_USER_AGENT, &self.user_agent);
+            let mut request = agent.get(current.as_str()).header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            );
             if same_origin(&session.base_url, &current) {
                 request = request
                     .header(HEADER_EMBY_TOKEN, &session.token)
@@ -912,24 +1211,46 @@ impl MediaStationApiClient {
         paused: bool,
     ) -> Result<(), ApiError> {
         let url = endpoint_from_path(&session.base_url, path)?;
-        let payload = json!({
-            "ItemId": source.media_id,
-            "MediaSourceId": source.media_source_id,
-            "PlaySessionId": source.play_session_id,
-            "PositionTicks": position_ms.saturating_mul(10_000),
-            "IsPaused": paused,
-            "CanSeek": true,
-            "PlayMethod": "DirectPlay",
-            "RepeatMode": "RepeatNone",
-        });
-        self.post_json_empty(session, &url, &payload)
+        let mut payload = Map::from_iter([
+            ("ItemId".to_string(), Value::String(source.media_id.clone())),
+            (
+                "PositionTicks".to_string(),
+                Value::from(position_ms.saturating_mul(10_000)),
+            ),
+            ("IsPaused".to_string(), Value::Bool(paused)),
+            ("CanSeek".to_string(), Value::Bool(true)),
+            (
+                "PlayMethod".to_string(),
+                Value::String("DirectPlay".to_string()),
+            ),
+            (
+                "RepeatMode".to_string(),
+                Value::String("RepeatNone".to_string()),
+            ),
+        ]);
+        if let Some(media_source_id) = &source.media_source_id {
+            payload.insert(
+                "MediaSourceId".to_string(),
+                Value::String(media_source_id.clone()),
+            );
+        }
+        if let Some(play_session_id) = &source.play_session_id {
+            payload.insert(
+                "PlaySessionId".to_string(),
+                Value::String(play_session_id.clone()),
+            );
+        }
+        self.post_json_empty(session, &url, &Value::Object(payload))
     }
 
     fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {
-        let response = self
-            .agent
+        let agent = self.agent_for_session(session)?;
+        let response = agent
             .get(url.as_str())
-            .header(HEADER_USER_AGENT, &self.user_agent)
+            .header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            )
             .header(HEADER_EMBY_TOKEN, &session.token)
             .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
             .call()
@@ -943,10 +1264,13 @@ impl MediaStationApiClient {
         url: &Url,
         payload: &Value,
     ) -> Result<Value, ApiError> {
-        let response = self
-            .agent
+        let agent = self.agent_for_session(session)?;
+        let response = agent
             .put(url.as_str())
-            .header(HEADER_USER_AGENT, &self.user_agent)
+            .header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            )
             .header(HEADER_EMBY_TOKEN, &session.token)
             .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
             .header("content-type", "application/json; charset=utf-8")
@@ -961,10 +1285,13 @@ impl MediaStationApiClient {
         url: &Url,
         payload: &Value,
     ) -> Result<(), ApiError> {
-        let mut response = self
-            .agent
+        let agent = self.agent_for_session(session)?;
+        let mut response = agent
             .post(url.as_str())
-            .header(HEADER_USER_AGENT, &self.user_agent)
+            .header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            )
             .header(HEADER_EMBY_TOKEN, &session.token)
             .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
             .header("content-type", "application/json; charset=utf-8")
@@ -980,6 +1307,18 @@ impl MediaStationApiClient {
             })?;
         ensure_success(url, status_code, &body)
     }
+}
+
+fn build_api_agent(proxy: Option<ureq::Proxy>) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
+        .proxy(proxy)
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 fn inherit_episode_landscape_images(series: &MediaCard, episodes: &mut [MediaCard]) {
@@ -1014,6 +1353,7 @@ pub enum ApiError {
     InvalidEndpoint {
         message: String,
     },
+    SystemProxyUnavailable,
     Transport {
         url: String,
         message: String,
@@ -1071,6 +1411,9 @@ impl fmt::Display for ApiError {
             }
             Self::InvalidEndpoint { message } => {
                 write!(formatter, "invalid API endpoint: {message}")
+            }
+            Self::SystemProxyUnavailable => {
+                formatter.write_str("the configured system HTTP proxy is unavailable")
             }
             Self::Transport { url, message } => {
                 write!(formatter, "API request failed for {url}: {message}")
@@ -1466,25 +1809,46 @@ fn parse_playback_source(
     media_id: &str,
     payload: &Value,
 ) -> Result<PlaybackSource, ApiError> {
-    let source = payload
+    let sources = payload
         .get("MediaSources")
         .and_then(Value::as_array)
-        .and_then(|sources| sources.first())
-        .and_then(Value::as_object)
         .ok_or(ApiError::MissingField {
-            field: "MediaSources[0]",
+            field: "MediaSources",
         })?;
-    let raw_url = optional_string(source.get("DirectStreamUrl"))
-        .or_else(|| optional_string(source.get("Path")))
+    let source = sources
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|source| optional_string(source.get("DirectStreamUrl")).is_some())
+        .or_else(|| {
+            sources.iter().filter_map(Value::as_object).find(|source| {
+                source
+                    .get("SupportsDirectPlay")
+                    .is_none_or(|value| value.as_bool() != Some(false))
+            })
+        })
         .ok_or(ApiError::MissingField {
-            field: "MediaSources[0].DirectStreamUrl/Path",
+            field: "MediaSources[0].SupportsDirectPlay",
         })?;
-    let url = resolve_server_url(&session.base_url, &raw_url)?;
-    validate_http_url("media_url", &url)?;
-    let (url, server_credential_query_removed) =
-        sanitize_server_resource_url(session, "media_url", url)?;
-    let media_source_id = required_string(source.get("Id"), "MediaSources[0].Id")?;
-    let play_session_id = required_string(payload.get("PlaySessionId"), "PlaySessionId")?;
+    let media_source_id = optional_string(source.get("Id"));
+    let play_session_id = optional_string(payload.get("PlaySessionId"));
+    let direct_stream_url = optional_string(source.get("DirectStreamUrl"));
+    let standard_emby_stream = direct_stream_url.is_none();
+    let (url, server_credential_query_removed) = if let Some(raw_url) = direct_stream_url {
+        let url = resolve_server_url(&session.base_url, &raw_url)?;
+        validate_http_url("media_url", &url)?;
+        sanitize_server_resource_url(session, "media_url", url)?
+    } else {
+        (
+            standard_emby_stream_url(
+                session,
+                media_id,
+                source,
+                media_source_id.as_deref(),
+                play_session_id.as_deref(),
+            )?,
+            false,
+        )
+    };
     let streams = source
         .get("MediaStreams")
         .and_then(Value::as_array)
@@ -1514,15 +1878,45 @@ fn parse_playback_source(
     Ok(PlaybackSource {
         media_id: media_id.to_string(),
         url,
+        standard_emby_stream,
         server_credential_query_removed,
         container: optional_string(source.get("Container")),
         bitrate: source.get("Bitrate").and_then(Value::as_u64),
         media_source_id,
         play_session_id,
+        default_audio_stream_index: source
+            .get("DefaultAudioStreamIndex")
+            .and_then(Value::as_i64),
+        default_subtitle_stream_index: source
+            .get("DefaultSubtitleStreamIndex")
+            .and_then(Value::as_i64),
         video,
         subtitles,
         audio_tracks,
     })
+}
+
+fn standard_emby_stream_url(
+    session: &MediaStationSession,
+    media_id: &str,
+    source: &Map<String, Value>,
+    media_source_id: Option<&str>,
+    play_session_id: Option<&str>,
+) -> Result<Url, ApiError> {
+    let container = required_string(source.get("Container"), "MediaSource.Container")?;
+    let mut url = endpoint(&session.base_url, &["Videos", media_id, "stream"])?;
+    let mut query = url.query_pairs_mut();
+    query
+        .append_pair("Container", &container)
+        .append_pair("Static", "true");
+    if let Some(media_source_id) = media_source_id {
+        query.append_pair("MediaSourceId", media_source_id);
+    }
+    if let Some(play_session_id) = play_session_id {
+        query.append_pair("PlaySessionId", play_session_id);
+    }
+    drop(query);
+    Ok(url)
 }
 
 fn parse_video_stream(stream: &Map<String, Value>) -> VideoStream {
@@ -1690,6 +2084,38 @@ fn parse_preference(payload: &Value) -> Result<PlaybackTrackPreference, ApiError
     })
 }
 
+fn standard_emby_preference(source: &PlaybackSource) -> PlaybackTrackPreference {
+    let audio_track_key = source
+        .default_audio_stream_index
+        .and_then(|index| {
+            source
+                .audio_tracks
+                .iter()
+                .find(|track| track.stream_index == Some(index))
+        })
+        .map(|track| track.key.clone());
+    let subtitle = source
+        .default_subtitle_stream_index
+        .and_then(|index| {
+            source
+                .subtitles
+                .iter()
+                .find(|track| track.stream_index == Some(index))
+        })
+        .or_else(|| {
+            source
+                .subtitles
+                .iter()
+                .find(|track| track.is_default || track.is_forced)
+        });
+    PlaybackTrackPreference {
+        configured: false,
+        subtitle_enabled: subtitle.is_some(),
+        subtitle_track_key: subtitle.map(|track| track.key.clone()),
+        audio_track_key,
+    }
+}
+
 fn read_json_response(
     url: &Url,
     mut response: ureq::http::Response<ureq::Body>,
@@ -1754,6 +2180,42 @@ fn endpoint_from_path(base_url: &Url, path: &str) -> Result<Url, ApiError> {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     endpoint(base_url, &segments)
+}
+
+fn resume_endpoint(session: &MediaStationSession) -> Result<Url, ApiError> {
+    match session.connection.client {
+        MediaStationClientProfile::MediaStationGo => {
+            endpoint(&session.base_url, &["Items", "Resume"])
+        }
+        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => endpoint(
+            &session.base_url,
+            &["Users", &session.user_id, "Items", "Resume"],
+        ),
+    }
+}
+
+fn media_detail_endpoint(session: &MediaStationSession, media_id: &str) -> Result<Url, ApiError> {
+    match session.connection.client {
+        MediaStationClientProfile::MediaStationGo => {
+            endpoint(&session.base_url, &["Items", media_id])
+        }
+        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => endpoint(
+            &session.base_url,
+            &["Users", &session.user_id, "Items", media_id],
+        ),
+    }
+}
+
+fn series_episodes_endpoint(
+    session: &MediaStationSession,
+    series_id: &str,
+) -> Result<Url, ApiError> {
+    match session.connection.client {
+        MediaStationClientProfile::MediaStationGo => endpoint(&session.base_url, &["Items"]),
+        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => {
+            endpoint(&session.base_url, &["Shows", series_id, "Episodes"])
+        }
+    }
 }
 
 fn resolve_server_url(base_url: &Url, raw: &str) -> Result<Url, ApiError> {
@@ -1914,11 +2376,22 @@ mod tests {
     use std::thread;
 
     fn session(base_url: Url) -> MediaStationSession {
-        MediaStationSession::new(
+        session_with_profile(base_url, MediaStationConnectionProfile::media_station_go())
+    }
+
+    fn session_with_profile(
+        base_url: Url,
+        connection: MediaStationConnectionProfile,
+    ) -> MediaStationSession {
+        MediaStationSession::new_with_profile(
             base_url,
             "user-1",
             "secret-token",
-            "MediaBrowser Client=\"MediaStation Windows\", Token=\"secret-token\"",
+            format!(
+                "MediaBrowser Client=\"{}\", Token=\"secret-token\"",
+                connection.client.authorization_client()
+            ),
+            connection,
         )
         .expect("session should be valid")
     }
@@ -2033,6 +2506,165 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn connection_profiles_keep_msg_direct_and_standard_emby_proxied() {
+        let msg = MediaStationConnectionProfile::media_station_go();
+        let proxied_msg = MediaStationConnectionProfile {
+            client: MediaStationClientProfile::MediaStationGo,
+            proxy: MediaStationProxyMode::System,
+        };
+        let senplayer =
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be supported");
+        let infuse =
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::Infuse)
+                .expect("Infuse should be supported");
+
+        assert_eq!(msg.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(
+            msg.client.user_agent("MediaStationGoWindows/0.1"),
+            "MediaStationGoWindows/0.1"
+        );
+        assert_eq!(senplayer.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(senplayer.client.user_agent("ignored"), "SenPlayer/1.0.0");
+        assert_eq!(infuse.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(infuse.client.user_agent("ignored"), "Infuse/1.0.0");
+        assert!(msg.is_supported());
+        assert!(proxied_msg.is_supported());
+        assert!(senplayer.is_supported());
+        assert!(infuse.is_supported());
+        assert!(
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::MediaStationGo)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resume_endpoint_preserves_msg_path_and_uses_standard_emby_contract() {
+        let base_url = Url::parse("https://media.example/emby").expect("URL should parse");
+        let msg = session(base_url.clone());
+        let standard = session_with_profile(
+            base_url,
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be a standard Emby profile"),
+        );
+
+        assert_eq!(
+            resume_endpoint(&msg)
+                .expect("MSG endpoint should build")
+                .path(),
+            "/emby/Items/Resume"
+        );
+        assert_eq!(
+            resume_endpoint(&standard)
+                .expect("standard Emby endpoint should build")
+                .path(),
+            "/emby/Users/user-1/Items/Resume"
+        );
+    }
+
+    #[test]
+    fn detail_endpoints_preserve_msg_paths_and_use_standard_emby_contract() {
+        let base_url = Url::parse("https://media.example/emby").expect("URL should parse");
+        let msg = session(base_url.clone());
+        let standard = session_with_profile(
+            base_url,
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be a standard Emby profile"),
+        );
+
+        assert_eq!(
+            media_detail_endpoint(&msg, "media-1")
+                .expect("MSG detail endpoint should build")
+                .path(),
+            "/emby/Items/media-1"
+        );
+        assert_eq!(
+            media_detail_endpoint(&standard, "media-1")
+                .expect("standard Emby detail endpoint should build")
+                .path(),
+            "/emby/Users/user-1/Items/media-1"
+        );
+        assert_eq!(
+            series_episodes_endpoint(&msg, "series-1")
+                .expect("MSG episodes endpoint should build")
+                .path(),
+            "/emby/Items"
+        );
+        assert_eq!(
+            series_episodes_endpoint(&standard, "series-1")
+                .expect("standard Emby episodes endpoint should build")
+                .path(),
+            "/emby/Shows/series-1/Episodes"
+        );
+    }
+
+    #[test]
+    fn standard_emby_latest_uses_user_scoped_contract() {
+        let body = json!([{
+            "Id": "movie-1",
+            "Name": "Latest Movie",
+            "Type": "Movie"
+        }])
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = serve_once(response);
+        let profile =
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be a standard Emby profile");
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let items = client
+            .load_latest_items(&session_with_profile(base_url, profile), "library-1", 18)
+            .expect("standard Emby latest items should load");
+        let request = server.join().expect("server thread should finish");
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request target should exist");
+        let parsed =
+            Url::parse(&format!("http://localhost{target}")).expect("request target should parse");
+        let params = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(parsed.path(), "/Users/user-1/Items/Latest");
+        assert_eq!(
+            params.get("ParentId").map(|value| value.as_ref()),
+            Some("library-1")
+        );
+        assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("18"));
+        assert!(params.get("Fields").is_some());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].media_type, "Movie");
+    }
+
+    #[test]
+    fn session_allows_explicit_system_proxy_without_changing_direct_defaults() {
+        let session = MediaStationSession::new_with_profile(
+            Url::parse("https://media.example").expect("URL should parse"),
+            "user-1",
+            "token",
+            "authorization",
+            MediaStationConnectionProfile {
+                client: MediaStationClientProfile::MediaStationGo,
+                proxy: MediaStationProxyMode::System,
+            },
+        )
+        .expect("a system proxy may be selected explicitly");
+
+        assert_eq!(
+            MediaStationConnectionProfile::media_station_go().proxy,
+            MediaStationProxyMode::Direct
+        );
+        assert_eq!(session.connection.proxy, MediaStationProxyMode::System);
     }
 
     #[test]
@@ -2233,6 +2865,125 @@ mod tests {
             Some("0")
         );
         assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("48"));
+        assert!(params.get("Recursive").is_none());
+    }
+
+    #[test]
+    fn standard_emby_library_page_recurses_without_returning_folder_nodes() {
+        let body = json!({
+            "StartIndex": 0,
+            "TotalRecordCount": 0,
+            "Items": []
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base_url, server) = serve_once(response);
+        let profile =
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be a standard Emby profile");
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        client
+            .load_library_page(&session_with_profile(base_url, profile), "library-1", 0, 48)
+            .expect("standard Emby library page should load");
+        let request = server.join().expect("server thread should finish");
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request target should exist");
+        let parsed =
+            Url::parse(&format!("http://localhost{target}")).expect("request target should parse");
+        let params = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("Recursive").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie,Series,Video,MusicVideo,BoxSet")
+        );
+    }
+
+    #[test]
+    fn standard_emby_search_sends_items_query_and_parses_results() {
+        let body = json!({
+            "Items": [{
+                "Id": "movie-1",
+                "Name": "Search Hit",
+                "Type": "Movie",
+                "ImageTags": { "Primary": "poster-tag" }
+            }]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base_url, server) = serve_once(response);
+        let profile =
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be a standard Emby profile");
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let results = client
+            .search_media(&session_with_profile(base_url, profile), "matrix", 12)
+            .expect("standard Emby search should parse");
+        let request = server.join().expect("server thread should finish");
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request target should exist");
+        let parsed =
+            Url::parse(&format!("http://localhost{target}")).expect("request target should parse");
+        let params = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let request_lower = request.to_ascii_lowercase();
+
+        assert_eq!(
+            params.get("UserId").map(|value| value.as_ref()),
+            Some("user-1")
+        );
+        assert_eq!(
+            params.get("SearchTerm").map(|value| value.as_ref()),
+            Some("matrix")
+        );
+        assert_eq!(
+            params.get("Recursive").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie,Series,Episode,Video,MusicVideo")
+        );
+        assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("12"));
+        assert!(params.get("Fields").is_some());
+        assert!(request_lower.contains("x-emby-token: secret-token"));
+        assert!(request_lower.contains("user-agent: senplayer/1.0.0"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "movie-1");
+        assert_eq!(results[0].title, "Search Hit");
+        assert_eq!(
+            results[0].primary_image,
+            Some(MediaImageRef {
+                item_id: "movie-1".to_string(),
+                image_type: MediaImageType::Primary,
+                image_index: None,
+                tag: "poster-tag".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2358,8 +3109,8 @@ mod tests {
 
         assert!(request.starts_with("GET /Items/media-1/PlaybackInfo?"));
         assert!(request_lower.contains("x-emby-token: secret-token"));
-        assert_eq!(source.media_source_id, "source-1");
-        assert_eq!(source.play_session_id, "play-session-1");
+        assert_eq!(source.media_source_id.as_deref(), Some("source-1"));
+        assert_eq!(source.play_session_id.as_deref(), Some("play-session-1"));
         assert_eq!(
             source.video.as_ref().and_then(|video| video.bit_depth),
             Some(10)
@@ -2376,6 +3127,192 @@ mod tests {
         assert_eq!(source.audio_tracks[1].key, "stream:4");
         assert!(source.subtitles[0].key.starts_with("subtitle:"));
         assert_eq!(source.subtitles[0].key.len(), "subtitle:".len() + 64);
+        assert!(!source.standard_emby_stream);
+    }
+
+    #[test]
+    fn standard_emby_playback_info_builds_authenticated_static_stream_url() {
+        let session = session(Url::parse("https://media.example/emby").expect("URL should parse"));
+        let payload = json!({
+            "PlaySessionId": "play-session-standard",
+            "MediaSources": [
+                {
+                    "Id": "unsupported-source",
+                    "Container": "iso",
+                    "SupportsDirectPlay": false
+                },
+                {
+                    "Id": "source-standard",
+                    "Path": "D:\\Media\\Movie.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": true,
+                    "DefaultAudioStreamIndex": 4,
+                    "DefaultSubtitleStreamIndex": 7,
+                    "MediaStreams": [
+                        { "Type": "Video", "Index": 0, "Codec": "hevc" },
+                        { "Type": "Audio", "Index": 1, "Codec": "aac" },
+                        { "Type": "Audio", "Index": 4, "Codec": "ac3" },
+                        {
+                            "Type": "Subtitle",
+                            "Index": 7,
+                            "Codec": "srt",
+                            "IsDefault": true,
+                            "IsExternal": false
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let source = parse_playback_source(&session, "media-1", &payload)
+            .expect("standard Emby PlaybackInfo should parse");
+        let query = source
+            .url
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(source.url.path(), "/emby/Videos/media-1/stream");
+        assert_eq!(query.get("Container").map(String::as_str), Some("mkv"));
+        assert_eq!(query.get("Static").map(String::as_str), Some("true"));
+        assert_eq!(
+            query.get("MediaSourceId").map(String::as_str),
+            Some("source-standard")
+        );
+        assert_eq!(
+            query.get("PlaySessionId").map(String::as_str),
+            Some("play-session-standard")
+        );
+        assert!(!source.url.as_str().contains("Movie.mkv"));
+        assert!(source.standard_emby_stream);
+        assert_eq!(source.media_source_id.as_deref(), Some("source-standard"));
+        assert_eq!(source.default_audio_stream_index, Some(4));
+        assert_eq!(source.default_subtitle_stream_index, Some(7));
+    }
+
+    #[test]
+    fn standard_emby_rejects_sources_that_explicitly_disable_direct_play() {
+        let session = session(Url::parse("https://media.example").expect("URL should parse"));
+        let error = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "MediaSources": [{
+                    "Id": "transcode-only",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": false
+                }]
+            }),
+        )
+        .expect_err("transcode-only standard sources must fail explicitly");
+
+        assert!(matches!(
+            error,
+            ApiError::MissingField {
+                field: "MediaSources[0].SupportsDirectPlay"
+            }
+        ));
+    }
+
+    #[test]
+    fn standard_emby_without_preference_extension_uses_playback_info_defaults() {
+        let response =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (base_url, server) = serve_once(response);
+        let session = session(base_url.clone());
+        let source = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "MediaSources": [{
+                    "Id": "source-1",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": true,
+                    "DefaultAudioStreamIndex": 4,
+                    "DefaultSubtitleStreamIndex": 7,
+                    "MediaStreams": [
+                        { "Type": "Audio", "Index": 1, "Codec": "aac" },
+                        { "Type": "Audio", "Index": 4, "Codec": "ac3" },
+                        {
+                            "Type": "Subtitle",
+                            "Index": 7,
+                            "Codec": "srt",
+                            "IsExternal": false
+                        }
+                    ]
+                }]
+            }),
+        )
+        .expect("standard source should parse");
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let state = client
+            .load_playback_preference(&session, "media-1", &source)
+            .expect("missing extension should select explicit session-only preferences");
+        let request = server.join().expect("server thread should finish");
+
+        assert!(request.starts_with("GET /Items/media-1/PlaybackPreferences HTTP/1.1"));
+        assert_eq!(
+            state.persistence,
+            PlaybackPreferencePersistence::SessionOnly
+        );
+        assert!(!state.preference.configured);
+        assert_eq!(
+            state.preference.audio_track_key.as_deref(),
+            Some("stream:4")
+        );
+        assert!(state.preference.subtitle_enabled);
+        assert_eq!(
+            state.preference.subtitle_track_key.as_deref(),
+            Some("stream:7")
+        );
+    }
+
+    #[test]
+    fn media_station_preference_extension_remains_server_persisted() {
+        let body = json!({
+            "configured": true,
+            "subtitle_enabled": false,
+            "audio_track_key": "stream:4"
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = serve_once(response);
+        let session = session(base_url.clone());
+        let source = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "MediaSources": [{
+                    "Id": "source-1",
+                    "DirectStreamUrl": "/Videos/media-1/stream"
+                }]
+            }),
+        )
+        .expect("extension source should parse");
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let state = client
+            .load_playback_preference(&session, "media-1", &source)
+            .expect("preference extension should parse");
+        server.join().expect("server thread should finish");
+
+        assert_eq!(
+            state.persistence,
+            PlaybackPreferencePersistence::ServerExtension
+        );
+        assert!(state.preference.configured);
+        assert!(!state.preference.subtitle_enabled);
+        assert_eq!(
+            state.preference.audio_track_key.as_deref(),
+            Some("stream:4")
+        );
     }
 
     #[test]
@@ -2387,11 +3324,14 @@ mod tests {
         let source = PlaybackSource {
             media_id: "media-1".to_string(),
             url: base_url,
+            standard_emby_stream: false,
             server_credential_query_removed: false,
             container: None,
             bitrate: None,
-            media_source_id: "source-1".to_string(),
-            play_session_id: "play-session-1".to_string(),
+            media_source_id: Some("source-1".to_string()),
+            play_session_id: Some("play-session-1".to_string()),
+            default_audio_stream_index: None,
+            default_subtitle_stream_index: None,
             video: None,
             subtitles: Vec::new(),
             audio_tracks: Vec::new(),

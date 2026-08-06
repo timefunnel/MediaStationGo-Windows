@@ -79,6 +79,8 @@ pub(crate) enum NativeFunction {
     MediaStationFrameInterpolation,
     MediaStationListAccounts,
     MediaStationSwitchAccount,
+    MediaStationDeleteAccount,
+    MediaStationUpdateAccount,
 }
 
 impl NativeFunction {
@@ -144,6 +146,8 @@ impl NativeFunction {
             "mediaStationFrameInterpolation" => Self::MediaStationFrameInterpolation,
             "mediaStationListAccounts" => Self::MediaStationListAccounts,
             "mediaStationSwitchAccount" => Self::MediaStationSwitchAccount,
+            "mediaStationDeleteAccount" => Self::MediaStationDeleteAccount,
+            "mediaStationUpdateAccount" => Self::MediaStationUpdateAccount,
             _ => return None,
         })
     }
@@ -210,6 +214,8 @@ impl NativeFunction {
             Self::MediaStationFrameInterpolation => "mediaStationFrameInterpolation",
             Self::MediaStationListAccounts => "mediaStationListAccounts",
             Self::MediaStationSwitchAccount => "mediaStationSwitchAccount",
+            Self::MediaStationDeleteAccount => "mediaStationDeleteAccount",
+            Self::MediaStationUpdateAccount => "mediaStationUpdateAccount",
         }
     }
 }
@@ -313,6 +319,8 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::MediaStationFrameInterpolation,
     NativeFunction::MediaStationListAccounts,
     NativeFunction::MediaStationSwitchAccount,
+    NativeFunction::MediaStationDeleteAccount,
+    NativeFunction::MediaStationUpdateAccount,
     NativeFunction::UpdateCheck,
     NativeFunction::UpdateDownload,
     NativeFunction::UpdateInstall,

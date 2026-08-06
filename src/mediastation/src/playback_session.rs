@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
+use crate::api::MediaStationProxyMode;
+
 const MAX_REDIRECTS: usize = 6;
 const DEFAULT_SESSION_TTL_MS: u64 = 120_000;
 const EXPIRY_SAFETY_MS: u64 = 60_000;
@@ -144,6 +146,7 @@ pub struct ResolveInput {
     pub server_base_url: Url,
     pub user_agent: String,
     pub auth: ServerAuth,
+    pub proxy_mode: MediaStationProxyMode,
 }
 
 impl ResolveInput {
@@ -173,6 +176,7 @@ impl fmt::Debug for ResolveInput {
             .field("server_base_url", &redacted_url(&self.server_base_url))
             .field("user_agent", &self.user_agent)
             .field("auth", &self.auth)
+            .field("proxy_mode", &self.proxy_mode)
             .finish()
     }
 }
@@ -250,6 +254,7 @@ impl fmt::Debug for PlaybackSession {
 pub struct ProbeRequest {
     pub url: Url,
     pub headers: HeaderMap,
+    pub proxy_mode: MediaStationProxyMode,
 }
 
 impl fmt::Debug for ProbeRequest {
@@ -258,6 +263,7 @@ impl fmt::Debug for ProbeRequest {
             .debug_struct("ProbeRequest")
             .field("url", &redacted_url(&self.url))
             .field("headers", &self.headers)
+            .field("proxy_mode", &self.proxy_mode)
             .finish()
     }
 }
@@ -295,22 +301,60 @@ pub trait ProbeTransport: Send + Sync {
 
 #[derive(Clone)]
 pub struct UreqTransport {
+    direct_agent: ureq::Agent,
+    system_proxy_agent: Arc<Mutex<Option<CachedSystemProxyAgent>>>,
+}
+
+struct CachedSystemProxyAgent {
+    proxy_url: String,
     agent: ureq::Agent,
 }
 
 impl UreqTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(25)))
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(Duration::from_secs(15)))
-            .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            direct_agent: build_probe_agent(None),
+            system_proxy_agent: Arc::new(Mutex::new(None)),
         }
     }
+
+    fn agent_for_mode(
+        &self,
+        proxy_mode: MediaStationProxyMode,
+    ) -> Result<ureq::Agent, TransportError> {
+        match proxy_mode {
+            MediaStationProxyMode::Direct => Ok(self.direct_agent.clone()),
+            MediaStationProxyMode::System => {
+                let proxy = ureq::Proxy::try_from_env()
+                    .ok_or_else(|| TransportError::new("system HTTP proxy is unavailable"))?;
+                let proxy_url = proxy.uri().to_string();
+                let mut cached = self.system_proxy_agent.lock();
+                if let Some(cached) = cached.as_ref()
+                    && cached.proxy_url == proxy_url
+                {
+                    return Ok(cached.agent.clone());
+                }
+                let agent = build_probe_agent(Some(proxy));
+                *cached = Some(CachedSystemProxyAgent {
+                    proxy_url,
+                    agent: agent.clone(),
+                });
+                Ok(agent)
+            }
+        }
+    }
+}
+
+fn build_probe_agent(proxy: Option<ureq::Proxy>) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(Duration::from_secs(25)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(15)))
+        .proxy(proxy)
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 impl Default for UreqTransport {
@@ -321,7 +365,8 @@ impl Default for UreqTransport {
 
 impl ProbeTransport for UreqTransport {
     fn probe(&self, request: &ProbeRequest) -> Result<ProbeResponse, TransportError> {
-        let mut builder = self.agent.get(request.url.as_str());
+        let agent = self.agent_for_mode(request.proxy_mode)?;
+        let mut builder = agent.get(request.url.as_str());
         for (name, value) in request.headers.iter() {
             builder = builder.header(name, value);
         }
@@ -491,6 +536,7 @@ struct CachedSession {
     session: PlaybackSession,
     auth: ServerAuth,
     server_base_url: Url,
+    proxy_mode: MediaStationProxyMode,
 }
 
 pub struct PlaybackSessionResolver<T: ProbeTransport> {
@@ -535,6 +581,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
             && cached.session.source_url == input.source_url
             && cached.server_base_url == input.server_base_url
             && cached.auth == input.auth
+            && cached.proxy_mode == input.proxy_mode
             && cached.session.is_reusable_at(now_epoch_ms)
         {
             return Ok(cached.session.as_reused());
@@ -547,6 +594,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
                 session: session.clone(),
                 auth: input.auth.clone(),
                 server_base_url: input.server_base_url.clone(),
+                proxy_mode: input.proxy_mode,
             },
         );
         Ok(session)
@@ -582,6 +630,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
                 .probe(&ProbeRequest {
                     url: current.clone(),
                     headers,
+                    proxy_mode: input.proxy_mode,
                 })
                 .map_err(|error| PlaybackSessionError::Transport {
                     url: redacted_url(&current),
@@ -909,6 +958,7 @@ mod tests {
             user_agent: "MediaStationWindows/0.1".to_string(),
             auth: ServerAuth::new("secret-token", "MediaBrowser Token=secret-token")
                 .expect("auth should be valid"),
+            proxy_mode: MediaStationProxyMode::Direct,
         }
     }
 

@@ -6,9 +6,11 @@ use jfn_frame_interpolation::{
 use jfn_mediastation::{
     ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
     MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaStationApiClient,
-    MediaStationSession, PlaybackSessionError, PlaybackSessionResolver, PlaybackSource,
-    PlaybackTrackPlan, PlaybackTrackPreference, PlaybackTrackPreferenceUpdate, SessionExpirySource,
-    SubtitleTrack, UreqTransport, build_playback_track_plan,
+    MediaStationClientProfile, MediaStationConnectionProfile, MediaStationProxyMode,
+    MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
+    PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
+    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport,
+    build_playback_track_plan,
 };
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
@@ -24,7 +26,7 @@ use jfn_playback::{
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write as _;
@@ -41,7 +43,7 @@ use crate::client::{Inner, RendererValue, post_renderer_message};
 use crate::ipc::list_string;
 use crate::mediastation_cache::{HomeSnapshotCache, ImageDiskCache, image_cache_key};
 use crate::mediastation_credentials::{
-    CredentialError, SavedAccount, StoredSession, WindowsCredentialStore,
+    CredentialError, SavedAccount, StoredSession, WindowsCredentialStore, account_credential_id,
 };
 
 const OPERATION_LOAD: &str = "load";
@@ -50,6 +52,8 @@ const OPERATION_SESSION_STATUS: &str = "session_status";
 const OPERATION_LOGOUT: &str = "logout";
 const OPERATION_LIST_ACCOUNTS: &str = "list_accounts";
 const OPERATION_SWITCH_ACCOUNT: &str = "switch_account";
+const OPERATION_DELETE_ACCOUNT: &str = "delete_account";
+const OPERATION_UPDATE_ACCOUNT: &str = "update_account";
 const OPERATION_IMAGE: &str = "image";
 const OPERATION_TRACKS: &str = "tracks";
 const OPERATION_TRACK_SELECTION: &str = "track_selection";
@@ -362,6 +366,7 @@ struct ActivePlaybackReport {
     session: MediaStationSession,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    preference_persistence: PlaybackPreferencePersistence,
     preference_scope_id: String,
     /// Incremented whenever the user explicitly saves a track preference, so
     /// the first-frame reconcile worker can tell whether the user changed the
@@ -378,6 +383,7 @@ struct RuntimeTrackReconcile {
     snapshot: SessionSnapshot,
     source: PlaybackSource,
     preference: PlaybackTrackPreference,
+    preference_persistence: PlaybackPreferencePersistence,
     preference_scope_id: String,
     /// Track preference revision captured when the session started. The
     /// reconcile worker skips overriding the runtime tracks if this is stale,
@@ -442,6 +448,7 @@ struct NativeLoadRequest<'a> {
     snapshot: &'a SessionSnapshot,
     source: &'a PlaybackSource,
     preference: &'a PlaybackTrackPreference,
+    preference_persistence: PlaybackPreferencePersistence,
     preference_scope_id: &'a str,
     media_id: &'a str,
     start_ms: u64,
@@ -749,6 +756,7 @@ impl MediaStationRuntime {
                         },
                         source: active.source.clone(),
                         preference: active.preference.clone(),
+                        preference_persistence: active.preference_persistence,
                         preference_scope_id: active.preference_scope_id.clone(),
                         preference_revision: active.preference_revision,
                     })
@@ -1081,7 +1089,10 @@ impl MediaStationRuntime {
                 "The selected credential does not match its account identifier",
             ));
         }
-        let authorization = native_authorization_header(Some(stored.access_token_secret()))?;
+        let authorization = native_authorization_header(
+            Some(stored.access_token_secret()),
+            stored.connection.client,
+        )?;
         let session = stored.to_session(authorization).map_err(|error| {
             log_error(&format!(
                 "MediaStation saved account could not be configured: code={}",
@@ -1106,6 +1117,258 @@ impl MediaStationRuntime {
             state.active_subtitle = None;
             state.active_interpolation = None;
             (session_status_payload(&state), stopped)
+        };
+        self.enqueue_report(stopped);
+        Ok(payload)
+    }
+
+    fn delete_saved_account(&self, account_id: &str) -> Result<Value, LoadFailure> {
+        let store = WindowsCredentialStore::account_by_id(account_id).map_err(|error| {
+            LoadFailure::new(error.code(), "The selected account identifier is invalid")
+        })?;
+        let stored = store
+            .load()
+            .map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account read before deletion failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(error.code(), "The selected account could not be read")
+            })?
+            .ok_or_else(|| {
+                LoadFailure::new(
+                    "account_not_found",
+                    "The selected account is no longer available",
+                )
+            })?;
+        if stored.account_id() != account_id {
+            return Err(LoadFailure::new(
+                "credential_account_mismatch",
+                "The selected credential does not match its account identifier",
+            ));
+        }
+
+        let (payload, stopped) = {
+            let mut state = self.state.lock();
+            let active = state.session.as_ref().is_some_and(|session| {
+                session.base_url == stored.base_url && session.user_id == stored.user_id
+            });
+            let active_store = WindowsCredentialStore::active();
+            let active_stored = if active {
+                active_store.load().map_err(|error| {
+                    log_error(&format!(
+                        "MediaStation active credential read before account deletion failed: code={}",
+                        error.code()
+                    ));
+                    LoadFailure::new(
+                        error.code(),
+                        "The active MediaStation session could not be read",
+                    )
+                })?
+            } else {
+                None
+            };
+            if active
+                && let Some(active_session) = active_stored.as_ref()
+                && (active_session.base_url != stored.base_url
+                    || active_session.user_id != stored.user_id)
+            {
+                return Err(LoadFailure::new(
+                    "credential_active_mismatch",
+                    "The persisted account no longer matches the active session",
+                ));
+            }
+
+            let account_deleted = store.delete().map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account deletion failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(error.code(), "The selected account could not be removed")
+            })?;
+            if !account_deleted {
+                return Err(LoadFailure::new(
+                    "account_not_found",
+                    "The selected account is no longer available",
+                ));
+            }
+            let active_deleted = if active {
+                match active_store.delete() {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        if account_deleted && let Err(rollback) = store.save(&stored) {
+                            log_error(&format!(
+                                "MediaStation account deletion rollback failed: delete_code={} rollback_code={}",
+                                error.code(),
+                                rollback.code()
+                            ));
+                            return Err(LoadFailure::new(
+                                "credential_delete_rollback_failed",
+                                "The account could not be removed and its previous credential could not be restored",
+                            ));
+                        }
+                        log_error(&format!(
+                            "MediaStation active credential deletion failed: code={}",
+                            error.code()
+                        ));
+                        return Err(LoadFailure::new(
+                            error.code(),
+                            "The active MediaStation session could not be removed",
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
+
+            let stopped = if active {
+                let stopped = take_stopped_report(&mut state);
+                state.generation = state.generation.wrapping_add(1);
+                state.session = None;
+                state.session_profile = None;
+                state.active_subtitle = None;
+                state.active_interpolation = None;
+                stopped
+            } else {
+                None
+            };
+            (
+                json!({
+                    "deleted": true,
+                    "activeDeleted": active_deleted,
+                    "configured": !active,
+                    "accountId": account_id,
+                }),
+                stopped,
+            )
+        };
+        self.enqueue_report(stopped);
+        Ok(payload)
+    }
+
+    fn update_saved_account(
+        &self,
+        expected_generation: u64,
+        account_id: &str,
+        stored: &StoredSession,
+    ) -> Result<Value, LoadFailure> {
+        if stored.account_id() != account_id {
+            return Err(LoadFailure::new(
+                "account_identity_changed",
+                "The authenticated user does not match the account being modified",
+            ));
+        }
+        let store = WindowsCredentialStore::account_by_id(account_id).map_err(|error| {
+            LoadFailure::new(error.code(), "The selected account identifier is invalid")
+        })?;
+        let authorization = native_authorization_header(
+            Some(stored.access_token_secret()),
+            stored.connection.client,
+        )?;
+        let updated_session = stored.to_session(authorization).map_err(|error| {
+            log_error(&format!(
+                "MediaStation updated account could not be configured: code={}",
+                api_error_code(&error)
+            ));
+            LoadFailure::new(
+                "updated_account_invalid",
+                "The updated account could not be configured",
+            )
+        })?;
+
+        let (payload, stopped) = {
+            let mut state = self.state.lock();
+            if state.generation != expected_generation {
+                return Err(session_changed());
+            }
+            let previous = store.load().map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account snapshot before update failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(error.code(), "The selected account could not be read")
+            })?;
+            let previous = previous.ok_or_else(|| {
+                LoadFailure::new(
+                    "account_not_found",
+                    "The selected account is no longer available",
+                )
+            })?;
+            if previous.account_id() != account_id {
+                return Err(LoadFailure::new(
+                    "credential_account_mismatch",
+                    "The selected credential does not match its account identifier",
+                ));
+            }
+            let active = state.session.as_ref().is_some_and(|session| {
+                session.base_url == previous.base_url && session.user_id == previous.user_id
+            });
+            let active_store = WindowsCredentialStore::active();
+            if active {
+                let active_previous = active_store.load().map_err(|error| {
+                    log_error(&format!(
+                        "MediaStation active credential snapshot before account update failed: code={}",
+                        error.code()
+                    ));
+                    LoadFailure::new(
+                        error.code(),
+                        "The active MediaStation session could not be read",
+                    )
+                })?;
+                if let Some(active_previous) = active_previous.as_ref()
+                    && (active_previous.base_url != previous.base_url
+                        || active_previous.user_id != previous.user_id)
+                {
+                    return Err(LoadFailure::new(
+                        "credential_active_mismatch",
+                        "The persisted account no longer matches the active session",
+                    ));
+                }
+            }
+
+            store.save(stored).map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account update failed: code={}",
+                    error.code()
+                ));
+                LoadFailure::new(error.code(), "The selected account could not be updated")
+            })?;
+            if active && let Err(error) = active_store.save(stored) {
+                if let Err(rollback) = store.save(&previous) {
+                    log_error(&format!(
+                        "MediaStation account update rollback failed: update_code={} rollback_code={}",
+                        error.code(),
+                        rollback.code()
+                    ));
+                    return Err(persistence_rollback_failure());
+                }
+                log_error(&format!(
+                    "MediaStation active credential update failed: code={}",
+                    error.code()
+                ));
+                return Err(LoadFailure::new(
+                    error.code(),
+                    "The active MediaStation session could not be updated",
+                ));
+            }
+
+            if active {
+                let stopped = take_stopped_report(&mut state);
+                state.generation = state.generation.wrapping_add(1);
+                state.session = Some(updated_session);
+                state.session_profile = Some(SessionProfile {
+                    user_name: stored.user_name.clone(),
+                    persisted: true,
+                });
+                state.active_subtitle = None;
+                state.active_interpolation = None;
+                (session_status_payload(&state), stopped)
+            } else {
+                (
+                    account_public_payload(account_id, stored, state.session.is_some()),
+                    None,
+                )
+            }
         };
         self.enqueue_report(stopped);
         Ok(payload)
@@ -1163,6 +1426,7 @@ impl MediaStationRuntime {
             load.snapshot,
             load.source,
             load.preference,
+            load.preference_persistence,
             load.preference_scope_id,
             load.start_ms,
         );
@@ -1255,6 +1519,30 @@ impl MediaStationRuntime {
             ));
         }
         Ok(active.preference_scope_id.clone())
+    }
+
+    fn active_preference_persistence(
+        &self,
+        snapshot: &SessionSnapshot,
+        media_id: &str,
+    ) -> Result<PlaybackPreferencePersistence, LoadFailure> {
+        let state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        let active = state.active_report.as_ref().ok_or_else(|| {
+            LoadFailure::new(
+                "playback_unavailable",
+                "No active playback can persist track preferences",
+            )
+        })?;
+        if active.source.media_id != media_id {
+            return Err(LoadFailure::new(
+                "playback_changed",
+                "The active playback item has changed",
+            ));
+        }
+        Ok(active.preference_persistence)
     }
 
     fn bump_preference_revision(&self, snapshot: &SessionSnapshot) {
@@ -1433,9 +1721,14 @@ fn session_status_payload(state: &RuntimeState) -> Value {
     json!({
         "configured": true,
         "persisted": profile.is_some_and(|profile| profile.persisted),
+        "accountId": account_credential_id(&session.base_url, &session.user_id),
+        "serverId": server_id_from_base_url(&session.base_url),
         "baseUrl": session.base_url.as_str(),
         "userId": session.user_id,
         "userName": profile.map(|profile| profile.user_name.as_str()).unwrap_or(&session.user_id),
+        "serverType": session.connection.client.server_type(),
+        "clientProfile": session.connection.client.as_str(),
+        "proxyMode": session.connection.proxy.as_str(),
     })
 }
 
@@ -1444,6 +1737,7 @@ fn activate_playback_report(
     snapshot: &SessionSnapshot,
     source: &PlaybackSource,
     preference: &PlaybackTrackPreference,
+    preference_persistence: PlaybackPreferencePersistence,
     preference_scope_id: &str,
     start_ms: u64,
 ) -> Option<ReportJob> {
@@ -1453,6 +1747,7 @@ fn activate_playback_report(
         session: snapshot.session.clone(),
         source: source.clone(),
         preference: preference.clone(),
+        preference_persistence,
         preference_scope_id: preference_scope_id.to_string(),
         preference_revision: 0,
         runtime_tracks_reconciled: false,
@@ -1649,8 +1944,9 @@ pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
             .save(&stored)
             .map_err(|error| error.code().to_string())?;
     }
-    let authorization = native_authorization_header(Some(stored.access_token_secret()))
-        .map_err(|failure| failure.code.to_string())?;
+    let authorization =
+        native_authorization_header(Some(stored.access_token_secret()), stored.connection.client)
+            .map_err(|failure| failure.code.to_string())?;
     let session = stored
         .to_session(authorization)
         .map_err(|error| api_error_code(&error).to_string())?;
@@ -1873,13 +2169,18 @@ pub(crate) fn handle_list_accounts_message(
                 "MediaStation saved accounts listed: count={}",
                 accounts.len()
             ));
-            dispatch_response(
-                &layer,
-                &request_id,
-                OPERATION_LIST_ACCOUNTS,
-                true,
-                saved_accounts_payload(&accounts),
-            )
+            match saved_accounts_payload(&accounts) {
+                Ok(payload) => {
+                    dispatch_response(&layer, &request_id, OPERATION_LIST_ACCOUNTS, true, payload)
+                }
+                Err(failure) => dispatch_response(
+                    &layer,
+                    &request_id,
+                    OPERATION_LIST_ACCOUNTS,
+                    false,
+                    failure.payload(),
+                ),
+            }
         }
         Err(error) => {
             log_error(&format!(
@@ -1906,7 +2207,7 @@ pub(crate) fn handle_switch_account_message(
         log_error("MediaStation account switch rejected: web layer unavailable");
         return true;
     };
-    let (request_id, account_id) = match parse_switch_account_request(args) {
+    let (request_id, account_id) = match parse_account_id_request(args) {
         Ok((request_id, account_id)) => (request_id, account_id),
         Err((request_id, failure)) => {
             dispatch_response(
@@ -1943,6 +2244,149 @@ pub(crate) fn handle_switch_account_message(
             false,
             failure.payload(),
         ),
+    }
+    true
+}
+
+pub(crate) fn handle_delete_account_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("MediaStation account deletion rejected: web layer unavailable");
+        return true;
+    };
+    let (request_id, account_id) = match parse_account_id_request(args) {
+        Ok(request) => request,
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_DELETE_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_DELETE_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    match runtime.delete_saved_account(&account_id) {
+        Ok(payload) => {
+            dispatch_response(&layer, &request_id, OPERATION_DELETE_ACCOUNT, true, payload)
+        }
+        Err(failure) => dispatch_response(
+            &layer,
+            &request_id,
+            OPERATION_DELETE_ACCOUNT,
+            false,
+            failure.payload(),
+        ),
+    }
+    true
+}
+
+pub(crate) fn handle_update_account_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("MediaStation account update rejected: web layer unavailable");
+        return true;
+    };
+    let request = match parse_update_account_request(args) {
+        Ok(request) => request,
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_UPDATE_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            dispatch_response(
+                &layer,
+                &request.request_id,
+                OPERATION_UPDATE_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let guard = match runtime.begin_auth_request(&request.request_id) {
+        Ok(guard) => guard,
+        Err(failure) => {
+            dispatch_response(
+                &layer,
+                &request.request_id,
+                OPERATION_UPDATE_ACCOUNT,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+
+    let request_id = request.request_id.clone();
+    let spawn_request_id = request_id.clone();
+    let expected_generation = guard.generation;
+    let worker_layer = Arc::clone(&layer);
+    let worker_runtime = Arc::clone(&runtime);
+    let spawn = thread::Builder::new()
+        .name("mediastation-account-update".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            match execute_account_update(&worker_runtime, expected_generation, &request) {
+                Ok(payload) => dispatch_response(
+                    &worker_layer,
+                    &request_id,
+                    OPERATION_UPDATE_ACCOUNT,
+                    true,
+                    payload,
+                ),
+                Err(failure) => dispatch_response(
+                    &worker_layer,
+                    &request_id,
+                    OPERATION_UPDATE_ACCOUNT,
+                    false,
+                    failure.payload(),
+                ),
+            }
+        });
+    if let Err(error) = spawn {
+        log_error(&format!(
+            "MediaStation account update worker could not start: kind={}",
+            error.kind()
+        ));
+        dispatch_response(
+            &layer,
+            &spawn_request_id,
+            OPERATION_UPDATE_ACCOUNT,
+            false,
+            LoadFailure::new(
+                "request_thread_failed",
+                "The native account update worker could not be started",
+            )
+            .payload(),
+        );
     }
     true
 }
@@ -2727,6 +3171,15 @@ struct AuthRequest {
     base_url: Url,
     username: String,
     password: String,
+    connection: MediaStationConnectionProfile,
+}
+
+struct UpdateAccountRequest {
+    request_id: String,
+    account_id: String,
+    username: String,
+    password: String,
+    connection: MediaStationConnectionProfile,
 }
 
 fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, LoadFailure)> {
@@ -2734,7 +3187,7 @@ fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, 
     let Some(args) = args else {
         unreachable!("parse_request_id rejects missing arguments")
     };
-    if args.size() < 4 {
+    if args.size() < 4 || args.size() == 5 {
         return Err((
             request_id,
             LoadFailure::new("invalid_request", "Authentication arguments are missing"),
@@ -2768,11 +3221,29 @@ fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, 
             LoadFailure::new("invalid_password", "The password is too long"),
         ));
     }
+    let connection = if args.size() == 4 {
+        MediaStationConnectionProfile::media_station_go()
+    } else {
+        for index in 4..6 {
+            if args.get_type(index).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+                return Err((
+                    request_id,
+                    LoadFailure::new(
+                        "invalid_request",
+                        "Authentication arguments must be strings",
+                    ),
+                ));
+            }
+        }
+        parse_connection_profile(&list_string(args, 4), &list_string(args, 5))
+            .map_err(|failure| (request_id.clone(), failure))?
+    };
     Ok(AuthRequest {
         request_id,
         base_url,
         username,
         password,
+        connection,
     })
 }
 
@@ -2801,67 +3272,170 @@ fn parse_request_id(args: Option<&ListValue>) -> Result<String, (String, LoadFai
     Ok(request_id)
 }
 
-fn parse_switch_account_request(
+fn parse_account_id_request(
     args: Option<&ListValue>,
 ) -> Result<(String, String), (String, LoadFailure)> {
+    let request_id = parse_request_id(args)?;
     let Some(args) = args else {
-        return Err((
-            String::new(),
-            LoadFailure::new("invalid_request", "Request arguments are missing"),
-        ));
+        unreachable!("parse_request_id rejects missing arguments")
     };
-    let request_id =
-        if args.size() > 0 && args.get_type(0).as_ref() == &sys::cef_value_type_t::VTYPE_STRING {
-            list_string(args, 0)
-        } else {
-            String::new()
-        };
-    if !valid_identifier(&request_id, MAX_REQUEST_ID_LEN) {
+    let account_id = parse_account_id(args, 1).map_err(|failure| (request_id.clone(), failure))?;
+    Ok((request_id, account_id))
+}
+
+fn parse_update_account_request(
+    args: Option<&ListValue>,
+) -> Result<UpdateAccountRequest, (String, LoadFailure)> {
+    let request_id = parse_request_id(args)?;
+    let Some(args) = args else {
+        unreachable!("parse_request_id rejects missing arguments")
+    };
+    if args.size() < 6 {
         return Err((
             request_id,
-            LoadFailure::new(
-                "invalid_request_id",
-                "The request identifier is empty or invalid",
-            ),
+            LoadFailure::new("invalid_request", "Account update arguments are missing"),
         ));
     }
-    let account_id =
-        if args.size() > 1 && args.get_type(1).as_ref() == &sys::cef_value_type_t::VTYPE_STRING {
-            list_string(args, 1)
-        } else {
+    let account_id = parse_account_id(args, 1).map_err(|failure| (request_id.clone(), failure))?;
+    for index in 2..6 {
+        if args.get_type(index).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
             return Err((
                 request_id,
                 LoadFailure::new(
-                    "invalid_account_id",
-                    "The account identifier is missing or invalid",
+                    "invalid_request",
+                    "Account update arguments must be strings",
                 ),
             ));
-        };
+        }
+    }
+    let username = list_string(args, 2);
+    if !valid_text(&username, MAX_USERNAME_LEN) {
+        return Err((
+            request_id,
+            LoadFailure::new("invalid_username", "The username is empty or invalid"),
+        ));
+    }
+    let password = list_string(args, 3);
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err((
+            request_id,
+            LoadFailure::new("invalid_password", "The password is too long"),
+        ));
+    }
+    let connection = parse_connection_profile(&list_string(args, 4), &list_string(args, 5))
+        .map_err(|failure| (request_id.clone(), failure))?;
+    Ok(UpdateAccountRequest {
+        request_id,
+        account_id,
+        username,
+        password,
+        connection,
+    })
+}
+
+fn parse_connection_profile(
+    client_profile: &str,
+    proxy_mode: &str,
+) -> Result<MediaStationConnectionProfile, LoadFailure> {
+    let client = MediaStationClientProfile::from_str(client_profile).ok_or_else(|| {
+        LoadFailure::new(
+            "invalid_client_profile",
+            "The selected server client profile is invalid",
+        )
+    })?;
+    let proxy = MediaStationProxyMode::from_str(proxy_mode).ok_or_else(|| {
+        LoadFailure::new(
+            "invalid_proxy_mode",
+            "The selected server proxy mode is invalid",
+        )
+    })?;
+    let connection = MediaStationConnectionProfile { client, proxy };
+    if !connection.is_supported() {
+        return Err(LoadFailure::new(
+            "invalid_connection_profile",
+            "The selected client and proxy combination is not supported",
+        ));
+    }
+    Ok(connection)
+}
+
+fn parse_account_id(args: &ListValue, index: usize) -> Result<String, LoadFailure> {
+    if args.size() <= index || args.get_type(index).as_ref() != &sys::cef_value_type_t::VTYPE_STRING
+    {
+        return Err(LoadFailure::new(
+            "invalid_account_id",
+            "The account identifier is missing or invalid",
+        ));
+    }
+    let account_id = list_string(args, index);
     if account_id.len() != ACCOUNT_ID_LEN
         || !account_id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err((
-            request_id,
-            LoadFailure::new("invalid_account_id", "The account identifier is invalid"),
+        return Err(LoadFailure::new(
+            "invalid_account_id",
+            "The account identifier is invalid",
         ));
     }
-    Ok((request_id, account_id))
+    Ok(account_id)
 }
 
-fn saved_accounts_payload(accounts: &[SavedAccount]) -> Value {
-    json!({
-        "accounts": accounts
+fn saved_accounts_payload(accounts: &[SavedAccount]) -> Result<Value, LoadFailure> {
+    let mut grouped: BTreeMap<String, Vec<&SavedAccount>> = BTreeMap::new();
+    for account in accounts {
+        grouped
+            .entry(account.session.base_url.as_str().to_string())
+            .or_default()
+            .push(account);
+    }
+    if grouped.values().any(|accounts| {
+        let expected = accounts[0].session.connection;
+        accounts
             .iter()
-            .map(|account| json!({
-                "accountId": account.account_id,
-                "baseUrl": account.session.base_url.as_str(),
-                "userId": account.session.user_id,
-                "userName": account.session.user_name,
+            .any(|account| account.session.connection != expected)
+    }) {
+        return Err(LoadFailure::new(
+            "server_connection_mismatch",
+            "Saved users for the same server have inconsistent connection profiles",
+        ));
+    }
+    Ok(json!({
+        "servers": grouped
+            .into_iter()
+            .map(|(base_url, accounts)| json!({
+                "serverId": server_id_from_base_url(&accounts[0].session.base_url),
+                "baseUrl": base_url,
+                "serverType": accounts[0].session.connection.client.server_type(),
+                "clientProfile": accounts[0].session.connection.client.as_str(),
+                "proxyMode": accounts[0].session.connection.proxy.as_str(),
+                "users": accounts.into_iter().map(|account| json!({
+                    "accountId": account.account_id,
+                    "userId": account.session.user_id,
+                    "userName": account.session.user_name,
+                })).collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
+    }))
+}
+
+fn account_public_payload(account_id: &str, stored: &StoredSession, configured: bool) -> Value {
+    json!({
+        "configured": configured,
+        "accountId": account_id,
+        "serverId": server_id_from_base_url(&stored.base_url),
+        "baseUrl": stored.base_url.as_str(),
+        "userId": stored.user_id,
+        "userName": stored.user_name,
+        "serverType": stored.connection.client.server_type(),
+        "clientProfile": stored.connection.client.as_str(),
+        "proxyMode": stored.connection.proxy.as_str(),
     })
+}
+
+fn server_id_from_base_url(base_url: &Url) -> String {
+    let digest = Sha256::digest(base_url.as_str().as_bytes());
+    format!("{digest:x}")
 }
 
 fn execute_authentication(
@@ -2869,22 +3443,25 @@ fn execute_authentication(
     expected_generation: u64,
     request: &AuthRequest,
 ) -> Result<Value, LoadFailure> {
-    let base_authorization = native_authorization_header(None)?;
+    ensure_server_connection_profile(&request.base_url, request.connection)?;
+    let base_authorization = native_authorization_header(None, request.connection.client)?;
     let authenticated = runtime
         .api
-        .authenticate(
+        .authenticate_with_profile(
             &request.base_url,
             &request.username,
             &request.password,
             &base_authorization,
+            request.connection,
         )
         .map_err(|error| authentication_failure(&error))?;
     let access_token = authenticated.access_token_secret().to_string();
-    let stored = StoredSession::new(
+    let stored = StoredSession::new_with_profile(
         authenticated.base_url,
         authenticated.user_id,
         authenticated.user_name,
         access_token,
+        request.connection,
     )
     .map_err(|error| {
         log_error(&format!(
@@ -2893,7 +3470,8 @@ fn execute_authentication(
         ));
         LoadFailure::new(error.code(), "The authenticated session is invalid")
     })?;
-    let authorization = native_authorization_header(Some(stored.access_token_secret()))?;
+    let authorization =
+        native_authorization_header(Some(stored.access_token_secret()), stored.connection.client)?;
     let session = stored.to_session(authorization).map_err(|error| {
         log_error(&format!(
             "MediaStation authenticated session could not be configured: code={}",
@@ -2910,6 +3488,96 @@ fn execute_authentication(
         stored.user_name.clone(),
         &stored,
     )
+}
+
+fn execute_account_update(
+    runtime: &MediaStationRuntime,
+    expected_generation: u64,
+    request: &UpdateAccountRequest,
+) -> Result<Value, LoadFailure> {
+    let store = WindowsCredentialStore::account_by_id(&request.account_id).map_err(|error| {
+        LoadFailure::new(error.code(), "The selected account identifier is invalid")
+    })?;
+    let previous = store
+        .load()
+        .map_err(|error| {
+            log_error(&format!(
+                "MediaStation saved account read before authentication update failed: code={}",
+                error.code()
+            ));
+            LoadFailure::new(error.code(), "The selected account could not be read")
+        })?
+        .ok_or_else(|| {
+            LoadFailure::new(
+                "account_not_found",
+                "The selected account is no longer available",
+            )
+        })?;
+    if previous.account_id() != request.account_id {
+        return Err(LoadFailure::new(
+            "credential_account_mismatch",
+            "The selected credential does not match its account identifier",
+        ));
+    }
+    if request.connection != previous.connection {
+        return Err(LoadFailure::new(
+            "server_connection_mismatch",
+            "The server connection profile cannot be changed while updating a user",
+        ));
+    }
+
+    let base_authorization = native_authorization_header(None, previous.connection.client)?;
+    let authenticated = runtime
+        .api
+        .authenticate_with_profile(
+            &previous.base_url,
+            &request.username,
+            &request.password,
+            &base_authorization,
+            previous.connection,
+        )
+        .map_err(|error| authentication_failure(&error))?;
+    let access_token = authenticated.access_token_secret().to_string();
+    let stored = StoredSession::new_with_profile(
+        authenticated.base_url,
+        authenticated.user_id,
+        authenticated.user_name,
+        access_token,
+        previous.connection,
+    )
+    .map_err(|error| {
+        log_error(&format!(
+            "MediaStation updated authenticated session was rejected: code={}",
+            error.code()
+        ));
+        LoadFailure::new(error.code(), "The authenticated session is invalid")
+    })?;
+    runtime.update_saved_account(expected_generation, &request.account_id, &stored)
+}
+
+fn ensure_server_connection_profile(
+    base_url: &Url,
+    requested: MediaStationConnectionProfile,
+) -> Result<(), LoadFailure> {
+    let accounts = WindowsCredentialStore::list_saved_accounts().map_err(|error| {
+        log_error(&format!(
+            "MediaStation saved account read before authentication failed: code={}",
+            error.code()
+        ));
+        LoadFailure::new(
+            error.code(),
+            "The saved server connection profile could not be read",
+        )
+    })?;
+    if accounts.iter().any(|account| {
+        account.session.base_url == *base_url && account.session.connection != requested
+    }) {
+        return Err(LoadFailure::new(
+            "server_connection_mismatch",
+            "This server already uses a different connection profile",
+        ));
+    }
+    Ok(())
 }
 
 fn persist_active_session(stored: &StoredSession) -> Result<(), LoadFailure> {
@@ -3076,7 +3744,10 @@ fn parse_server_url(raw: &str) -> Result<Url, LoadFailure> {
     Ok(url)
 }
 
-fn native_authorization_header(token: Option<&str>) -> Result<String, LoadFailure> {
+fn native_authorization_header(
+    token: Option<&str>,
+    client_profile: MediaStationClientProfile,
+) -> Result<String, LoadFailure> {
     if token.is_some_and(|token| {
         token.is_empty()
             || token.len() > 2_048
@@ -3090,8 +3761,10 @@ fn native_authorization_header(token: Option<&str>) -> Result<String, LoadFailur
             "The server returned an invalid access token",
         ));
     }
+    let client = client_profile.authorization_client();
+    let version = client_profile.authorization_version(APP_VERSION);
     let mut authorization = format!(
-        "MediaBrowser Client=\"MediaStation Windows\", Device=\"Windows\", DeviceId=\"mediastation-windows\", Version=\"{APP_VERSION}\""
+        "MediaBrowser Client=\"{client}\", Device=\"Windows\", DeviceId=\"mediastation-windows\", Version=\"{version}\""
     );
     if let Some(token) = token {
         authorization.push_str(", Token=\"");
@@ -3802,6 +4475,8 @@ fn execute_track_selection(
 ) -> Result<Value, LoadFailure> {
     let source = runtime.active_playback_source(snapshot, &request.media_id)?;
     let preference_scope_id = runtime.active_preference_scope_id(snapshot, &request.media_id)?;
+    let preference_persistence =
+        runtime.active_preference_persistence(snapshot, &request.media_id)?;
     let catalog = current_runtime_track_catalog(&source)?;
     let previous_preference = runtime_preference_update(&catalog);
     let (update, selection) = match request.kind {
@@ -3843,10 +4518,13 @@ fn execute_track_selection(
                     ..PlaybackTrackPreferenceUpdate::default()
                 };
                 runtime.ensure_generation(snapshot.generation)?;
-                runtime
-                    .api
-                    .update_playback_preference(&snapshot.session, &preference_scope_id, &update)
-                    .map_err(|error| api_failure("preference_update_failed", &error))?;
+                persist_track_preference(
+                    runtime,
+                    snapshot,
+                    preference_persistence,
+                    &preference_scope_id,
+                    &update,
+                )?;
                 runtime.ensure_generation(snapshot.generation)?;
                 runtime.bump_preference_revision(snapshot);
                 return match runtime.apply_track_selection(
@@ -3854,18 +4532,21 @@ fn execute_track_selection(
                     &request.media_id,
                     TrackSelection::SubtitleOff,
                 ) {
-                    Ok(payload) => {
+                    Ok(mut payload) => {
                         runtime.commit_active_preference_update(
                             snapshot,
                             &request.media_id,
                             &update,
                         );
+                        payload["preferencePersistence"] =
+                            Value::String(preference_persistence.as_str().to_string());
                         Ok(payload)
                     }
                     Err(failure) => {
                         rollback_track_preference(
                             runtime,
                             snapshot,
+                            preference_persistence,
                             &preference_scope_id,
                             &previous_preference,
                         );
@@ -3911,29 +4592,52 @@ fn execute_track_selection(
     };
 
     runtime.ensure_generation(snapshot.generation)?;
-    runtime
-        .api
-        .update_playback_preference(&snapshot.session, &preference_scope_id, &update)
-        .map_err(|error| api_failure("preference_update_failed", &error))?;
+    persist_track_preference(
+        runtime,
+        snapshot,
+        preference_persistence,
+        &preference_scope_id,
+        &update,
+    )?;
     runtime.ensure_generation(snapshot.generation)?;
     // Record that the user explicitly changed the track preference so the
     // first-frame reconcile worker will not re-apply or correct it.
     runtime.bump_preference_revision(snapshot);
     match runtime.apply_track_selection(snapshot, &request.media_id, selection) {
-        Ok(payload) => {
+        Ok(mut payload) => {
             runtime.commit_active_preference_update(snapshot, &request.media_id, &update);
+            payload["preferencePersistence"] =
+                Value::String(preference_persistence.as_str().to_string());
             Ok(payload)
         }
         Err(failure) => {
             rollback_track_preference(
                 runtime,
                 snapshot,
+                preference_persistence,
                 &preference_scope_id,
                 &previous_preference,
             );
             Err(failure)
         }
     }
+}
+
+fn persist_track_preference(
+    runtime: &MediaStationRuntime,
+    snapshot: &SessionSnapshot,
+    persistence: PlaybackPreferencePersistence,
+    media_id: &str,
+    update: &PlaybackTrackPreferenceUpdate,
+) -> Result<(), LoadFailure> {
+    if persistence == PlaybackPreferencePersistence::SessionOnly {
+        return Ok(());
+    }
+    runtime
+        .api
+        .update_playback_preference(&snapshot.session, media_id, update)
+        .map(|_| ())
+        .map_err(|error| api_failure("preference_update_failed", &error))
 }
 
 fn runtime_preference_update(catalog: &RuntimeTrackCatalog) -> PlaybackTrackPreferenceUpdate {
@@ -3957,9 +4661,13 @@ fn runtime_preference_update(catalog: &RuntimeTrackCatalog) -> PlaybackTrackPref
 fn rollback_track_preference(
     runtime: &MediaStationRuntime,
     snapshot: &SessionSnapshot,
+    persistence: PlaybackPreferencePersistence,
     media_id: &str,
     previous: &PlaybackTrackPreferenceUpdate,
 ) {
+    if persistence == PlaybackPreferencePersistence::SessionOnly {
+        return;
+    }
     if runtime.ensure_generation(snapshot.generation).is_err() {
         return;
     }
@@ -4100,7 +4808,9 @@ fn reconcile_runtime_track_preference_inner(
         )?;
     }
 
-    if preference_update_has_values(&correction) {
+    if preference_update_has_values(&correction)
+        && reconcile.preference_persistence == PlaybackPreferencePersistence::ServerExtension
+    {
         runtime.ensure_generation(reconcile.snapshot.generation)?;
         runtime
             .api
@@ -4491,10 +5201,17 @@ fn execute_load(
     }
 
     runtime.ensure_generation(snapshot.generation)?;
-    let preference = runtime
+    let preference_state = runtime
         .api
-        .load_playback_preference(&snapshot.session, &request.preference_scope_id)
+        .load_playback_preference(&snapshot.session, &request.preference_scope_id, &source)
         .map_err(|error| api_failure("preference_load_failed", &error))?;
+    let preference = preference_state.preference;
+    let preference_persistence = preference_state.persistence;
+    log_debug(&format!(
+        "MediaStation playback preference capability: media_id={} persistence={}",
+        request.media_id,
+        preference_persistence.as_str()
+    ));
     let plan = build_playback_track_plan(&source, &preference);
 
     // PlaybackInfo can omit embedded streams. Correcting an unknown key here
@@ -4513,7 +5230,11 @@ fn execute_load(
         .playback_resolve_input(
             &request.media_id,
             source.url.clone(),
-            runtime.user_agent.clone(),
+            snapshot
+                .session
+                .connection
+                .client
+                .user_agent(&runtime.user_agent),
         )
         .map_err(|error| playback_session_failure("resolve_input_failed", &error))?;
     let playback = runtime
@@ -4543,17 +5264,15 @@ fn execute_load(
         .request_headers
         .to_mpv_http_header_fields()
         .map_err(header_encoding_failure)?;
-    // Serve the resolved CDN URL through the ureq-backed mediastation://
-    // protocol instead of handing ffmpeg the direct CDN URL. The 115 cloud
-    // CDN 403s ffmpeg's TLS fingerprint, so mpv reads the stream from ureq.
-    let media_user_agent = playback
-        .request_headers
-        .get("user-agent")
-        .unwrap_or("MediaStationGoWindows/0.1.0-dev");
-    let playback_url = CString::new(jfn_mpv::stream_cb::build_uri(
-        playback.resolved_url.as_str(),
-        media_user_agent,
-        playback.content_length,
+    // Same-origin Emby streams must stay on mpv's HTTP path so its
+    // X-Emby-* headers reach the server. Cross-origin CDN streams use the
+    // ureq-backed protocol because some CDNs reject ffmpeg's TLS fingerprint.
+    let use_mpv_http = source.standard_emby_stream
+        || snapshot.session.connection.client != MediaStationClientProfile::MediaStationGo;
+    let playback_url = CString::new(native_playback_url(
+        &playback,
+        use_mpv_http,
+        snapshot.session.connection.proxy,
     ))
     .map_err(|_| {
         LoadFailure::new(
@@ -4565,6 +5284,16 @@ fn execute_load(
         LoadFailure::new(
             "invalid_playback_headers",
             "The playback headers contain an invalid byte",
+        )
+    })?;
+    let playback_proxy = runtime
+        .api
+        .playback_proxy_url(&snapshot.session)
+        .map_err(|error| api_failure("playback_proxy_unavailable", &error))?;
+    let playback_proxy = playback_proxy.map(CString::new).transpose().map_err(|_| {
+        LoadFailure::new(
+            "invalid_playback_proxy",
+            "The system HTTP proxy URL contains an invalid byte",
         )
     })?;
     let video_filter = interpolation
@@ -4597,6 +5326,9 @@ fn execute_load(
             .as_ref()
             .map_or(c"".as_ptr(), |subtitle| subtitle.path.as_ptr()),
         http_header_fields: header_fields.as_ptr(),
+        http_proxy: playback_proxy
+            .as_ref()
+            .map_or(c"".as_ptr(), |value| value.as_ptr()),
         video_filter: video_filter
             .as_ref()
             .map_or(c"".as_ptr(), |value| value.as_ptr()),
@@ -4612,6 +5344,7 @@ fn execute_load(
         snapshot,
         source: &source,
         preference: &preference,
+        preference_persistence,
         preference_scope_id: &request.preference_scope_id,
         media_id: &request.media_id,
         start_ms: request.start_ms,
@@ -4652,11 +5385,37 @@ fn execute_load(
         "subtitleRedirectCount": subtitle_redirect_count,
         "subtitleTargetHost": subtitle_target_host,
         "reportingAvailable": runtime.reporter.is_available(),
+        "preferencePersistence": preference_persistence.as_str(),
         "preferenceScopeId": request.preference_scope_id,
         "preferenceCorrection": correction_status,
         "preferenceCorrectionErrorCode": correction_error_code,
         "frameInterpolation": interpolation.as_ref().map(frame_interpolation_payload),
     }))
+}
+
+fn native_playback_url(
+    playback: &PlaybackSession,
+    use_mpv_http: bool,
+    proxy_mode: MediaStationProxyMode,
+) -> String {
+    match use_mpv_http {
+        true => playback.resolved_url.as_str().to_string(),
+        false => {
+            let media_user_agent = playback
+                .request_headers
+                .get("user-agent")
+                .unwrap_or("MediaStationGoWindows/0.1.0-dev");
+            jfn_mpv::stream_cb::build_uri(
+                playback.resolved_url.as_str(),
+                media_user_agent,
+                playback.content_length,
+                match proxy_mode {
+                    MediaStationProxyMode::Direct => jfn_mpv::stream_cb::StreamProxyMode::Direct,
+                    MediaStationProxyMode::System => jfn_mpv::stream_cb::StreamProxyMode::System,
+                },
+            )
+        }
+    }
 }
 
 fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
@@ -5163,6 +5922,7 @@ fn api_error_code(error: &ApiError) -> &'static str {
         ApiError::UnsupportedScheme { .. } => "unsupported_scheme",
         ApiError::EmbeddedCredentials { .. } => "embedded_credentials",
         ApiError::InvalidEndpoint { .. } => "invalid_endpoint",
+        ApiError::SystemProxyUnavailable => "system_proxy_unavailable",
         ApiError::Transport { .. } => "transport",
         ApiError::HttpStatus { .. } => "http_status",
         ApiError::InvalidJson { .. } => "invalid_json",
@@ -5278,15 +6038,101 @@ mod tests {
             url: base_url
                 .join("/Videos/media-1/stream")
                 .expect("media URL should resolve"),
+            standard_emby_stream: false,
             server_credential_query_removed: false,
             container: Some("mkv".to_string()),
             bitrate: Some(10_000_000),
-            media_source_id: "source-1".to_string(),
-            play_session_id: "play-session-1".to_string(),
+            media_source_id: Some("source-1".to_string()),
+            play_session_id: Some("play-session-1".to_string()),
+            default_audio_stream_index: None,
+            default_subtitle_stream_index: None,
             video: None,
             subtitles: Vec::new(),
             audio_tracks: Vec::new(),
         }
+    }
+
+    fn playback_session(base_url: Url, delivery_mode: DeliveryMode) -> PlaybackSession {
+        let mut request_headers = jfn_mediastation::HeaderMap::default();
+        request_headers.insert("user-agent", "MediaStationWindows/test");
+        PlaybackSession {
+            user_id: "user-1".to_string(),
+            media_id: "media-1".to_string(),
+            source_url: base_url.clone(),
+            resolved_url: base_url,
+            request_headers,
+            content_length: Some(42),
+            content_version: None,
+            expires_at_epoch_ms: u64::MAX,
+            metrics: jfn_mediastation::PlaybackSessionMetrics {
+                redirect_count: 0,
+                resolve_ms: 0,
+                status_code: 206,
+                target_host: "media.example".to_string(),
+                delivery_mode,
+                accepts_ranges: true,
+                expiry_source: SessionExpirySource::DefaultTtl,
+                reused: false,
+            },
+        }
+    }
+
+    #[test]
+    fn standard_server_playback_keeps_http_url_for_mpv_headers() {
+        let url = Url::parse("https://media.example/Videos/media-1/stream?Static=true")
+            .expect("URL should parse");
+        let playback = playback_session(url.clone(), DeliveryMode::Server);
+
+        assert_eq!(
+            native_playback_url(&playback, true, MediaStationProxyMode::System),
+            url.as_str()
+        );
+    }
+
+    #[test]
+    fn standard_cross_origin_playback_keeps_http_url_for_proxy() {
+        let url = Url::parse("https://cdn.example/media-1.mkv").expect("URL should parse");
+        let playback = playback_session(url.clone(), DeliveryMode::DirectCdn);
+
+        assert_eq!(
+            native_playback_url(&playback, true, MediaStationProxyMode::System),
+            url.as_str()
+        );
+    }
+
+    #[test]
+    fn media_station_stream_keeps_mediastation_protocol() {
+        let url =
+            Url::parse("https://cdn.example/video.mkv?sig=redacted").expect("URL should parse");
+        let playback = playback_session(url, DeliveryMode::DirectCdn);
+
+        assert_eq!(
+            native_playback_url(&playback, false, MediaStationProxyMode::Direct),
+            "mediastation://https://cdn.example/video.mkv?sig=redacted|MediaStationWindows/test|42|direct"
+        );
+    }
+
+    #[test]
+    fn same_origin_media_station_stream_keeps_existing_protocol() {
+        let url =
+            Url::parse("https://media.example/Videos/media-1/stream").expect("URL should parse");
+        let playback = playback_session(url, DeliveryMode::Server);
+
+        assert!(
+            native_playback_url(&playback, false, MediaStationProxyMode::Direct)
+                .starts_with("mediastation://")
+        );
+    }
+
+    #[test]
+    fn proxied_msg_stream_keeps_protocol_and_carries_system_mode() {
+        let url = Url::parse("https://cdn.example/video.mkv").expect("URL should parse");
+        let playback = playback_session(url, DeliveryMode::DirectCdn);
+
+        assert!(
+            native_playback_url(&playback, false, MediaStationProxyMode::System)
+                .ends_with("|system")
+        );
     }
 
     fn playback_event(kind: PlaybackEventKind, position_ms: u64) -> PlaybackEvent {
@@ -5514,14 +6360,25 @@ mod tests {
 
         assert_eq!(payload["configured"], true);
         assert_eq!(payload["persisted"], true);
+        assert_eq!(
+            payload["accountId"],
+            account_credential_id(&session("user-1").base_url, "user-1")
+        );
+        assert_eq!(
+            payload["serverId"],
+            server_id_from_base_url(&session("user-1").base_url)
+        );
         assert_eq!(payload["userId"], "user-1");
         assert_eq!(payload["userName"], "Test User");
+        assert_eq!(payload["serverType"], "mediastation_go");
+        assert_eq!(payload["clientProfile"], "mediastation_go");
+        assert_eq!(payload["proxyMode"], "direct");
         assert!(!text.contains("test-token"));
         assert!(!text.to_ascii_lowercase().contains("authorization"));
     }
 
     #[test]
-    fn saved_accounts_payload_contains_only_public_identity_fields() {
+    fn saved_accounts_payload_groups_users_by_server_without_secrets() {
         let stored = StoredSession::new(
             Url::parse("https://media.example/base").expect("URL should parse"),
             "saved-user",
@@ -5529,24 +6386,92 @@ mod tests {
             "saved-account-secret",
         )
         .expect("stored session should be valid");
+        let second = StoredSession::new(
+            Url::parse("https://other.example/emby").expect("URL should parse"),
+            "second-user",
+            "Second User",
+            "second-account-secret",
+        )
+        .expect("second stored session should be valid");
         let account_id = stored.account_id();
-        let payload = saved_accounts_payload(&[SavedAccount {
-            account_id: account_id.clone(),
-            session: stored,
-        }]);
-        let account = payload["accounts"][0]
+        let second_id = second.account_id();
+        let payload = saved_accounts_payload(&[
+            SavedAccount {
+                account_id: account_id.clone(),
+                session: stored,
+            },
+            SavedAccount {
+                account_id: second_id.clone(),
+                session: second,
+            },
+        ])
+        .expect("consistent server groups should encode");
+        let servers = payload["servers"]
+            .as_array()
+            .expect("server groups should be an array");
+        assert_eq!(servers.len(), 2);
+        let server = servers
+            .iter()
+            .find(|server| server["baseUrl"] == "https://media.example/base")
+            .expect("media server group should be present");
+        let account = server["users"][0]
             .as_object()
             .expect("account payload should be an object");
         let text = payload.to_string();
 
-        assert_eq!(account.len(), 4);
+        assert_eq!(
+            server["serverId"],
+            server_id_from_base_url(&Url::parse("https://media.example/base").unwrap())
+        );
+        assert_eq!(account.len(), 3);
         assert_eq!(account["accountId"], account_id);
-        assert_eq!(account["baseUrl"], "https://media.example/base");
         assert_eq!(account["userId"], "saved-user");
         assert_eq!(account["userName"], "Saved User");
+        assert_eq!(account["accountId"], account_id);
+        assert_ne!(account["accountId"], second_id);
+        assert_eq!(server["serverType"], "mediastation_go");
+        assert_eq!(server["clientProfile"], "mediastation_go");
+        assert_eq!(server["proxyMode"], "direct");
         assert!(!text.contains("saved-account-secret"));
+        assert!(!text.contains("second-account-secret"));
         assert!(!text.to_ascii_lowercase().contains("token"));
         assert!(!text.to_ascii_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn saved_accounts_reject_mixed_profiles_for_one_server() {
+        let base_url = Url::parse("https://media.example/base").expect("URL should parse");
+        let msg = StoredSession::new_with_profile(
+            base_url.clone(),
+            "msg-user",
+            "MSG User",
+            "msg-secret",
+            MediaStationConnectionProfile::media_station_go(),
+        )
+        .expect("MSG session should be valid");
+        let emby = StoredSession::new_with_profile(
+            base_url,
+            "emby-user",
+            "Emby User",
+            "emby-secret",
+            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
+                .expect("SenPlayer should be supported"),
+        )
+        .expect("Emby session should be valid");
+
+        let error = saved_accounts_payload(&[
+            SavedAccount {
+                account_id: msg.account_id(),
+                session: msg,
+            },
+            SavedAccount {
+                account_id: emby.account_id(),
+                session: emby,
+            },
+        ])
+        .expect_err("one server cannot expose mixed connection profiles");
+
+        assert_eq!(error.code, "server_connection_mismatch");
     }
 
     #[test]
@@ -5914,10 +6839,51 @@ mod tests {
 
     #[test]
     fn native_authorization_rejects_header_injection() {
-        let error = native_authorization_header(Some("token\r\nInjected: value"))
-            .expect_err("control characters must fail");
+        let error = native_authorization_header(
+            Some("token\r\nInjected: value"),
+            MediaStationClientProfile::MediaStationGo,
+        )
+        .expect_err("control characters must fail");
 
         assert_eq!(error.code, "invalid_access_token");
+    }
+
+    #[test]
+    fn native_authorization_uses_explicit_standard_emby_identity() {
+        let authorization = native_authorization_header(None, MediaStationClientProfile::SenPlayer)
+            .expect("SenPlayer authorization should encode");
+
+        assert!(authorization.contains("Client=\"SenPlayer\""));
+        assert!(authorization.contains("Version=\"1.0.0\""));
+        assert!(!authorization.contains("MediaStation Windows"));
+    }
+
+    #[test]
+    fn connection_parser_supports_all_server_types_and_proxy_modes() {
+        assert_eq!(
+            parse_connection_profile("mediastation_go", "direct").expect("MSG direct should parse"),
+            MediaStationConnectionProfile::media_station_go()
+        );
+        assert_eq!(
+            parse_connection_profile("senplayer", "system")
+                .expect("standard Emby proxy should parse"),
+            MediaStationConnectionProfile {
+                client: MediaStationClientProfile::SenPlayer,
+                proxy: MediaStationProxyMode::System,
+            }
+        );
+        assert_eq!(
+            parse_connection_profile("mediastation_go", "system")
+                .expect("MSG may explicitly use the system proxy")
+                .proxy,
+            MediaStationProxyMode::System
+        );
+        assert_eq!(
+            parse_connection_profile("infuse", "direct")
+                .expect("standard Emby direct should parse")
+                .proxy,
+            MediaStationProxyMode::Direct
+        );
     }
 
     #[test]
@@ -5947,8 +6913,16 @@ mod tests {
             audio_track_key: None,
         };
         assert!(
-            activate_playback_report(&mut state, &snapshot, &source, &preference, "series-1", 250,)
-                .is_none()
+            activate_playback_report(
+                &mut state,
+                &snapshot,
+                &source,
+                &preference,
+                PlaybackPreferencePersistence::ServerExtension,
+                "series-1",
+                250,
+            )
+            .is_none()
         );
         let now = Instant::now();
 

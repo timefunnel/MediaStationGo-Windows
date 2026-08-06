@@ -103,6 +103,12 @@
     let overviewTrigger = null;
     let loginCanCancel = false;
     let loginReturnFocus = null;
+    let loginMode = 'add';
+    let loginAccount = null;
+    let loginConnectionLocked = false;
+    let savedAccountsRevision = 0;
+    let pendingDeleteAccount = null;
+    let deleteReturnFocus = null;
     let contentTransitionTimer = 0;
     let homeRefreshTimer = 0;
     let homeRefreshGeneration = 0;
@@ -573,6 +579,7 @@
             session_changed: '账号状态已变化，请重试',
             account_not_found: '所选账号已不存在，请刷新列表',
             invalid_account_id: '所选账号标识无效',
+            account_identity_changed: '认证后的用户与原账号不一致，未修改原账号',
             saved_account_invalid: '所选账号凭据无效',
             credential_enumerate_failed: '无法读取 Windows 中保存的账号',
             credential_read_failed: '无法读取 Windows 中保存的账号凭据',
@@ -582,6 +589,15 @@
             credential_account_target_invalid: '已保存账号标识无效',
             credential_account_mismatch: '已保存账号标识与凭据不一致',
             credential_persist_rollback_failed: '账号保存失败，且无法恢复之前的账号状态',
+            credential_delete_rollback_failed: '账号删除失败，且无法恢复之前的账号状态',
+            credential_active_mismatch: '保存的账号与当前会话不一致',
+            updated_account_invalid: '修改后的账号无法配置',
+            invalid_client_profile: '服务器客户端身份无效',
+            invalid_proxy_mode: '服务器代理模式无效',
+            invalid_connection_profile: '服务器连接配置无效',
+            server_connection_mismatch: '该服务器已有账号使用其他连接配置',
+            system_proxy_unavailable: '未检测到可用的 Windows 系统代理',
+            playback_proxy_unavailable: '标准 Emby 播放需要可用的 Windows 系统代理',
             settings_write_failed: '无法保存当前服务器设置',
             frame_interpolation_runtime_unavailable: 'RIFE 插帧组件不可用',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
@@ -652,12 +668,81 @@
         byId('drawer-server').textContent = session?.baseUrl || '';
     }
 
+    function validConnectionProfile(value) {
+        return Boolean(value && (
+            (value.serverType === 'mediastation_go'
+                && value.clientProfile === 'mediastation_go'
+                && ['direct', 'system'].includes(value.proxyMode))
+            || (value.serverType === 'standard_emby'
+                && ['senplayer', 'infuse'].includes(value.clientProfile)
+                && ['direct', 'system'].includes(value.proxyMode))
+        ));
+    }
+
+    function defaultConnectionProfile() {
+        return {
+            serverType: 'mediastation_go',
+            clientProfile: 'mediastation_go',
+            proxyMode: 'direct',
+        };
+    }
+
+    function selectedLoginConnection() {
+        const serverType = document.querySelector('input[name="server-type"]:checked')?.value;
+        if (serverType === 'standard_emby') {
+            return {
+                serverType,
+                clientProfile: byId('emby-client-profile').value,
+                proxyMode: byId('login-proxy-mode').value,
+            };
+        }
+        return {
+            serverType: 'mediastation_go',
+            clientProfile: 'mediastation_go',
+            proxyMode: byId('login-proxy-mode').value,
+        };
+    }
+
+    function syncLoginConnectionUi() {
+        const standardEmby = document.querySelector('input[name="server-type"]:checked')?.value
+            === 'standard_emby';
+        byId('emby-client-profile-field').classList.toggle('hidden', !standardEmby);
+        byId('login-proxy-mode').disabled = loginConnectionLocked;
+    }
+
+    function setLoginConnection(source, locked) {
+        const connection = source && validConnectionProfile(source)
+            ? source
+            : defaultConnectionProfile();
+        const type = connection.serverType;
+        loginConnectionLocked = locked;
+        document.querySelectorAll('input[name="server-type"]').forEach((input) => {
+            input.checked = input.value === type;
+            input.disabled = locked;
+        });
+        byId('emby-client-profile').value = type === 'standard_emby'
+            ? connection.clientProfile
+            : 'senplayer';
+        byId('emby-client-profile').disabled = locked;
+        byId('login-proxy-mode').value = connection.proxyMode;
+        syncLoginConnectionUi();
+    }
+
     function setPlayerMode(enabled) {
         document.documentElement.classList.toggle('player-mode', enabled);
         document.body.classList.toggle('player-mode', enabled);
     }
 
-    function showLogin(baseUrl = '', message = '', canCancel = false) {
+    function showLogin(
+        baseUrl = '',
+        message = '',
+        canCancel = false,
+        mode = 'login',
+        account = null,
+        connection = null,
+    ) {
+        loginMode = mode;
+        loginAccount = account;
         loginCanCancel = canCancel;
         splash.classList.add('hidden');
         appShell.classList.add('hidden');
@@ -665,8 +750,16 @@
         setPlayerMode(false);
         loginView.classList.remove('hidden');
         byId('server-url').value = baseUrl;
+        byId('server-url').readOnly = mode === 'update' || mode === 'server-user';
+        setLoginConnection(connection || account, mode === 'update' || mode === 'server-user');
+        byId('username').value = mode === 'update' ? account?.userName || '' : '';
         byId('password').value = '';
         byId('login-cancel').classList.toggle('hidden', !canCancel);
+        byId('login-title').textContent = mode === 'update'
+            ? '修改账号'
+            : mode === 'server-user' ? '添加服务器用户'
+                : mode === 'add' ? '添加账号' : '登录媒体服务器';
+        byId('login-submit').lastElementChild.textContent = mode === 'update' ? '保存修改' : '登录';
         byId('login-error').textContent = message;
         window.setTimeout(() => byId(baseUrl ? 'username' : 'server-url').focus(), 0);
     }
@@ -675,6 +768,8 @@
         session = account;
         loginCanCancel = false;
         loginReturnFocus = null;
+        loginMode = 'add';
+        loginAccount = null;
         updateSessionUi();
         splash.classList.add('hidden');
         loginView.classList.add('hidden');
@@ -717,19 +812,39 @@
         updateImageCacheStatus();
     }
 
-    function beginAccountChange() {
-        if (!session) return;
-        loginReturnFocus = byId('account-open');
+    function beginAddAccount(baseUrl = '', lockServer = false, trigger = null, server = null) {
+        if (!session && !baseUrl) return;
+        loginReturnFocus = trigger || byId('account-open');
         closeDrawer(false);
-        byId('username').value = '';
-        showLogin(session.baseUrl || '', '', true);
+        const selectedBaseUrl = baseUrl || session?.baseUrl || '';
+        const connection = server
+            || (session?.baseUrl === selectedBaseUrl && validConnectionProfile(session) ? session : null);
+        showLogin(
+            selectedBaseUrl,
+            '',
+            true,
+            lockServer ? 'server-user' : 'add',
+            null,
+            connection,
+        );
+    }
+
+    function beginUpdateAccount(account, trigger = null) {
+        if (!account?.accountId) return;
+        loginReturnFocus = trigger || byId('account-open');
+        closeDrawer(false);
+        showLogin(account.baseUrl, '', true, 'update', account);
     }
 
     function cancelAccountChange() {
         if (!loginCanCancel || !session) return;
         loginCanCancel = false;
+        loginMode = 'add';
+        loginAccount = null;
         loginView.classList.add('hidden');
         appShell.classList.remove('hidden');
+        byId('server-url').readOnly = false;
+        setLoginConnection(null, false);
         byId('login-error').textContent = '';
         byId('password').value = '';
         byId('login-cancel').classList.add('hidden');
@@ -756,17 +871,36 @@
         event.preventDefault();
         const button = byId('login-submit');
         const errorText = byId('login-error');
+        const mode = loginMode;
+        const account = loginAccount;
         button.disabled = true;
         errorText.textContent = '';
         try {
-            const status = await nativeRequest('mediaStationAuthenticate', 'authenticate', [
-                byId('server-url').value.trim(),
-                byId('username').value.trim(),
-                byId('password').value,
-            ]);
+            const connection = selectedLoginConnection();
+            const status = mode === 'update'
+                ? await nativeRequest('mediaStationUpdateAccount', 'update_account', [
+                    account.accountId,
+                    byId('username').value.trim(),
+                    byId('password').value,
+                    connection.clientProfile,
+                    connection.proxyMode,
+                ])
+                : await nativeRequest('mediaStationAuthenticate', 'authenticate', [
+                    byId('server-url').value.trim(),
+                    byId('username').value.trim(),
+                    byId('password').value,
+                    connection.clientProfile,
+                    connection.proxyMode,
+                ]);
             byId('password').value = '';
-            resetCatalogState();
-            await showApp(status);
+            const updatedInactiveAccount = mode === 'update' && !isCurrentAccount(account);
+            if (updatedInactiveAccount) {
+                returnToAccountDrawer();
+                showToast('账号已更新');
+            } else {
+                resetCatalogState();
+                await showApp(status);
+            }
         } catch (error) {
             errorText.textContent = friendlyError(error);
         } finally {
@@ -2796,6 +2930,7 @@
 
     function closeDrawer(restoreFocus = true) {
         if (!currentDrawer) return;
+        if (currentDrawer === byId('account-drawer')) savedAccountsRevision += 1;
         currentDrawer.classList.remove('open');
         currentDrawer.setAttribute('aria-hidden', 'true');
         byId('drawer-scrim').classList.add('hidden');
@@ -2805,77 +2940,168 @@
         if (restoreFocus) trigger?.focus();
     }
 
-    async function logout() {
-        const button = byId('logout-button');
-        button.disabled = true;
+    function isCurrentAccount(account) {
+        return Boolean(session?.accountId && account?.accountId === session.accountId);
+    }
+
+    function isCurrentServer(server) {
+        return Boolean(session?.serverId && server?.serverId === session.serverId);
+    }
+
+    function serverLabel(baseUrl) {
         try {
-            await nativeRequest('mediaStationLogout', 'logout');
-            closeDrawer(false);
-            session = null;
-            resetCatalogState();
-            showLogin(byId('drawer-server').textContent || '');
-        } catch (error) {
-            showToast(friendlyError(error));
-        } finally {
-            button.disabled = false;
+            const url = new URL(baseUrl);
+            return url.host;
+        } catch {
+            return baseUrl;
         }
+    }
+
+    function returnToAccountDrawer() {
+        loginCanCancel = false;
+        loginMode = 'add';
+        loginAccount = null;
+        loginReturnFocus = null;
+        loginView.classList.add('hidden');
+        appShell.classList.remove('hidden');
+        byId('server-url').readOnly = false;
+        setLoginConnection(null, false);
+        byId('login-cancel').classList.add('hidden');
+        openDrawer(byId('account-drawer'), byId('account-open'));
+        loadSavedAccounts();
     }
 
     async function loadSavedAccounts() {
         const list = byId('saved-accounts-list');
         const state = byId('saved-accounts-state');
+        const revision = ++savedAccountsRevision;
         list.replaceChildren();
         state.textContent = '正在读取账号...';
         state.classList.remove('hidden', 'error');
         try {
             const result = await nativeRequest('mediaStationListAccounts', 'list_accounts');
-            const accounts = Array.isArray(result.accounts) ? result.accounts : [];
+            if (revision !== savedAccountsRevision) return;
+            const servers = Array.isArray(result.servers) ? result.servers : [];
+            const accounts = [];
+            const accountIds = new Set();
+            if (servers.some((server) => (
+                typeof server.serverId !== 'string'
+                || !/^[0-9a-f]{64}$/.test(server.serverId)
+                || typeof server.baseUrl !== 'string'
+                || !server.baseUrl
+                || !validConnectionProfile(server)
+                || !Array.isArray(server.users)
+                || server.users.some((account) => (
+                    typeof account.accountId !== 'string'
+                    || !/^[0-9a-f]{64}$/.test(account.accountId)
+                    || typeof account.userId !== 'string'
+                    || !account.userId
+                    || typeof account.userName !== 'string'
+                ))
+            ))) {
+                throw new Error('已保存账号数据无效');
+            }
+            servers.forEach((server) => server.users.forEach((account) => {
+                if (accountIds.has(account.accountId)) throw new Error('已保存账号数据重复');
+                accountIds.add(account.accountId);
+                accounts.push({
+                    ...account,
+                    baseUrl: server.baseUrl,
+                    serverId: server.serverId,
+                    serverType: server.serverType,
+                    clientProfile: server.clientProfile,
+                    proxyMode: server.proxyMode,
+                });
+            }));
             if (!accounts.length) {
                 state.textContent = '暂无已保存账号';
                 return;
             }
-            if (accounts.some((account) => (
-                typeof account.accountId !== 'string'
-                || !/^[0-9a-f]{64}$/.test(account.accountId)
-                || typeof account.baseUrl !== 'string'
-                || !account.baseUrl
-                || typeof account.userId !== 'string'
-                || !account.userId
-                || typeof account.userName !== 'string'
-            ))) {
-                throw new Error('已保存账号数据无效');
-            }
-            const isCurrent = (account) => Boolean(
-                session
-                && account.baseUrl === session.baseUrl
-                && account.userId === session.userId
-            );
-            accounts.sort((left, right) => {
-                const leftActive = isCurrent(left);
-                const rightActive = isCurrent(right);
+            servers.sort((left, right) => {
+                const leftActive = isCurrentServer(left);
+                const rightActive = isCurrentServer(right);
                 if (leftActive !== rightActive) return leftActive ? -1 : 1;
-                return String(left.userName || left.userId).localeCompare(
-                    String(right.userName || right.userId),
-                    'zh-CN',
-                ) || String(left.baseUrl).localeCompare(String(right.baseUrl));
+                return left.baseUrl.localeCompare(right.baseUrl);
             });
             state.classList.add('hidden');
-            accounts.forEach((account, index) => {
-                const active = isCurrent(account);
-                const button = element('button', 'saved-account-item' + (active ? ' active' : ''), '');
-                button.type = 'button';
-                if (active) button.setAttribute('aria-current', 'true');
-                const avatar = element('span', 'avatar', (account.userName || '?').slice(0, 1).toUpperCase());
-                const body = element('div', 'saved-account-copy', null);
-                body.append(element('strong', '', account.userName || account.userId));
-                body.append(element('span', '', account.baseUrl.replace(/^https?:\/\//, '')));
-                button.append(avatar, body);
-                if (active) button.append(element('span', 'saved-account-current', '当前'));
-                button.style.animationDelay = `${Math.min(index * 30, 240)}ms`;
-                button.addEventListener('click', () => switchAccount(account, active, button));
-                list.append(button);
+            let animationIndex = 0;
+            servers.forEach((server) => {
+                const serverSection = element('section', 'saved-account-server', null);
+                const serverHeader = element('header', 'saved-account-server-header', null);
+                const serverCopy = element('div', 'saved-account-server-copy', null);
+                serverCopy.append(
+                    element('strong', '', serverLabel(server.baseUrl)),
+                    element('span', '', server.baseUrl),
+                    element(
+                        'span',
+                        'saved-account-server-connection',
+                        server.serverType === 'standard_emby'
+                            ? `标准 Emby · ${server.clientProfile === 'infuse' ? 'Infuse' : 'SenPlayer'} · ${server.proxyMode === 'system' ? '系统代理' : '直连'}`
+                            : `MediaStationGo · ${server.proxyMode === 'system' ? '系统代理' : '直连'}`,
+                    ),
+                );
+                const serverCount = element('span', 'saved-account-server-count', `${server.users.length} 个用户`);
+                const addUser = element('button', 'icon-button saved-account-server-add', '\u002b');
+                addUser.type = 'button';
+                addUser.title = '在此服务器添加用户';
+                addUser.setAttribute('aria-label', '在此服务器添加用户');
+                addUser.addEventListener('click', () => (
+                    beginAddAccount(server.baseUrl, true, addUser, server)
+                ));
+                serverHeader.append(serverCopy, serverCount, addUser);
+                const users = element('div', 'saved-account-users', null);
+                const sortedUsers = server.users.slice().sort((left, right) => {
+                    const leftActive = isCurrentAccount({ ...left, serverId: server.serverId });
+                    const rightActive = isCurrentAccount({ ...right, serverId: server.serverId });
+                    if (leftActive !== rightActive) return leftActive ? -1 : 1;
+                    return String(left.userName || left.userId).localeCompare(
+                        String(right.userName || right.userId),
+                        'zh-CN',
+                    );
+                });
+                sortedUsers.forEach((user) => {
+                    const account = {
+                        ...user,
+                        baseUrl: server.baseUrl,
+                        serverId: server.serverId,
+                        serverType: server.serverType,
+                        clientProfile: server.clientProfile,
+                        proxyMode: server.proxyMode,
+                    };
+                    const active = isCurrentAccount(account);
+                    const row = element('div', 'saved-account-row' + (active ? ' active' : ''), null);
+                    const switchButton = element('button', 'saved-account-switch', null);
+                    switchButton.type = 'button';
+                    if (active) switchButton.setAttribute('aria-current', 'true');
+                    const avatar = element('span', 'avatar', initials(user.userName || user.userId));
+                    const body = element('div', 'saved-account-copy', null);
+                    body.append(element('strong', '', user.userName || user.userId));
+                    body.append(element('span', '', user.userId));
+                    switchButton.append(avatar, body);
+                    if (active) switchButton.append(element('span', 'saved-account-current', '当前'));
+                    switchButton.addEventListener('click', () => switchAccount(account, active, switchButton));
+                    const actions = element('div', 'saved-account-actions', null);
+                    const edit = element('button', 'icon-button', '\u270e');
+                    edit.type = 'button';
+                    edit.title = '修改账号';
+                    edit.setAttribute('aria-label', `修改 ${user.userName || user.userId}`);
+                    edit.addEventListener('click', () => beginUpdateAccount(account, edit));
+                    const remove = element('button', 'icon-button account-delete-action', '\u{1f5d1}\ufe0e');
+                    remove.type = 'button';
+                    remove.title = '删除账号';
+                    remove.setAttribute('aria-label', `删除 ${user.userName || user.userId}`);
+                    remove.addEventListener('click', () => openDeleteAccountDialog(account, remove));
+                    actions.append(edit, remove);
+                    row.append(switchButton, actions);
+                    row.style.animationDelay = `${Math.min(animationIndex * 30, 240)}ms`;
+                    animationIndex += 1;
+                    users.append(row);
+                });
+                serverSection.append(serverHeader, users);
+                list.append(serverSection);
             });
         } catch (error) {
+            if (revision !== savedAccountsRevision) return;
             const message = friendlyError(error);
             state.textContent = `账号列表加载失败：${message}`;
             state.classList.add('error');
@@ -2892,7 +3118,7 @@
         const list = byId('saved-accounts-list');
         const state = byId('saved-accounts-state');
         list.querySelectorAll('button').forEach((button) => { button.disabled = true; });
-        selectedButton?.classList.add('switching');
+        selectedButton?.closest('.saved-account-row')?.classList.add('busy');
         selectedButton?.setAttribute('aria-busy', 'true');
         const spinner = element('span', 'saved-account-spinner', '');
         selectedButton?.append(spinner);
@@ -2914,10 +3140,57 @@
             state.classList.add('error');
             showToast(message);
             list.querySelectorAll('button').forEach((button) => { button.disabled = false; });
-            selectedButton?.classList.remove('switching');
+            selectedButton?.closest('.saved-account-row')?.classList.remove('busy');
             spinner.remove();
         } finally {
             selectedButton?.removeAttribute('aria-busy');
+        }
+    }
+
+    function openDeleteAccountDialog(account, trigger) {
+        pendingDeleteAccount = account;
+        deleteReturnFocus = trigger;
+        const active = isCurrentAccount(account);
+        byId('account-delete-message').textContent = active
+            ? `确定删除“${account.userName || account.userId}”？删除当前账号后将退出当前会话。`
+            : `确定删除“${account.userName || account.userId}”？该账号的保存凭据将从此设备移除。`;
+        byId('account-delete-scrim').classList.remove('hidden');
+        window.setTimeout(() => byId('account-delete-confirm').focus(), 0);
+    }
+
+    function closeDeleteAccountDialog(restoreFocus = true) {
+        byId('account-delete-scrim').classList.add('hidden');
+        const trigger = deleteReturnFocus;
+        pendingDeleteAccount = null;
+        deleteReturnFocus = null;
+        if (restoreFocus) focusElement(trigger || byId('account-open'));
+    }
+
+    async function confirmDeleteAccount() {
+        const account = pendingDeleteAccount;
+        if (!account) return;
+        const confirm = byId('account-delete-confirm');
+        const cancel = byId('account-delete-cancel');
+        confirm.disabled = true;
+        cancel.disabled = true;
+        const active = isCurrentAccount(account);
+        try {
+            await nativeRequest('mediaStationDeleteAccount', 'delete_account', [account.accountId]);
+            closeDeleteAccountDialog(false);
+            if (active) {
+                closeDrawer(false);
+                session = null;
+                resetCatalogState();
+                showLogin(account.baseUrl, '', false, 'login', null, account);
+            } else {
+                loadSavedAccounts();
+                showToast('账号已删除');
+            }
+        } catch (error) {
+            showToast(friendlyError(error));
+        } finally {
+            confirm.disabled = false;
+            cancel.disabled = false;
         }
     }
 
@@ -4563,9 +4836,22 @@
     byId('overview-scrim').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeOverview();
     });
-    byId('logout-button').addEventListener('click', logout);
-    byId('change-account-button').addEventListener('click', beginAccountChange);
+    byId('change-account-button').addEventListener('click', () => beginAddAccount(session?.baseUrl || ''));
+    byId('account-delete-scrim').addEventListener('click', (event) => {
+        if (event.target === event.currentTarget) closeDeleteAccountDialog();
+    });
+    byId('account-delete-close').addEventListener('click', () => closeDeleteAccountDialog());
+    byId('account-delete-cancel').addEventListener('click', () => closeDeleteAccountDialog());
+    byId('account-delete-confirm').addEventListener('click', confirmDeleteAccount);
     byId('login-cancel').addEventListener('click', cancelAccountChange);
+    document.querySelectorAll('input[name="server-type"]').forEach((input) => {
+        input.addEventListener('change', () => {
+            if (input.checked && input.value === 'mediastation_go') {
+                byId('login-proxy-mode').value = 'direct';
+            }
+            syncLoginConnectionUi();
+        });
+    });
     const defaultSubtitleFontSize = byId('default-subtitle-font-size');
     const defaultSubtitleBottomOffset = byId('default-subtitle-bottom-offset');
     const updateDefaultSubtitleStyle = (persist) => {
@@ -4693,6 +4979,13 @@
     });
 
     document.addEventListener('keydown', (event) => {
+        if (!byId('account-delete-scrim').classList.contains('hidden')) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeDeleteAccountDialog();
+            }
+            return;
+        }
         const inputActive = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
         if (player) {
             if (player.exiting) {

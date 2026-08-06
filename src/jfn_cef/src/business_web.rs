@@ -290,6 +290,7 @@ fn handle_player_load(args: &ListValue) {
         external_audio_url: ext_audio_c.as_ptr(),
         external_sub_url: ext_sub_c.as_ptr(),
         http_header_fields: c"".as_ptr(),
+        http_proxy: c"".as_ptr(),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
         subtitle_style_override: false,
@@ -340,6 +341,12 @@ fn handle_message(message: BrowserMessage) -> bool {
     }
     if message.name() == "mediaStationSwitchAccount" {
         return crate::mediastation_runtime::handle_switch_account_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationDeleteAccount" {
+        return crate::mediastation_runtime::handle_delete_account_message(web_layer(), args);
+    }
+    if message.name() == "mediaStationUpdateAccount" {
+        return crate::mediastation_runtime::handle_update_account_message(web_layer(), args);
     }
     if message.name() == "mediaStationCatalog" {
         return crate::mediastation_runtime::handle_catalog_message(web_layer(), args);

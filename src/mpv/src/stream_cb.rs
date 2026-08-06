@@ -19,6 +19,39 @@ const MPV_ERROR_LOADING_FAILED: c_int = -13;
 
 const PROTOCOL: &[u8] = b"mediastation";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamProxyMode {
+    Direct,
+    System,
+}
+
+impl StreamProxyMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::System => "system",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(Self::Direct),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+}
+
+fn stream_agent(proxy_mode: StreamProxyMode) -> Option<ureq::Agent> {
+    let proxy = match proxy_mode {
+        StreamProxyMode::Direct => None,
+        StreamProxyMode::System => Some(ureq::Proxy::try_from_env()?),
+    };
+    Some(ureq::Agent::new_with_config(
+        ureq::Agent::config_builder().proxy(proxy).build(),
+    ))
+}
+
 /// A single open media stream. Guarded by a mutex because mpv may call the
 /// cancel callback from a different thread than read/seek.
 struct Stream {
@@ -124,7 +157,7 @@ unsafe extern "C" fn open_cb(
     }
     let uri = unsafe { CStr::from_ptr(uri) }.to_bytes();
     let uri = String::from_utf8_lossy(uri).into_owned();
-    // URI format: mediastation://<url>|<user-agent>|<content-length>
+    // URI format: mediastation://<url>|<user-agent>|<content-length>|<proxy-mode>
     let rest = uri.strip_prefix("mediastation://").unwrap_or(&uri);
     let mut parts = rest.split('|');
     let Some(url) = parts.next() else {
@@ -132,9 +165,19 @@ unsafe extern "C" fn open_cb(
     };
     let user_agent = parts.next().unwrap_or("MediaStationGoWindows/0.1.0-dev");
     let content_length = parts.next().and_then(|v| v.parse::<u64>().ok());
+    let Some(proxy_mode) = parts
+        .next()
+        .map(StreamProxyMode::from_str)
+        .unwrap_or(Some(StreamProxyMode::Direct))
+    else {
+        return MPV_ERROR_LOADING_FAILED;
+    };
+    let Some(agent) = stream_agent(proxy_mode) else {
+        return MPV_ERROR_LOADING_FAILED;
+    };
     let cookie = StreamCookie {
         inner: Mutex::new(Stream {
-            agent: ureq::Agent::new_with_defaults(),
+            agent,
             url: url.to_string(),
             user_agent: user_agent.to_string(),
             content_length,
@@ -174,10 +217,45 @@ pub fn register_protocol(handle: *mut sys::mpv_handle) {
 }
 
 /// Build a `mediastation://` URI carrying the target URL, user agent, and
-/// optional content length.
-pub fn build_uri(url: &str, user_agent: &str, content_length: Option<u64>) -> String {
-    match content_length {
-        Some(size) => format!("mediastation://{url}|{user_agent}|{size}"),
-        None => format!("mediastation://{url}|{user_agent}"),
+/// optional content length, and server-selected proxy mode.
+pub fn build_uri(
+    url: &str,
+    user_agent: &str,
+    content_length: Option<u64>,
+    proxy_mode: StreamProxyMode,
+) -> String {
+    let content_length = content_length
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    format!(
+        "mediastation://{url}|{user_agent}|{content_length}|{}",
+        proxy_mode.as_str()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_carries_explicit_proxy_mode_and_preserves_empty_content_length() {
+        assert_eq!(
+            build_uri(
+                "https://cdn.example/video.mkv",
+                "MediaStationGoWindows/test",
+                None,
+                StreamProxyMode::System,
+            ),
+            "mediastation://https://cdn.example/video.mkv|MediaStationGoWindows/test||system"
+        );
+        assert_eq!(
+            build_uri(
+                "https://cdn.example/video.mkv",
+                "MediaStationGoWindows/test",
+                Some(42),
+                StreamProxyMode::Direct,
+            ),
+            "mediastation://https://cdn.example/video.mkv|MediaStationGoWindows/test|42|direct"
+        );
     }
 }
