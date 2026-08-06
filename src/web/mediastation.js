@@ -2848,6 +2848,13 @@
             clearAppBackdrop(appBackdropRevision);
         }
         const root = element('section', 'search-view');
+        const back = element('button', 'back-button hero-carousel-previous search-back');
+        back.append(element('span', 'hero-carousel-chevron'));
+        back.type = 'button';
+        back.title = '返回';
+        back.setAttribute('aria-label', '返回');
+        back.dataset.focusKey = 'search:back';
+        back.addEventListener('click', goBack);
         const form = element('form', 'search-form');
         const field = element('div', 'search-field');
         const leading = element('span', 'search-leading');
@@ -2907,7 +2914,7 @@
                 renderSearch(data);
             }
         });
-        root.append(form);
+        root.append(back, form);
         if (data.status === 'loading') {
             const state = element('div', 'search-state', '正在搜索…');
             state.setAttribute('role', 'status');
@@ -2937,6 +2944,10 @@
     }
 
     function openSearch() {
+        if (currentView?.kind === 'search') {
+            focusElement(content.querySelector('.search-field input'));
+            return;
+        }
         setCurrentView({ kind: 'search', data: { query: '', draft: '', items: null, status: 'idle', error: '' } });
     }
 
