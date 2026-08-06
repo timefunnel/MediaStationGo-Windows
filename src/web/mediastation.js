@@ -23,6 +23,7 @@
     const history = [];
     const homeRefreshDelayMs = 1200;
     const heroRotationIntervalMs = 9000;
+    const heroCarouselMaxCards = 20;
     const libraryPageSize = 48;
     const maximumLibraryCacheEntries = 12;
     const playerPlaybackSettingsKey = 'MediaStationGo.Windows.playbackSettingsByMedia.v2';
@@ -728,6 +729,26 @@
         syncLoginConnectionUi();
     }
 
+    function setLoginLoading(loading) {
+        const form = byId('login-form');
+        form.classList.toggle('is-loading', loading);
+        if (loading) form.setAttribute('aria-busy', 'true');
+        else form.removeAttribute('aria-busy');
+        byId('login-submit').disabled = loading;
+        byId('login-cancel').disabled = loading;
+        byId('server-url').disabled = loading;
+        byId('username').disabled = loading;
+        byId('password').disabled = loading;
+        document.querySelectorAll('input[name="server-type"]').forEach((input) => {
+            input.disabled = loading || loginConnectionLocked;
+        });
+        byId('emby-client-profile').disabled = loading || loginConnectionLocked;
+        byId('login-proxy-mode').disabled = loading || loginConnectionLocked;
+        byId('login-submit-label').textContent = loading
+            ? loginMode === 'update' ? '正在保存...' : '正在登录...'
+            : loginMode === 'update' ? '保存修改' : '登录';
+    }
+
     function setPlayerMode(enabled) {
         document.documentElement.classList.toggle('player-mode', enabled);
         document.body.classList.toggle('player-mode', enabled);
@@ -759,7 +780,7 @@
             ? '修改账号'
             : mode === 'server-user' ? '添加服务器用户'
                 : mode === 'add' ? '添加账号' : '登录媒体服务器';
-        byId('login-submit').lastElementChild.textContent = mode === 'update' ? '保存修改' : '登录';
+        setLoginLoading(false);
         byId('login-error').textContent = message;
         window.setTimeout(() => byId(baseUrl ? 'username' : 'server-url').focus(), 0);
     }
@@ -873,7 +894,8 @@
         const errorText = byId('login-error');
         const mode = loginMode;
         const account = loginAccount;
-        button.disabled = true;
+        if (button.disabled) return;
+        setLoginLoading(true);
         errorText.textContent = '';
         try {
             const connection = selectedLoginConnection();
@@ -904,7 +926,7 @@
         } catch (error) {
             errorText.textContent = friendlyError(error);
         } finally {
-            button.disabled = false;
+            setLoginLoading(false);
         }
     });
 
@@ -1765,7 +1787,7 @@
             const target = Math.floor(Math.random() * (index + 1));
             [cards[index], cards[target]] = [cards[target], cards[index]];
         }
-        return cards;
+        return cards.slice(0, heroCarouselMaxCards);
     }
 
     function startHeroCarousel(hero, cards) {

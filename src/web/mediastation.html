@@ -45,7 +45,11 @@
         <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
         <div class="login-actions">
           <button id="login-cancel" class="secondary-command hidden" type="button">取消</button>
-          <button id="login-submit" class="primary-command" type="submit"><span aria-hidden="true">&#9654;</span><span>登录</span></button>
+          <button id="login-submit" class="primary-command" type="submit">
+            <span class="login-submit-icon" aria-hidden="true">&#9654;</span>
+            <span class="login-submit-spinner" aria-hidden="true"></span>
+            <span id="login-submit-label">登录</span>
+          </button>
         </div>
         <p id="login-error" class="form-error" role="alert"></p>
       </form>
