@@ -358,6 +358,8 @@ $MsysMpvSource = ConvertTo-MsysPath $MpvSourceDir
 $MsysNvofApiInclude = ConvertTo-MsysPath $NvofApiIncludeDir
 $MsysFfmpegPrefix = ConvertTo-MsysPath $FfmpegLinkDir
 $MsysLibplaceboPrefix = ConvertTo-MsysPath $LibplaceboLinkDir
+$MsysSystemPkgConfig = "/$($MsysEnv.ToLowerInvariant())/lib/pkgconfig"
+$MsysSystemSharePkgConfig = "/$($MsysEnv.ToLowerInvariant())/share/pkgconfig"
 
 # Run a command in MSYS2
 function Invoke-Msys2 {
@@ -382,6 +384,8 @@ pacman -S --needed --noconfirm \
     $PkgPrefix-vulkan-loader \
     $PkgPrefix-shaderc \
     $PkgPrefix-spirv-cross \
+    $PkgPrefix-lcms2 \
+    $PkgPrefix-libdovi \
     $PkgPrefix-llvm \
     $PkgPrefix-tools
 "@ -Description "Installing MSYS2 dependencies"
@@ -398,7 +402,7 @@ if (-not (Test-Path (Join-Path $MesonBuildDir "build.ninja"))) {
     Invoke-Msys2 @"
 cd '$MsysMpvSource' && \
 CFLAGS="-I$MsysNvofApiInclude" \
-PKG_CONFIG_PATH="$MsysFfmpegPrefix/lib/pkgconfig:$MsysLibplaceboPrefix/lib/pkgconfig" \
+PKG_CONFIG_PATH="$MsysFfmpegPrefix/lib/pkgconfig:$MsysLibplaceboPrefix/lib/pkgconfig:${MsysSystemPkgConfig}:${MsysSystemSharePkgConfig}" \
 meson setup build --default-library=shared \
     -Dgpl=false \
     -Dlibmpv=true \
