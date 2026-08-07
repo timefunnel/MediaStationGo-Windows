@@ -19,6 +19,7 @@ $SourceDir = Join-Path $ThirdPartyDir "ffmpeg-$FfmpegCommit"
 $BuildDir = Join-Path $ThirdPartyDir "ffmpeg-build-$FfmpegCommit"
 $InstallDir = Join-Path $ThirdPartyDir "ffmpeg-install-$FfmpegCommit"
 $BuildStamp = Join-Path $InstallDir "lib\mediastation-ffmpeg-source.sha256"
+$CachedConfigHeader = Join-Path $InstallDir "lib\mediastation-ffmpeg-config.h"
 
 if ($Arch -eq "arm64") {
     $MsysEnv = "CLANGARM64"
@@ -103,15 +104,15 @@ function Assert-FfmpegInstall {
         (Join-Path $InstallDir "bin\avcodec-62.dll"),
         (Join-Path $InstallDir "bin\ffmpeg.exe"),
         (Join-Path $InstallDir "include\libavcodec\avcodec.h"),
-        (Join-Path $InstallDir "lib\pkgconfig\libavcodec.pc")
+        (Join-Path $InstallDir "lib\pkgconfig\libavcodec.pc"),
+        $CachedConfigHeader
     )) {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
             throw "Pinned LGPL FFmpeg install is incomplete: $Path"
         }
     }
 
-    $ConfigHeader = Join-Path $BuildDir "config.h"
-    $Config = Get-Content -LiteralPath $ConfigHeader -Raw
+    $Config = Get-Content -LiteralPath $CachedConfigHeader -Raw
     foreach ($DisabledFeature in @("CONFIG_GPL", "CONFIG_VERSION3", "CONFIG_NONFREE")) {
         if ($Config -notmatch "(?m)^#define $DisabledFeature 0$") {
             throw "FFmpeg license feature is not disabled: $DisabledFeature"
@@ -241,6 +242,12 @@ Invoke-Msys2 "make -C '$MsysBuildDir' -j`$(nproc)" `
     -Description "Building LGPL FFmpeg $FfmpegVersion"
 Invoke-Msys2 "make -C '$MsysBuildDir' install" `
     -Description "Installing LGPL FFmpeg $FfmpegVersion"
+
+$GeneratedConfigHeader = Join-Path $BuildDir "config.h"
+if (-not (Test-Path -LiteralPath $GeneratedConfigHeader -PathType Leaf)) {
+    throw "Pinned LGPL FFmpeg build config is missing: $GeneratedConfigHeader"
+}
+Copy-Item -LiteralPath $GeneratedConfigHeader -Destination $CachedConfigHeader -Force
 
 Assert-FfmpegInstall
 Sync-FfmpegLinkPrefix
