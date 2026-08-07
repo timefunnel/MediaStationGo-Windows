@@ -127,6 +127,64 @@ function Assert-LibplaceboInstall {
     }
 }
 
+function Initialize-PinnedLibplaceboSource {
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+        $DownloadPath = "$ArchivePath.download"
+        try {
+            & curl.exe -L --fail --retry 5 --retry-delay 3 --retry-all-errors `
+                --output $DownloadPath $ArchiveUrl
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to download pinned libplacebo source archive"
+            }
+            $DownloadedHash = (Get-FileHash -LiteralPath $DownloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($DownloadedHash -ne $ArchiveSha256) {
+                throw "Downloaded libplacebo archive hash mismatch: expected=$ArchiveSha256 actual=$DownloadedHash"
+            }
+            Move-Item -LiteralPath $DownloadPath -Destination $ArchivePath
+        } finally {
+            Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $ActualArchiveHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($ActualArchiveHash -ne $ArchiveSha256) {
+        throw "Pinned libplacebo archive hash mismatch: expected=$ArchiveSha256 actual=$ActualArchiveHash path=$ArchivePath"
+    }
+
+    if (-not ((Test-Path -LiteralPath $SourceStamp -PathType Leaf) -and
+            ((Get-Content -LiteralPath $SourceStamp -Raw).Trim() -eq $SourceContractHash))) {
+        Assert-ThirdPartyPath $SourceDir
+        if (Test-Path -LiteralPath $SourceDir) {
+            Remove-Item -LiteralPath $SourceDir -Recurse -Force
+        }
+        & tar.exe -xf $ArchivePath -C $ThirdPartyDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract pinned libplacebo source archive"
+        }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir "meson.build") -PathType Leaf)) {
+        throw "Pinned libplacebo source archive did not produce the expected directory: $SourceDir"
+    }
+
+    foreach ($Patch in $SourcePatches) {
+        if (Test-GitPatchApplies -RepositoryDirectory $RepoRoot -TargetDirectory $SourceRelativeDir `
+                -PatchPath $Patch.Path) {
+            & git -C $RepoRoot apply "--directory=$SourceRelativeDir" $Patch.Path
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to apply libplacebo source patch $($Patch.Id)"
+            }
+            Write-Host "Applied libplacebo source patch $($Patch.Id)" -ForegroundColor Green
+        } else {
+            if (-not (Test-GitPatchApplies -RepositoryDirectory $RepoRoot `
+                    -TargetDirectory $SourceRelativeDir -PatchPath $Patch.Path -Reverse)) {
+                throw "Pinned libplacebo source does not match source patch $($Patch.Id)"
+            }
+            Write-Host "Libplacebo source patch already applied: $($Patch.Id)" -ForegroundColor Green
+        }
+    }
+    [System.IO.File]::WriteAllText($SourceStamp, $SourceContractHash, $Utf8NoBom)
+}
+
 $ContractFiles = @($PSCommandPath) + @($SourcePatches | ForEach-Object { $_.Path })
 foreach ($ContractFile in $ContractFiles) {
     if (-not (Test-Path -LiteralPath $ContractFile -PathType Leaf)) {
@@ -146,6 +204,7 @@ try {
     $Hasher.Dispose()
 }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+Initialize-PinnedLibplaceboSource
 $StampMatches = (Test-Path -LiteralPath $BuildStamp -PathType Leaf) -and
     ((Get-Content -LiteralPath $BuildStamp -Raw).Trim() -eq $SourceContractHash)
 if (-not $Force -and $StampMatches) {
@@ -174,62 +233,6 @@ pacman -S --needed --noconfirm \
     $PkgPrefix-llvm \
     $PkgPrefix-tools
 "@ -Description "Installing pinned libplacebo build dependencies"
-
-if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
-    $DownloadPath = "$ArchivePath.download"
-    try {
-        & curl.exe -L --fail --retry 5 --retry-delay 3 --retry-all-errors `
-            --output $DownloadPath $ArchiveUrl
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to download pinned libplacebo source archive"
-        }
-        $DownloadedHash = (Get-FileHash -LiteralPath $DownloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($DownloadedHash -ne $ArchiveSha256) {
-            throw "Downloaded libplacebo archive hash mismatch: expected=$ArchiveSha256 actual=$DownloadedHash"
-        }
-        Move-Item -LiteralPath $DownloadPath -Destination $ArchivePath
-    } finally {
-        Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-$ActualArchiveHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($ActualArchiveHash -ne $ArchiveSha256) {
-    throw "Pinned libplacebo archive hash mismatch: expected=$ArchiveSha256 actual=$ActualArchiveHash path=$ArchivePath"
-}
-
-if (-not ((Test-Path -LiteralPath $SourceStamp -PathType Leaf) -and
-        ((Get-Content -LiteralPath $SourceStamp -Raw).Trim() -eq $SourceContractHash))) {
-    Assert-ThirdPartyPath $SourceDir
-    if (Test-Path -LiteralPath $SourceDir) {
-        Remove-Item -LiteralPath $SourceDir -Recurse -Force
-    }
-    & tar.exe -xf $ArchivePath -C $ThirdPartyDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to extract pinned libplacebo source archive"
-    }
-}
-if (-not (Test-Path -LiteralPath (Join-Path $SourceDir "meson.build") -PathType Leaf)) {
-    throw "Pinned libplacebo source archive did not produce the expected directory: $SourceDir"
-}
-
-foreach ($Patch in $SourcePatches) {
-    if (Test-GitPatchApplies -RepositoryDirectory $RepoRoot -TargetDirectory $SourceRelativeDir `
-            -PatchPath $Patch.Path) {
-        & git -C $RepoRoot apply "--directory=$SourceRelativeDir" $Patch.Path
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to apply libplacebo source patch $($Patch.Id)"
-        }
-        Write-Host "Applied libplacebo source patch $($Patch.Id)" -ForegroundColor Green
-    } else {
-        if (-not (Test-GitPatchApplies -RepositoryDirectory $RepoRoot `
-                -TargetDirectory $SourceRelativeDir -PatchPath $Patch.Path -Reverse)) {
-            throw "Pinned libplacebo source does not match source patch $($Patch.Id)"
-        }
-        Write-Host "Libplacebo source patch already applied: $($Patch.Id)" -ForegroundColor Green
-    }
-}
-[System.IO.File]::WriteAllText($SourceStamp, $SourceContractHash, $Utf8NoBom)
 
 foreach ($Path in @($BuildDir, $InstallDir)) {
     Assert-ThirdPartyPath $Path
