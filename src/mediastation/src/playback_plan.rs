@@ -9,20 +9,13 @@ fn descriptor_has_code(descriptor: &str, codes: &[&str]) -> bool {
         .any(|token| codes.contains(&token))
 }
 
-fn chinese_subtitle_variant(track: &crate::SubtitleTrack) -> Option<u8> {
-    let language = track
-        .language
-        .as_deref()
+fn chinese_subtitle_variant(language: Option<&str>, label: Option<&str>) -> Option<u8> {
+    let language = language
         .unwrap_or_default()
         .trim()
         .to_lowercase()
         .replace('_', "-");
-    let label = track
-        .label
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
+    let label = label.unwrap_or_default().trim().to_lowercase();
     let descriptor = format!("{language} {label}");
     if ["zh-cn", "zh-sg", "zh-hans", "chs", "sc"]
         .iter()
@@ -59,23 +52,29 @@ fn chinese_subtitle_variant(track: &crate::SubtitleTrack) -> Option<u8> {
     None
 }
 
+pub fn chinese_subtitle_preference_rank(
+    language: Option<&str>,
+    label: Option<&str>,
+    is_default: bool,
+    is_forced: bool,
+) -> Option<(u8, u8, u8)> {
+    chinese_subtitle_variant(language, label)
+        .map(|variant| (u8::from(is_forced), u8::from(!is_default), variant))
+}
+
 fn preferred_chinese_subtitle(source: &PlaybackSource) -> Option<usize> {
     source
         .subtitles
         .iter()
         .enumerate()
         .filter_map(|(index, track)| {
-            chinese_subtitle_variant(track).map(|variant| {
-                (
-                    index,
-                    (
-                        u8::from(track.is_forced),
-                        u8::from(!track.is_default),
-                        variant,
-                        index,
-                    ),
-                )
-            })
+            chinese_subtitle_preference_rank(
+                track.language.as_deref(),
+                track.label.as_deref(),
+                track.is_default,
+                track.is_forced,
+            )
+            .map(|rank| (index, (rank, index)))
         })
         .min_by_key(|(_, rank)| *rank)
         .map(|(index, _)| index)

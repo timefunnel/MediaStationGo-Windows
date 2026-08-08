@@ -10,7 +10,7 @@ use jfn_mediastation::{
     MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
     PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
     PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport,
-    build_playback_track_plan,
+    build_playback_track_plan, chinese_subtitle_preference_rank,
 };
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
@@ -4760,45 +4760,110 @@ fn reconcile_runtime_track_preference_inner(
                 .iter()
                 .any(|track| track.key == key && track.selected);
             if !already_selected {
-                match runtime_subtitle_selection(
-                    runtime,
-                    &reconcile.snapshot,
-                    &reconcile.source,
-                    &catalog,
-                    key,
-                ) {
-                    Ok(selection) => {
-                        if runtime
-                            .apply_track_selection(
+                if is_legacy_runtime_subtitle_key(key) {
+                    let Some((track, migration)) = legacy_runtime_subtitle_migration(&catalog, key)
+                    else {
+                        log_error(&format!(
+                            "MediaStation legacy subtitle preference migration unavailable: media_id={} key={}",
+                            reconcile.source.media_id, key
+                        ));
+                        return Err(LoadFailure::new(
+                            "subtitle_preference_migration_unavailable",
+                            "The saved runtime subtitle preference could not be mapped safely",
+                        ));
+                    };
+                    let mpv_track = track.mpv_id.ok_or_else(|| {
+                        LoadFailure::new(
+                            "subtitle_track_unavailable",
+                            "The migrated subtitle track has no native player identifier",
+                        )
+                    })?;
+                    if !track.selected {
+                        runtime.apply_track_selection(
+                            &reconcile.snapshot,
+                            &reconcile.source.media_id,
+                            TrackSelection::SubtitleEmbedded {
+                                mpv_track,
+                                key: track.key.clone(),
+                            },
+                        )?;
+                    }
+                    correction.subtitle_enabled = migration.subtitle_enabled;
+                    correction.subtitle_track_key = migration.subtitle_track_key;
+                    log_debug(&format!(
+                        "MediaStation legacy subtitle preference migrated: media_id={} old_key={} new_key={}",
+                        reconcile.source.media_id, key, track.key
+                    ));
+                } else {
+                    match runtime_subtitle_selection(
+                        runtime,
+                        &reconcile.snapshot,
+                        &reconcile.source,
+                        &catalog,
+                        key,
+                    ) {
+                        Ok(selection) => {
+                            if let Err(failure) = runtime.apply_track_selection(
                                 &reconcile.snapshot,
                                 &reconcile.source.media_id,
                                 selection,
-                            )
-                            .is_err()
-                        {
+                            ) {
+                                if is_runtime_subtitle_key(key) {
+                                    log_error(&format!(
+                                        "MediaStation runtime subtitle restore failed without changing preference: media_id={} key={} code={}",
+                                        reconcile.source.media_id, key, failure.code
+                                    ));
+                                    return Err(failure);
+                                }
+                                correction_from_subtitle_baseline(&mut correction, &baseline);
+                                log_error(&format!(
+                                    "MediaStation preferred subtitle fallback: media_id={} key={}",
+                                    reconcile.source.media_id, key
+                                ));
+                            }
+                        }
+                        Err(failure) => {
+                            if is_runtime_subtitle_key(key) {
+                                log_error(&format!(
+                                    "MediaStation runtime subtitle preference unavailable without changing preference: media_id={} key={} code={}",
+                                    reconcile.source.media_id, key, failure.code
+                                ));
+                                return Err(failure);
+                            }
+                            // Server-backed stream keys retain the existing
+                            // correction behavior when the stream disappeared.
                             correction_from_subtitle_baseline(&mut correction, &baseline);
                             log_error(&format!(
-                                "MediaStation preferred subtitle fallback: media_id={} key={}",
+                                "MediaStation saved subtitle unavailable: media_id={} key={}",
                                 reconcile.source.media_id, key
                             ));
                         }
-                    }
-                    Err(_) => {
-                        // The saved subtitle key no longer matches the live
-                        // track catalog (stream indexes can shift between
-                        // loads). Keep whatever mpv has selected — the load
-                        // plan already fell back to the container default —
-                        // and correct the preference to the actual state.
-                        correction_from_subtitle_baseline(&mut correction, &baseline);
-                        log_error(&format!(
-                            "MediaStation saved subtitle unavailable: media_id={} key={}",
-                            reconcile.source.media_id, key
-                        ));
                     }
                 }
             }
         } else if reconcile.preference.configured {
             correction.subtitle_enabled = Some(false);
+        } else if let Some(track) = preferred_runtime_subtitle_track(&catalog) {
+            let mpv_track = track.mpv_id.ok_or_else(|| {
+                LoadFailure::new(
+                    "subtitle_track_unavailable",
+                    "The preferred runtime subtitle has no native player identifier",
+                )
+            })?;
+            if !track.selected {
+                runtime.apply_track_selection(
+                    &reconcile.snapshot,
+                    &reconcile.source.media_id,
+                    TrackSelection::SubtitleEmbedded {
+                        mpv_track,
+                        key: track.key.clone(),
+                    },
+                )?;
+            }
+            log_debug(&format!(
+                "MediaStation unconfigured runtime subtitle selected: media_id={} key={}",
+                reconcile.source.media_id, track.key
+            ));
         }
     } else if baseline.subtitle_enabled == Some(true) {
         runtime.apply_track_selection(
@@ -4820,6 +4885,11 @@ fn reconcile_runtime_track_preference_inner(
                 &correction,
             )
             .map_err(|error| api_failure("preference_correction_failed", &error))?;
+        runtime.commit_active_preference_update(
+            &reconcile.snapshot,
+            &reconcile.source.media_id,
+            &correction,
+        );
         log_debug(&format!(
             "MediaStation runtime track preference corrected: media_id={}",
             reconcile.source.media_id
@@ -4868,6 +4938,66 @@ fn runtime_subtitle_selection(
     })
 }
 
+const RUNTIME_SUBTITLE_KEY_PREFIX: &str = "runtime:subtitle:";
+const RUNTIME_SUBTITLE_KEY_V2_PREFIX: &str = "runtime:subtitle:v2:";
+
+fn is_runtime_subtitle_key(key: &str) -> bool {
+    key.starts_with(RUNTIME_SUBTITLE_KEY_PREFIX)
+}
+
+fn is_legacy_runtime_subtitle_key(key: &str) -> bool {
+    is_runtime_subtitle_key(key) && !key.starts_with(RUNTIME_SUBTITLE_KEY_V2_PREFIX)
+}
+
+fn preferred_runtime_subtitle_track(catalog: &RuntimeTrackCatalog) -> Option<&RuntimeTrack> {
+    let eligible = |track: &&RuntimeTrack| {
+        !track.external
+            && track.mpv_id.is_some()
+            && track.key.starts_with(RUNTIME_SUBTITLE_KEY_V2_PREFIX)
+    };
+    catalog
+        .subtitles
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| eligible(track))
+        .filter_map(|(index, track)| {
+            chinese_subtitle_preference_rank(
+                track.language.as_deref(),
+                track.label.as_deref(),
+                track.is_default,
+                track.is_forced,
+            )
+            .map(|rank| (track, (rank, index)))
+        })
+        .min_by_key(|(_, rank)| *rank)
+        .map(|(track, _)| track)
+        .or_else(|| {
+            catalog
+                .subtitles
+                .iter()
+                .filter(eligible)
+                .find(|track| track.is_default || track.is_forced)
+        })
+}
+
+fn legacy_runtime_subtitle_migration<'a>(
+    catalog: &'a RuntimeTrackCatalog,
+    key: &str,
+) -> Option<(&'a RuntimeTrack, PlaybackTrackPreferenceUpdate)> {
+    if !is_legacy_runtime_subtitle_key(key) {
+        return None;
+    }
+    let track = preferred_runtime_subtitle_track(catalog)?;
+    Some((
+        track,
+        PlaybackTrackPreferenceUpdate {
+            subtitle_enabled: Some(true),
+            subtitle_track_key: Some(track.key.clone()),
+            ..PlaybackTrackPreferenceUpdate::default()
+        },
+    ))
+}
+
 fn pending_embedded_subtitle_preference(
     catalog: &RuntimeTrackCatalog,
     preference: &PlaybackTrackPreference,
@@ -4875,12 +5005,18 @@ fn pending_embedded_subtitle_preference(
     if !preference.subtitle_enabled || catalog.subtitles.iter().any(|track| track.selected) {
         return None;
     }
-    let key = preference.subtitle_track_key.as_deref()?;
-    let track = catalog
-        .subtitles
-        .iter()
-        .find(|track| !track.external && track.key == key)?;
-    Some((track.mpv_id?, key.to_string()))
+    let track = if let Some(key) = preference.subtitle_track_key.as_deref() {
+        catalog
+            .subtitles
+            .iter()
+            .find(|track| !track.external && track.key == key)
+            .or_else(|| legacy_runtime_subtitle_migration(catalog, key).map(|(track, _)| track))?
+    } else if !preference.configured {
+        preferred_runtime_subtitle_track(catalog)?
+    } else {
+        return None;
+    };
+    Some((track.mpv_id?, track.key.clone()))
 }
 
 fn restore_pending_embedded_subtitle_preference(
@@ -5662,12 +5798,11 @@ fn runtime_node_flag(node: &jfn_mpv::Node, key: &str) -> bool {
 }
 
 fn runtime_fallback_track_key(track: &MpvRuntimeTrack, ordinal: usize) -> String {
-    let kind = match track.kind {
-        RuntimeTrackKind::Audio => "audio",
-        RuntimeTrackKind::Subtitle => "subtitle",
-    };
+    if track.kind == RuntimeTrackKind::Subtitle {
+        return runtime_subtitle_fallback_track_key_v2(track, ordinal);
+    }
     let identity = [
-        kind.to_string(),
+        "audio".to_string(),
         track
             .source_id
             .map_or_else(String::new, |value| value.to_string()),
@@ -5687,7 +5822,33 @@ fn runtime_fallback_track_key(track: &MpvRuntimeTrack, ordinal: usize) -> String
     ]
     .join("\0");
     let digest = Sha256::digest(identity.as_bytes());
-    format!("runtime:{kind}:{digest:x}")
+    format!("runtime:audio:{digest:x}")
+}
+
+fn normalize_runtime_track_identity(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn runtime_subtitle_fallback_track_key_v2(track: &MpvRuntimeTrack, ordinal: usize) -> String {
+    let identity = [
+        normalize_runtime_track_identity(track.codec.as_deref()),
+        normalize_runtime_track_identity(track.language.as_deref()).replace('_', "-"),
+        normalize_runtime_track_identity(track.title.as_deref()),
+        if track.external {
+            "external".to_string()
+        } else {
+            "embedded".to_string()
+        },
+        ordinal.to_string(),
+    ]
+    .join("\0");
+    let digest = Sha256::digest(identity.as_bytes());
+    format!("{RUNTIME_SUBTITLE_KEY_V2_PREFIX}{digest:x}")
 }
 
 fn runtime_tracks_payload(catalog: &RuntimeTrackCatalog) -> Value {
@@ -6658,6 +6819,29 @@ mod tests {
         ])
     }
 
+    fn runtime_subtitle_candidate(
+        key: &str,
+        mpv_id: i64,
+        language: &str,
+        label: &str,
+        selected: bool,
+        is_default: bool,
+    ) -> RuntimeTrack {
+        RuntimeTrack {
+            kind: RuntimeTrackKind::Subtitle,
+            key: key.to_string(),
+            mpv_id: Some(mpv_id),
+            codec: Some("ass".to_string()),
+            language: Some(language.to_string()),
+            label: Some(label.to_string()),
+            channel_count: None,
+            selected,
+            external: false,
+            is_default,
+            is_forced: false,
+        }
+    }
+
     #[test]
     fn runtime_track_catalog_merges_server_keys_with_complete_mpv_tracks() {
         let base_url = Url::parse("https://media.example").expect("URL");
@@ -6721,7 +6905,11 @@ mod tests {
 
         assert_eq!(catalog.subtitles.len(), 3);
         assert_eq!(catalog.subtitles[0].key, "stream:14");
-        assert!(catalog.subtitles[1].key.starts_with("runtime:subtitle:"));
+        assert!(
+            catalog.subtitles[1]
+                .key
+                .starts_with(RUNTIME_SUBTITLE_KEY_V2_PREFIX)
+        );
         assert_eq!(catalog.subtitles[2].key, "stream:99");
         assert!(!catalog.subtitles[0].external);
         assert!(catalog.subtitles[2].external);
@@ -6736,11 +6924,276 @@ mod tests {
     }
 
     #[test]
+    fn runtime_subtitle_v2_key_ignores_transient_mpv_indexes() {
+        let mut track = MpvRuntimeTrack {
+            kind: RuntimeTrackKind::Subtitle,
+            id: 4,
+            source_id: Some(1),
+            ff_index: Some(7),
+            codec: Some(" ASS ".to_string()),
+            language: Some("ZH_CN".to_string()),
+            title: Some(" Simplified   Chinese ".to_string()),
+            channel_count: None,
+            sample_rate: None,
+            selected: false,
+            external: false,
+            is_default: false,
+            is_forced: false,
+        };
+        let original = runtime_fallback_track_key(&track, 0);
+
+        track.id = 18;
+        track.source_id = Some(9);
+        track.ff_index = Some(22);
+        track.selected = true;
+        track.is_default = true;
+        track.is_forced = true;
+        let reparsed = runtime_fallback_track_key(&track, 0);
+
+        assert!(original.starts_with(RUNTIME_SUBTITLE_KEY_V2_PREFIX));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn runtime_subtitle_v2_key_tracks_stable_identity_changes() {
+        let track = MpvRuntimeTrack {
+            kind: RuntimeTrackKind::Subtitle,
+            id: 4,
+            source_id: Some(1),
+            ff_index: Some(7),
+            codec: Some("ass".to_string()),
+            language: Some("zh-cn".to_string()),
+            title: Some("Simplified Chinese".to_string()),
+            channel_count: None,
+            sample_rate: None,
+            selected: false,
+            external: false,
+            is_default: false,
+            is_forced: false,
+        };
+        let original = runtime_fallback_track_key(&track, 0);
+
+        let mut changed = track.clone();
+        changed.codec = Some("subrip".to_string());
+        assert_ne!(original, runtime_fallback_track_key(&changed, 0));
+        changed = track.clone();
+        changed.language = Some("eng".to_string());
+        assert_ne!(original, runtime_fallback_track_key(&changed, 0));
+        changed = track.clone();
+        changed.title = Some("Traditional Chinese".to_string());
+        assert_ne!(original, runtime_fallback_track_key(&changed, 0));
+        changed = track.clone();
+        changed.external = true;
+        assert_ne!(original, runtime_fallback_track_key(&changed, 0));
+        assert_ne!(original, runtime_fallback_track_key(&track, 1));
+    }
+
+    #[test]
+    fn legacy_runtime_subtitle_migration_prefers_chinese_and_keeps_enabled() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:english",
+                    2,
+                    "eng",
+                    "English",
+                    false,
+                    true,
+                ),
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:chinese",
+                    4,
+                    "zh-CN",
+                    "Simplified Chinese",
+                    false,
+                    false,
+                ),
+            ],
+            ..RuntimeTrackCatalog::default()
+        };
+
+        let (track, update) =
+            legacy_runtime_subtitle_migration(&catalog, "runtime:subtitle:old-unstable-key")
+                .expect("legacy runtime key should migrate");
+
+        assert_eq!(track.key, "runtime:subtitle:v2:chinese");
+        assert_eq!(update.subtitle_enabled, Some(true));
+        assert_eq!(
+            update.subtitle_track_key.as_deref(),
+            Some("runtime:subtitle:v2:chinese")
+        );
+        assert_eq!(update.audio_track_key, None);
+        let preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("runtime:subtitle:old-unstable-key".to_string()),
+            audio_track_key: None,
+        };
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((4, "runtime:subtitle:v2:chinese".to_string()))
+        );
+    }
+
+    #[test]
+    fn runtime_subtitle_migration_without_safe_candidate_preserves_preference() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![runtime_subtitle_candidate(
+                "runtime:subtitle:v2:spanish",
+                2,
+                "spa",
+                "Spanish",
+                false,
+                false,
+            )],
+            ..RuntimeTrackCatalog::default()
+        };
+
+        assert!(
+            legacy_runtime_subtitle_migration(&catalog, "runtime:subtitle:old-unstable-key")
+                .is_none()
+        );
+        assert!(legacy_runtime_subtitle_migration(&catalog, "stream:missing").is_none());
+    }
+
+    #[test]
+    fn legacy_runtime_subtitle_migration_uses_default_when_chinese_is_absent() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![runtime_subtitle_candidate(
+                "runtime:subtitle:v2:english-default",
+                2,
+                "eng",
+                "English",
+                false,
+                true,
+            )],
+            ..RuntimeTrackCatalog::default()
+        };
+
+        let (track, update) =
+            legacy_runtime_subtitle_migration(&catalog, "runtime:subtitle:old-unstable-key")
+                .expect("default runtime subtitle should be a safe migration target");
+
+        assert_eq!(track.key, "runtime:subtitle:v2:english-default");
+        assert_eq!(update.subtitle_enabled, Some(true));
+        assert_eq!(
+            update.subtitle_track_key.as_deref(),
+            Some(track.key.as_str())
+        );
+    }
+
+    #[test]
+    fn unconfigured_enabled_runtime_subtitle_prefers_chinese_without_mutating_preference() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:english-default",
+                    2,
+                    "eng",
+                    "English",
+                    false,
+                    true,
+                ),
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:chinese",
+                    4,
+                    "chi",
+                    "简体",
+                    false,
+                    false,
+                ),
+            ],
+            ..RuntimeTrackCatalog::default()
+        };
+        let preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: true,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((4, "runtime:subtitle:v2:chinese".to_string()))
+        );
+        assert!(!preference.configured);
+        assert_eq!(preference.subtitle_track_key, None);
+    }
+
+    #[test]
+    fn unconfigured_enabled_runtime_subtitle_uses_default_without_chinese() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:spanish",
+                    2,
+                    "spa",
+                    "Spanish",
+                    false,
+                    false,
+                ),
+                runtime_subtitle_candidate(
+                    "runtime:subtitle:v2:english-default",
+                    4,
+                    "eng",
+                    "English",
+                    false,
+                    true,
+                ),
+            ],
+            ..RuntimeTrackCatalog::default()
+        };
+        let preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: true,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((4, "runtime:subtitle:v2:english-default".to_string()))
+        );
+    }
+
+    #[test]
+    fn runtime_subtitle_auto_restore_respects_disabled_and_configured_preferences() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![runtime_subtitle_candidate(
+                "runtime:subtitle:v2:chinese",
+                4,
+                "chi",
+                "简体",
+                false,
+                true,
+            )],
+            ..RuntimeTrackCatalog::default()
+        };
+        let mut preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: false,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+        preference.subtitle_enabled = true;
+        preference.configured = true;
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+    }
+
+    #[test]
     fn pending_subtitle_restore_requires_enabled_matching_embedded_track() {
         let mut catalog = RuntimeTrackCatalog {
             subtitles: vec![RuntimeTrack {
                 kind: RuntimeTrackKind::Subtitle,
-                key: "runtime:subtitle:saved".to_string(),
+                key: "runtime:subtitle:v2:saved".to_string(),
                 mpv_id: Some(4),
                 codec: Some("subrip".to_string()),
                 language: Some("zho".to_string()),
@@ -6756,13 +7209,13 @@ mod tests {
         let mut preference = PlaybackTrackPreference {
             configured: true,
             subtitle_enabled: true,
-            subtitle_track_key: Some("runtime:subtitle:saved".to_string()),
+            subtitle_track_key: Some("runtime:subtitle:v2:saved".to_string()),
             audio_track_key: None,
         };
 
         assert_eq!(
             pending_embedded_subtitle_preference(&catalog, &preference),
-            Some((4, "runtime:subtitle:saved".to_string()))
+            Some((4, "runtime:subtitle:v2:saved".to_string()))
         );
 
         preference.subtitle_enabled = false;

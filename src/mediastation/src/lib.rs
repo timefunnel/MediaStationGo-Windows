@@ -12,7 +12,9 @@ pub use api::{
     PlaybackTrackPreference, PlaybackTrackPreferenceState, PlaybackTrackPreferenceUpdate,
     SubtitleTrack, VideoStream,
 };
-pub use playback_plan::{PlaybackTrackPlan, TRACK_DISABLE, build_playback_track_plan};
+pub use playback_plan::{
+    PlaybackTrackPlan, TRACK_DISABLE, build_playback_track_plan, chinese_subtitle_preference_rank,
+};
 pub use playback_session::{
     DeliveryMode, HeaderEncodingError, HeaderMap, PlaybackSession, PlaybackSessionError,
     PlaybackSessionMetrics, PlaybackSessionResolver, ProbeRequest, ProbeResponse, ProbeTransport,
