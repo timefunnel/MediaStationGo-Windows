@@ -348,6 +348,9 @@ fn handle_message(message: BrowserMessage) -> bool {
     if message.name() == "mediaStationUpdateAccount" {
         return crate::mediastation_runtime::handle_update_account_message(web_layer(), args);
     }
+    if message.name() == "mediaStationSetProxyMode" {
+        return crate::mediastation_runtime::handle_set_proxy_mode_message(web_layer(), args);
+    }
     if message.name() == "mediaStationCatalog" {
         return crate::mediastation_runtime::handle_catalog_message(web_layer(), args);
     }

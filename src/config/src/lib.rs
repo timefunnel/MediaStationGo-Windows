@@ -65,6 +65,7 @@ struct SettingsData {
     hide_scrollbar: bool,
     frame_interpolation_model: String,
     auto_update_check: bool,
+    media_station_proxy_mode: String,
 }
 
 impl Default for SettingsData {
@@ -85,6 +86,7 @@ impl Default for SettingsData {
             hide_scrollbar: true,
             frame_interpolation_model: String::new(),
             auto_update_check: true,
+            media_station_proxy_mode: String::new(),
         }
     }
 }
@@ -177,6 +179,15 @@ impl SettingsData {
         if let Some(b) = v.get("autoUpdateCheck").and_then(Value::as_bool) {
             self.auto_update_check = b;
         }
+        if let Some(mode) = v.get("mediaStationProxyMode").and_then(Value::as_str)
+            && matches!(mode, "direct" | "system")
+        {
+            self.media_station_proxy_mode = if mode == "system" {
+                "system".to_string()
+            } else {
+                String::new()
+            };
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -255,6 +266,12 @@ impl SettingsData {
         if !self.auto_update_check {
             o.insert("autoUpdateCheck".into(), Value::Bool(false));
         }
+        if !self.media_station_proxy_mode.is_empty() {
+            o.insert(
+                "mediaStationProxyMode".into(),
+                Value::String(self.media_station_proxy_mode.clone()),
+            );
+        }
         Value::Object(o)
     }
 
@@ -304,6 +321,14 @@ impl SettingsData {
         o.insert(
             "autoUpdateCheck".into(),
             Value::Bool(self.auto_update_check),
+        );
+        o.insert(
+            "mediaStationProxyMode".into(),
+            Value::String(if self.media_station_proxy_mode.is_empty() {
+                "direct".to_string()
+            } else {
+                self.media_station_proxy_mode.clone()
+            }),
         );
         let opts: Vec<Value> = hwdec_opts
             .iter()
@@ -605,6 +630,27 @@ pub fn titlebar_theme_color() -> bool {
 bool_accessors!(hide_scrollbar, set_hide_scrollbar, hide_scrollbar);
 bool_accessors!(auto_update_check, set_auto_update_check, auto_update_check);
 
+pub fn media_station_proxy_mode() -> String {
+    let configured = state().lock().data.media_station_proxy_mode.clone();
+    if configured.is_empty() {
+        "direct".to_string()
+    } else {
+        configured
+    }
+}
+
+/// Returns false without changing state when the caller supplies a mode outside
+/// the two explicit connection modes accepted by the MediaStation runtime.
+pub fn set_media_station_proxy_mode(mode: &str) -> bool {
+    let value = match mode {
+        "direct" => String::new(),
+        "system" => "system".to_string(),
+        _ => return false,
+    };
+    state().lock().data.media_station_proxy_mode = value;
+    true
+}
+
 pub fn window_geometry() -> JfnWindowGeometry {
     state().lock().data.window
 }
@@ -793,5 +839,26 @@ mod tests {
 
         settings.overlay_json(&json!({ "autoUpdateCheck": true }));
         assert_eq!(settings.to_json().get("autoUpdateCheck"), None);
+    }
+
+    #[test]
+    fn media_station_proxy_mode_defaults_to_direct_and_persists_only_for_system() {
+        let mut settings = SettingsData::default();
+        assert!(settings.to_json().get("mediaStationProxyMode").is_none());
+
+        settings.overlay_json(&json!({ "mediaStationProxyMode": "system" }));
+        assert_eq!(
+            settings
+                .to_json()
+                .get("mediaStationProxyMode")
+                .and_then(|value| value.as_str()),
+            Some("system")
+        );
+
+        settings.overlay_json(&json!({ "mediaStationProxyMode": "direct" }));
+        assert!(settings.to_json().get("mediaStationProxyMode").is_none());
+
+        settings.overlay_json(&json!({ "mediaStationProxyMode": "invalid" }));
+        assert!(settings.to_json().get("mediaStationProxyMode").is_none());
     }
 }

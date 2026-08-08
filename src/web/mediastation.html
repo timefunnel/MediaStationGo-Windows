@@ -16,8 +16,17 @@
   <section id="login-view" class="login-view hidden" aria-labelledby="login-title">
     <header class="login-brand">
       <div class="brand brand-large"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></div>
+      <button id="login-settings-open" class="login-settings-entry" type="button" title="连接设置" aria-label="打开连接设置" data-focus-key="login:settings"><span aria-hidden="true">⚙︎</span><span>连接设置</span></button>
     </header>
     <main class="login-layout">
+      <section class="login-intro" aria-hidden="true">
+        <div class="login-poster-stack"><span></span><span></span><span></span></div>
+        <div class="login-intro-copy">
+          <p class="eyebrow">私人媒体空间</p>
+          <h2>回到你想看的世界。</h2>
+          <p>安全连接你的媒体服务器，继续上次没有看完的故事。</p>
+        </div>
+      </section>
       <section id="login-account-panel" class="login-panel login-account-panel hidden" aria-labelledby="login-account-title">
         <div class="login-panel-heading">
           <div>
@@ -45,18 +54,14 @@
             <label><input type="radio" name="server-type" value="standard_emby"><span>标准 Emby</span></label>
           </div>
         </fieldset>
-        <label id="emby-client-profile-field" class="hidden">客户端身份
-          <select id="emby-client-profile" name="client-profile">
-            <option value="senplayer">SenPlayer</option>
-            <option value="infuse">Infuse</option>
-          </select>
-        </label>
-        <label>代理方式
-          <select id="login-proxy-mode" name="proxy-mode">
-            <option value="direct">直连</option>
-            <option value="system">系统代理</option>
-          </select>
-        </label>
+        <fieldset id="emby-client-profile-field" class="login-connection-fieldset login-client-profile-field hidden">
+          <legend>客户端身份 <span class="inline-tip" tabindex="0" aria-label="部分 Emby 服务器只接受特定的客户端身份；默认无需选择，连接失败时再尝试 SenPlayer 或 Infuse。">i<span role="tooltip">部分 Emby 服务器只接受特定的客户端身份。默认无需选择；连接失败时再尝试 SenPlayer 或 Infuse。</span></span></legend>
+          <div class="login-option-cards login-client-profile-options" role="radiogroup" aria-label="客户端身份">
+            <label class="login-client-profile-default"><input type="radio" name="emby-client-profile" value="mediastation_windows" checked><span><strong>不指定</strong><small>使用默认客户端身份</small></span></label>
+            <label><input type="radio" name="emby-client-profile" value="senplayer"><span><strong>SenPlayer</strong><small>通用兼容</small></span></label>
+            <label><input type="radio" name="emby-client-profile" value="infuse"><span><strong>Infuse</strong><small>原生身份</small></span></label>
+          </div>
+        </fieldset>
         <label>用户名<input id="username" name="username" autocomplete="username" required></label>
         <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
         <div class="login-actions">
@@ -150,10 +155,9 @@
   </section>
 
   <div id="drawer-scrim" class="drawer-scrim hidden"></div>
-  <aside id="account-drawer" class="drawer" aria-hidden="true">
-    <header><h2>账号</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
-    <div class="drawer-body">
-      <div class="account-summary"><span id="drawer-avatar" aria-hidden="true">M</span><div><strong id="drawer-user"></strong><p id="drawer-server"></p></div></div>
+  <aside id="account-drawer" class="drawer account-popover" role="dialog" aria-modal="true" aria-label="账号菜单" aria-hidden="true">
+    <header class="account-popover-header"><div class="account-summary"><span id="drawer-avatar" aria-hidden="true">M</span><div><div class="account-summary-title"><strong id="drawer-user"></strong><span class="account-current-status">当前正在使用</span></div><p id="drawer-server"></p></div></div><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+    <div class="drawer-body account-popover-body">
       <section id="saved-accounts" class="saved-accounts" aria-label="已保存账号">
         <h3>已保存账号</h3>
         <p id="saved-accounts-state" class="saved-accounts-state" role="status" aria-live="polite">正在读取账号...</p>
@@ -177,9 +181,9 @@
       </div>
     </section>
   </div>
-  <aside id="settings-drawer" class="drawer" aria-hidden="true">
+  <aside id="settings-drawer" class="drawer settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true">
     <header><h2>设置</h2><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
-    <div class="drawer-body settings-list">
+    <div class="drawer-body settings-list legacy-settings-content">
       <section class="setting-block update-settings">
         <div class="setting-toggle-row">
           <label for="auto-update-check">自动检查更新</label>
@@ -220,6 +224,55 @@
       </section>
       <section><h3>图片缓存</h3><p id="image-cache-status">0 张图片</p><button id="clear-image-cache" class="secondary-command" type="button">清除图片缓存</button></section>
     </div>
+    <section class="settings-preferences">
+      <header class="settings-modal-header"><div><p class="eyebrow">偏好中心</p><h2 id="settings-title">设置</h2></div><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+      <div class="settings-layout">
+        <nav class="settings-nav settings-authenticated" aria-label="设置分类">
+          <button type="button" data-settings-section="network" data-focus-key="settings:network"><span aria-hidden="true">⌁</span>网络与代理</button>
+          <button type="button" data-settings-section="appearance" data-focus-key="settings:appearance"><span aria-hidden="true">◐</span>外观</button>
+          <button type="button" data-settings-section="playback" data-focus-key="settings:playback"><span aria-hidden="true">▣</span>播放与字幕</button>
+          <button type="button" data-settings-section="storage" data-focus-key="settings:storage"><svg class="settings-nav-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M7 15h.01M10 15h5"></path></svg>存储空间</button>
+          <button type="button" data-settings-section="update" data-focus-key="settings:update"><span aria-hidden="true">↻</span>更新</button>
+        </nav>
+        <div class="settings-content">
+          <section class="settings-section setting-block" data-settings-section="network" aria-labelledby="settings-proxy-title">
+            <p class="eyebrow">网络与代理</p>
+            <h3 id="settings-proxy-title">系统代理</h3>
+            <p id="settings-proxy-description">选择登录到媒体服务器时使用的连接方式。</p>
+            <fieldset id="settings-proxy-mode" class="setting-choice-field" aria-describedby="settings-proxy-description">
+              <legend>连接方式</legend>
+              <div class="settings-option-cards" role="radiogroup" aria-label="连接方式">
+                <label><input type="radio" name="settings-proxy-mode" value="direct" checked><span><strong>直连</strong><small>不使用系统代理</small></span></label>
+                <label><input type="radio" name="settings-proxy-mode" value="system"><span><strong>系统代理</strong><small>使用 Windows 配置</small></span></label>
+              </div>
+            </fieldset>
+            <p id="settings-proxy-status" class="component-status" role="status" aria-live="polite"></p>
+          </section>
+          <section class="settings-section setting-block settings-authenticated" data-settings-section="appearance" aria-labelledby="settings-appearance-title">
+            <p class="eyebrow">外观</p><h3 id="settings-appearance-title">选择你的夜间主题</h3><p>保持深色界面的可读性，仅替换选中项和重点操作的色彩。</p>
+            <div class="theme-grid" aria-label="主题选择">
+              <button class="theme-choice" type="button" data-ui-theme="violet" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>夜幕紫</b><small>深邃而有电影感</small></button>
+              <button class="theme-choice" type="button" data-ui-theme="cobalt" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>深海蓝</b><small>清晰、克制</small></button>
+              <button class="theme-choice" type="button" data-ui-theme="ember" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>霞光橘</b><small>温暖、有能量</small></button>
+            </div>
+          </section>
+          <section class="settings-section setting-block default-subtitle-settings settings-authenticated" data-settings-section="playback">
+            <p class="eyebrow">播放与字幕</p><h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
+            <label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
+            <label class="setting-range-row" for="settings-subtitle-bottom-offset"><span>距底部</span><input id="settings-subtitle-bottom-offset" type="range" min="0" max="30" step="1"><output id="settings-subtitle-bottom-offset-value" for="settings-subtitle-bottom-offset"></output></label>
+            <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>
+            <div class="setting-block frame-interpolation-settings"><h3>RTX 插帧组件</h3><p id="settings-frame-interpolation-status" class="component-status">正在检测组件...</p></div>
+          </section>
+          <section class="settings-section setting-block settings-authenticated" data-settings-section="storage"><p class="eyebrow">存储空间</p><h3>图片缓存</h3><p id="settings-image-cache-status">0 张图片</p><button id="settings-clear-image-cache" class="secondary-command" type="button">清除图片缓存</button></section>
+          <section class="settings-section setting-block update-settings settings-authenticated" data-settings-section="update">
+            <p class="eyebrow">更新</p><div class="setting-toggle-row"><label for="settings-auto-update-check">自动检查更新</label><input id="settings-auto-update-check" type="checkbox" role="switch"></div>
+            <p id="settings-app-update-status" class="component-status" role="status" aria-live="polite">尚未检查更新</p>
+            <div class="setting-actions"><button id="settings-check-app-update" class="secondary-command" type="button">检查更新</button><button id="settings-download-app-update" class="primary-command hidden" type="button">下载更新</button><button id="settings-install-app-update" class="primary-command hidden" type="button">安装更新</button></div>
+            <div id="settings-confirm-app-update" class="update-confirm hidden"><p>安装更新会关闭当前应用，是否继续？</p><div class="setting-actions"><button id="settings-cancel-app-update" class="secondary-command" type="button">取消</button><button id="settings-confirm-install-app-update" class="danger-command" type="button">确认安装</button></div></div>
+          </section>
+        </div>
+      </div>
+    </section>
   </aside>
 
   <div id="overview-scrim" class="modal-scrim hidden">

@@ -31,6 +31,7 @@
     const defaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v2';
     const legacyDefaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v1';
     const seriesPlaybackSettingsKey = 'MediaStationGo.Windows.seriesPlaybackSettings.v1';
+    const uiThemeSettingKey = 'MediaStationGo.Windows.uiTheme.v1';
     const playerSubtitleStyleDefaults = Object.freeze({ fontSize: 36, bottomOffset: 8 });
     const seriesPlaybackSettingDefaults = Object.freeze({
         autoNext: true,
@@ -81,6 +82,12 @@
     let toastTimer = 0;
     let drawerTrigger = null;
     let currentDrawer = null;
+    let drawerScrimCloseTimer = 0;
+    let settingsCardAnimation = null;
+    let settingsCardAnimationFrame = 0;
+    let settingsMotionLayer = null;
+    const settingsCardOpenMotionDuration = 280;
+    const settingsCardCloseMotionDuration = 220;
     let currentView = null;
     let session = null;
     let homeData = null;
@@ -130,6 +137,11 @@
     let playerPlaybackRate = 1;
     let preferredInterpolationModel = 'rife-v4.26';
     let autoUpdateCheckEnabled = window.jmpInfo?.settings?.advanced?.autoUpdateCheck !== false;
+    let globalProxyMode = window.jmpInfo?.settings?.advanced?.mediaStationProxyMode === 'system'
+        ? 'system'
+        : 'direct';
+    let activeSettingsSection = 'network';
+    let proxySettingsStatus = { state: '', text: '' };
     let appUpdateState = { status: 'idle', payload: {} };
     let automaticUpdateTimer = 0;
     let updateNotificationVersion = '';
@@ -447,14 +459,14 @@
     }
 
     function refreshDefaultSubtitleStyleControls() {
-        const fontSize = byId('default-subtitle-font-size');
-        const bottomOffset = byId('default-subtitle-bottom-offset');
+        const fontSize = byId('settings-subtitle-font-size');
+        const bottomOffset = byId('settings-subtitle-bottom-offset');
         fontSize.value = String(defaultPlayerSubtitleStyle.fontSize);
         bottomOffset.value = String(defaultPlayerSubtitleStyle.bottomOffset);
         fontSize.style.setProperty('--setting-range-progress', `${(defaultPlayerSubtitleStyle.fontSize - 24) / 40 * 100}%`);
         bottomOffset.style.setProperty('--setting-range-progress', `${defaultPlayerSubtitleStyle.bottomOffset / 30 * 100}%`);
-        byId('default-subtitle-font-size-value').value = String(defaultPlayerSubtitleStyle.fontSize);
-        byId('default-subtitle-bottom-offset-value').value = `${defaultPlayerSubtitleStyle.bottomOffset}%`;
+        byId('settings-subtitle-font-size-value').value = String(defaultPlayerSubtitleStyle.fontSize);
+        byId('settings-subtitle-bottom-offset-value').value = `${defaultPlayerSubtitleStyle.bottomOffset}%`;
     }
 
     function applyDefaultPlayerSubtitleStyle(style, persist = false) {
@@ -673,11 +685,9 @@
     function validConnectionProfile(value) {
         return Boolean(value && (
             (value.serverType === 'mediastation_go'
-                && value.clientProfile === 'mediastation_go'
-                && ['direct', 'system'].includes(value.proxyMode))
+                && value.clientProfile === 'mediastation_go')
             || (value.serverType === 'standard_emby'
-                && ['senplayer', 'infuse'].includes(value.clientProfile)
-                && ['direct', 'system'].includes(value.proxyMode))
+                && ['mediastation_windows', 'senplayer', 'infuse'].includes(value.clientProfile))
         ));
     }
 
@@ -685,8 +695,24 @@
         return {
             serverType: 'mediastation_go',
             clientProfile: 'mediastation_go',
-            proxyMode: 'direct',
         };
+    }
+
+    function embyClientProfileInputs() {
+        return document.querySelectorAll('input[name="emby-client-profile"]');
+    }
+
+    function selectedEmbyClientProfile() {
+        const selected = document.querySelector('input[name="emby-client-profile"]:checked');
+        if (!selected) throw new Error('请先选择 Emby 客户端身份。');
+        return selected.value;
+    }
+
+    function setEmbyClientProfile(profile, disabled) {
+        embyClientProfileInputs().forEach((input) => {
+            input.checked = input.value === profile;
+            input.disabled = disabled;
+        });
     }
 
     function selectedLoginConnection() {
@@ -694,14 +720,12 @@
         if (serverType === 'standard_emby') {
             return {
                 serverType,
-                clientProfile: byId('emby-client-profile').value,
-                proxyMode: byId('login-proxy-mode').value,
+                clientProfile: selectedEmbyClientProfile(),
             };
         }
         return {
             serverType: 'mediastation_go',
             clientProfile: 'mediastation_go',
-            proxyMode: byId('login-proxy-mode').value,
         };
     }
 
@@ -709,7 +733,6 @@
         const standardEmby = document.querySelector('input[name="server-type"]:checked')?.value
             === 'standard_emby';
         byId('emby-client-profile-field').classList.toggle('hidden', !standardEmby);
-        byId('login-proxy-mode').disabled = loginConnectionLocked;
     }
 
     function setLoginConnection(source, locked) {
@@ -722,11 +745,9 @@
             input.checked = input.value === type;
             input.disabled = locked;
         });
-        byId('emby-client-profile').value = type === 'standard_emby'
+        setEmbyClientProfile(type === 'standard_emby'
             ? connection.clientProfile
-            : 'senplayer';
-        byId('emby-client-profile').disabled = locked;
-        byId('login-proxy-mode').value = connection.proxyMode;
+            : 'mediastation_windows', locked);
         syncLoginConnectionUi();
     }
 
@@ -743,8 +764,9 @@
         document.querySelectorAll('input[name="server-type"]').forEach((input) => {
             input.disabled = loading || loginConnectionLocked;
         });
-        byId('emby-client-profile').disabled = loading || loginConnectionLocked;
-        byId('login-proxy-mode').disabled = loading || loginConnectionLocked;
+        embyClientProfileInputs().forEach((input) => {
+            input.disabled = loading || loginConnectionLocked;
+        });
         byId('login-submit-label').textContent = loading
             ? loginMode === 'update' ? '正在保存...' : '正在登录...'
             : loginMode === 'update' ? '保存修改' : '登录';
@@ -935,14 +957,12 @@
                     byId('username').value.trim(),
                     byId('password').value,
                     connection.clientProfile,
-                    connection.proxyMode,
                 ])
                 : await nativeRequest('mediaStationAuthenticate', 'authenticate', [
                     byId('server-url').value.trim(),
                     byId('username').value.trim(),
                     byId('password').value,
                     connection.clientProfile,
-                    connection.proxyMode,
                 ]);
             byId('password').value = '';
             const updatedInactiveAccount = mode === 'update' && !isCurrentAccount(account);
@@ -1026,11 +1046,11 @@
     }
 
     function refreshUpdateControls() {
-        const statusNode = byId('app-update-status');
-        const checkButton = byId('check-app-update');
-        const downloadButton = byId('download-app-update');
-        const installButton = byId('install-app-update');
-        const confirm = byId('confirm-app-update');
+        const statusNode = byId('settings-app-update-status');
+        const checkButton = byId('settings-check-app-update');
+        const downloadButton = byId('settings-download-app-update');
+        const installButton = byId('settings-install-app-update');
+        const confirm = byId('settings-confirm-app-update');
         if (!statusNode || !checkButton || !downloadButton || !installButton || !confirm) return;
         const { status, payload } = appUpdateState;
         statusNode.textContent = updateStatusText(status, payload);
@@ -1383,7 +1403,7 @@
 
     function updateImageCacheStatus() {
         const diskSize = formatBytes(imageDiskStats.imageBytes);
-        byId('image-cache-status').textContent = `磁盘 ${diskSize} · 本次 ${imageCache.size} 张`;
+        byId('settings-image-cache-status').textContent = `磁盘 ${diskSize} · 本次 ${imageCache.size} 张`;
     }
 
     async function refreshImageCacheStatus() {
@@ -1396,13 +1416,13 @@
             updateImageCacheStatus();
         } catch (error) {
             console.error(`图片缓存统计失败：${friendlyError(error)}`);
-            byId('image-cache-status').textContent = '统计失败';
+            byId('settings-image-cache-status').textContent = '统计失败';
         }
     }
 
     function updateFrameInterpolationStatus(status) {
         if (!status) return;
-        const label = byId('frame-interpolation-status');
+        const label = byId('settings-frame-interpolation-status');
         if (interpolationModels[status.selectedModel]) {
             preferredInterpolationModel = status.selectedModel;
         }
@@ -1430,7 +1450,7 @@
             );
             updateFrameInterpolationStatus(status);
         } catch (error) {
-            const label = byId('frame-interpolation-status');
+            const label = byId('settings-frame-interpolation-status');
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
         }
@@ -3037,25 +3057,286 @@
         setCurrentView({ kind: 'search', data: { query: '', draft: '', items: null, status: 'idle', error: '' } });
     }
 
+    function validUiTheme(value) {
+        return ['violet', 'cobalt', 'ember'].includes(value);
+    }
+
+    function loadUiTheme() {
+        try {
+            const stored = window.localStorage.getItem(uiThemeSettingKey);
+            return validUiTheme(stored) ? stored : 'violet';
+        } catch (error) {
+            console.error(`MediaStation UI theme could not be read: ${error}`);
+            return 'violet';
+        }
+    }
+
+    function applyUiTheme(theme, persist = false) {
+        const selected = validUiTheme(theme) ? theme : 'violet';
+        document.documentElement.dataset.uiTheme = selected;
+        document.querySelectorAll('[data-ui-theme]').forEach((button) => {
+            button.setAttribute('aria-pressed', String(button.dataset.uiTheme === selected));
+        });
+        if (!persist) return;
+        try {
+            window.localStorage.setItem(uiThemeSettingKey, selected);
+        } catch (error) {
+            console.error(`MediaStation UI theme could not be saved: ${error}`);
+            showToast('主题保存失败');
+        }
+    }
+
+    function setProxySettingsStatus(state, text) {
+        proxySettingsStatus = { state, text };
+        const status = byId('settings-proxy-status');
+        status.textContent = text;
+        status.dataset.state = state;
+    }
+
+    function selectSettingsSection(section) {
+        const settings = byId('settings-drawer');
+        const signedIn = Boolean(session);
+        const available = signedIn
+            ? ['network', 'appearance', 'playback', 'storage', 'update']
+            : ['network'];
+        activeSettingsSection = available.includes(section) ? section : 'network';
+        settings.classList.toggle('is-signed-out', !signedIn);
+        settings.querySelectorAll('.settings-section').forEach((panel) => {
+            panel.classList.toggle('hidden', panel.dataset.settingsSection !== activeSettingsSection);
+        });
+        settings.querySelectorAll('[data-settings-section]').forEach((button) => {
+            button.classList.toggle('is-active', button.dataset.settingsSection === activeSettingsSection);
+        });
+    }
+
+    function proxyModeInputs() {
+        return document.querySelectorAll('input[name="settings-proxy-mode"]');
+    }
+
+    function setProxyModeInputs(mode, disabled) {
+        proxyModeInputs().forEach((input) => {
+            input.checked = input.value === mode;
+            input.disabled = disabled;
+        });
+    }
+
+    function refreshProxySettings() {
+        const signedIn = Boolean(session);
+        const description = byId('settings-proxy-description');
+        setProxyModeInputs(globalProxyMode, false);
+        description.textContent = signedIn
+            ? '应用于当前会话和之后所有服务器的连接，不会写入账号凭据。'
+            : '选择下一次登录媒体服务器时使用的全局连接方式。';
+        if (!proxySettingsStatus.text) {
+            setProxySettingsStatus(
+                '',
+                signedIn ? '当前全局连接设置已生效。' : '保存后会在下次登录时生效。',
+            );
+        } else {
+            setProxySettingsStatus(proxySettingsStatus.state, proxySettingsStatus.text);
+        }
+    }
+
+    async function updateGlobalProxyMode(mode) {
+        if (!['direct', 'system'].includes(mode) || mode === globalProxyMode) {
+            setProxyModeInputs(globalProxyMode, false);
+            return;
+        }
+        const previous = globalProxyMode;
+        setProxyModeInputs(mode, true);
+        setProxySettingsStatus('', '正在保存全局连接设置...');
+        try {
+            const status = await nativeRequest(
+                'mediaStationSetProxyMode',
+                'set_proxy_mode',
+                [mode],
+            );
+            globalProxyMode = mode;
+            if (session && status?.configured) {
+                session = { ...session, ...status };
+                updateSessionUi();
+            }
+            setProxySettingsStatus('ready', mode === 'system' ? '已启用 Windows 系统代理。' : '已切换为直连。');
+        } catch (error) {
+            globalProxyMode = previous;
+            setProxyModeInputs(previous, true);
+            setProxySettingsStatus('error', friendlyError(error));
+        } finally {
+            setProxyModeInputs(globalProxyMode, false);
+        }
+    }
+
+    function settingsMotionDuration(opening) {
+        if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return 0;
+        return opening ? settingsCardOpenMotionDuration : settingsCardCloseMotionDuration;
+    }
+
+    function clearSettingsCardMotion() {
+        window.cancelAnimationFrame(settingsCardAnimationFrame);
+        settingsCardAnimationFrame = 0;
+        settingsCardAnimation?.cancel();
+        settingsCardAnimation = null;
+        settingsMotionLayer?.remove();
+        settingsMotionLayer = null;
+        byId('settings-drawer').classList.remove('is-animating');
+    }
+
+    function animateSettingsCard(trigger, opening, onFinished) {
+        clearSettingsCardMotion();
+        if (!trigger || !settingsMotionDuration(opening)) {
+            onFinished?.();
+            return;
+        }
+        const drawer = byId('settings-drawer');
+        const card = drawer.querySelector('.settings-preferences');
+        if (!card) return;
+        const triggerBounds = trigger.getBoundingClientRect();
+        const cardBounds = card.getBoundingClientRect();
+        if (!cardBounds.width || !cardBounds.height) return;
+        const scaleX = Math.max(triggerBounds.width / cardBounds.width, 0.025);
+        const scaleY = Math.max(triggerBounds.height / cardBounds.height, 0.025);
+        const translateX = (triggerBounds.left + (triggerBounds.width / 2))
+            - (cardBounds.left + (cardBounds.width / 2));
+        const translateY = (triggerBounds.top + (triggerBounds.height / 2))
+            - (cardBounds.top + (cardBounds.height / 2));
+        const collapsedTransform = `translate3d(${translateX}px, ${translateY}px, 0) scale(${scaleX}, ${scaleY})`;
+        const triggerRadius = Math.min(triggerBounds.width, triggerBounds.height) / 2;
+        const collapsedRadius = `${Math.max(8, triggerRadius / scaleX)}px / ${Math.max(8, triggerRadius / scaleY)}px`;
+        const collapsedState = {
+            opacity: 0.38,
+            transform: collapsedTransform,
+            borderRadius: collapsedRadius,
+            boxShadow: '0 2px 6px rgba(0,0,0,0.18)',
+        };
+        const expandedState = {
+            opacity: 1,
+            transform: 'none',
+            borderRadius: '14px',
+            boxShadow: '0 28px 58px rgba(0,0,0,0.4)',
+        };
+        const startState = opening ? collapsedState : expandedState;
+        const endState = opening ? expandedState : collapsedState;
+        const layer = card.cloneNode(true);
+        layer.classList.add('settings-motion-layer');
+        layer.setAttribute('aria-hidden', 'true');
+        layer.removeAttribute('id');
+        layer.querySelectorAll('[id]').forEach((node) => node.removeAttribute('id'));
+        // The motion layer shares the document with the live settings card.
+        // Keep its copied radios out of the live group, otherwise appending the
+        // layer clears the selected proxy mode on the real form.
+        layer.querySelectorAll('input[name="settings-proxy-mode"]').forEach((input) => {
+            const liveInput = card.querySelector(`input[name="settings-proxy-mode"][value="${input.value}"]`);
+            input.name = 'settings-proxy-mode-motion';
+            input.checked = liveInput.checked;
+        });
+        Object.assign(layer.style, {
+            left: `${cardBounds.left}px`,
+            top: `${cardBounds.top}px`,
+            width: `${cardBounds.width}px`,
+            height: `${cardBounds.height}px`,
+            opacity: String(startState.opacity),
+            transform: startState.transform,
+            borderRadius: startState.borderRadius,
+            boxShadow: startState.boxShadow,
+        });
+        drawer.classList.add('is-animating');
+        document.body.append(layer);
+        settingsMotionLayer = layer;
+        const animation = layer.animate(
+            [startState, endState],
+            {
+                duration: settingsMotionDuration(opening),
+                easing: opening
+                    ? 'cubic-bezier(0.16, 0.84, 0.26, 1)'
+                    : 'cubic-bezier(0.5, 0, 0.82, 0.2)',
+                fill: 'both',
+            },
+        );
+        settingsCardAnimation = animation;
+        animation.pause();
+        animation.currentTime = 0;
+        settingsCardAnimationFrame = requestAnimationFrame(() => {
+            settingsCardAnimationFrame = 0;
+            if (settingsCardAnimation === animation) animation.play();
+        });
+        void animation.finished.then(() => {
+            if (settingsCardAnimation !== animation) return;
+            settingsCardAnimation = null;
+            if (settingsMotionLayer === layer) settingsMotionLayer = null;
+            if (!opening) drawer.classList.add('is-closed');
+            layer.remove();
+            drawer.classList.remove('is-animating');
+            if (opening && currentDrawer === drawer) {
+                focusElement(drawer.querySelector('.settings-nav .is-active, .settings-preferences .drawer-close'));
+            }
+            onFinished?.();
+        }).catch(() => {});
+    }
+
+    function openSettings(trigger) {
+        selectSettingsSection(activeSettingsSection);
+        refreshProxySettings();
+        openDrawer(byId('settings-drawer'), trigger);
+        animateSettingsCard(trigger, true);
+        if (session) {
+            refreshFrameInterpolationStatus();
+            refreshUpdateControls();
+        }
+    }
+
     function openDrawer(drawer, trigger) {
         closeDrawer(false);
+        const settingsDrawer = byId('settings-drawer');
+        if (drawer === settingsDrawer || settingsDrawer.classList.contains('is-closing')) {
+            clearSettingsCardMotion();
+            settingsDrawer.classList.remove('is-closed', 'is-closing');
+        }
+        drawer.classList.remove('is-closed', 'is-closing');
         currentDrawer = drawer;
         drawerTrigger = trigger;
-        byId('drawer-scrim').classList.remove('hidden');
+        window.clearTimeout(drawerScrimCloseTimer);
+        const scrim = byId('drawer-scrim');
+        scrim.classList.remove('hidden', 'is-closing', 'is-settings-closing');
         drawer.classList.add('open');
         drawer.setAttribute('aria-hidden', 'false');
-        requestAnimationFrame(() => drawer.querySelector('button, input')?.focus());
+        requestAnimationFrame(() => {
+            if (drawer === byId('settings-drawer') && drawer.classList.contains('is-animating')) return;
+            const target = drawer === byId('settings-drawer')
+                ? drawer.querySelector('.settings-nav .is-active, .settings-preferences .drawer-close')
+                : drawer.querySelector('button, input');
+            focusElement(target);
+        });
     }
 
     function closeDrawer(restoreFocus = true) {
         if (!currentDrawer) return;
-        if (currentDrawer === byId('account-drawer')) savedAccountsRevision += 1;
-        currentDrawer.classList.remove('open');
-        currentDrawer.setAttribute('aria-hidden', 'true');
-        byId('drawer-scrim').classList.add('hidden');
+        const closingSettings = currentDrawer === byId('settings-drawer');
+        const closingDrawer = currentDrawer;
         const trigger = drawerTrigger;
+        if (!closingSettings) savedAccountsRevision += 1;
+        closingDrawer.classList.toggle('is-closing', closingSettings);
+        closingDrawer.classList.remove('open');
+        closingDrawer.setAttribute('aria-hidden', 'true');
+        const scrim = byId('drawer-scrim');
+        scrim.classList.add('is-closing');
+        scrim.classList.toggle('is-settings-closing', closingSettings);
+        window.clearTimeout(drawerScrimCloseTimer);
         currentDrawer = null;
         drawerTrigger = null;
+        if (closingSettings) {
+            animateSettingsCard(trigger, false, () => {
+                if (currentDrawer) return;
+                scrim.classList.add('hidden');
+                scrim.classList.remove('is-closing', 'is-settings-closing');
+                closingDrawer.classList.remove('is-closing');
+            });
+        } else {
+            drawerScrimCloseTimer = window.setTimeout(() => {
+                if (currentDrawer) return;
+                scrim.classList.add('hidden');
+                scrim.classList.remove('is-closing', 'is-settings-closing');
+            }, 230);
+        }
         if (restoreFocus) trigger?.focus();
     }
 
@@ -3131,8 +3412,13 @@
             serverId: server.serverId,
             serverType: server.serverType,
             clientProfile: server.clientProfile,
-            proxyMode: server.proxyMode,
         };
+    }
+
+    function standardEmbyClientLabel(profile) {
+        if (profile === 'senplayer') return 'SenPlayer';
+        if (profile === 'infuse') return 'Infuse';
+        return '默认身份';
     }
 
     function renderSavedAccountServers(servers, surface) {
@@ -3157,17 +3443,14 @@
             const serverSection = element('section', 'saved-account-server', null);
             const serverHeader = element('header', 'saved-account-server-header', null);
             const serverCopy = element('div', 'saved-account-server-copy', null);
-            serverCopy.append(
-                element('strong', '', serverLabel(server.baseUrl)),
-                element('span', '', server.baseUrl),
-                element(
-                    'span',
-                    'saved-account-server-connection',
-                    server.serverType === 'standard_emby'
-                        ? `标准 Emby · ${server.clientProfile === 'infuse' ? 'Infuse' : 'SenPlayer'} · ${server.proxyMode === 'system' ? '系统代理' : '直连'}`
-                        : `MediaStationGo · ${server.proxyMode === 'system' ? '系统代理' : '直连'}`,
-                ),
-            );
+            serverCopy.append(element('strong', '', serverLabel(server.baseUrl)));
+            serverCopy.append(element(
+                'span',
+                'saved-account-server-client',
+                server.serverType === 'standard_emby'
+                    ? `标准 Emby · ${standardEmbyClientLabel(server.clientProfile)}`
+                    : 'MediaStationGo',
+            ));
             const serverCount = element('span', 'saved-account-server-count', `${server.users.length} 个用户`);
             const addUser = element('button', 'icon-button saved-account-server-add', '\u002b');
             addUser.type = 'button';
@@ -5025,12 +5308,24 @@
         loadSavedAccounts();
     });
     byId('settings-open').addEventListener('click', (event) => {
-        openDrawer(byId('settings-drawer'), event.currentTarget);
-        refreshFrameInterpolationStatus();
-        refreshUpdateControls();
+        openSettings(event.currentTarget);
     });
+    byId('login-settings-open').addEventListener('click', (event) => openSettings(event.currentTarget));
     byId('drawer-scrim').addEventListener('click', () => closeDrawer());
+    byId('settings-drawer').addEventListener('click', (event) => {
+        if (event.target === event.currentTarget) closeDrawer();
+    });
     document.querySelectorAll('.drawer-close').forEach((button) => button.addEventListener('click', () => closeDrawer()));
+    proxyModeInputs().forEach((input) => input.addEventListener('change', (event) => {
+        void updateGlobalProxyMode(event.currentTarget.value);
+    }));
+    document.querySelectorAll('.settings-nav [data-settings-section]').forEach((button) => {
+        button.addEventListener('click', () => selectSettingsSection(button.dataset.settingsSection));
+    });
+    document.querySelectorAll('[data-ui-theme]').forEach((button) => {
+        button.addEventListener('click', () => applyUiTheme(button.dataset.uiTheme, true));
+    });
+    applyUiTheme(loadUiTheme());
     byId('overview-close').addEventListener('click', closeOverview);
     byId('overview-scrim').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeOverview();
@@ -5046,14 +5341,11 @@
     byId('login-cancel').addEventListener('click', cancelAccountChange);
     document.querySelectorAll('input[name="server-type"]').forEach((input) => {
         input.addEventListener('change', () => {
-            if (input.checked && input.value === 'mediastation_go') {
-                byId('login-proxy-mode').value = 'direct';
-            }
             syncLoginConnectionUi();
         });
     });
-    const defaultSubtitleFontSize = byId('default-subtitle-font-size');
-    const defaultSubtitleBottomOffset = byId('default-subtitle-bottom-offset');
+    const defaultSubtitleFontSize = byId('settings-subtitle-font-size');
+    const defaultSubtitleBottomOffset = byId('settings-subtitle-bottom-offset');
     const updateDefaultSubtitleStyle = (persist) => {
         applyDefaultPlayerSubtitleStyle({
             fontSize: Number(defaultSubtitleFontSize.value),
@@ -5064,11 +5356,11 @@
     defaultSubtitleFontSize.addEventListener('change', () => updateDefaultSubtitleStyle(true));
     defaultSubtitleBottomOffset.addEventListener('input', () => updateDefaultSubtitleStyle(false));
     defaultSubtitleBottomOffset.addEventListener('change', () => updateDefaultSubtitleStyle(true));
-    byId('reset-default-subtitle-style').addEventListener('click', () => {
+    byId('settings-reset-subtitle-style').addEventListener('click', () => {
         applyDefaultPlayerSubtitleStyle(playerSubtitleStyleDefaults, true);
     });
     refreshDefaultSubtitleStyleControls();
-    const autoUpdateToggle = byId('auto-update-check');
+    const autoUpdateToggle = byId('settings-auto-update-check');
     autoUpdateToggle.checked = autoUpdateCheckEnabled;
     autoUpdateToggle.addEventListener('change', () => {
         autoUpdateCheckEnabled = autoUpdateToggle.checked;
@@ -5081,28 +5373,28 @@
             automaticUpdateTimer = 0;
         }
     });
-    byId('check-app-update').addEventListener('click', requestUpdateCheck);
-    byId('download-app-update').addEventListener('click', () => {
+    byId('settings-check-app-update').addEventListener('click', requestUpdateCheck);
+    byId('settings-download-app-update').addEventListener('click', () => {
         if (!window.jmpNative?.updateDownload) return;
         appUpdateState = { status: 'downloading', payload: appUpdateState.payload };
         refreshUpdateControls();
         window.jmpNative.updateDownload();
     });
-    byId('install-app-update').addEventListener('click', () => {
-        byId('confirm-app-update').classList.remove('hidden');
-        byId('confirm-install-app-update').focus();
+    byId('settings-install-app-update').addEventListener('click', () => {
+        byId('settings-confirm-app-update').classList.remove('hidden');
+        byId('settings-confirm-install-app-update').focus();
     });
-    byId('cancel-app-update').addEventListener('click', () => {
-        byId('confirm-app-update').classList.add('hidden');
-        byId('install-app-update').focus();
+    byId('settings-cancel-app-update').addEventListener('click', () => {
+        byId('settings-confirm-app-update').classList.add('hidden');
+        byId('settings-install-app-update').focus();
     });
-    byId('confirm-install-app-update').addEventListener('click', () => {
+    byId('settings-confirm-install-app-update').addEventListener('click', () => {
         if (!window.jmpNative?.updateInstall) return;
         appUpdateState = { status: 'verifying', payload: appUpdateState.payload };
         refreshUpdateControls();
         window.jmpNative.updateInstall();
     });
-    byId('clear-image-cache').addEventListener('click', async (event) => {
+    byId('settings-clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;
         const view = captureView();
@@ -5261,7 +5553,8 @@
         }
         if (event.key === 'Escape' || (event.key === 'Backspace' && !inputActive)) {
             event.preventDefault();
-            if (!loginView.classList.contains('hidden') && loginCanCancel) cancelAccountChange();
+            if (!loginView.classList.contains('hidden') && currentDrawer) closeDrawer();
+            else if (!loginView.classList.contains('hidden') && loginCanCancel) cancelAccountChange();
             else if (!loginView.classList.contains('hidden')) return;
             else goBack();
             return;

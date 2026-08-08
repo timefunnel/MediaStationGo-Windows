@@ -11,7 +11,7 @@ const ACCOUNT_CREDENTIAL_PREFIX: &str = "MediaStationGo.Windows.Account.";
 const ACCOUNT_CREDENTIAL_SUFFIX: &str = ".v1";
 const ACCOUNT_CREDENTIAL_FILTER: &str = "MediaStationGo.Windows.Account.*";
 const ACCOUNT_ID_LEN: usize = 64;
-const CREDENTIAL_SCHEMA_VERSION: u64 = 2;
+const CREDENTIAL_SCHEMA_VERSION: u64 = 3;
 const MAX_CREDENTIAL_BYTES: usize = 3_072;
 const MAX_CREDENTIAL_TARGET_UNITS: usize = 256;
 
@@ -97,6 +97,12 @@ impl StoredSession {
         if !connection.is_supported() {
             return Err(CredentialError::new("credential_connection_invalid"));
         }
+        // Proxy mode is an application-wide preference. Account credentials
+        // retain only the client identity needed by the media server.
+        let connection = MediaStationConnectionProfile {
+            client: connection.client,
+            proxy: MediaStationProxyMode::Direct,
+        };
         Ok(Self {
             base_url,
             user_id,
@@ -106,16 +112,20 @@ impl StoredSession {
         })
     }
 
-    pub(crate) fn to_session(
+    pub(crate) fn to_session_with_proxy(
         &self,
         authorization: String,
+        proxy: MediaStationProxyMode,
     ) -> Result<MediaStationSession, ApiError> {
         MediaStationSession::new_with_profile(
             self.base_url.clone(),
             self.user_id.clone(),
             self.access_token.clone(),
             authorization,
-            self.connection,
+            MediaStationConnectionProfile {
+                client: self.connection.client,
+                proxy,
+            },
         )
     }
 
@@ -136,7 +146,6 @@ impl StoredSession {
             "accessToken": self.access_token,
             "connection": {
                 "clientProfile": self.connection.client.as_str(),
-                "proxyMode": self.connection.proxy.as_str(),
             },
         }))
         .map_err(|_| CredentialError::new("credential_encode_failed"))?;
@@ -158,7 +167,7 @@ impl StoredSession {
             .ok_or_else(|| CredentialError::new("credential_version_unsupported"))?;
         let connection = match version {
             1 => MediaStationConnectionProfile::media_station_go(),
-            CREDENTIAL_SCHEMA_VERSION => decode_connection_profile(&value)?,
+            2 | CREDENTIAL_SCHEMA_VERSION => decode_connection_profile(&value)?,
             _ => return Err(CredentialError::new("credential_version_unsupported")),
         };
         let base_url = required_string(&value, "baseUrl")?;
@@ -249,12 +258,10 @@ fn decode_connection_profile(
         .and_then(Value::as_str)
         .and_then(MediaStationClientProfile::from_str)
         .ok_or_else(|| CredentialError::new("credential_client_profile_invalid"))?;
-    let proxy = connection
-        .get("proxyMode")
-        .and_then(Value::as_str)
-        .and_then(MediaStationProxyMode::from_str)
-        .ok_or_else(|| CredentialError::new("credential_proxy_mode_invalid"))?;
-    Ok(MediaStationConnectionProfile { client, proxy })
+    Ok(MediaStationConnectionProfile {
+        client,
+        proxy: MediaStationProxyMode::Direct,
+    })
 }
 
 fn validate_base_url(base_url: &Url) -> Result<(), CredentialError> {
@@ -561,21 +568,46 @@ mod tests {
     }
 
     #[test]
-    fn credential_codec_supports_generic_proxy_and_direct_defaults() {
+    fn credential_codec_migrates_legacy_proxy_to_global_default() {
         let proxied_msg = br#"{"version":2,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t","connection":{"clientProfile":"mediastation_go","proxyMode":"system"}}"#;
         let decoded =
-            StoredSession::decode(proxied_msg).expect("MSG may explicitly use the system proxy");
-        assert_eq!(decoded.connection.proxy, MediaStationProxyMode::System);
+            StoredSession::decode(proxied_msg).expect("legacy proxy setting should migrate");
+        assert_eq!(decoded.connection.proxy, MediaStationProxyMode::Direct);
 
         let direct_emby = br#"{"version":2,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t","connection":{"clientProfile":"senplayer","proxyMode":"direct"}}"#;
         let decoded = StoredSession::decode(direct_emby)
-            .expect("standard Emby should default to direct until proxy is selected");
+            .expect("standard Emby client profile should migrate");
         assert_eq!(decoded.connection.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(
+            decoded.connection.client,
+            MediaStationClientProfile::SenPlayer
+        );
+    }
+
+    #[test]
+    fn credential_codec_never_persists_proxy_mode() {
+        let stored = StoredSession::new_with_profile(
+            Url::parse("https://media.example").expect("URL should parse"),
+            "user",
+            "User",
+            "secret",
+            MediaStationConnectionProfile {
+                client: MediaStationClientProfile::MediaStationGo,
+                proxy: MediaStationProxyMode::System,
+            },
+        )
+        .expect("stored session should be valid");
+
+        let encoded = stored.encode().expect("credential should encode");
+        let payload: Value = serde_json::from_slice(&encoded).expect("credential should be JSON");
+        assert_eq!(payload["version"], CREDENTIAL_SCHEMA_VERSION);
+        assert!(payload["connection"].get("proxyMode").is_none());
+        assert_eq!(stored.connection.proxy, MediaStationProxyMode::Direct);
     }
 
     #[test]
     fn credential_codec_rejects_unknown_schema() {
-        let encoded = br#"{"version":3,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t"}"#;
+        let encoded = br#"{"version":4,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t"}"#;
 
         let error = StoredSession::decode(encoded).expect_err("unknown schema must fail");
 

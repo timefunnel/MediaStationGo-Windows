@@ -54,6 +54,7 @@ const OPERATION_LIST_ACCOUNTS: &str = "list_accounts";
 const OPERATION_SWITCH_ACCOUNT: &str = "switch_account";
 const OPERATION_DELETE_ACCOUNT: &str = "delete_account";
 const OPERATION_UPDATE_ACCOUNT: &str = "update_account";
+const OPERATION_SET_PROXY_MODE: &str = "set_proxy_mode";
 const OPERATION_IMAGE: &str = "image";
 const OPERATION_TRACKS: &str = "tracks";
 const OPERATION_TRACK_SELECTION: &str = "track_selection";
@@ -640,6 +641,8 @@ impl MediaStationRuntime {
         user_name: String,
         persisted: bool,
     ) -> u64 {
+        let mut session = session;
+        session.connection.proxy = configured_proxy_mode();
         let (generation, stopped) = {
             let mut state = self.state.lock();
             let stopped = if state.session.as_ref() != Some(&session) {
@@ -959,6 +962,72 @@ impl MediaStationRuntime {
         session_status_payload(&state)
     }
 
+    fn set_global_proxy_mode(&self, proxy: MediaStationProxyMode) -> Result<Value, LoadFailure> {
+        let current_session = {
+            let state = self.state.lock();
+            state.session.as_ref().map(|session| {
+                let mut updated = session.clone();
+                updated.connection.proxy = proxy;
+                updated
+            })
+        };
+        if proxy == MediaStationProxyMode::System
+            && let Some(session) = current_session.as_ref()
+        {
+            self.api.playback_proxy_url(session).map_err(|error| {
+                log_error(&format!(
+                    "MediaStation system proxy setting rejected: code={}",
+                    api_error_code(&error)
+                ));
+                LoadFailure::new(
+                    api_error_code(&error),
+                    "The selected system proxy is unavailable",
+                )
+            })?;
+        }
+
+        let previous = jfn_config::media_station_proxy_mode();
+        if !jfn_config::set_media_station_proxy_mode(proxy.as_str()) {
+            return Err(LoadFailure::new(
+                "invalid_proxy_mode",
+                "The selected global proxy mode is invalid",
+            ));
+        }
+        if !jfn_config::settings_save() {
+            let _ = jfn_config::set_media_station_proxy_mode(&previous);
+            return Err(LoadFailure::new(
+                "settings_write_failed",
+                "The global proxy setting could not be persisted",
+            ));
+        }
+
+        let (payload, stopped) = {
+            let mut state = self.state.lock();
+            let changed = state
+                .session
+                .as_ref()
+                .is_some_and(|session| session.connection.proxy != proxy);
+            let stopped = if changed {
+                state
+                    .session
+                    .as_mut()
+                    .expect("a changed proxy mode requires an active session")
+                    .connection
+                    .proxy = proxy;
+                let stopped = take_stopped_report(&mut state);
+                state.generation = state.generation.wrapping_add(1);
+                state.active_subtitle = None;
+                state.active_interpolation = None;
+                stopped
+            } else {
+                None
+            };
+            (session_status_payload(&state), stopped)
+        };
+        self.enqueue_report(stopped);
+        Ok(payload)
+    }
+
     fn commit_persisted_session(
         &self,
         expected_generation: u64,
@@ -1093,7 +1162,7 @@ impl MediaStationRuntime {
             Some(stored.access_token_secret()),
             stored.connection.client,
         )?;
-        let session = stored.to_session(authorization).map_err(|error| {
+        let session = runtime_session_from_stored(&stored, authorization).map_err(|error| {
             log_error(&format!(
                 "MediaStation saved account could not be configured: code={}",
                 api_error_code(&error)
@@ -1265,16 +1334,17 @@ impl MediaStationRuntime {
             Some(stored.access_token_secret()),
             stored.connection.client,
         )?;
-        let updated_session = stored.to_session(authorization).map_err(|error| {
-            log_error(&format!(
-                "MediaStation updated account could not be configured: code={}",
-                api_error_code(&error)
-            ));
-            LoadFailure::new(
-                "updated_account_invalid",
-                "The updated account could not be configured",
-            )
-        })?;
+        let updated_session =
+            runtime_session_from_stored(stored, authorization).map_err(|error| {
+                log_error(&format!(
+                    "MediaStation updated account could not be configured: code={}",
+                    api_error_code(&error)
+                ));
+                LoadFailure::new(
+                    "updated_account_invalid",
+                    "The updated account could not be configured",
+                )
+            })?;
 
         let (payload, stopped) = {
             let mut state = self.state.lock();
@@ -1947,8 +2017,7 @@ pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
     let authorization =
         native_authorization_header(Some(stored.access_token_secret()), stored.connection.client)
             .map_err(|failure| failure.code.to_string())?;
-    let session = stored
-        .to_session(authorization)
+    let session = runtime_session_from_stored(&stored, authorization)
         .map_err(|error| api_error_code(&error).to_string())?;
     runtime()
         .map(|runtime| {
@@ -2387,6 +2456,59 @@ pub(crate) fn handle_update_account_message(
             )
             .payload(),
         );
+    }
+    true
+}
+
+pub(crate) fn handle_set_proxy_mode_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    let Some(layer) = layer else {
+        log_error("MediaStation global proxy setting rejected: web layer unavailable");
+        return true;
+    };
+    let request = match parse_proxy_mode_request(args) {
+        Ok(request) => request,
+        Err((request_id, failure)) => {
+            dispatch_response(
+                &layer,
+                &request_id,
+                OPERATION_SET_PROXY_MODE,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            dispatch_response(
+                &layer,
+                &request.request_id,
+                OPERATION_SET_PROXY_MODE,
+                false,
+                failure.payload(),
+            );
+            return true;
+        }
+    };
+    match runtime.set_global_proxy_mode(request.proxy) {
+        Ok(payload) => dispatch_response(
+            &layer,
+            &request.request_id,
+            OPERATION_SET_PROXY_MODE,
+            true,
+            payload,
+        ),
+        Err(failure) => dispatch_response(
+            &layer,
+            &request.request_id,
+            OPERATION_SET_PROXY_MODE,
+            false,
+            failure.payload(),
+        ),
     }
     true
 }
@@ -3182,12 +3304,17 @@ struct UpdateAccountRequest {
     connection: MediaStationConnectionProfile,
 }
 
+struct ProxyModeRequest {
+    request_id: String,
+    proxy: MediaStationProxyMode,
+}
+
 fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, LoadFailure)> {
     let request_id = parse_request_id(args)?;
     let Some(args) = args else {
         unreachable!("parse_request_id rejects missing arguments")
     };
-    if args.size() < 4 || args.size() == 5 {
+    if args.size() != 4 && args.size() != 5 {
         return Err((
             request_id,
             LoadFailure::new("invalid_request", "Authentication arguments are missing"),
@@ -3222,20 +3349,19 @@ fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, 
         ));
     }
     let connection = if args.size() == 4 {
-        MediaStationConnectionProfile::media_station_go()
+        parse_client_connection("mediastation_go")
+            .map_err(|failure| (request_id.clone(), failure))?
     } else {
-        for index in 4..6 {
-            if args.get_type(index).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
-                return Err((
-                    request_id,
-                    LoadFailure::new(
-                        "invalid_request",
-                        "Authentication arguments must be strings",
-                    ),
-                ));
-            }
+        if args.get_type(4).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+            return Err((
+                request_id,
+                LoadFailure::new(
+                    "invalid_request",
+                    "Authentication arguments must be strings",
+                ),
+            ));
         }
-        parse_connection_profile(&list_string(args, 4), &list_string(args, 5))
+        parse_client_connection(&list_string(args, 4))
             .map_err(|failure| (request_id.clone(), failure))?
     };
     Ok(AuthRequest {
@@ -3283,6 +3409,31 @@ fn parse_account_id_request(
     Ok((request_id, account_id))
 }
 
+fn parse_proxy_mode_request(
+    args: Option<&ListValue>,
+) -> Result<ProxyModeRequest, (String, LoadFailure)> {
+    let request_id = parse_request_id(args)?;
+    let Some(args) = args else {
+        unreachable!("parse_request_id rejects missing arguments")
+    };
+    if args.size() != 2 || args.get_type(1).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err((
+            request_id,
+            LoadFailure::new("invalid_request", "Global proxy mode arguments are invalid"),
+        ));
+    }
+    let proxy = MediaStationProxyMode::from_str(&list_string(args, 1)).ok_or_else(|| {
+        (
+            request_id.clone(),
+            LoadFailure::new(
+                "invalid_proxy_mode",
+                "The selected global proxy mode is invalid",
+            ),
+        )
+    })?;
+    Ok(ProxyModeRequest { request_id, proxy })
+}
+
 fn parse_update_account_request(
     args: Option<&ListValue>,
 ) -> Result<UpdateAccountRequest, (String, LoadFailure)> {
@@ -3290,14 +3441,14 @@ fn parse_update_account_request(
     let Some(args) = args else {
         unreachable!("parse_request_id rejects missing arguments")
     };
-    if args.size() < 6 {
+    if args.size() != 5 {
         return Err((
             request_id,
             LoadFailure::new("invalid_request", "Account update arguments are missing"),
         ));
     }
     let account_id = parse_account_id(args, 1).map_err(|failure| (request_id.clone(), failure))?;
-    for index in 2..6 {
+    for index in 2..5 {
         if args.get_type(index).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
             return Err((
                 request_id,
@@ -3322,7 +3473,7 @@ fn parse_update_account_request(
             LoadFailure::new("invalid_password", "The password is too long"),
         ));
     }
-    let connection = parse_connection_profile(&list_string(args, 4), &list_string(args, 5))
+    let connection = parse_client_connection(&list_string(args, 4))
         .map_err(|failure| (request_id.clone(), failure))?;
     Ok(UpdateAccountRequest {
         request_id,
@@ -3333,9 +3484,21 @@ fn parse_update_account_request(
     })
 }
 
-fn parse_connection_profile(
+fn configured_proxy_mode() -> MediaStationProxyMode {
+    match jfn_config::media_station_proxy_mode().as_str() {
+        "direct" => MediaStationProxyMode::Direct,
+        "system" => MediaStationProxyMode::System,
+        value => {
+            log_error(&format!(
+                "MediaStation global proxy setting is invalid and was ignored: mode={value}"
+            ));
+            MediaStationProxyMode::Direct
+        }
+    }
+}
+
+fn parse_client_connection(
     client_profile: &str,
-    proxy_mode: &str,
 ) -> Result<MediaStationConnectionProfile, LoadFailure> {
     let client = MediaStationClientProfile::from_str(client_profile).ok_or_else(|| {
         LoadFailure::new(
@@ -3343,13 +3506,10 @@ fn parse_connection_profile(
             "The selected server client profile is invalid",
         )
     })?;
-    let proxy = MediaStationProxyMode::from_str(proxy_mode).ok_or_else(|| {
-        LoadFailure::new(
-            "invalid_proxy_mode",
-            "The selected server proxy mode is invalid",
-        )
-    })?;
-    let connection = MediaStationConnectionProfile { client, proxy };
+    let connection = MediaStationConnectionProfile {
+        client,
+        proxy: configured_proxy_mode(),
+    };
     if !connection.is_supported() {
         return Err(LoadFailure::new(
             "invalid_connection_profile",
@@ -3357,6 +3517,13 @@ fn parse_connection_profile(
         ));
     }
     Ok(connection)
+}
+
+fn runtime_session_from_stored(
+    stored: &StoredSession,
+    authorization: String,
+) -> Result<MediaStationSession, ApiError> {
+    stored.to_session_with_proxy(authorization, configured_proxy_mode())
 }
 
 fn parse_account_id(args: &ListValue, index: usize) -> Result<String, LoadFailure> {
@@ -3390,10 +3557,10 @@ fn saved_accounts_payload(accounts: &[SavedAccount]) -> Result<Value, LoadFailur
             .push(account);
     }
     if grouped.values().any(|accounts| {
-        let expected = accounts[0].session.connection;
+        let expected = accounts[0].session.connection.client;
         accounts
             .iter()
-            .any(|account| account.session.connection != expected)
+            .any(|account| account.session.connection.client != expected)
     }) {
         return Err(LoadFailure::new(
             "server_connection_mismatch",
@@ -3408,7 +3575,6 @@ fn saved_accounts_payload(accounts: &[SavedAccount]) -> Result<Value, LoadFailur
                 "baseUrl": base_url,
                 "serverType": accounts[0].session.connection.client.server_type(),
                 "clientProfile": accounts[0].session.connection.client.as_str(),
-                "proxyMode": accounts[0].session.connection.proxy.as_str(),
                 "users": accounts.into_iter().map(|account| json!({
                     "accountId": account.account_id,
                     "userId": account.session.user_id,
@@ -3429,7 +3595,6 @@ fn account_public_payload(account_id: &str, stored: &StoredSession, configured: 
         "userName": stored.user_name,
         "serverType": stored.connection.client.server_type(),
         "clientProfile": stored.connection.client.as_str(),
-        "proxyMode": stored.connection.proxy.as_str(),
     })
 }
 
@@ -3472,7 +3637,7 @@ fn execute_authentication(
     })?;
     let authorization =
         native_authorization_header(Some(stored.access_token_secret()), stored.connection.client)?;
-    let session = stored.to_session(authorization).map_err(|error| {
+    let session = runtime_session_from_stored(&stored, authorization).map_err(|error| {
         log_error(&format!(
             "MediaStation authenticated session could not be configured: code={}",
             api_error_code(&error)
@@ -3519,14 +3684,18 @@ fn execute_account_update(
             "The selected credential does not match its account identifier",
         ));
     }
-    if request.connection != previous.connection {
+    if request.connection.client != previous.connection.client {
         return Err(LoadFailure::new(
             "server_connection_mismatch",
-            "The server connection profile cannot be changed while updating a user",
+            "The server client profile cannot be changed while updating a user",
         ));
     }
 
     let base_authorization = native_authorization_header(None, previous.connection.client)?;
+    let connection = MediaStationConnectionProfile {
+        client: previous.connection.client,
+        proxy: configured_proxy_mode(),
+    };
     let authenticated = runtime
         .api
         .authenticate_with_profile(
@@ -3534,7 +3703,7 @@ fn execute_account_update(
             &request.username,
             &request.password,
             &base_authorization,
-            previous.connection,
+            connection,
         )
         .map_err(|error| authentication_failure(&error))?;
     let access_token = authenticated.access_token_secret().to_string();
@@ -6592,7 +6761,7 @@ mod tests {
         assert_ne!(account["accountId"], second_id);
         assert_eq!(server["serverType"], "mediastation_go");
         assert_eq!(server["clientProfile"], "mediastation_go");
-        assert_eq!(server["proxyMode"], "direct");
+        assert!(server.get("proxyMode").is_none());
         assert!(!text.contains("saved-account-secret"));
         assert!(!text.contains("second-account-secret"));
         assert!(!text.to_ascii_lowercase().contains("token"));
@@ -7312,30 +7481,24 @@ mod tests {
     }
 
     #[test]
-    fn connection_parser_supports_all_server_types_and_proxy_modes() {
+    fn client_connection_parser_supports_all_server_types() {
         assert_eq!(
-            parse_connection_profile("mediastation_go", "direct").expect("MSG direct should parse"),
-            MediaStationConnectionProfile::media_station_go()
+            parse_client_connection("mediastation_go")
+                .expect("MediaStationGo client profile should parse")
+                .client,
+            MediaStationClientProfile::MediaStationGo
         );
         assert_eq!(
-            parse_connection_profile("senplayer", "system")
-                .expect("standard Emby proxy should parse"),
-            MediaStationConnectionProfile {
-                client: MediaStationClientProfile::SenPlayer,
-                proxy: MediaStationProxyMode::System,
-            }
+            parse_client_connection("senplayer")
+                .expect("SenPlayer client profile should parse")
+                .client,
+            MediaStationClientProfile::SenPlayer
         );
         assert_eq!(
-            parse_connection_profile("mediastation_go", "system")
-                .expect("MSG may explicitly use the system proxy")
-                .proxy,
-            MediaStationProxyMode::System
-        );
-        assert_eq!(
-            parse_connection_profile("infuse", "direct")
-                .expect("standard Emby direct should parse")
-                .proxy,
-            MediaStationProxyMode::Direct
+            parse_client_connection("infuse")
+                .expect("Infuse client profile should parse")
+                .client,
+            MediaStationClientProfile::Infuse
         );
     }
 

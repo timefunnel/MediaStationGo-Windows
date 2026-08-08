@@ -81,6 +81,7 @@ pub(crate) enum NativeFunction {
     MediaStationSwitchAccount,
     MediaStationDeleteAccount,
     MediaStationUpdateAccount,
+    MediaStationSetProxyMode,
 }
 
 impl NativeFunction {
@@ -148,6 +149,7 @@ impl NativeFunction {
             "mediaStationSwitchAccount" => Self::MediaStationSwitchAccount,
             "mediaStationDeleteAccount" => Self::MediaStationDeleteAccount,
             "mediaStationUpdateAccount" => Self::MediaStationUpdateAccount,
+            "mediaStationSetProxyMode" => Self::MediaStationSetProxyMode,
             _ => return None,
         })
     }
@@ -216,6 +218,7 @@ impl NativeFunction {
             Self::MediaStationSwitchAccount => "mediaStationSwitchAccount",
             Self::MediaStationDeleteAccount => "mediaStationDeleteAccount",
             Self::MediaStationUpdateAccount => "mediaStationUpdateAccount",
+            Self::MediaStationSetProxyMode => "mediaStationSetProxyMode",
         }
     }
 }
@@ -321,6 +324,7 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::MediaStationSwitchAccount,
     NativeFunction::MediaStationDeleteAccount,
     NativeFunction::MediaStationUpdateAccount,
+    NativeFunction::MediaStationSetProxyMode,
     NativeFunction::UpdateCheck,
     NativeFunction::UpdateDownload,
     NativeFunction::UpdateInstall,

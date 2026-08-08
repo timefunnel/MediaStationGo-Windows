@@ -22,6 +22,7 @@ const MAX_DETAIL_EPISODES: usize = 5_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaStationClientProfile {
     MediaStationGo,
+    MediaStationWindows,
     SenPlayer,
     Infuse,
 }
@@ -30,6 +31,7 @@ impl MediaStationClientProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MediaStationGo => "mediastation_go",
+            Self::MediaStationWindows => "mediastation_windows",
             Self::SenPlayer => "senplayer",
             Self::Infuse => "infuse",
         }
@@ -38,6 +40,7 @@ impl MediaStationClientProfile {
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "mediastation_go" => Some(Self::MediaStationGo),
+            "mediastation_windows" => Some(Self::MediaStationWindows),
             "senplayer" => Some(Self::SenPlayer),
             "infuse" => Some(Self::Infuse),
             _ => None,
@@ -47,13 +50,13 @@ impl MediaStationClientProfile {
     pub const fn server_type(self) -> &'static str {
         match self {
             Self::MediaStationGo => "mediastation_go",
-            Self::SenPlayer | Self::Infuse => "standard_emby",
+            Self::MediaStationWindows | Self::SenPlayer | Self::Infuse => "standard_emby",
         }
     }
 
     pub const fn authorization_client(self) -> &'static str {
         match self {
-            Self::MediaStationGo => "MediaStation Windows",
+            Self::MediaStationGo | Self::MediaStationWindows => "MediaStation Windows",
             Self::SenPlayer => "SenPlayer",
             Self::Infuse => "Infuse",
         }
@@ -61,14 +64,14 @@ impl MediaStationClientProfile {
 
     pub const fn authorization_version(self, media_station_version: &'static str) -> &'static str {
         match self {
-            Self::MediaStationGo => media_station_version,
+            Self::MediaStationGo | Self::MediaStationWindows => media_station_version,
             Self::SenPlayer | Self::Infuse => "1.0.0",
         }
     }
 
     pub fn user_agent<'a>(self, media_station_user_agent: &'a str) -> &'a str {
         match self {
-            Self::MediaStationGo => media_station_user_agent,
+            Self::MediaStationGo | Self::MediaStationWindows => media_station_user_agent,
             Self::SenPlayer => "SenPlayer/1.0.0",
             Self::Infuse => "Infuse/1.0.0",
         }
@@ -115,12 +118,12 @@ impl MediaStationConnectionProfile {
     pub const fn standard_emby(client: MediaStationClientProfile) -> Option<Self> {
         match client {
             MediaStationClientProfile::MediaStationGo => None,
-            MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => {
-                Some(Self {
-                    client,
-                    proxy: MediaStationProxyMode::Direct,
-                })
-            }
+            MediaStationClientProfile::MediaStationWindows
+            | MediaStationClientProfile::SenPlayer
+            | MediaStationClientProfile::Infuse => Some(Self {
+                client,
+                proxy: MediaStationProxyMode::Direct,
+            }),
         }
     }
 
@@ -128,6 +131,7 @@ impl MediaStationConnectionProfile {
         matches!(
             self.client,
             MediaStationClientProfile::MediaStationGo
+                | MediaStationClientProfile::MediaStationWindows
                 | MediaStationClientProfile::SenPlayer
                 | MediaStationClientProfile::Infuse
         ) && matches!(
@@ -2187,7 +2191,9 @@ fn resume_endpoint(session: &MediaStationSession) -> Result<Url, ApiError> {
         MediaStationClientProfile::MediaStationGo => {
             endpoint(&session.base_url, &["Items", "Resume"])
         }
-        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => endpoint(
+        MediaStationClientProfile::MediaStationWindows
+        | MediaStationClientProfile::SenPlayer
+        | MediaStationClientProfile::Infuse => endpoint(
             &session.base_url,
             &["Users", &session.user_id, "Items", "Resume"],
         ),
@@ -2199,7 +2205,9 @@ fn media_detail_endpoint(session: &MediaStationSession, media_id: &str) -> Resul
         MediaStationClientProfile::MediaStationGo => {
             endpoint(&session.base_url, &["Items", media_id])
         }
-        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => endpoint(
+        MediaStationClientProfile::MediaStationWindows
+        | MediaStationClientProfile::SenPlayer
+        | MediaStationClientProfile::Infuse => endpoint(
             &session.base_url,
             &["Users", &session.user_id, "Items", media_id],
         ),
@@ -2212,7 +2220,9 @@ fn series_episodes_endpoint(
 ) -> Result<Url, ApiError> {
     match session.connection.client {
         MediaStationClientProfile::MediaStationGo => endpoint(&session.base_url, &["Items"]),
-        MediaStationClientProfile::SenPlayer | MediaStationClientProfile::Infuse => {
+        MediaStationClientProfile::MediaStationWindows
+        | MediaStationClientProfile::SenPlayer
+        | MediaStationClientProfile::Infuse => {
             endpoint(&session.base_url, &["Shows", series_id, "Episodes"])
         }
     }
@@ -2518,6 +2528,10 @@ mod tests {
         let senplayer =
             MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
                 .expect("SenPlayer should be supported");
+        let default_standard = MediaStationConnectionProfile::standard_emby(
+            MediaStationClientProfile::MediaStationWindows,
+        )
+        .expect("the default standard Emby profile should be supported");
         let infuse =
             MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::Infuse)
                 .expect("Infuse should be supported");
@@ -2529,11 +2543,24 @@ mod tests {
         );
         assert_eq!(senplayer.proxy, MediaStationProxyMode::Direct);
         assert_eq!(senplayer.client.user_agent("ignored"), "SenPlayer/1.0.0");
+        assert_eq!(default_standard.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(
+            default_standard
+                .client
+                .user_agent("MediaStationGoWindows/0.1"),
+            "MediaStationGoWindows/0.1"
+        );
+        assert_eq!(default_standard.client.server_type(), "standard_emby");
+        assert_eq!(
+            MediaStationClientProfile::from_str("mediastation_windows"),
+            Some(MediaStationClientProfile::MediaStationWindows)
+        );
         assert_eq!(infuse.proxy, MediaStationProxyMode::Direct);
         assert_eq!(infuse.client.user_agent("ignored"), "Infuse/1.0.0");
         assert!(msg.is_supported());
         assert!(proxied_msg.is_supported());
         assert!(senplayer.is_supported());
+        assert!(default_standard.is_supported());
         assert!(infuse.is_supported());
         assert!(
             MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::MediaStationGo)
