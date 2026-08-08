@@ -4076,6 +4076,27 @@
         return option;
     }
 
+    function createPlayerEpisodeOption(episode, selected, onSelect) {
+        const option = element('button', 'player-episode-option');
+        option.type = 'button';
+        option.setAttribute('role', 'radio');
+        option.setAttribute('aria-checked', String(selected));
+        option.setAttribute('aria-label', episodeOptionTitle(episode));
+
+        const art = element('span', 'card-art');
+        const fallback = element('span', 'art-fallback');
+        const image = document.createElement('img');
+        image.alt = '';
+        image.decoding = 'async';
+        art.append(fallback, image);
+        const ref = episode.landscapeImage || episode.primaryImage;
+        observeImage(image, ref, imageWidthFor(ref, true));
+        art.append(element('span', 'player-episode-badge', Number.isFinite(episode.indexNumber) ? `第 ${episode.indexNumber} 集` : '剧集'));
+        option.append(art);
+        option.addEventListener('click', onSelect);
+        return option;
+    }
+
     function createSubtitleStyleControl({ label, property, min, max, suffix }) {
         const row = element('label', 'player-subtitle-style-row');
         const input = element('input', 'player-panel-control');
@@ -4156,14 +4177,6 @@
     function episodeOptionTitle(episode) {
         const index = Number.isFinite(episode?.indexNumber) ? `第 ${episode.indexNumber} 集` : '剧集';
         return episode?.title ? `${index} · ${episode.title}` : index;
-    }
-
-    function episodeOptionMeta(episode) {
-        const values = [];
-        if (episode?.resumePositionMs > 0) values.push(`已看到 ${formatTime(episode.resumePositionMs)}`);
-        else if (episode?.played) values.push('已看完');
-        if (episode?.durationMs > 0) values.push(formatDuration(episode.durationMs));
-        return values.join(' · ');
     }
 
     function formatSeriesSkipSeconds(seconds) {
@@ -4285,24 +4298,19 @@
                         if (!player || player.episodeSeason === season) return;
                         player.episodeSeason = season;
                         renderPlayerPanel();
-                        requestAnimationFrame(() => focusElement(playerPanelContent.querySelector('.track-option[aria-checked="true"], .track-option')));
+                        requestAnimationFrame(() => focusElement(playerPanelContent.querySelector('.player-episode-option[aria-checked="true"], .player-episode-option')));
                     });
                     tabs.append(tab);
                 }
                 playerPanelContent.append(tabs);
             }
-            const group = element('div');
+            const group = element('div', 'player-episode-grid');
             group.setAttribute('role', 'radiogroup');
             const episodes = allEpisodes
                 .filter((episode) => episodeSeasonNumber(episode) === player.episodeSeason)
                 .sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
             for (const episode of episodes) {
-                group.append(createTrackOption({
-                    title: episodeOptionTitle(episode),
-                    meta: episodeOptionMeta(episode),
-                    selected: player.card.id === episode.id,
-                    onSelect: () => switchPlayerEpisode(episode),
-                }));
+                group.append(createPlayerEpisodeOption(episode, player.card.id === episode.id, () => switchPlayerEpisode(episode)));
             }
             playerPanelContent.append(group);
             return;
@@ -4507,7 +4515,7 @@
                     refreshPlayerTools();
                     renderPlayerPanel();
                     if (activePlayer.panelKind === 'episodes') {
-                        requestAnimationFrame(() => focusElement(playerPanelContent.querySelector('[aria-checked="true"], .track-option, .player-season-tab')));
+                        requestAnimationFrame(() => focusElement(playerPanelContent.querySelector('[aria-checked="true"], .track-option, .player-episode-option, .player-season-tab')));
                     }
                 }
             }
@@ -4718,7 +4726,7 @@
     }
 
     function movePlayerPanelFocus(delta) {
-        const options = [...playerPanelContent.querySelectorAll('.player-panel-control, .track-option')]
+        const options = [...playerPanelContent.querySelectorAll('.player-panel-control, .track-option, .player-episode-option')]
             .filter((option) => !option.disabled);
         if (!options.length) {
             playerPanelContent.scrollBy({ top: delta * 88, behavior: 'smooth' });
@@ -4736,6 +4744,35 @@
         if (next) {
             next.scrollIntoView({ block: 'nearest' });
             focusElement(next);
+        }
+    }
+
+    function movePlayerEpisodeFocus(key) {
+        const options = [...playerPanelContent.querySelectorAll('.player-episode-option')]
+            .filter((option) => !option.disabled);
+        const current = options.indexOf(document.activeElement);
+        if (current < 0) return;
+
+        const columns = 1;
+        const delta = key === 'ArrowLeft' ? -1
+            : key === 'ArrowRight' ? 1
+                : key === 'ArrowUp' ? -columns
+                    : columns;
+        const targetIndex = current + delta;
+        const crossesRowBoundary = (key === 'ArrowLeft' && current % columns === 0)
+            || (key === 'ArrowRight' && current % columns === columns - 1);
+        const target = !crossesRowBoundary ? options[targetIndex] : null;
+        if (target) {
+            target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            focusElement(target);
+            return;
+        }
+
+        if (key === 'ArrowUp' && current < columns) {
+            const controls = [...playerPanelContent.querySelectorAll('.player-panel-control')]
+                .filter((option) => !option.disabled);
+            const previous = controls.at(-1) || playerPanelContent.querySelector('.player-season-tab[aria-selected="true"]');
+            if (previous) focusElement(previous);
         }
     }
 
@@ -5088,6 +5125,9 @@
                     event.preventDefault(); closePlayerPanel(true);
                 } else if ((event.key === 'Enter' || event.key === ' ') && toolButtons.includes(active)) {
                     event.preventDefault(); active.click();
+                } else if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key) && active?.matches('.player-episode-option')) {
+                    event.preventDefault();
+                    movePlayerEpisodeFocus(event.key);
                 } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && active?.matches('.player-season-tab')) {
                     event.preventDefault();
                     const tabs = [...playerPanelContent.querySelectorAll('.player-season-tab')];
@@ -5096,7 +5136,7 @@
                     if (next && next !== active) { next.focus(); next.click(); }
                 } else if (event.key === 'ArrowDown' && active?.matches('.player-season-tab')) {
                     event.preventDefault();
-                    focusElement(playerPanelContent.querySelector('.track-option[aria-checked="true"], .track-option'));
+                    focusElement(playerPanelContent.querySelector('.player-episode-option[aria-checked="true"], .player-episode-option'));
                 } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
                     event.preventDefault(); movePlayerPanelFocus(event.key === 'ArrowDown' ? 1 : -1);
                 }
