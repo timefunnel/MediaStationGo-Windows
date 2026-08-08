@@ -38,8 +38,6 @@
         outroSkipSeconds: 0,
     });
     const playerPlaybackRates = Object.freeze([0.5, 0.75, 1, 1.25, 1.5, 2]);
-    const playSymbol = '\u23f5\ufe0e';
-    const pauseSymbol = '\u23f8\ufe0e';
     const interpolationModels = Object.freeze({
         'rife-v4.26': { label: '质量优先', name: 'RIFE v4.26' },
         'rife-v4.26-scale0.5': { label: '均衡优先', name: 'RIFE v4.26 · Scale 0.5' },
@@ -3991,7 +3989,6 @@
     function refreshPlayerPlaybackRate() {
         const button = byId('player-speed');
         const label = formatPlayerPlaybackRate(playerPlaybackRate);
-        button.querySelector('span').textContent = label;
         button.title = `播放速度：${label}`;
         button.setAttribute('aria-label', button.title);
     }
@@ -4027,7 +4024,6 @@
         playback.classList.toggle('is-playing', playing);
         playback.title = playing ? '暂停' : '播放';
         playback.setAttribute('aria-label', playback.title);
-        playback.querySelector('span').textContent = playing ? pauseSymbol : playSymbol;
         const episodic = player?.card?.type === 'Episode' && Boolean(player.card.seriesId);
         episodes.classList.toggle('hidden', !episodic);
         episodes.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !episodic || player?.episodesLoading;
@@ -4151,7 +4147,8 @@
         option.type = 'button';
         option.setAttribute('role', 'radio');
         option.setAttribute('aria-checked', String(selected));
-        option.setAttribute('aria-label', episodeOptionTitle(episode));
+        const optionTitle = episodeOptionTitle(episode);
+        option.setAttribute('aria-label', selected ? `${optionTitle}，正在播放` : optionTitle);
 
         const art = element('span', 'card-art');
         const fallback = element('span', 'art-fallback');
@@ -4162,6 +4159,12 @@
         const ref = episode.landscapeImage || episode.primaryImage;
         observeImage(image, ref, imageWidthFor(ref, true));
         art.append(element('span', 'player-episode-badge', Number.isFinite(episode.indexNumber) ? `第 ${episode.indexNumber} 集` : '剧集'));
+        if (selected) {
+            const playingState = element('span', 'player-episode-playing-state');
+            playingState.setAttribute('aria-hidden', 'true');
+            playingState.append(element('strong', '', '正在播放'));
+            art.append(playingState);
+        }
         option.append(art);
         option.addEventListener('click', onSelect);
         return option;
