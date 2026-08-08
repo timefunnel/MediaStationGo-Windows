@@ -116,6 +116,7 @@
     let homeRefreshTimer = 0;
     let homeRefreshGeneration = 0;
     let homeRefreshFailures = 0;
+    let homeVerificationPending = false;
     let heroRotationTimer = 0;
     let heroCarouselController = null;
     let libraryFilterRevision = 0;
@@ -832,9 +833,9 @@
     }
 
     function resetCatalogState() {
-        window.clearTimeout(homeRefreshTimer);
-        homeRefreshTimer = 0;
-        homeRefreshGeneration += 1;
+        invalidateHomeRefresh();
+        homeRefreshFailures = 0;
+        homeVerificationPending = false;
         stopHeroCarousel();
         window.clearTimeout(imageStatsTimer);
         imageStatsTimer = 0;
@@ -1192,6 +1193,12 @@
         content.replaceChildren(element('div', 'empty-state', message));
     }
 
+    function invalidateHomeRefresh() {
+        window.clearTimeout(homeRefreshTimer);
+        homeRefreshTimer = 0;
+        homeRefreshGeneration += 1;
+    }
+
     async function loadHome(replaceHistory = false) {
         if (!homeData) renderLoading();
         try {
@@ -1483,6 +1490,7 @@
         const button = element('button', `media-card${options.landscape ? ' landscape-card' : ''}${cardVariant}`);
         button.type = 'button';
         button.dataset.cardIndex = String(options.index ?? 0);
+        button.dataset.mediaId = card.id;
         button.dataset.focusKey = `media:${card.id}`;
         const art = element('span', 'card-art');
         const fallback = element('span', 'art-fallback', initials(title));
@@ -1692,6 +1700,54 @@
         heading.append(headingActions);
         section.append(heading, carousel);
         return section;
+    }
+
+    function captureMediaRowRects(rowKey) {
+        const row = content.querySelector(`.media-row[data-row-key="${rowKey}"]`);
+        if (!row) return new Map();
+        return new Map([...row.querySelectorAll('.media-card[data-media-id]')]
+            .map((card) => [card.dataset.mediaId, card.getBoundingClientRect()]));
+    }
+
+    function animateMediaRowReorder(rowKey, previousRects, emphasizedId) {
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            const row = content.querySelector(`.media-row[data-row-key="${rowKey}"]`);
+            if (!row) return;
+            for (const card of row.querySelectorAll('.media-card[data-media-id]')) {
+                const id = card.dataset.mediaId;
+                const before = previousRects.get(id);
+                const after = card.getBoundingClientRect();
+                let keyframes;
+                if (before?.width > 0 && before?.height > 0) {
+                    const deltaX = before.left - after.left;
+                    const deltaY = before.top - after.top;
+                    if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) continue;
+                    keyframes = [
+                        { transform: `translate3d(${deltaX}px, ${deltaY}px, 0)` },
+                        { transform: 'translate3d(0, 0, 0)' },
+                    ];
+                } else if (id === emphasizedId) {
+                    keyframes = [
+                        { opacity: 0.35, transform: 'translate3d(0, 12px, 0) scale(0.98)' },
+                        { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)' },
+                    ];
+                } else {
+                    continue;
+                }
+                card.style.zIndex = id === emphasizedId ? '2' : '1';
+                card.style.willChange = 'transform, opacity';
+                const animation = card.animate(keyframes, {
+                    duration: id === emphasizedId ? 440 : 360,
+                    easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+                });
+                const cleanup = () => {
+                    card.style.removeProperty('z-index');
+                    card.style.removeProperty('will-change');
+                };
+                animation.finished.then(cleanup, cleanup);
+            }
+        }));
     }
 
     function updateHero(hero, card) {
@@ -3299,6 +3355,9 @@
             : { ...seriesPlaybackSettingDefaults };
         const activePlayer = {
             card,
+            resumeCardRects: currentView?.kind === 'home'
+                ? captureMediaRowRects('resume')
+                : new Map(),
             playbackSettingsScopeId: playbackPreferenceScope(card),
             playing: true,
             started: false,
@@ -3506,16 +3565,27 @@
     }
 
     function handlePlaybackEvent(event) {
-        // The stopped-session report has landed server-side; refresh the home
-        // catalog so Continue Watching progress is current. Must run before
-        // the !player guard below because it arrives after the player closed.
+        // The stopped-session report has landed server-side. Verify the local
+        // Continue Watching update after the player has returned to the app;
+        // the signal may race the terminal playback event.
         if (event.kind === 'home_stale') {
-            scheduleHomeRefresh(200);
+            if (player) {
+                homeVerificationPending = true;
+            } else {
+                homeVerificationPending = false;
+                scheduleHomeRefresh(200);
+            }
             return;
         }
         if (!player) return;
         if (event.kind === 'canceled' && (player.interpolationChanging || player.episodeChanging) && !player.exiting) return;
-        if (Number.isFinite(event.positionMs) && !player.scrubbing) player.positionMs = event.positionMs;
+        // Only position-bearing events may change the player timeline. Other
+        // event snapshots can still contain the load-time or terminal zero.
+        if (['position', 'seeked'].includes(event.kind)
+            && Number.isFinite(event.positionMs)
+            && !player.scrubbing) {
+            player.positionMs = event.positionMs;
+        }
         if (Number.isFinite(event.durationMs) && event.durationMs > 0) player.durationMs = event.durationMs;
         updatePlayerProgress();
         if (event.kind === 'position') maybeHandleEpisodeAutomation(player, event);
@@ -4823,22 +4893,23 @@
     }
 
     function finishPlayer() {
-        // Optimistically update Continue Watching with the position we last
-        // saw and move the just-ended item to the front, so it reflects the
-        // playback immediately; the network refresh (and the home_stale
-        // fallback) then reconciles with the authoritative server value.
+        // Update Continue Watching from the player state before returning to
+        // the app. Invalidate any older home request so it cannot overwrite
+        // this newer local state while the stopped report is still pending.
+        const activeCardId = player?.card?.id || '';
+        const resumeCardRects = player?.resumeCardRects || new Map();
         if (player && player.positionMs > 0 && homeData && Array.isArray(homeData.resume)) {
             const id = player.card?.id;
             const index = id ? homeData.resume.findIndex((item) => item.id === id) : -1;
-            if (index >= 0) {
-                const item = homeData.resume[index];
-                if (player.positionMs > (item.resumePositionMs || 0)) {
-                    item.resumePositionMs = player.positionMs;
+            if (id) {
+                const item = index >= 0 ? homeData.resume[index] : { ...player.card };
+                item.resumePositionMs = Math.max(player.positionMs, item.resumePositionMs || 0);
+                if (player.durationMs > 0) {
+                    item.durationMs = Math.max(player.durationMs, item.durationMs || 0);
                 }
-                if (index !== 0) {
-                    homeData.resume.splice(index, 1);
-                    homeData.resume.unshift(item);
-                }
+                if (index >= 0) homeData.resume.splice(index, 1);
+                homeData.resume.unshift(item);
+                invalidateHomeRefresh();
             }
         }
         window.clearTimeout(playerClickTimer);
@@ -4859,17 +4930,20 @@
         refreshPlayerCursor();
         setPlayerMode(false);
         appShell.classList.remove('hidden');
-        // Re-render the home view immediately with the optimistically updated
-        // Continue Watching progress, then refresh the catalog right away so
-        // the server value lands; the "home_stale" event refreshes again as
-        // the authoritative fallback.
+        // Re-render immediately from the player state. The native
+        // "home_stale" event is emitted only after the stopped report succeeds;
+        // that later refresh verifies and reconciles the local update.
         if (currentView?.kind === 'home' && homeData) {
             const saved = captureView();
             currentView = { ...currentView, data: homeData };
             renderHome(homeData);
             if (saved) restoreViewState(saved);
+            animateMediaRowReorder('resume', resumeCardRects, activeCardId);
         }
-        scheduleHomeRefresh(300);
+        if (homeVerificationPending) {
+            homeVerificationPending = false;
+            scheduleHomeRefresh(200);
+        }
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
     }
 
