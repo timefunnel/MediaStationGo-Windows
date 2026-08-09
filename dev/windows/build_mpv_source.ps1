@@ -97,6 +97,10 @@ if ($Arch -eq "arm64") {
 }
 $LibplaceboLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\libplacebo-$LibplaceboCommit"
 $FfmpegLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\ffmpeg-$FfmpegCommit"
+$ObjdumpPath = Join-Path $MsysPath "$MsysEnv\bin\objdump.exe"
+if (-not (Test-Path -LiteralPath $ObjdumpPath -PathType Leaf)) {
+    throw "objdump is required to verify libmpv dependencies: $ObjdumpPath"
+}
 
 # Verify mpv submodule exists
 if (-not (Test-Path (Join-Path $MpvSourceDir "meson.build"))) {
@@ -231,11 +235,7 @@ function Assert-MpvUsesPinnedLibplacebo {
     if ($UnexpectedDlls) {
         throw "Unexpected libplacebo runtime DLLs were packaged: $($UnexpectedDlls.Name -join ', ')"
     }
-    $Objdump = Join-Path $MsysPath "$MsysEnv\bin\objdump.exe"
-    if (-not (Test-Path -LiteralPath $Objdump -PathType Leaf)) {
-        throw "objdump is required to verify libmpv dependencies: $Objdump"
-    }
-    $Imports = (& $Objdump -p $MpvDll 2>&1) -join "`n"
+    $Imports = (& $ObjdumpPath -p $MpvDll 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to inspect libmpv dependencies with objdump"
     }
