@@ -97,9 +97,12 @@ if ($Arch -eq "arm64") {
 }
 $LibplaceboLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\libplacebo-$LibplaceboCommit"
 $FfmpegLinkDir = Join-Path $MsysPath "mediastation\$MsysEnv\ffmpeg-$FfmpegCommit"
-$ObjdumpPath = Join-Path $MsysPath "$MsysEnv\bin\objdump.exe"
-if (-not (Test-Path -LiteralPath $ObjdumpPath -PathType Leaf)) {
-    throw "objdump is required to verify libmpv dependencies: $ObjdumpPath"
+$ObjdumpPath = @(
+    (Join-Path $MsysPath "$MsysEnv\bin\llvm-objdump.exe"),
+    (Join-Path $MsysPath "$MsysEnv\bin\objdump.exe")
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $ObjdumpPath) {
+    throw "llvm-objdump or objdump is required to verify libmpv dependencies under $MsysPath\$MsysEnv\bin"
 }
 
 # Verify mpv submodule exists
