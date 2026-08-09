@@ -20,9 +20,33 @@ const MIRROR_ASSET_HOST: &str = "cdn.timefunnel.top";
 const MIRROR_ASSET_PATH: &str = "/mediastation/updates/windows/x64/";
 const USER_AGENT: &str = "MediaStationGo-Windows-Updater";
 const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS.txt";
+const PORTABLE_MARKER_NAME: &str = ".mediastation-portable";
+const PORTABLE_UPDATER_NAME: &str = "mediastation-portable-updater.exe";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
-const MAX_INSTALLER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_UPDATE_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageKind {
+    Installer,
+    Portable,
+}
+
+impl PackageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Installer => "installer",
+            Self::Portable => "portable",
+        }
+    }
+
+    fn asset_name(self, version: &str) -> String {
+        match self {
+            Self::Installer => format!("MediaStationGo-{version}-windows-x64-setup.exe"),
+            Self::Portable => format!("MediaStationGo-{version}-windows-x64-portable.zip"),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ReleaseInfo {
@@ -33,6 +57,7 @@ struct ReleaseInfo {
     asset_url: String,
     asset_size: u64,
     sha256: String,
+    package_kind: PackageKind,
 }
 
 #[derive(Default)]
@@ -74,6 +99,14 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
         return;
     }
 
+    let package_kind = match runtime_package_kind() {
+        Ok(kind) => kind,
+        Err(error) => {
+            post_error(inner, error);
+            return;
+        }
+    };
+
     {
         let mut state = STATE.lock();
         if state.checking || state.downloading || state.installing {
@@ -89,7 +122,7 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
     let spawn = std::thread::Builder::new()
         .name("mediastation-update-check".to_string())
         .spawn(move || {
-            let result = fetch_latest_release().and_then(|release| {
+            let result = fetch_latest_release(package_kind).and_then(|release| {
                 is_newer_release(crate::APP_VERSION_FULL, &release.version)
                     .map(|newer| (release, newer))
             });
@@ -110,6 +143,7 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
                             "releaseUrl": release.release_url,
                             "assetName": release.asset_name,
                             "assetBytes": release.asset_size,
+                            "packageKind": release.package_kind.as_str(),
                         }),
                     );
                 }
@@ -175,7 +209,7 @@ pub(crate) fn download_update(inner: Arc<Inner>) {
     let spawn = std::thread::Builder::new()
         .name("mediastation-update-download".to_string())
         .spawn(move || {
-            let result = download_installer(&release, &worker_inner);
+            let result = download_update_package(&release, &worker_inner);
             let mut state = STATE.lock();
             state.downloading = false;
             match result {
@@ -188,6 +222,7 @@ pub(crate) fn download_update(inner: Arc<Inner>) {
                         json!({
                             "version": release.version,
                             "assetName": release.asset_name,
+                            "packageKind": release.package_kind.as_str(),
                         }),
                     );
                 }
@@ -242,14 +277,17 @@ pub(crate) fn install_update(inner: Arc<Inner>) {
     let spawn = std::thread::Builder::new()
         .name("mediastation-update-install".to_string())
         .spawn(move || {
-            let result =
-                verify_file_sha256(&path, &release.sha256).and_then(|()| launch_installer(&path));
+            let result = verify_file_sha256(&path, &release.sha256)
+                .and_then(|()| launch_update_package(&path, &release));
             match result {
                 Ok(()) => {
                     post_status(
                         worker_inner,
                         "installing",
-                        json!({ "version": release.version }),
+                        json!({
+                            "version": release.version,
+                            "packageKind": release.package_kind.as_str(),
+                        }),
                     );
                     jfn_playback::shutdown::jfn_shutdown_initiate();
                 }
@@ -275,8 +313,8 @@ pub(crate) fn install_update(inner: Arc<Inner>) {
     }
 }
 
-fn fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
-    match fetch_release(MIRROR_RELEASE_URL) {
+fn fetch_latest_release(package_kind: PackageKind) -> Result<ReleaseInfo, UpdateError> {
+    match fetch_release(MIRROR_RELEASE_URL, package_kind) {
         Ok(release) => Ok(release),
         Err(mirror_error) => {
             jfn_logging::log(
@@ -287,7 +325,7 @@ fn fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
                     mirror_error.code, mirror_error.message
                 ),
             );
-            fetch_release(GITHUB_RELEASE_API_URL).map_err(|github_error| {
+            fetch_release(GITHUB_RELEASE_API_URL, package_kind).map_err(|github_error| {
                 UpdateError::new(
                     "update_sources_failed",
                     format!(
@@ -300,10 +338,13 @@ fn fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
     }
 }
 
-fn fetch_release(metadata_url: &str) -> Result<ReleaseInfo, UpdateError> {
+fn fetch_release(
+    metadata_url: &str,
+    package_kind: PackageKind,
+) -> Result<ReleaseInfo, UpdateError> {
     let agent = github_agent(Duration::from_secs(45));
     let metadata = get_text(&agent, metadata_url, MAX_METADATA_BYTES)?;
-    let mut release = parse_release_metadata(&metadata)?;
+    let mut release = parse_release_metadata(&metadata, package_kind)?;
     let checksum_asset_url = checksum_asset_url(&metadata)?;
     let checksums = get_text(&agent, &checksum_asset_url, MAX_CHECKSUM_BYTES)?;
     release.sha256 = checksum_for_asset(&checksums, &release.asset_name)?;
@@ -362,7 +403,10 @@ fn get_text(agent: &ureq::Agent, url: &str, maximum_bytes: u64) -> Result<String
         })
 }
 
-fn parse_release_metadata(metadata: &str) -> Result<ReleaseInfo, UpdateError> {
+fn parse_release_metadata(
+    metadata: &str,
+    package_kind: PackageKind,
+) -> Result<ReleaseInfo, UpdateError> {
     let payload: Value = serde_json::from_str(metadata).map_err(|error| {
         UpdateError::new(
             "release_metadata_invalid",
@@ -382,7 +426,7 @@ fn parse_release_metadata(metadata: &str) -> Result<ReleaseInfo, UpdateError> {
     let version = stable_version_from_tag(&tag)?.to_string();
     let release_url = required_string(&payload, "html_url")?;
     validate_release_page_url(&release_url)?;
-    let expected_asset_name = format!("MediaStationGo-{version}-windows-x64-setup.exe");
+    let expected_asset_name = package_kind.asset_name(&version);
     let assets = payload
         .get("assets")
         .and_then(Value::as_array)
@@ -397,8 +441,8 @@ fn parse_release_metadata(metadata: &str) -> Result<ReleaseInfo, UpdateError> {
         })
         .ok_or_else(|| {
             UpdateError::new(
-                "installer_asset_missing",
-                format!("正式版本缺少 Windows x64 安装器：{expected_asset_name}"),
+                "update_asset_missing",
+                format!("正式版本缺少当前运行模式的 Windows x64 更新包：{expected_asset_name}"),
             )
         })?;
     let asset_url = required_string(asset, "browser_download_url")?;
@@ -406,11 +450,11 @@ fn parse_release_metadata(metadata: &str) -> Result<ReleaseInfo, UpdateError> {
     let asset_size = asset
         .get("size")
         .and_then(Value::as_u64)
-        .ok_or_else(|| UpdateError::new("installer_size_missing", "安装器没有有效的文件大小"))?;
-    if asset_size == 0 || asset_size > MAX_INSTALLER_BYTES {
+        .ok_or_else(|| UpdateError::new("update_size_missing", "更新包没有有效的文件大小"))?;
+    if asset_size == 0 || asset_size > MAX_UPDATE_PACKAGE_BYTES {
         return Err(UpdateError::new(
-            "installer_size_invalid",
-            format!("安装器大小不在允许范围内：{asset_size} 字节"),
+            "update_size_invalid",
+            format!("更新包大小不在允许范围内：{asset_size} 字节"),
         ));
     }
 
@@ -422,6 +466,7 @@ fn parse_release_metadata(metadata: &str) -> Result<ReleaseInfo, UpdateError> {
         asset_url,
         asset_size,
         sha256: String::new(),
+        package_kind,
     })
 }
 
@@ -517,8 +562,8 @@ fn checksum_for_asset(checksums: &str, asset_name: &str) -> Result<String, Updat
         }
     }
     Err(UpdateError::new(
-        "installer_checksum_missing",
-        format!("SHA256SUMS.txt 中缺少安装器校验值：{asset_name}"),
+        "update_checksum_missing",
+        format!("SHA256SUMS.txt 中缺少更新包校验值：{asset_name}"),
     ))
 }
 
@@ -583,7 +628,10 @@ fn is_newer_release(current: &str, latest: &str) -> Result<bool, UpdateError> {
         || (latest_version == current_version && current_is_prerelease))
 }
 
-fn download_installer(release: &ReleaseInfo, inner: &Arc<Inner>) -> Result<PathBuf, UpdateError> {
+fn download_update_package(
+    release: &ReleaseInfo,
+    inner: &Arc<Inner>,
+) -> Result<PathBuf, UpdateError> {
     let update_dir = jfn_paths::cache_dir().join("updates");
     fs::create_dir_all(&update_dir).map_err(|error| {
         UpdateError::new(
@@ -606,7 +654,7 @@ fn download_installer(release: &ReleaseInfo, inner: &Arc<Inner>) -> Result<PathB
         })?;
     }
 
-    let result = download_installer_to(&temporary, release, inner);
+    let result = download_update_package_to(&temporary, release, inner);
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -615,21 +663,18 @@ fn download_installer(release: &ReleaseInfo, inner: &Arc<Inner>) -> Result<PathB
         fs::remove_file(&destination).map_err(|error| {
             UpdateError::new(
                 "update_replace_failed",
-                format!("无法替换旧的更新安装器：{error}"),
+                format!("无法替换旧的更新包：{error}"),
             )
         })?;
     }
     fs::rename(&temporary, &destination).map_err(|error| {
-        UpdateError::new(
-            "update_finalize_failed",
-            format!("无法保存更新安装器：{error}"),
-        )
+        UpdateError::new("update_finalize_failed", format!("无法保存更新包：{error}"))
     })?;
-    cleanup_old_installers(&update_dir, &destination);
+    cleanup_old_update_packages(&update_dir, &destination);
     Ok(destination)
 }
 
-fn download_installer_to(
+fn download_update_package_to(
     destination: &Path,
     release: &ReleaseInfo,
     inner: &Arc<Inner>,
@@ -650,25 +695,22 @@ fn download_installer_to(
 
     loop {
         let count = reader.read(&mut buffer).map_err(|error| {
-            UpdateError::new(
-                "update_download_failed",
-                format!("更新安装器下载失败：{error}"),
-            )
+            UpdateError::new("update_download_failed", format!("更新包下载失败：{error}"))
         })?;
         if count == 0 {
             break;
         }
         downloaded = downloaded.saturating_add(count as u64);
-        if downloaded > MAX_INSTALLER_BYTES || downloaded > release.asset_size {
+        if downloaded > MAX_UPDATE_PACKAGE_BYTES || downloaded > release.asset_size {
             return Err(UpdateError::new(
-                "installer_size_invalid",
-                "下载的安装器超过正式版本声明的大小",
+                "update_size_invalid",
+                "下载的更新包超过正式版本声明的大小",
             ));
         }
         file.write_all(&buffer[..count]).map_err(|error| {
             UpdateError::new(
                 "update_file_write_failed",
-                format!("无法写入更新安装器：{error}"),
+                format!("无法写入更新包：{error}"),
             )
         })?;
         hasher.update(&buffer[..count]);
@@ -690,9 +732,9 @@ fn download_installer_to(
 
     if downloaded != release.asset_size {
         return Err(UpdateError::new(
-            "installer_size_mismatch",
+            "update_size_mismatch",
             format!(
-                "安装器大小不匹配：应为 {} 字节，实际为 {downloaded} 字节",
+                "更新包大小不匹配：应为 {} 字节，实际为 {downloaded} 字节",
                 release.asset_size
             ),
         ));
@@ -700,14 +742,14 @@ fn download_installer_to(
     file.sync_all().map_err(|error| {
         UpdateError::new(
             "update_file_sync_failed",
-            format!("无法完整保存更新安装器：{error}"),
+            format!("无法完整保存更新包：{error}"),
         )
     })?;
     let actual = hex_digest(&hasher.finalize());
     if actual != release.sha256 {
         return Err(UpdateError::new(
-            "installer_checksum_mismatch",
-            "安装器 SHA-256 校验失败，文件不会被执行",
+            "update_checksum_mismatch",
+            "更新包 SHA-256 校验失败，文件不会被应用",
         ));
     }
     Ok(())
@@ -717,7 +759,7 @@ fn verify_file_sha256(path: &Path, expected: &str) -> Result<(), UpdateError> {
     let mut file = File::open(path).map_err(|error| {
         UpdateError::new(
             "update_file_missing",
-            format!("无法打开已下载的安装器：{error}"),
+            format!("无法打开已下载的更新包：{error}"),
         )
     })?;
     let mut hasher = Sha256::new();
@@ -726,7 +768,7 @@ fn verify_file_sha256(path: &Path, expected: &str) -> Result<(), UpdateError> {
         let count = file.read(&mut buffer).map_err(|error| {
             UpdateError::new(
                 "update_file_read_failed",
-                format!("无法校验已下载的安装器：{error}"),
+                format!("无法校验已下载的更新包：{error}"),
             )
         })?;
         if count == 0 {
@@ -736,8 +778,8 @@ fn verify_file_sha256(path: &Path, expected: &str) -> Result<(), UpdateError> {
     }
     if hex_digest(&hasher.finalize()) != expected {
         return Err(UpdateError::new(
-            "installer_checksum_mismatch",
-            "安装器 SHA-256 校验失败，文件不会被执行",
+            "update_checksum_mismatch",
+            "更新包 SHA-256 校验失败，文件不会被应用",
         ));
     }
     Ok(())
@@ -747,7 +789,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn cleanup_old_installers(update_dir: &Path, keep: &Path) {
+fn cleanup_old_update_packages(update_dir: &Path, keep: &Path) {
     let Ok(entries) = fs::read_dir(update_dir) else {
         return;
     };
@@ -759,9 +801,46 @@ fn cleanup_old_installers(update_dir: &Path, keep: &Path) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with("MediaStationGo-") && name.ends_with("-windows-x64-setup.exe") {
+        if name.starts_with("MediaStationGo-")
+            && (name.ends_with("-windows-x64-setup.exe")
+                || name.ends_with("-windows-x64-portable.zip"))
+        {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(windows)]
+fn runtime_package_kind() -> Result<PackageKind, UpdateError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        UpdateError::new(
+            "executable_path_failed",
+            format!("无法确认当前应用目录：{error}"),
+        )
+    })?;
+    let install_dir = executable.parent().ok_or_else(|| {
+        UpdateError::new("executable_path_failed", "当前应用程序没有有效的安装目录")
+    })?;
+    Ok(if install_dir.join(PORTABLE_MARKER_NAME).is_file() {
+        PackageKind::Portable
+    } else {
+        PackageKind::Installer
+    })
+}
+
+#[cfg(not(windows))]
+fn runtime_package_kind() -> Result<PackageKind, UpdateError> {
+    Err(UpdateError::new(
+        "unsupported_platform",
+        "自动更新目前只支持 Windows x64",
+    ))
+}
+
+#[cfg(windows)]
+fn launch_update_package(path: &Path, release: &ReleaseInfo) -> Result<(), UpdateError> {
+    match release.package_kind {
+        PackageKind::Installer => launch_installer(path),
+        PackageKind::Portable => launch_portable_updater(path, release),
     }
 }
 
@@ -778,8 +857,80 @@ fn launch_installer(path: &Path) -> Result<(), UpdateError> {
         })
 }
 
+#[cfg(windows)]
+fn launch_portable_updater(path: &Path, release: &ReleaseInfo) -> Result<(), UpdateError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        UpdateError::new(
+            "executable_path_failed",
+            format!("无法确认当前便携版目录：{error}"),
+        )
+    })?;
+    let install_dir = executable.parent().ok_or_else(|| {
+        UpdateError::new("executable_path_failed", "当前便携版没有有效的应用目录")
+    })?;
+    if !install_dir.join(PORTABLE_MARKER_NAME).is_file() {
+        return Err(UpdateError::new(
+            "portable_marker_missing",
+            "当前应用目录缺少便携版标记，无法安全覆盖更新",
+        ));
+    }
+
+    let source = install_dir.join(PORTABLE_UPDATER_NAME);
+    if !source.is_file() {
+        return Err(UpdateError::new(
+            "portable_updater_missing",
+            format!("当前便携版缺少更新助手：{PORTABLE_UPDATER_NAME}"),
+        ));
+    }
+    let update_dir = path.parent().ok_or_else(|| {
+        UpdateError::new("update_directory_failed", "下载的更新包没有有效的缓存目录")
+    })?;
+    let helper = update_dir.join(format!(
+        "mediastation-portable-updater-{}.exe",
+        release.version
+    ));
+    if helper.exists() {
+        fs::remove_file(&helper).map_err(|error| {
+            UpdateError::new(
+                "portable_updater_prepare_failed",
+                format!("无法替换缓存中的便携版更新助手：{error}"),
+            )
+        })?;
+    }
+    fs::copy(&source, &helper).map_err(|error| {
+        UpdateError::new(
+            "portable_updater_prepare_failed",
+            format!("无法准备便携版更新助手：{error}"),
+        )
+    })?;
+
+    let log_file = update_dir.join("portable-update.log");
+    std::process::Command::new(&helper)
+        .current_dir(install_dir)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .arg("--archive")
+        .arg(path)
+        .arg("--install-dir")
+        .arg(install_dir)
+        .arg("--expected-version")
+        .arg(&release.version)
+        .arg("--expected-sha256")
+        .arg(&release.sha256)
+        .arg("--log-file")
+        .arg(log_file)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            UpdateError::new(
+                "portable_updater_launch_failed",
+                format!("无法启动便携版更新助手：{error}"),
+            )
+        })
+}
+
 #[cfg(not(windows))]
-fn launch_installer(_path: &Path) -> Result<(), UpdateError> {
+fn launch_update_package(_path: &Path, _release: &ReleaseInfo) -> Result<(), UpdateError> {
     Err(UpdateError::new(
         "unsupported_platform",
         "自动更新目前只支持 Windows x64",
@@ -857,10 +1008,47 @@ mod tests {
             ]
         })
         .to_string();
-        let release = parse_release_metadata(&metadata).unwrap();
+        let release = parse_release_metadata(&metadata, PackageKind::Installer).unwrap();
         assert_eq!(release.version, "0.1.1");
         assert_eq!(release.asset_size, 123456);
+        assert_eq!(release.package_kind, PackageKind::Installer);
         assert!(checksum_asset_url(&metadata).is_ok());
+    }
+
+    #[test]
+    fn release_metadata_selects_portable_asset_for_portable_runtime() {
+        let metadata = json!({
+            "draft": false,
+            "prerelease": false,
+            "tag_name": "v0.1.4",
+            "html_url": "https://github.com/timefunnel/MediaStationGo-Windows/releases/tag/v0.1.4",
+            "assets": [
+                {
+                    "name": "MediaStationGo-0.1.4-windows-x64-setup.exe",
+                    "browser_download_url": "https://github.com/timefunnel/MediaStationGo-Windows/releases/download/v0.1.4/MediaStationGo-0.1.4-windows-x64-setup.exe",
+                    "size": 200000000,
+                },
+                {
+                    "name": "MediaStationGo-0.1.4-windows-x64-portable.zip",
+                    "browser_download_url": "https://github.com/timefunnel/MediaStationGo-Windows/releases/download/v0.1.4/MediaStationGo-0.1.4-windows-x64-portable.zip",
+                    "size": 210000000,
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://github.com/timefunnel/MediaStationGo-Windows/releases/download/v0.1.4/SHA256SUMS.txt",
+                    "size": 300,
+                }
+            ]
+        })
+        .to_string();
+
+        let release = parse_release_metadata(&metadata, PackageKind::Portable).unwrap();
+        assert_eq!(
+            release.asset_name,
+            "MediaStationGo-0.1.4-windows-x64-portable.zip"
+        );
+        assert_eq!(release.asset_size, 210000000);
+        assert_eq!(release.package_kind, PackageKind::Portable);
     }
 
     #[test]
@@ -877,6 +1065,11 @@ mod tests {
                     "size": 218412564,
                 },
                 {
+                    "name": "MediaStationGo-0.1.2-windows-x64-portable.zip",
+                    "browser_download_url": "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/MediaStationGo-0.1.2-windows-x64-portable.zip",
+                    "size": 329412564,
+                },
+                {
                     "name": "SHA256SUMS.txt",
                     "browser_download_url": "https://cdn.timefunnel.top/mediastation/updates/windows/x64/v0.1.2/SHA256SUMS.txt",
                     "size": 334,
@@ -885,9 +1078,12 @@ mod tests {
         })
         .to_string();
 
-        let release = parse_release_metadata(&metadata).unwrap();
+        let release = parse_release_metadata(&metadata, PackageKind::Installer).unwrap();
         assert_eq!(release.version, "0.1.2");
         assert_eq!(release.asset_size, 218412564);
+        let portable = parse_release_metadata(&metadata, PackageKind::Portable).unwrap();
+        assert_eq!(portable.asset_size, 329412564);
+        assert_eq!(portable.package_kind, PackageKind::Portable);
         assert!(checksum_asset_url(&metadata).is_ok());
     }
 

@@ -12,6 +12,10 @@ crate-type = ["rlib"]
 name = "jellium-desktop"
 path = "src/main.rs"
 
+[[bin]]
+name = "mediastation-portable-updater"
+path = "src/portable_updater.rs"
+
 [features]
 default = ["kde-palette"]
 kde-palette = ["jfn-wayland/kde-palette"]
@@ -40,6 +44,13 @@ jfn-macos = { path = "../macos" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 jfn-windows = { path = "../windows" }
+sha2.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-resource = "3"
@@ -49,6 +60,9 @@ gix = { workspace = true }
 jfn-linux-util = { path = "../linux_util" }
 jfn-wayland = { path = "../wayland", default-features = false }
 jfn-x11 = { path = "../x11" }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

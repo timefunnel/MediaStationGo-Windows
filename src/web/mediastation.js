@@ -1037,9 +1037,11 @@
             const percent = Number.isFinite(Number(payload.percent)) ? Number(payload.percent) : 0;
             return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%`;
         }
-        if (status === 'verifying') return '正在校验安装器...';
+        if (status === 'verifying') return '正在校验更新包...';
         if (status === 'ready') return `更新 ${payload.version || ''} 已下载完成`.trim();
-        if (status === 'installing') return '正在启动安装程序，应用即将关闭...';
+        if (status === 'installing') return payload.packageKind === 'portable'
+            ? '正在应用便携版更新，应用即将关闭...'
+            : '正在启动安装程序，应用即将关闭...';
         if (status === 'up_to_date') return `当前已是最新版本（${payload.currentVersion || ''}）`.trim();
         if (status === 'error') return payload.message || '更新检查失败';
         return '尚未检查更新';

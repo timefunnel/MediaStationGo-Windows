@@ -2478,8 +2478,12 @@ dependencies = [
  "jfn-x11",
  "parking_lot",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

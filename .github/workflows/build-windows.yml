@@ -68,6 +68,7 @@ jobs:
             ${{ matrix.pkg_prefix }}-clang
             ${{ matrix.pkg_prefix }}-meson
             ${{ matrix.pkg_prefix }}-pkgconf
+            ${{ matrix.pkg_prefix }}-binutils
             ${{ matrix.pkg_prefix }}-nasm
             ${{ matrix.pkg_prefix }}-yasm
             ${{ matrix.pkg_prefix }}-bzip2

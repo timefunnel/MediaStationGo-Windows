@@ -87,7 +87,8 @@ if ($Forbidden) {
     throw "Forbidden public runtime files were staged: $($Forbidden.Name -join ', ')"
 }
 foreach ($RequiredRuntime in @(
-    'jellium-desktop.exe', 'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll',
+    'jellium-desktop.exe', 'mediastation-portable-updater.exe',
+    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll',
     'rife_runtime.dll', 'tensorrt_rtx_1_4.dll', 'cudart64_12.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $RequiredRuntime) -PathType Leaf)) {
@@ -104,11 +105,28 @@ foreach ($Model in @(
 }
 
 $PortableArchive = Join-Path $DistDir "$BaseName-portable.zip"
+$PortableMarkerName = '.mediastation-portable'
+$PortableManifestName = '.mediastation-portable-files.txt'
+$PortableMarker = Join-Path $InstallDir $PortableMarkerName
+$PortableManifest = Join-Path $InstallDir $PortableManifestName
 if (Test-Path -LiteralPath $PortableArchive) {
     Remove-Item -LiteralPath $PortableArchive -Force
 }
-Compress-Archive -Path (Join-Path $InstallDir '*') -DestinationPath $PortableArchive `
-    -CompressionLevel Optimal
+[System.IO.File]::WriteAllText($PortableMarker, "$Version`n", $Utf8NoBom)
+$PortableFiles = Get-ChildItem -LiteralPath $InstallDir -Recurse -File -Force |
+    ForEach-Object {
+        $_.FullName.Substring($InstallDir.Length + 1).Replace('\', '/')
+    } |
+    Where-Object { $_ -ne $PortableManifestName }
+$PortableFiles = @($PortableFiles + $PortableManifestName | Sort-Object -Unique)
+[System.IO.File]::WriteAllLines($PortableManifest, $PortableFiles, $Utf8NoBom)
+try {
+    Compress-Archive -Path (Join-Path $InstallDir '*') -DestinationPath $PortableArchive `
+        -CompressionLevel Optimal
+} finally {
+    Remove-Item -LiteralPath $PortableMarker, $PortableManifest -Force -ErrorAction SilentlyContinue
+}
+Remove-Item -LiteralPath (Join-Path $InstallDir 'mediastation-portable-updater.exe') -Force
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem

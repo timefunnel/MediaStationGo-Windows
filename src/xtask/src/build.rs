@@ -29,6 +29,9 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         .arg("jellium-desktop")
         .arg("--manifest-path")
         .arg(&manifest);
+    if cfg!(target_os = "windows") {
+        cmd.arg("--bin").arg("mediastation-portable-updater");
+    }
     if args.no_kde_palette {
         cmd.arg("--no-default-features");
     }
@@ -99,6 +102,14 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     let bin_src = target_dir.join("release").join(bin_name);
     let bin_dst = out.join(bin_name);
     xfs::copy_file(&bin_src, &bin_dst)?;
+    if cfg!(target_os = "windows") {
+        xfs::copy_file(
+            &target_dir
+                .join("release")
+                .join("mediastation-portable-updater.exe"),
+            &out.join("mediastation-portable-updater.exe"),
+        )?;
+    }
 
     crate::platform::stage_cef(&out, &cef_info)?;
     crate::platform::stage_mpv(&out, &mpv_info, used_external_mpv, &bin_dst)?;

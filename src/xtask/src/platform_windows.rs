@@ -38,6 +38,10 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
         &build_dir.join("jellium-desktop.exe"),
         &prefix.join("jellium-desktop.exe"),
     )?;
+    xfs::copy_executable(
+        &build_dir.join("mediastation-portable-updater.exe"),
+        &prefix.join("mediastation-portable-updater.exe"),
+    )?;
     if args.cef_path.is_none() {
         let cef = cef::discover(&args.external_cef)?;
         xfs::copy_glob(&cef.dir, prefix, &["*.dll", "*.bin", "*.json"])?;
