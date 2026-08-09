@@ -59,6 +59,7 @@ jobs:
           platform: ${{ github.workflow }}-${{ matrix.arch }}
 
       - name: Setup MSYS2
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
@@ -108,7 +109,10 @@ jobs:
 
       - name: Build mpv from source
         shell: pwsh
-        run: dev\windows\build_mpv_source.ps1 -Arch ${{ matrix.arch }}
+        run: >-
+          dev\windows\build_mpv_source.ps1
+          -Arch ${{ matrix.arch }}
+          -MsysPath '${{ steps.msys2.outputs.msys2-location }}'
 
       - name: Build
         shell: cmd
@@ -118,8 +122,8 @@ jobs:
           # libclang.dll under the msystem prefix's bin/; cmd.exe
           # doesn't pick that up from setup-msys2, so point bindgen
           # at it explicitly.
-          LIBCLANG_PATH: C:\msys64\${{ matrix.msystem }}\bin
-          MSYS_BIN: C:\msys64\${{ matrix.msystem }}\bin
+          LIBCLANG_PATH: ${{ steps.msys2.outputs.msys2-location }}\${{ matrix.msystem }}\bin
+          MSYS_BIN: ${{ steps.msys2.outputs.msys2-location }}\${{ matrix.msystem }}\bin
           # mingw's libclang doesn't auto-pick the MSVC target triple, so
           # MSVC's arch-specific headers (__int64, vcruntime intrinsics,
           # etc.) get parsed against the wrong default target. Pin it.
