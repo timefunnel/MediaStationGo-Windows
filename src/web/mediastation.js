@@ -1126,18 +1126,20 @@
             || content;
     }
 
-    function restoreViewState(view) {
+    function restoreViewState(view, { restoreFocus = true } = {}) {
         requestAnimationFrame(() => {
             content.scrollTop = view.scrollTop || 0;
             content.querySelectorAll('.media-row[data-row-key]').forEach((row) => {
                 row.scrollLeft = view.rows?.[row.dataset.rowKey] || 0;
             });
             requestAnimationFrame(() => {
-                const target = focusTargetForView(view);
-                if (target === content) {
-                    content.focus({ preventScroll: true });
-                } else {
-                    focusElement(target, true);
+                if (restoreFocus) {
+                    const target = focusTargetForView(view);
+                    if (target === content) {
+                        content.focus({ preventScroll: true });
+                    } else {
+                        focusElement(target, true);
+                    }
                 }
                 content.scrollTop = view.scrollTop || 0;
             });
@@ -1257,7 +1259,7 @@
                     const saved = captureView();
                     currentView = { ...currentView, data: homeData };
                     renderHome(homeData);
-                    if (saved) restoreViewState(saved);
+                    if (saved) restoreViewState(saved, { restoreFocus: Boolean(saved.focusKey) });
                 }
             } catch (error) {
                 if (generation !== homeRefreshGeneration || session !== expectedSession) return;
@@ -5287,7 +5289,7 @@
             const saved = captureView();
             currentView = { ...currentView, data: homeData };
             renderHome(homeData);
-            if (saved) restoreViewState(saved);
+            if (saved) restoreViewState(saved, { restoreFocus: Boolean(saved.focusKey) });
             animateMediaRowReorder('resume', resumeCardRects, activeCardId);
         }
         if (homeVerificationPending) {
