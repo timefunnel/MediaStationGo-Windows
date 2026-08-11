@@ -3654,6 +3654,7 @@
             panelKind: '',
             trackChanging: false,
             trackRefreshing: false,
+            metadataRefreshMediaId: null,
             scrubbing: false,
             scrubPositionMs: null,
             interpolationEnabled: false,
@@ -3723,6 +3724,7 @@
             );
             if (player === activePlayer) {
                 activePlayer.loadInfo = loadInfo;
+                schedulePlaybackMetadataRefresh(activePlayer);
                 if (activePlayer.exiting) return;
                 applyPlayerPlaybackRate(1);
                 refreshPlayerTools();
@@ -3735,6 +3737,68 @@
             if (activePlayer.exiting && activePlayer.stopSent) return;
             if (!activePlayer.exiting) showToast(friendlyError(error));
             finishPlayer();
+        }
+    }
+
+    function applyPlaybackMetadataRefresh(activePlayer, tracks) {
+        if (!activePlayer?.loadInfo || !tracks) return;
+        activePlayer.loadInfo.audioTracks = Array.isArray(tracks.audioTracks) ? tracks.audioTracks : [];
+        activePlayer.loadInfo.subtitleTracks = Array.isArray(tracks.subtitleTracks) ? tracks.subtitleTracks : [];
+        activePlayer.loadInfo.audioTrackKey = tracks.audioTrackKey || null;
+        activePlayer.loadInfo.subtitleTrackKey = tracks.subtitleTrackKey || null;
+        activePlayer.loadInfo.subtitleEnabled = tracks.subtitleEnabled === true;
+        activePlayer.loadInfo.sourceVideo = tracks.sourceVideo || null;
+        activePlayer.loadInfo.container = tracks.container || null;
+        activePlayer.loadInfo.bitrate = Number.isFinite(tracks.bitrate) ? tracks.bitrate : null;
+        activePlayer.loadInfo.mediaMetadataPending = tracks.mediaMetadataPending === true;
+    }
+
+    function schedulePlaybackMetadataRefresh(activePlayer) {
+        if (player !== activePlayer
+            || !activePlayer.started
+            || !activePlayer.loadInfo?.mediaMetadataPending
+            || activePlayer.exiting) return;
+        const mediaId = activePlayer.card?.id;
+        if (!mediaId || activePlayer.metadataRefreshMediaId === mediaId) return;
+        activePlayer.metadataRefreshMediaId = mediaId;
+        void refreshUnprobedPlaybackMetadata(activePlayer, mediaId);
+    }
+
+    async function refreshUnprobedPlaybackMetadata(activePlayer, mediaId) {
+        const retryDelaysMs = [0, 1000, 2000, 4000];
+        for (const retryDelayMs of retryDelaysMs) {
+            if (retryDelayMs > 0) {
+                await new Promise((resolve) => window.setTimeout(resolve, retryDelayMs));
+            }
+            if (player !== activePlayer
+                || activePlayer.exiting
+                || activePlayer.card?.id !== mediaId
+                || !activePlayer.loadInfo?.mediaMetadataPending) return;
+            try {
+                const tracks = await nativeRequest(
+                    'mediaStationTracks',
+                    'tracks',
+                    [mediaId],
+                    15000,
+                );
+                if (player !== activePlayer || activePlayer.exiting || activePlayer.card?.id !== mediaId) return;
+                applyPlaybackMetadataRefresh(activePlayer, tracks);
+                if (tracks.metadataRefreshErrorCode) {
+                    console.error(`Playback metadata refresh failed: ${tracks.metadataRefreshErrorCode}`);
+                }
+                if (!activePlayer.loadInfo.mediaMetadataPending) {
+                    refreshPlayerTools();
+                    return;
+                }
+            } catch (error) {
+                console.error(`Playback metadata refresh request failed: ${friendlyError(error)}`);
+            }
+        }
+        if (player === activePlayer
+            && !activePlayer.exiting
+            && activePlayer.card?.id === mediaId
+            && activePlayer.loadInfo?.mediaMetadataPending) {
+            console.warn(`Playback metadata remained pending after bounded refresh: media_id=${mediaId}`);
         }
     }
 
@@ -3901,6 +3965,7 @@
                     if (!shouldPlay && window.jmpNative) window.jmpNative.playerPause();
                     refreshPlayerTools();
                     setPlayerLoading(false);
+                    schedulePlaybackMetadataRefresh(player);
                     if (firstFrame && !player.panelKind) {
                         hidePlayerFeedback();
                         hidePlayerControls();
@@ -4905,11 +4970,7 @@
                     15000,
                 );
                 if (player !== activePlayer || activePlayer.exiting) return;
-                activePlayer.loadInfo.audioTracks = tracks.audioTracks;
-                activePlayer.loadInfo.subtitleTracks = tracks.subtitleTracks;
-                activePlayer.loadInfo.audioTrackKey = tracks.audioTrackKey || null;
-                activePlayer.loadInfo.subtitleTrackKey = tracks.subtitleTrackKey || null;
-                activePlayer.loadInfo.subtitleEnabled = tracks.subtitleEnabled === true;
+                applyPlaybackMetadataRefresh(activePlayer, tracks);
             } catch (error) {
                 if (player === activePlayer && !activePlayer.exiting) showToast(friendlyError(error));
                 return;
@@ -5023,6 +5084,7 @@
             );
             if (player !== activePlayer || activePlayer.exiting) return false;
             activePlayer.loadInfo = loadInfo;
+            schedulePlaybackMetadataRefresh(activePlayer);
             applyPlayerPlaybackRate(targetPlaybackRate);
             refreshPlayerTools();
             return true;
