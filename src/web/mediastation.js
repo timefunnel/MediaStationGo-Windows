@@ -1002,38 +1002,69 @@
 
     function updateStatusText(status, payload) {
         if (status === 'checking') return '正在检查更新...';
-        if (status === 'available') return `发现新版本 ${payload.version || ''}`.trim();
+        if (status === 'available') {
+            const packageLabel = payload.packageKind === 'portable' ? '便携版' : '安装版';
+            const assetBytes = Number(payload.assetBytes);
+            const size = Number.isFinite(assetBytes) && assetBytes > 0 ? formatBytes(assetBytes) : '';
+            return `发现新版本 ${displayAppVersion(payload.version)} · ${packageLabel}${size ? ` · ${size}` : ''}`;
+        }
         if (status === 'downloading') {
             const percent = Number.isFinite(Number(payload.percent)) ? Number(payload.percent) : 0;
-            return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%`;
+            const downloaded = formatBytes(payload.downloadedBytes);
+            const total = formatBytes(payload.totalBytes);
+            const progress = downloaded && total ? ` · ${downloaded} / ${total}` : '';
+            return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%${progress}`;
         }
         if (status === 'verifying') return '正在校验更新包...';
-        if (status === 'ready') return `更新 ${payload.version || ''} 已下载完成`.trim();
+        if (status === 'ready') return `${displayAppVersion(payload.version)} 已下载并校验完成，可以应用更新`;
         if (status === 'installing') return payload.packageKind === 'portable'
             ? '正在应用便携版更新，应用即将关闭...'
             : '正在启动安装程序，应用即将关闭...';
-        if (status === 'up_to_date') return `当前已是最新版本（${payload.currentVersion || ''}）`.trim();
+        if (status === 'up_to_date') return '当前已是最新版本';
         if (status === 'error') return payload.message || '更新检查失败';
         return '尚未检查更新';
     }
 
+    function displayAppVersion(version) {
+        const value = String(version || '').trim();
+        if (!value) return '未知版本';
+        return value.toLowerCase().startsWith('v') ? value : `v${value}`;
+    }
+
     function refreshUpdateControls() {
+        const versionNode = byId('settings-app-version');
         const statusNode = byId('settings-app-update-status');
         const checkButton = byId('settings-check-app-update');
         const downloadButton = byId('settings-download-app-update');
         const installButton = byId('settings-install-app-update');
         const confirm = byId('settings-confirm-app-update');
-        if (!statusNode || !checkButton || !downloadButton || !installButton || !confirm) return;
+        if (!versionNode || !statusNode || !checkButton || !downloadButton || !installButton || !confirm) return;
         const { status, payload } = appUpdateState;
+        versionNode.textContent = displayAppVersion(window.jmpInfo?.version);
         statusNode.textContent = updateStatusText(status, payload);
-        statusNode.dataset.state = status === 'error' ? 'error' : (status === 'ready' ? 'ready' : '');
-        const busy = status === 'checking' || status === 'downloading' || status === 'verifying' || status === 'installing';
-        checkButton.disabled = busy;
-        downloadButton.disabled = busy;
-        installButton.disabled = busy;
-        checkButton.classList.toggle('hidden', status === 'installing');
-        downloadButton.classList.toggle('hidden', status !== 'available');
-        installButton.classList.toggle('hidden', status !== 'ready');
+        statusNode.dataset.state = status === 'error'
+            ? 'error'
+            : (status === 'ready' || status === 'up_to_date' ? 'ready' : '');
+        const downloading = status === 'downloading';
+        const applying = status === 'verifying' || status === 'installing';
+        checkButton.disabled = status === 'checking';
+        checkButton.dataset.busy = String(status === 'checking');
+        checkButton.textContent = status === 'checking'
+            ? '正在检查...'
+            : status === 'error' ? '重试检查' : status === 'idle' ? '检查更新' : '重新检查';
+        checkButton.classList.toggle('hidden', downloading || applying);
+        downloadButton.disabled = downloading;
+        downloadButton.dataset.busy = String(downloading);
+        downloadButton.textContent = downloading
+            ? `正在下载 ${Math.max(0, Math.min(100, Number(payload.percent) || 0))}%`
+            : `下载 ${displayAppVersion(payload.version)}`;
+        downloadButton.classList.toggle('hidden', status !== 'available' && !downloading);
+        installButton.disabled = applying;
+        installButton.dataset.busy = String(applying);
+        installButton.textContent = status === 'verifying'
+            ? '正在校验...'
+            : status === 'installing' ? '正在应用更新...' : `应用 ${displayAppVersion(payload.version)}`;
+        installButton.classList.toggle('hidden', status !== 'ready' && !applying);
         if (status !== 'ready') confirm.classList.add('hidden');
     }
 
@@ -1065,7 +1096,7 @@
     window._onAppUpdateStatus = (status, payloadJson) => {
         let payload = {};
         try { payload = JSON.parse(payloadJson || '{}'); } catch { payload = {}; }
-        appUpdateState = { status, payload };
+        appUpdateState = { status, payload: { ...appUpdateState.payload, ...payload } };
         refreshUpdateControls();
         if (status === 'available' && payload.version && payload.version !== updateNotificationVersion) {
             updateNotificationVersion = payload.version;
