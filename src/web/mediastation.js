@@ -683,18 +683,13 @@
     }
 
     function validConnectionProfile(value) {
-        return Boolean(value && (
-            (value.serverType === 'mediastation_go'
-                && value.clientProfile === 'mediastation_go')
-            || (value.serverType === 'standard_emby'
-                && ['mediastation_windows', 'senplayer', 'infuse'].includes(value.clientProfile))
-        ));
+        return Boolean(value
+            && ['mediastation_windows', 'senplayer', 'infuse'].includes(value.clientProfile));
     }
 
     function defaultConnectionProfile() {
         return {
-            serverType: 'mediastation_go',
-            clientProfile: 'mediastation_go',
+            clientProfile: 'mediastation_windows',
         };
     }
 
@@ -716,39 +711,17 @@
     }
 
     function selectedLoginConnection() {
-        const serverType = document.querySelector('input[name="server-type"]:checked')?.value;
-        if (serverType === 'standard_emby') {
-            return {
-                serverType,
-                clientProfile: selectedEmbyClientProfile(),
-            };
-        }
         return {
-            serverType: 'mediastation_go',
-            clientProfile: 'mediastation_go',
+            clientProfile: selectedEmbyClientProfile(),
         };
-    }
-
-    function syncLoginConnectionUi() {
-        const standardEmby = document.querySelector('input[name="server-type"]:checked')?.value
-            === 'standard_emby';
-        byId('emby-client-profile-field').classList.toggle('hidden', !standardEmby);
     }
 
     function setLoginConnection(source, locked) {
         const connection = source && validConnectionProfile(source)
             ? source
             : defaultConnectionProfile();
-        const type = connection.serverType;
         loginConnectionLocked = locked;
-        document.querySelectorAll('input[name="server-type"]').forEach((input) => {
-            input.checked = input.value === type;
-            input.disabled = locked;
-        });
-        setEmbyClientProfile(type === 'standard_emby'
-            ? connection.clientProfile
-            : 'mediastation_windows', locked);
-        syncLoginConnectionUi();
+        setEmbyClientProfile(connection.clientProfile, locked);
     }
 
     function setLoginLoading(loading) {
@@ -761,9 +734,6 @@
         byId('server-url').disabled = loading;
         byId('username').disabled = loading;
         byId('password').disabled = loading;
-        document.querySelectorAll('input[name="server-type"]').forEach((input) => {
-            input.disabled = loading || loginConnectionLocked;
-        });
         embyClientProfileInputs().forEach((input) => {
             input.disabled = loading || loginConnectionLocked;
         });
@@ -3414,12 +3384,11 @@
             ...user,
             baseUrl: server.baseUrl,
             serverId: server.serverId,
-            serverType: server.serverType,
             clientProfile: server.clientProfile,
         };
     }
 
-    function standardEmbyClientLabel(profile) {
+    function embyClientIdentityLabel(profile) {
         if (profile === 'senplayer') return 'SenPlayer';
         if (profile === 'infuse') return 'Infuse';
         return '默认身份';
@@ -3451,9 +3420,7 @@
             serverCopy.append(element(
                 'span',
                 'saved-account-server-client',
-                server.serverType === 'standard_emby'
-                    ? `标准 Emby · ${standardEmbyClientLabel(server.clientProfile)}`
-                    : 'MediaStationGo',
+                `Emby · ${embyClientIdentityLabel(server.clientProfile)}`,
             ));
             const serverCount = element('span', 'saved-account-server-count', `${server.users.length} 个用户`);
             const addUser = element('button', 'icon-button saved-account-server-add', '\u002b');
@@ -5405,11 +5372,6 @@
     byId('account-delete-cancel').addEventListener('click', () => closeDeleteAccountDialog());
     byId('account-delete-confirm').addEventListener('click', confirmDeleteAccount);
     byId('login-cancel').addEventListener('click', cancelAccountChange);
-    document.querySelectorAll('input[name="server-type"]').forEach((input) => {
-        input.addEventListener('change', () => {
-            syncLoginConnectionUi();
-        });
-    });
     const defaultSubtitleFontSize = byId('settings-subtitle-font-size');
     const defaultSubtitleBottomOffset = byId('settings-subtitle-bottom-offset');
     const updateDefaultSubtitleStyle = (persist) => {

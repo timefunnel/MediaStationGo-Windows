@@ -76,7 +76,7 @@ impl StoredSession {
             user_id,
             user_name,
             access_token,
-            MediaStationConnectionProfile::media_station_go(),
+            MediaStationConnectionProfile::default_emby(),
         )
     }
 
@@ -166,7 +166,7 @@ impl StoredSession {
             .and_then(Value::as_u64)
             .ok_or_else(|| CredentialError::new("credential_version_unsupported"))?;
         let connection = match version {
-            1 => MediaStationConnectionProfile::media_station_go(),
+            1 => MediaStationConnectionProfile::default_emby(),
             2 | CREDENTIAL_SCHEMA_VERSION => decode_connection_profile(&value)?,
             _ => return Err(CredentialError::new("credential_version_unsupported")),
         };
@@ -256,7 +256,7 @@ fn decode_connection_profile(
     let client = connection
         .get("clientProfile")
         .and_then(Value::as_str)
-        .and_then(MediaStationClientProfile::from_str)
+        .and_then(MediaStationClientProfile::parse)
         .ok_or_else(|| CredentialError::new("credential_client_profile_invalid"))?;
     Ok(MediaStationConnectionProfile {
         client,
@@ -526,18 +526,22 @@ mod tests {
         let session = session();
         let encoded = session.encode().expect("credential should encode");
         let decoded = StoredSession::decode(&encoded).expect("credential should decode");
+        let payload: Value =
+            serde_json::from_slice(&encoded).expect("credential should contain valid JSON");
 
         assert_eq!(decoded, session);
+        assert_eq!(
+            payload["connection"]["clientProfile"],
+            "mediastation_windows"
+        );
         let debug = format!("{decoded:?}");
         assert!(!debug.contains("credential-roundtrip-secret"));
         assert!(debug.contains("<redacted>"));
     }
 
     #[test]
-    fn standard_emby_credential_codec_round_trips_profile() {
-        let profile =
-            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
-                .expect("SenPlayer should be a standard Emby profile");
+    fn emby_credential_codec_round_trips_client_identity() {
+        let profile = MediaStationConnectionProfile::emby(MediaStationClientProfile::SenPlayer);
         let session = StoredSession::new_with_profile(
             Url::parse("https://emby.example/base").expect("URL should parse"),
             "user-2",
@@ -556,14 +560,14 @@ mod tests {
     }
 
     #[test]
-    fn version_one_credentials_migrate_to_direct_media_station_go() {
+    fn version_one_credentials_migrate_to_default_emby_identity() {
         let encoded = br#"{"version":1,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t"}"#;
 
         let decoded = StoredSession::decode(encoded).expect("v1 credential should migrate");
 
         assert_eq!(
             decoded.connection,
-            MediaStationConnectionProfile::media_station_go()
+            MediaStationConnectionProfile::default_emby()
         );
     }
 
@@ -573,6 +577,10 @@ mod tests {
         let decoded =
             StoredSession::decode(proxied_msg).expect("legacy proxy setting should migrate");
         assert_eq!(decoded.connection.proxy, MediaStationProxyMode::Direct);
+        assert_eq!(
+            decoded.connection.client,
+            MediaStationClientProfile::MediaStationWindows
+        );
 
         let direct_emby = br#"{"version":2,"baseUrl":"https://media.example","userId":"u","userName":"n","accessToken":"t","connection":{"clientProfile":"senplayer","proxyMode":"direct"}}"#;
         let decoded = StoredSession::decode(direct_emby)
@@ -592,7 +600,7 @@ mod tests {
             "User",
             "secret",
             MediaStationConnectionProfile {
-                client: MediaStationClientProfile::MediaStationGo,
+                client: MediaStationClientProfile::MediaStationWindows,
                 proxy: MediaStationProxyMode::System,
             },
         )

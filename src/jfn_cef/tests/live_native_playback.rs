@@ -34,9 +34,13 @@ fn live_connection_profile() -> MediaStationConnectionProfile {
     let client = match env::var("MEDIASTATION_LIVE_CLIENT_PROFILE").as_deref() {
         Ok("senplayer") => MediaStationClientProfile::SenPlayer,
         Ok("infuse") => MediaStationClientProfile::Infuse,
-        Ok("mediastation_go") | Err(_) => MediaStationClientProfile::MediaStationGo,
+        Ok("mediastation_go" | "mediastation_windows") | Err(_) => {
+            MediaStationClientProfile::MediaStationWindows
+        }
         Ok(_) => {
-            panic!("MEDIASTATION_LIVE_CLIENT_PROFILE must be mediastation_go, senplayer, or infuse")
+            panic!(
+                "MEDIASTATION_LIVE_CLIENT_PROFILE must be mediastation_windows, senplayer, or infuse"
+            )
         }
     };
     let proxy = match env::var("MEDIASTATION_LIVE_PROXY_MODE").as_deref() {
@@ -78,14 +82,14 @@ fn live_session(
         env::var("MEDIASTATION_LIVE_TOKEN"),
         env::var("MEDIASTATION_LIVE_AUTHORIZATION"),
     ) {
-        return MediaStationSession::new_with_profile(
-            base_url,
-            user_id,
-            token,
-            authorization,
-            profile,
-        )
-        .expect("live session should be valid");
+        let mut session =
+            MediaStationSession::new_with_profile(base_url, user_id, token, authorization, profile)
+                .expect("live session should be valid");
+        let extensions = client
+            .load_protocol_extensions(&session)
+            .expect("live server capabilities should load");
+        session.set_protocol_extensions(extensions);
+        return session;
     }
     let username = required_env("MEDIASTATION_LIVE_USERNAME");
     let password = required_env("MEDIASTATION_LIVE_PASSWORD");
@@ -101,14 +105,19 @@ fn live_session(
         )
         .expect("live account should authenticate");
     let token = authenticated.access_token_secret().to_string();
-    MediaStationSession::new_with_profile(
+    let mut session = MediaStationSession::new_with_profile(
         authenticated.base_url,
         authenticated.user_id,
         token.clone(),
         live_authorization(profile, device_id, Some(&token)),
         profile,
     )
-    .expect("authenticated live session should be valid")
+    .expect("authenticated live session should be valid");
+    let extensions = client
+        .load_protocol_extensions(&session)
+        .expect("live server capabilities should load");
+    session.set_protocol_extensions(extensions);
+    session
 }
 
 fn live_media_id(api: &MediaStationApiClient, session: &MediaStationSession) -> String {

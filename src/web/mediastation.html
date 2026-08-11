@@ -47,17 +47,10 @@
           </div>
         </div>
         <label>服务器地址<input id="server-url" name="server" type="url" inputmode="url" placeholder="https://example.com" required></label>
-        <fieldset class="login-connection-fieldset">
-          <legend>服务器类型</legend>
-          <div class="login-server-type" role="radiogroup" aria-label="服务器类型">
-            <label><input type="radio" name="server-type" value="mediastation_go" checked><span>MediaStationGo</span></label>
-            <label><input type="radio" name="server-type" value="standard_emby"><span>标准 Emby</span></label>
-          </div>
-        </fieldset>
-        <fieldset id="emby-client-profile-field" class="login-connection-fieldset login-client-profile-field hidden">
-          <legend>客户端身份 <span class="inline-tip" tabindex="0" aria-label="部分 Emby 服务器只接受特定的客户端身份；默认无需选择，连接失败时再尝试 SenPlayer 或 Infuse。">i<span role="tooltip">部分 Emby 服务器只接受特定的客户端身份。默认无需选择；连接失败时再尝试 SenPlayer 或 Infuse。</span></span></legend>
+        <fieldset id="emby-client-profile-field" class="login-connection-fieldset login-client-profile-field">
+          <legend>兼容身份（高级） <span class="inline-tip" tabindex="0" aria-label="默认使用 MediaStation Windows 身份；仅在服务器明确要求时选择 SenPlayer 或 Infuse。">i<span role="tooltip">默认使用 MediaStation Windows 身份；仅在服务器明确要求时选择 SenPlayer 或 Infuse。</span></span></legend>
           <div class="login-option-cards login-client-profile-options" role="radiogroup" aria-label="客户端身份">
-            <label class="login-client-profile-default"><input type="radio" name="emby-client-profile" value="mediastation_windows" checked><span><strong>不指定</strong><small>使用默认客户端身份</small></span></label>
+            <label class="login-client-profile-default"><input type="radio" name="emby-client-profile" value="mediastation_windows" checked><span><strong>默认</strong><small>MediaStation Windows</small></span></label>
             <label><input type="radio" name="emby-client-profile" value="senplayer"><span><strong>SenPlayer</strong><small>通用兼容</small></span></label>
             <label><input type="radio" name="emby-client-profile" value="infuse"><span><strong>Infuse</strong><small>原生身份</small></span></label>
           </div>

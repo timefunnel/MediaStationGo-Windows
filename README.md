@@ -4,7 +4,7 @@
 [![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D4)](https://github.com/timefunnel/MediaStationGo-Windows/releases/latest)
 [![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
 
-MediaStationGo for Windows 是面向 [MediaStationGo](https://github.com/timefunnel/MediaStationGo) 与标准 Emby 服务器的原生 Windows 媒体客户端。它以 CEF 构建桌面媒体界面，以 libmpv 负责原生播放，并由 Rust 层统一管理账号、媒体请求、播放会话和应用更新。
+MediaStationGo for Windows 是通用的 Emby 协议兼容原生 Windows 媒体客户端，[MediaStationGo](https://github.com/timefunnel/MediaStationGo) 是其中一种受支持的服务端实现。它以 CEF 构建桌面媒体界面，以 libmpv 负责原生播放，并由 Rust 层统一管理账号、媒体请求、播放会话和应用更新。
 
 [下载最新版本](https://github.com/timefunnel/MediaStationGo-Windows/releases/latest) · [提交问题](https://github.com/timefunnel/MediaStationGo-Windows/issues) · [Windows 发布流程](docs/windows-release-process.md)
 
@@ -15,7 +15,7 @@ MediaStationGo for Windows 是面向 [MediaStationGo](https://github.com/timefun
 - **完整媒体浏览**：首页推荐、继续观看、媒体库、类型与题材筛选、搜索、详情、演职员、分季选集。
 - **原生播放控制**：硬件解码、HDR10、播放进度、倍速、音量、全屏、音轨与字幕切换，以及默认或单片字幕样式。
 - **剧集连续观看**：播放器内选集、自动播放下一集、片头片尾跳过设置；退出播放后立即更新“继续观看”。
-- **多服务器与多账号**：支持 MediaStationGo 和标准 Emby，可保存、切换、修改或删除多个账号。
+- **多服务器与多账号**：支持标准 Emby API 及兼容实现，可保存、切换、修改或删除多个账号。
 - **安全原生会话**：密码和访问令牌保存在 Windows 凭据管理器中，不暴露给页面脚本；媒体重定向与跨域请求按来源限制凭据。
 - **网络与代理**：可在应用内切换直连或 Windows 系统代理，设置作用于当前会话及后续服务器连接。
 - **直链与 CDN 播放**：原生解析播放信息、验证重定向与 Range 支持，并复用已经验证的最终播放地址。
@@ -30,7 +30,7 @@ MediaStationGo for Windows 是面向 [MediaStationGo](https://github.com/timefun
   <tr>
     <td width="50%">
       <img src="docs/images/mediastationgo-add-account.png" alt="MediaStationGo 添加账号与服务器连接界面">
-      <br><strong>账号连接</strong><br>选择 MediaStationGo 或标准 Emby，并配置服务器与客户端身份。
+      <br><strong>账号连接</strong><br>填写 Emby 服务器地址与账号；仅在服务器明确要求时调整高级兼容身份。
     </td>
     <td width="50%">
       <img src="docs/images/mediastationgo-library.png" alt="MediaStationGo 媒体库与筛选界面">
@@ -90,8 +90,8 @@ Get-FileHash .\MediaStationGo-<版本>-windows-x64-setup.exe -Algorithm SHA256
 ## 快速开始
 
 1. 安装应用，或完整解压便携包后运行 `jellium-desktop.exe`。
-2. 添加账号，填写完整的 `http://` 或 `https://` 服务器地址、服务器类型、用户名和密码。
-3. 标准 Emby 可按服务器兼容性选择默认身份、SenPlayer 或 Infuse；MediaStationGo 使用原生连接配置。
+2. 添加账号，填写完整的 `http://` 或 `https://` Emby 服务器地址、用户名和密码。
+3. 默认使用 MediaStation Windows 客户端身份；仅在服务器明确要求时选择 SenPlayer 或 Infuse 兼容身份。
 4. 如需使用 Windows 系统代理，在登录页或右上角“设置 → 网络与代理”中切换。
 5. 登录后从首页、媒体库或搜索进入详情页并开始播放。
 
@@ -100,7 +100,7 @@ Get-FileHash .\MediaStationGo-<版本>-windows-x64-setup.exe -Algorithm SHA256
 ## 系统要求
 
 - Windows x64。
-- 可访问的 MediaStationGo 或标准 Emby 服务器，以及有效账号。
+- 可访问的标准 Emby API 或兼容服务端，以及有效账号。
 - 支持目标视频格式的显卡和驱动；实际硬件解码与 HDR 输出能力取决于设备、驱动和显示链路。
 
 RTX 插帧是可选功能，不影响普通播放。启用它还需要：
@@ -130,7 +130,7 @@ RTX 插帧是可选功能，不影响普通播放。启用它还需要：
 
 - 应用版本和安装方式。
 - Windows 版本、显卡型号和驱动版本。
-- 服务器类型（MediaStationGo 或标准 Emby）。
+- 服务端产品与版本，以及是否使用反向代理或 URL 子路径。
 - 可复现步骤、预期结果和实际错误信息。
 - 已脱敏的相关日志。
 

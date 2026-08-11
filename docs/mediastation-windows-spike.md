@@ -2,8 +2,9 @@
 
 ## Scope
 
-This branch validates whether Jellium Desktop can host a dedicated
-MediaStationGo Windows client. It is not the final application repository.
+This branch validates whether Jellium Desktop can host a generic native Emby
+Windows client. MediaStationGo is one compatible server implementation, not a
+separate client protocol mode. It is not the final application repository.
 The Android TV project remains a read-only protocol and interaction reference.
 
 The active RIFE precision, TensorRT profile, and VRR refresh-matching work is
@@ -11,7 +12,7 @@ tracked in [windows-rife-tensorrt-profiles.md](windows-rife-tensorrt-profiles.md
 
 The Spike must prove these paths before product UI work expands:
 
-1. Resolve standard Emby and MediaStationGo PlaybackInfo streams through an
+1. Resolve Emby PlaybackInfo streams and advertised extensions through an
    explicit redirect chain.
 2. Reuse the final server or CDN URL for the playback session.
 3. Keep server credentials on the configured server origin only.
@@ -25,24 +26,24 @@ Standard Emby is the baseline playback contract. The client uses
 default stream indexes to construct
 `/Videos/{Id}/stream?Container=...&Static=true`. The server filesystem
 `Path` is metadata only and is never exposed to mpv or the renderer.
-MediaStationGo may additionally provide `DirectStreamUrl` and
+Compatible servers may additionally provide `DirectStreamUrl` and
 `PlaybackPreferences`; those are optional extensions, not requirements for
 standard Emby playback. When `DirectStreamUrl` is present, it remains the
-authoritative MediaStationGo source and the standard URL constructor is not
-used.
+authoritative source and the standard URL constructor is not used.
+`PlaybackPreferences` is called only when `/System/Info` advertises
+`ProtocolExtensions: [{"Id":"playback-preferences","Version":1}]`.
 
 ## Ownership Boundaries
 
 Rust owns:
 
-- MediaStationGo and standard Emby authentication and API requests.
-- Standard Emby and MediaStationGo PlaybackInfo parsing and stable track
-  identifiers.
+- Emby-compatible authentication and API requests.
+- PlaybackInfo parsing and stable track identifiers.
 - Redirect handling, CDN URL expiry, Range probing, and session reuse.
 - Playing, Progress, and Stopped reports.
-- Optional PlaybackPreferences reads and writes. A standard Emby server without
-  that extension uses PlaybackInfo defaults and keeps track changes for the
-  current native session only.
+- Optional PlaybackPreferences reads and writes. A server without the advertised
+  extension uses PlaybackInfo defaults and keeps track changes for the current
+  native session only; the client does not probe the extension endpoint.
 - Sensitive headers and the libmpv load request.
 
 The packaged CEF frontend owns:
@@ -51,7 +52,7 @@ The packaged CEF frontend owns:
 - Home, library, details, season/episode, and player-control views.
 - Asynchronous IPC calls identified by request IDs.
 
-The frontend must not receive the MediaStationGo token, place credentials in a
+The frontend must not receive the Emby access token, place credentials in a
 URL, perform authenticated media requests, or keep a second media-library data
 store. Local persistence is limited to non-authoritative UI state and cache
 metadata.
@@ -59,7 +60,7 @@ metadata.
 ## Native Account Session
 
 Authentication is native-owned. The renderer may submit a server URL,
-username, password, client profile, and proxy mode to the native login IPC, but
+username, password, and client profile to the native login IPC, but
 it never receives the resulting token or authorization header. The native API calls
 `Users/AuthenticateByName`, validates the returned account fields, constructs
 the authenticated header, and configures playback only after persistence has
@@ -73,15 +74,14 @@ only an opaque selector; the renderer cannot derive or receive the token from
 it. The regular JSON settings file contains no account secret; its only
 account-related value is the selected server URL.
 
-Credential payload schema v2 stores the connection profile with the secret.
-Schema v1 credentials remain readable and migrate as `mediastation_go` with
-`direct` proxy mode. Supported combinations are intentionally closed:
-MediaStationGo always uses its original client identity and defaults to
-explicit direct agents, while allowing an explicit system-proxy selection;
-standard Emby uses either the SenPlayer or Infuse identity and follows the
-same per-server proxy selection (direct by default). API requests, redirect/
-Range probes, subtitles,
-playback reporting, and mpv HTTP playback all use that per-server profile.
+Credential payload schema v3 stores the Emby client identity with the secret.
+Schema v1 credentials and the legacy `mediastation_go` identity remain readable
+and normalize to `mediastation_windows`; users are not required to sign in
+again. Supported identities are intentionally closed to MediaStation Windows,
+SenPlayer, and Infuse. Proxy mode is an application-wide preference and is not
+stored in each account credential. API requests, redirect/Range probes,
+subtitles, playback reporting, and mpv HTTP playback use the selected identity
+and current proxy mode independently of the server implementation.
 
 Startup restores the active credential only when its exact normalized server
 URL matches the selected server. It also creates or refreshes that account's
@@ -92,8 +92,8 @@ explicitly and are not silently deleted or skipped.
 
 The account drawer enumerates the per-account Credential Manager entries with a
 target-prefix filter and groups users by normalized server URL. It receives
-only `accountId`, `serverId`, `baseUrl`, `userId`, `userName`, `serverType`,
-`clientProfile`, and `proxyMode`. Selecting an account reads that exact credential by stable ID,
+only `accountId`, `serverId`, `baseUrl`, `userId`, `userName`, and
+`clientProfile`. Selecting an account reads that exact credential by stable ID,
 revalidates its identity, updates the active session, invalidates in-flight
 native work, and reloads the catalog. There is no renderer-side account store,
 token cache, fallback account, or list-index identity.
@@ -102,9 +102,9 @@ The drawer can also start a new login while retaining the active native
 session. Cancel returns to the original account, page, and focus target. A
 successful authentication upserts that account's secure entry and makes it
 active; it does not remove the other saved accounts.
-Adding a user under an existing server inherits and locks that server's
-connection profile. Updating a user re-authenticates only that stable account
-and cannot change the server profile. Deleting an inactive account leaves the
+Adding a user under an existing server inherits and locks that server's client
+identity. Updating a user re-authenticates only that stable account
+and cannot change the server's client identity. Deleting an inactive account leaves the
 active session untouched; deleting the active account clears the active session
 only after both credential deletions succeed.
 
@@ -123,13 +123,13 @@ The renderer-facing account calls are:
 
 ```javascript
 window.jmpNative.mediaStationAuthenticate(
-  requestId, baseUrl, username, password, clientProfile, proxyMode
+  requestId, baseUrl, username, password, clientProfile
 );
 window.jmpNative.mediaStationSessionStatus(requestId);
 window.jmpNative.mediaStationListAccounts(requestId);
 window.jmpNative.mediaStationSwitchAccount(requestId, accountId);
 window.jmpNative.mediaStationUpdateAccount(
-  requestId, accountId, username, password, clientProfile, proxyMode
+  requestId, accountId, username, password, clientProfile
 );
 window.jmpNative.mediaStationDeleteAccount(requestId, accountId);
 window.jmpNative.mediaStationLogout(requestId);
@@ -224,16 +224,13 @@ shows the one authoritative server track.
 - A cross-origin final URL is accepted only after the server redirect chain and
   only when byte ranges are supported.
 - Direct CDN sessions contain no private server headers.
-- Standard Emby requests require a configured Windows system proxy. Its mpv
-  HTTP loads receive the proxy as a per-file `http-proxy` option. MediaStationGo
-  defaults to explicit direct API/probe agents and the `mediastation://` stream
-  reader, preserving the existing direct MSG chain; an explicit MSG system
-  proxy profile applies to both.
+- Emby requests use the configured direct or Windows system-proxy mode. mpv HTTP
+  loads receive the proxy as a per-file `http-proxy` option when required.
 - Same-origin streams constructed from the standard Emby contract are handed
   to mpv as ordinary HTTP URLs so `X-Emby-Token` and
-  `X-Emby-Authorization` are applied to every range request. The existing
-  MediaStationGo `DirectStreamUrl` path remains on the native
-  `mediastation://` reader, including its cross-origin CDN behavior.
+  `X-Emby-Authorization` are applied to every range request. A PlaybackInfo
+  `DirectStreamUrl` uses the native `mediastation://` reader, including its
+  cross-origin CDN behavior, regardless of the server brand.
 - External subtitle responses are limited to 16 MiB and use an explicit format
   allowlist. Empty, oversized, unknown-format, or insecurely redirected
   subtitles fail without silently disabling the saved subtitle preference.
@@ -280,7 +277,7 @@ Adopt these ideas:
 - Compact icon controls and direct access to search and account actions.
 - Skeleton/loading states that preserve final layout dimensions.
 
-Adapt them for MediaStationGo:
+Adapt them for this Windows client:
 
 - Keep the brand logo at the fixed top-left position.
 - Keep the active user and settings gear at fixed top-right positions on all
@@ -312,7 +309,9 @@ The Spike is successful only when all of the following have evidence:
 
 - Unit tests cover credential isolation, redirects, Range behavior, expiry,
   user-scoped reuse, and log redaction.
-- A real MediaStationGo account can resolve and start a server or CDN stream.
+- A real Emby-compatible account can resolve and start a standard server stream.
+- A server advertising supported protocol extensions can resolve and start its
+  `DirectStreamUrl` server or CDN stream without a brand-specific client mode.
 - Playing, Progress, and Stopped reports are visible on the server.
 - Subtitle and audio preference failures cannot create a startup crash loop.
 - SDR and HDR10 are verified on a real HDR display with source format, decoded

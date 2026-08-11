@@ -1172,6 +1172,17 @@ impl MediaStationRuntime {
                 "The saved account could not be configured",
             )
         })?;
+        let session =
+            discover_session_protocol_extensions(&self.api, session).map_err(|error| {
+                log_error(&format!(
+                    "MediaStation saved account capabilities could not be loaded: code={}",
+                    api_error_code(&error)
+                ));
+                LoadFailure::new(
+                    "server_capabilities_unavailable",
+                    "The server capabilities could not be loaded",
+                )
+            })?;
         let user_name = stored.user_name.clone();
         let (payload, stopped) = {
             let mut state = self.state.lock();
@@ -1343,6 +1354,17 @@ impl MediaStationRuntime {
                 LoadFailure::new(
                     "updated_account_invalid",
                     "The updated account could not be configured",
+                )
+            })?;
+        let updated_session = discover_session_protocol_extensions(&self.api, updated_session)
+            .map_err(|error| {
+                log_error(&format!(
+                    "MediaStation updated account capabilities could not be loaded: code={}",
+                    api_error_code(&error)
+                ));
+                LoadFailure::new(
+                    "server_capabilities_unavailable",
+                    "The server capabilities could not be loaded",
                 )
             })?;
 
@@ -1822,7 +1844,6 @@ fn session_status_payload(state: &RuntimeState) -> Value {
         "baseUrl": session.base_url.as_str(),
         "userId": session.user_id,
         "userName": profile.map(|profile| profile.user_name.as_str()).unwrap_or(&session.user_id),
-        "serverType": session.connection.client.server_type(),
         "clientProfile": session.connection.client.as_str(),
         "proxyMode": session.connection.proxy.as_str(),
     })
@@ -2045,12 +2066,11 @@ pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
             .map_err(|failure| failure.code.to_string())?;
     let session = runtime_session_from_stored(&stored, authorization)
         .map_err(|error| api_error_code(&error).to_string())?;
-    runtime()
-        .map(|runtime| {
-            runtime.configure_session_profile(session, stored.user_name, true);
-            true
-        })
-        .map_err(|failure| failure.code.to_string())
+    let runtime = runtime().map_err(|failure| failure.code.to_string())?;
+    let session = discover_session_protocol_extensions(&runtime.api, session)
+        .map_err(|error| api_error_code(&error).to_string())?;
+    runtime.configure_session_profile(session, stored.user_name, true);
+    Ok(true)
 }
 
 pub(crate) fn handle_authenticate_message(
@@ -3375,7 +3395,7 @@ fn parse_auth_request(args: Option<&ListValue>) -> Result<AuthRequest, (String, 
         ));
     }
     let connection = if args.size() == 4 {
-        parse_client_connection("mediastation_go")
+        parse_client_connection("mediastation_windows")
             .map_err(|failure| (request_id.clone(), failure))?
     } else {
         if args.get_type(4).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
@@ -3448,7 +3468,7 @@ fn parse_proxy_mode_request(
             LoadFailure::new("invalid_request", "Global proxy mode arguments are invalid"),
         ));
     }
-    let proxy = MediaStationProxyMode::from_str(&list_string(args, 1)).ok_or_else(|| {
+    let proxy = MediaStationProxyMode::parse(&list_string(args, 1)).ok_or_else(|| {
         (
             request_id.clone(),
             LoadFailure::new(
@@ -3526,7 +3546,7 @@ fn configured_proxy_mode() -> MediaStationProxyMode {
 fn parse_client_connection(
     client_profile: &str,
 ) -> Result<MediaStationConnectionProfile, LoadFailure> {
-    let client = MediaStationClientProfile::from_str(client_profile).ok_or_else(|| {
+    let client = MediaStationClientProfile::parse(client_profile).ok_or_else(|| {
         LoadFailure::new(
             "invalid_client_profile",
             "The selected server client profile is invalid",
@@ -3550,6 +3570,15 @@ fn runtime_session_from_stored(
     authorization: String,
 ) -> Result<MediaStationSession, ApiError> {
     stored.to_session_with_proxy(authorization, configured_proxy_mode())
+}
+
+fn discover_session_protocol_extensions(
+    api: &MediaStationApiClient,
+    mut session: MediaStationSession,
+) -> Result<MediaStationSession, ApiError> {
+    let extensions = api.load_protocol_extensions(&session)?;
+    session.set_protocol_extensions(extensions);
+    Ok(session)
 }
 
 fn parse_account_id(args: &ListValue, index: usize) -> Result<String, LoadFailure> {
@@ -3599,7 +3628,6 @@ fn saved_accounts_payload(accounts: &[SavedAccount]) -> Result<Value, LoadFailur
             .map(|(base_url, accounts)| json!({
                 "serverId": server_id_from_base_url(&accounts[0].session.base_url),
                 "baseUrl": base_url,
-                "serverType": accounts[0].session.connection.client.server_type(),
                 "clientProfile": accounts[0].session.connection.client.as_str(),
                 "users": accounts.into_iter().map(|account| json!({
                     "accountId": account.account_id,
@@ -3619,7 +3647,6 @@ fn account_public_payload(account_id: &str, stored: &StoredSession, configured: 
         "baseUrl": stored.base_url.as_str(),
         "userId": stored.user_id,
         "userName": stored.user_name,
-        "serverType": stored.connection.client.server_type(),
         "clientProfile": stored.connection.client.as_str(),
     })
 }
@@ -3671,6 +3698,16 @@ fn execute_authentication(
         LoadFailure::new(
             "authenticated_session_invalid",
             "The authenticated session could not be configured",
+        )
+    })?;
+    let session = discover_session_protocol_extensions(&runtime.api, session).map_err(|error| {
+        log_error(&format!(
+            "MediaStation authenticated server capabilities could not be loaded: code={}",
+            api_error_code(&error)
+        ));
+        LoadFailure::new(
+            "server_capabilities_unavailable",
+            "The server capabilities could not be loaded",
         )
     })?;
     runtime.commit_persisted_session(
@@ -3764,15 +3801,23 @@ fn ensure_server_connection_profile(
             "The saved server connection profile could not be read",
         )
     })?;
-    if accounts.iter().any(|account| {
-        account.session.base_url == *base_url && account.session.connection != requested
-    }) {
+    if saved_server_client_profile_conflicts(&accounts, base_url, requested.client) {
         return Err(LoadFailure::new(
             "server_connection_mismatch",
-            "This server already uses a different connection profile",
+            "This server already uses a different client profile",
         ));
     }
     Ok(())
+}
+
+fn saved_server_client_profile_conflicts(
+    accounts: &[SavedAccount],
+    base_url: &Url,
+    requested: MediaStationClientProfile,
+) -> bool {
+    accounts.iter().any(|account| {
+        account.session.base_url == *base_url && account.session.connection.client != requested
+    })
 }
 
 fn persist_active_session(stored: &StoredSession) -> Result<(), LoadFailure> {
@@ -5625,8 +5670,7 @@ fn execute_load(
     // Same-origin Emby streams must stay on mpv's HTTP path so its
     // X-Emby-* headers reach the server. Cross-origin CDN streams use the
     // ureq-backed protocol because some CDNs reject ffmpeg's TLS fingerprint.
-    let use_mpv_http = source.standard_emby_stream
-        || snapshot.session.connection.client != MediaStationClientProfile::MediaStationGo;
+    let use_mpv_http = source.standard_emby_stream;
     let playback_url = CString::new(native_playback_url(
         &playback,
         use_mpv_http,
@@ -6352,6 +6396,8 @@ fn api_error_code(error: &ApiError) -> &'static str {
         ApiError::ResponseTooLarge { .. } => "response_too_large",
         ApiError::EmptyResponse { .. } => "empty_response",
         ApiError::EmptyPreferenceUpdate => "empty_preference_update",
+        ApiError::InvalidServerContract { .. } => "invalid_server_contract",
+        ApiError::UnsupportedProtocolExtension { .. } => "unsupported_protocol_extension",
     }
 }
 
@@ -6507,7 +6553,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_cross_origin_playback_keeps_http_url_for_proxy() {
+    fn http_playback_keeps_cross_origin_url_for_proxy() {
         let url = Url::parse("https://cdn.example/media-1.mkv").expect("URL should parse");
         let playback = playback_session(url.clone(), DeliveryMode::DirectCdn);
 
@@ -6518,7 +6564,7 @@ mod tests {
     }
 
     #[test]
-    fn media_station_stream_keeps_mediastation_protocol() {
+    fn direct_stream_url_uses_native_protocol() {
         let url =
             Url::parse("https://cdn.example/video.mkv?sig=redacted").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
@@ -6530,7 +6576,7 @@ mod tests {
     }
 
     #[test]
-    fn same_origin_media_station_stream_keeps_existing_protocol() {
+    fn same_origin_direct_stream_url_uses_native_protocol() {
         let url =
             Url::parse("https://media.example/Videos/media-1/stream").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::Server);
@@ -6542,7 +6588,7 @@ mod tests {
     }
 
     #[test]
-    fn proxied_msg_stream_keeps_protocol_and_carries_system_mode() {
+    fn proxied_direct_stream_url_carries_system_mode() {
         let url = Url::parse("https://cdn.example/video.mkv").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
 
@@ -6787,8 +6833,8 @@ mod tests {
         );
         assert_eq!(payload["userId"], "user-1");
         assert_eq!(payload["userName"], "Test User");
-        assert_eq!(payload["serverType"], "mediastation_go");
-        assert_eq!(payload["clientProfile"], "mediastation_go");
+        assert!(payload.get("serverType").is_none());
+        assert_eq!(payload["clientProfile"], "mediastation_windows");
         assert_eq!(payload["proxyMode"], "direct");
         assert!(!text.contains("test-token"));
         assert!(!text.to_ascii_lowercase().contains("authorization"));
@@ -6846,8 +6892,8 @@ mod tests {
         assert_eq!(account["userName"], "Saved User");
         assert_eq!(account["accountId"], account_id);
         assert_ne!(account["accountId"], second_id);
-        assert_eq!(server["serverType"], "mediastation_go");
-        assert_eq!(server["clientProfile"], "mediastation_go");
+        assert!(server.get("serverType").is_none());
+        assert_eq!(server["clientProfile"], "mediastation_windows");
         assert!(server.get("proxyMode").is_none());
         assert!(!text.contains("saved-account-secret"));
         assert!(!text.contains("second-account-secret"));
@@ -6858,37 +6904,64 @@ mod tests {
     #[test]
     fn saved_accounts_reject_mixed_profiles_for_one_server() {
         let base_url = Url::parse("https://media.example/base").expect("URL should parse");
-        let msg = StoredSession::new_with_profile(
+        let default = StoredSession::new_with_profile(
             base_url.clone(),
-            "msg-user",
-            "MSG User",
-            "msg-secret",
-            MediaStationConnectionProfile::media_station_go(),
+            "default-user",
+            "Default User",
+            "default-secret",
+            MediaStationConnectionProfile::default_emby(),
         )
-        .expect("MSG session should be valid");
-        let emby = StoredSession::new_with_profile(
+        .expect("default session should be valid");
+        let senplayer = StoredSession::new_with_profile(
             base_url,
-            "emby-user",
-            "Emby User",
-            "emby-secret",
-            MediaStationConnectionProfile::standard_emby(MediaStationClientProfile::SenPlayer)
-                .expect("SenPlayer should be supported"),
+            "senplayer-user",
+            "SenPlayer User",
+            "senplayer-secret",
+            MediaStationConnectionProfile::emby(MediaStationClientProfile::SenPlayer),
         )
-        .expect("Emby session should be valid");
+        .expect("SenPlayer session should be valid");
 
         let error = saved_accounts_payload(&[
             SavedAccount {
-                account_id: msg.account_id(),
-                session: msg,
+                account_id: default.account_id(),
+                session: default,
             },
             SavedAccount {
-                account_id: emby.account_id(),
-                session: emby,
+                account_id: senplayer.account_id(),
+                session: senplayer,
             },
         ])
         .expect_err("one server cannot expose mixed connection profiles");
 
         assert_eq!(error.code, "server_connection_mismatch");
+    }
+
+    #[test]
+    fn saved_server_identity_check_ignores_global_proxy_mode() {
+        let base_url = Url::parse("https://media.example/base").expect("URL should parse");
+        let stored = StoredSession::new_with_profile(
+            base_url.clone(),
+            "saved-user",
+            "Saved User",
+            "saved-secret",
+            MediaStationConnectionProfile::default_emby(),
+        )
+        .expect("stored session should be valid");
+        let accounts = [SavedAccount {
+            account_id: stored.account_id(),
+            session: stored,
+        }];
+
+        assert!(!saved_server_client_profile_conflicts(
+            &accounts,
+            &base_url,
+            MediaStationClientProfile::MediaStationWindows,
+        ));
+        assert!(saved_server_client_profile_conflicts(
+            &accounts,
+            &base_url,
+            MediaStationClientProfile::SenPlayer,
+        ));
     }
 
     #[test]
@@ -7609,7 +7682,7 @@ mod tests {
     fn native_authorization_rejects_header_injection() {
         let error = native_authorization_header(
             Some("token\r\nInjected: value"),
-            MediaStationClientProfile::MediaStationGo,
+            MediaStationClientProfile::MediaStationWindows,
         )
         .expect_err("control characters must fail");
 
@@ -7627,12 +7700,18 @@ mod tests {
     }
 
     #[test]
-    fn client_connection_parser_supports_all_server_types() {
+    fn client_connection_parser_supports_identities_and_legacy_alias() {
         assert_eq!(
             parse_client_connection("mediastation_go")
-                .expect("MediaStationGo client profile should parse")
+                .expect("legacy MediaStationGo client profile should migrate")
                 .client,
-            MediaStationClientProfile::MediaStationGo
+            MediaStationClientProfile::MediaStationWindows
+        );
+        assert_eq!(
+            parse_client_connection("mediastation_windows")
+                .expect("default client profile should parse")
+                .client,
+            MediaStationClientProfile::MediaStationWindows
         );
         assert_eq!(
             parse_client_connection("senplayer")

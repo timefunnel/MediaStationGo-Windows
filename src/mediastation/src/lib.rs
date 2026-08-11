@@ -1,4 +1,4 @@
-//! MediaStationGo protocol and playback-session support.
+//! Emby-compatible API and native playback-session support.
 
 mod api;
 mod playback_plan;

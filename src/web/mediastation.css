@@ -142,14 +142,6 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .login-panel input:read-only { color: var(--muted); background: rgba(255,255,255,0.04); cursor: not-allowed; }
 .login-connection-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .login-connection-fieldset legend { margin-bottom: 8px; color: var(--muted); font-size: 13px; }
-.login-server-type { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid rgba(255,255,255,0.16); border-radius: 6px; overflow: hidden; background: #101615; }
-.login-server-type label { display: block; min-width: 0; color: var(--muted); cursor: pointer; }
-.login-server-type label + label { border-left: 1px solid rgba(255,255,255,0.12); }
-.login-server-type input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.login-server-type span { display: grid; place-items: center; min-height: 44px; padding: 0 10px; text-align: center; }
-.login-server-type input:checked + span { color: var(--text); background: var(--accent-dim); box-shadow: inset 0 -2px var(--accent); font-weight: 650; }
-.login-server-type input:focus-visible + span { outline: 2px solid rgba(117, 227, 210, 0.92); outline-offset: -2px; }
-.login-server-type input:disabled + span { cursor: not-allowed; opacity: 0.58; }
 .login-panel select { width: 100%; height: 46px; padding: 0 34px 0 13px; color: var(--text); border: 1px solid rgba(255,255,255,0.16); border-radius: 6px; background: #101615; }
 .login-panel select:disabled { color: var(--muted); background: rgba(255,255,255,0.04); cursor: not-allowed; }
 .primary-command, .secondary-command, .danger-command {
@@ -1187,8 +1179,6 @@ html[data-ui-theme="ember"] { --accent: #e18a63; --accent-strong: #ffc09d; --acc
 .login-panel h1 { font-size: 30px; font-weight: 620; letter-spacing: -0.04em; }
 .login-panel input, .login-panel select { border-radius: 8px; background: rgba(8,8,12,0.42); }
 .login-panel input:focus, .login-panel select:focus { border-color: color-mix(in srgb, var(--accent) 80%, white 20%); box-shadow: 0 0 0 3px var(--accent-dim); outline: 0; }
-.login-server-type { border-radius: 9px; background: rgba(8,8,12,0.42); }
-.login-server-type input:checked + span { box-shadow: inset 0 -2px var(--accent); }
 .login-option-cards, .settings-option-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .login-option-cards label, .settings-option-cards label { display: block; min-width: 0; color: var(--muted); cursor: pointer; }
 .login-option-cards input, .settings-option-cards input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); opacity: 0; overflow: hidden; white-space: nowrap; }
