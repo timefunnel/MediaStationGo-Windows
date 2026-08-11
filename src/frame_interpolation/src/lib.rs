@@ -1,11 +1,15 @@
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const RIFE_RUNTIME_ABI: u32 = 8;
 const RIFE_MANIFEST_SCHEMA: u64 = 4;
@@ -313,18 +317,7 @@ fn probe_capability(cache_root: &Path) -> Result<(GpuInfo, RuntimeComponents), I
 }
 
 fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
-    let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,uuid,driver_version",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .map_err(|error| {
-            InterpolationError::new(
-                "frame_interpolation_nvidia_smi_unavailable",
-                format!("nvidia-smi could not be started: {error}"),
-            )
-        })?;
+    let output = run_nvidia_smi(OsStr::new("nvidia-smi"))?;
     if !output.status.success() {
         return Err(InterpolationError::new(
             "frame_interpolation_nvidia_driver_unavailable",
@@ -355,6 +348,25 @@ fn probe_gpu() -> Result<GpuInfo, InterpolationError> {
         ));
     }
     Ok(GpuInfo { name, uuid, driver })
+}
+
+fn run_nvidia_smi(program: &OsStr) -> Result<Output, InterpolationError> {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    command
+        .args([
+            "--query-gpu=name,uuid,driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .map_err(|error| {
+            InterpolationError::new(
+                "frame_interpolation_nvidia_smi_unavailable",
+                format!("nvidia-smi could not be started: {error}"),
+            )
+        })
 }
 
 fn probe_runtime(
@@ -1532,6 +1544,14 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_nvidia_smi_is_reported_explicitly() {
+        let error = run_nvidia_smi(OsStr::new("jfn-missing-nvidia-smi-4f98c34d.exe"))
+            .expect_err("the test executable must not exist");
+        assert_eq!(error.code, "frame_interpolation_nvidia_smi_unavailable");
+        assert!(error.detail.contains("nvidia-smi could not be started"));
+    }
 
     fn ready_report() -> CapabilityReport {
         let model_runtime = |model: InterpolationModel| ModelRuntime {
