@@ -1529,6 +1529,32 @@ impl MediaStationRuntime {
         Ok(active.source.clone())
     }
 
+    fn merge_active_playback_metadata(
+        &self,
+        snapshot: &SessionSnapshot,
+        media_id: &str,
+        refreshed: &PlaybackSource,
+    ) -> Result<PlaybackSource, LoadFailure> {
+        let mut state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        let active = state.active_report.as_mut().ok_or_else(|| {
+            LoadFailure::new(
+                "playback_unavailable",
+                "No active playback can refresh metadata",
+            )
+        })?;
+        if active.source.media_id != media_id || refreshed.media_id != media_id {
+            return Err(LoadFailure::new(
+                "playback_changed",
+                "The active playback item changed during metadata refresh",
+            ));
+        }
+        merge_playback_source_metadata(&mut active.source, refreshed);
+        Ok(active.source.clone())
+    }
+
     fn active_preference_revision(&self, snapshot: &SessionSnapshot) -> Result<u64, LoadFailure> {
         let state = self.state.lock();
         if state.generation != snapshot.generation || state.session.is_none() {
@@ -4236,7 +4262,30 @@ fn execute_tracks_request(
     snapshot: &SessionSnapshot,
     request: &TracksRequest,
 ) -> Result<Value, LoadFailure> {
-    let source = runtime.active_playback_source(snapshot, &request.media_id)?;
+    let mut source = runtime.active_playback_source(snapshot, &request.media_id)?;
+    let mut metadata_refresh_error = None;
+    if playback_source_metadata_pending(&source) {
+        match runtime
+            .api
+            .load_playback_source(&snapshot.session, &request.media_id)
+        {
+            Ok(refreshed) => {
+                source = runtime.merge_active_playback_metadata(
+                    snapshot,
+                    &request.media_id,
+                    &refreshed,
+                )?;
+            }
+            Err(error) => {
+                let code = api_error_code(&error);
+                log_error(&format!(
+                    "MediaStation playback metadata refresh failed: media_id={} code={code}",
+                    request.media_id
+                ));
+                metadata_refresh_error = Some(code);
+            }
+        }
+    }
     let mut catalog = current_runtime_track_catalog(&source)?;
     if restore_pending_embedded_subtitle_preference(
         runtime,
@@ -4255,7 +4304,11 @@ fn execute_tracks_request(
         catalog.subtitles.len(),
         catalog.subtitles.iter().any(|track| track.selected),
     ));
-    Ok(runtime_tracks_payload(&catalog))
+    Ok(runtime_tracks_payload(
+        &catalog,
+        Some(&source),
+        metadata_refresh_error,
+    ))
 }
 
 pub(crate) fn handle_track_selection_message(
@@ -5643,7 +5696,7 @@ fn execute_load(
         subtitle_style_override: true,
         subtitle_font_size: request.subtitle_font_size,
         subtitle_position: request.subtitle_position,
-        is_infinite_stream: false,
+        defer_audio_to_mpv: source.audio_tracks.is_empty(),
     };
     runtime.load_if_current(NativeLoadRequest {
         snapshot,
@@ -5685,6 +5738,7 @@ fn execute_load(
         "sourceVideo": source_video_payload(&source),
         "container": source.container,
         "bitrate": source.bitrate,
+        "mediaMetadataPending": playback_source_metadata_pending(&source),
         "subtitleDelivery": subtitle_delivery,
         "subtitleBytes": subtitle_bytes,
         "subtitleRedirectCount": subtitle_redirect_count,
@@ -6020,13 +6074,46 @@ fn runtime_subtitle_fallback_track_key_v2(track: &MpvRuntimeTrack, ordinal: usiz
     format!("{RUNTIME_SUBTITLE_KEY_V2_PREFIX}{digest:x}")
 }
 
-fn runtime_tracks_payload(catalog: &RuntimeTrackCatalog) -> Value {
+fn playback_source_metadata_pending(source: &PlaybackSource) -> bool {
+    source.video.is_none() || source.audio_tracks.is_empty()
+}
+
+fn merge_playback_source_metadata(current: &mut PlaybackSource, refreshed: &PlaybackSource) {
+    if let Some(container) = refreshed
+        .container
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        current.container = Some(container.clone());
+    }
+    if refreshed.bitrate.is_some() {
+        current.bitrate = refreshed.bitrate;
+    }
+    if refreshed.video.is_some() {
+        current.video.clone_from(&refreshed.video);
+    }
+    if !refreshed.audio_tracks.is_empty() {
+        current.audio_tracks.clone_from(&refreshed.audio_tracks);
+        current.default_audio_stream_index = refreshed.default_audio_stream_index;
+    }
+}
+
+fn runtime_tracks_payload(
+    catalog: &RuntimeTrackCatalog,
+    source: Option<&PlaybackSource>,
+    metadata_refresh_error: Option<&str>,
+) -> Value {
     json!({
         "audioTrackKey": catalog.audio.iter().find(|track| track.selected).map(|track| &track.key),
         "subtitleTrackKey": catalog.subtitles.iter().find(|track| track.selected).map(|track| &track.key),
         "subtitleEnabled": catalog.subtitles.iter().any(|track| track.selected),
         "audioTracks": catalog.audio.iter().map(runtime_audio_track_payload).collect::<Vec<_>>(),
         "subtitleTracks": catalog.subtitles.iter().map(runtime_subtitle_track_payload).collect::<Vec<_>>(),
+        "sourceVideo": source.map_or(Value::Null, source_video_payload),
+        "container": source.and_then(|value| value.container.as_deref()),
+        "bitrate": source.and_then(|value| value.bitrate),
+        "mediaMetadataPending": source.is_some_and(playback_source_metadata_pending),
+        "metadataRefreshErrorCode": metadata_refresh_error,
     })
 }
 
@@ -7083,13 +7170,72 @@ mod tests {
         assert!(!catalog.subtitles[0].external);
         assert!(catalog.subtitles[2].external);
 
-        let payload = runtime_tracks_payload(&catalog);
+        let payload = runtime_tracks_payload(&catalog, Some(&source), None);
         let text = payload.to_string().to_ascii_lowercase();
         assert!(payload["audioTracks"][0].get("id").is_none());
         assert!(payload["audioTracks"][0].get("mpvId").is_none());
         assert!(!text.contains("media.example"));
         assert!(!text.contains("private"));
         assert!(!text.contains("token"));
+    }
+
+    #[test]
+    fn refreshed_metadata_preserves_active_playback_identity() {
+        let base_url = Url::parse("https://media.example").expect("base URL");
+        let mut current = playback_source(&base_url);
+        current.container = Some("strm".to_string());
+        current.bitrate = None;
+        let original_url = current.url.clone();
+        let original_media_source_id = current.media_source_id.clone();
+        let original_play_session_id = current.play_session_id.clone();
+
+        let mut refreshed = current.clone();
+        refreshed.url = Url::parse("https://cdn.example/video.mkv").expect("refreshed URL");
+        refreshed.media_source_id = Some("refreshed-source".to_string());
+        refreshed.play_session_id = Some("refreshed-session".to_string());
+        refreshed.container = Some("mkv".to_string());
+        refreshed.bitrate = Some(12_000_000);
+        refreshed.video = Some(jfn_mediastation::VideoStream {
+            dynamic_range: Some("HDR10".to_string()),
+            range_type: None,
+            codec: Some("hevc".to_string()),
+            profile: Some("Main 10".to_string()),
+            level: None,
+            width: Some(3840),
+            height: Some(2160),
+            frame_rate: Some(23.976),
+            color_space: None,
+            color_transfer: None,
+            color_range: None,
+            bit_depth: Some(10),
+            max_content_light_level: None,
+            max_frame_average_light_level: None,
+            dolby_vision_profile: None,
+            dolby_vision_level: None,
+            dolby_vision_base_layer_present: None,
+            dolby_vision_compatibility_id: None,
+        });
+        refreshed.audio_tracks.push(jfn_mediastation::AudioTrack {
+            key: "stream:1".to_string(),
+            stream_index: Some(1),
+            codec: Some("eac3".to_string()),
+            language: Some("zho".to_string()),
+            label: Some("5.1".to_string()),
+            channel_count: Some(6),
+        });
+        refreshed.default_audio_stream_index = Some(1);
+
+        assert!(playback_source_metadata_pending(&current));
+        merge_playback_source_metadata(&mut current, &refreshed);
+
+        assert!(!playback_source_metadata_pending(&current));
+        assert_eq!(current.url, original_url);
+        assert_eq!(current.media_source_id, original_media_source_id);
+        assert_eq!(current.play_session_id, original_play_session_id);
+        assert_eq!(current.container.as_deref(), Some("mkv"));
+        assert_eq!(current.bitrate, Some(12_000_000));
+        assert_eq!(current.audio_tracks.len(), 1);
+        assert_eq!(current.default_audio_stream_index, Some(1));
     }
 
     #[test]

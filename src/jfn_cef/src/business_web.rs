@@ -296,7 +296,7 @@ fn handle_player_load(args: &ListValue) {
         subtitle_style_override: false,
         subtitle_font_size: 0.0,
         subtitle_position: 100.0,
-        is_infinite_stream,
+        defer_audio_to_mpv: is_infinite_stream,
     };
     if let Err(error) = unsafe { jfn_mpv_load_file(url_c.as_ptr(), &opts) } {
         let error_message = error.to_string();

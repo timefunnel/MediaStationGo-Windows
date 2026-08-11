@@ -479,7 +479,8 @@ pub struct JfnMpvLoadOptions {
     pub subtitle_style_override: bool,
     pub subtitle_font_size: f64,
     pub subtitle_position: f64,
-    pub is_infinite_stream: bool,
+    /// Let mpv select the container's default audio track for this file.
+    pub defer_audio_to_mpv: bool,
 }
 
 #[derive(Debug)]
@@ -569,7 +570,7 @@ pub unsafe fn jfn_mpv_load_file(
     let video_filter = unsafe { cstr_to_string(o.video_filter) };
     let hwdec = unsafe { cstr_to_string(o.hwdec) };
     let defer_audio =
-        o.is_infinite_stream && o.audio_track == TRACK_DISABLE && ext_audio.is_empty();
+        should_defer_audio_to_mpv(o.defer_audio_to_mpv, o.audio_track, !ext_audio.is_empty());
 
     let mut load_options = vec![
         ("start".to_string(), o.start_secs.to_string()),
@@ -632,6 +633,10 @@ pub unsafe fn jfn_mpv_load_file(
     Ok(())
 }
 
+fn should_defer_audio_to_mpv(requested: bool, audio_track: i64, has_external_audio: bool) -> bool {
+    requested && audio_track == TRACK_DISABLE && !has_external_audio
+}
+
 pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     let snapshot = {
         let mut s = pending_slot().lock();
@@ -655,9 +660,9 @@ pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     let vid_s = track_to_mpv_str(vid);
     unsafe { set_str(c"vid", &vid_s) };
     if !defer_audio {
-        // Normal path: jellyfin-web is authoritative. Skipped only for
-        // the unprobed-live case (track-auto-selection=yes was set
-        // per-file in load_file so mpv's demuxer already picked).
+        // Normal path: the server catalog is authoritative. Skipped only
+        // when an unprobed source explicitly delegates the initial audio
+        // choice to mpv's demuxer for this file.
         let aid_s = track_to_mpv_str(aid);
         unsafe { set_str(c"aid", &aid_s) };
     }
@@ -748,7 +753,7 @@ pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::media_station_subtitle_options;
+    use super::{media_station_subtitle_options, should_defer_audio_to_mpv};
 
     #[test]
     fn media_station_subtitle_style_uses_vertical_position_not_layout_margin() {
@@ -757,5 +762,13 @@ mod tests {
         assert!(options.contains(&("sub-font-size".to_string(), "36".to_string())));
         assert!(options.contains(&("sub-pos".to_string(), "92".to_string())));
         assert!(!options.iter().any(|(name, _)| name == "sub-margin-y"));
+    }
+
+    #[test]
+    fn deferred_audio_requires_an_unselected_internal_track() {
+        assert!(should_defer_audio_to_mpv(true, 0, false));
+        assert!(!should_defer_audio_to_mpv(false, 0, false));
+        assert!(!should_defer_audio_to_mpv(true, 1, false));
+        assert!(!should_defer_audio_to_mpv(true, 0, true));
     }
 }
