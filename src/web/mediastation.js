@@ -970,11 +970,13 @@
     }
 
     function setCurrentView(view, pushHistory = true, capturedOverride) {
+        const previousView = currentView;
         const captured = capturedOverride === undefined ? captureView() : capturedOverride;
         if (pushHistory && captured) history.push(captured);
         currentView = { ...view, scrollTop: 0, rows: {}, focusKey: '' };
         content.scrollTop = 0;
         renderCurrentView(captured ? 'forward' : '');
+        refreshHomeAfterEntry(previousView);
     }
 
     function beginLoadingView(kind, captured, render) {
@@ -992,6 +994,7 @@
 
     function restoreLoadingSource(loadingView, captured) {
         if (currentView !== loadingView) return false;
+        const previousView = currentView;
         const previous = history.pop();
         if (previous) {
             currentView = previous;
@@ -1002,6 +1005,7 @@
             renderCurrentView('back');
             restoreViewState(captured);
         }
+        refreshHomeAfterEntry(previousView);
         return true;
     }
 
@@ -1161,6 +1165,7 @@
             closeDrawer();
             return;
         }
+        const previousView = currentView;
         const previous = history.pop();
         if (!previous) {
             if (currentView?.kind !== 'home' && homeData) setCurrentView({ kind: 'home', data: homeData }, false);
@@ -1169,6 +1174,7 @@
         currentView = previous;
         renderCurrentView('back');
         restoreViewState(previous);
+        refreshHomeAfterEntry(previousView);
     }
 
     function renderCurrentView(transition = '') {
@@ -1225,6 +1231,11 @@
         window.clearTimeout(homeRefreshTimer);
         homeRefreshTimer = 0;
         homeRefreshGeneration += 1;
+    }
+
+    function refreshHomeAfterEntry(previousView) {
+        if (!previousView || previousView.kind === 'home' || currentView?.kind !== 'home') return;
+        scheduleHomeRefresh(0);
     }
 
     async function loadHome(replaceHistory = false) {
