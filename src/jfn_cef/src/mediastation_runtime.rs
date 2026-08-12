@@ -41,7 +41,9 @@ use url::Url;
 use crate::APP_VERSION;
 use crate::client::{Inner, RendererValue, post_renderer_message};
 use crate::ipc::list_string;
-use crate::mediastation_cache::{HomeSnapshotCache, ImageDiskCache, image_cache_key};
+use crate::mediastation_cache::{
+    HomeSnapshotCache, ImageDiskCache, SeriesDetailSnapshotCache, image_cache_key,
+};
 use crate::mediastation_credentials::{
     CredentialError, SavedAccount, StoredSession, WindowsCredentialStore, account_credential_id,
 };
@@ -77,6 +79,7 @@ const MIN_SUBTITLE_POSITION: f64 = 70.0;
 const MAX_SUBTITLE_POSITION: f64 = 100.0;
 const SUBTITLE_CACHE_DIRECTORY: &str = "mediastation-subtitles";
 const HOME_CACHE_DIRECTORY: &str = "mediastation-home-v1";
+const SERIES_DETAIL_CACHE_DIRECTORY: &str = "mediastation-series-details-v1";
 const IMAGE_CACHE_DIRECTORY: &str = "mediastation-images-v1";
 const MAX_IMAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const SUBTITLE_FILE_PREFIX: &str = "subtitle-";
@@ -435,6 +438,7 @@ struct MediaStationRuntime {
     user_agent: String,
     reporter: PlaybackReportDispatcher,
     home_cache: HomeSnapshotCache,
+    series_detail_cache: Mutex<SeriesDetailSnapshotCache>,
     image_cache: Mutex<ImageDiskCache>,
     state: Mutex<RuntimeState>,
 }
@@ -611,6 +615,9 @@ impl MediaStationRuntime {
             user_agent,
             reporter,
             home_cache: HomeSnapshotCache::new(cache_root.join(HOME_CACHE_DIRECTORY)),
+            series_detail_cache: Mutex::new(SeriesDetailSnapshotCache::new(
+                cache_root.join(SERIES_DETAIL_CACHE_DIRECTORY),
+            )),
             image_cache: Mutex::new(ImageDiskCache::new(
                 cache_root.join(IMAGE_CACHE_DIRECTORY),
                 MAX_IMAGE_CACHE_BYTES,
@@ -1057,7 +1064,7 @@ impl MediaStationRuntime {
     }
 
     fn logout_persisted_session(&self) -> Result<bool, LoadFailure> {
-        let (deleted, stopped) = {
+        let (deleted, stopped, removed_session) = {
             let mut state = self.state.lock();
             let active_store = WindowsCredentialStore::active();
             let active_stored = active_store.load().map_err(|error| {
@@ -1121,15 +1128,26 @@ impl MediaStationRuntime {
             } else {
                 false
             };
+            let removed_session = state.session.clone();
             let stopped = take_stopped_report(&mut state);
             state.generation = state.generation.wrapping_add(1);
             state.session = None;
             state.session_profile = None;
             state.active_subtitle = None;
             state.active_interpolation = None;
-            (active_deleted || account_deleted, stopped)
+            (active_deleted || account_deleted, stopped, removed_session)
         };
         self.enqueue_report(stopped);
+        if let Some(session) = removed_session
+            && let Err(error) = self
+                .series_detail_cache
+                .lock()
+                .remove_account(&session.base_url, &session.user_id)
+        {
+            log_error(&format!(
+                "MediaStation series detail snapshot removal after logout failed: {error}"
+            ));
+        }
         Ok(deleted)
     }
 
@@ -1323,6 +1341,15 @@ impl MediaStationRuntime {
             )
         };
         self.enqueue_report(stopped);
+        if let Err(error) = self
+            .series_detail_cache
+            .lock()
+            .remove_account(&stored.base_url, &stored.user_id)
+        {
+            log_error(&format!(
+                "MediaStation series detail snapshot removal after account deletion failed: {error}"
+            ));
+        }
         Ok(payload)
     }
 
@@ -2730,6 +2757,7 @@ enum CatalogOperation {
     Items,
     Filters,
     Detail,
+    SeriesEpisodes,
     PersonItems,
     Search,
     CacheStats,
@@ -2743,6 +2771,7 @@ impl CatalogOperation {
             Self::Items => "items",
             Self::Filters => "filters",
             Self::Detail => "detail",
+            Self::SeriesEpisodes => "series_episodes",
             Self::PersonItems => "person_items",
             Self::Search => "search",
             Self::CacheStats => "cache_stats",
@@ -2791,6 +2820,7 @@ fn parse_catalog_request(
         "items" => CatalogOperation::Items,
         "filters" => CatalogOperation::Filters,
         "detail" => CatalogOperation::Detail,
+        "series_episodes" => CatalogOperation::SeriesEpisodes,
         "person_items" => CatalogOperation::PersonItems,
         "search" => CatalogOperation::Search,
         "cache_stats" => CatalogOperation::CacheStats,
@@ -3025,11 +3055,148 @@ fn execute_catalog_request(
         }
         CatalogOperation::Detail => {
             let media_id = required_param(&request.params, "mediaId")?;
-            detail_payload(
+            let refresh = bool_param(&request.params, "refresh", false)?;
+            if !refresh {
+                match runtime
+                    .series_detail_cache
+                    .lock()
+                    .load(&snapshot.session, &media_id)
+                {
+                    Ok(Some(cached)) => {
+                        log_debug(&format!(
+                            "MediaStation series detail snapshot hit: age_ms={}",
+                            unix_time_ms().saturating_sub(cached.saved_at_ms)
+                        ));
+                        runtime.ensure_generation(snapshot.generation)?;
+                        return Ok(with_series_detail_cache_status(
+                            cached.payload,
+                            "hit",
+                            Some(cached.saved_at_ms),
+                            false,
+                        ));
+                    }
+                    Ok(None) => log_debug("MediaStation series detail snapshot miss"),
+                    Err(error) => {
+                        log_error(&format!(
+                            "MediaStation series detail snapshot read failed: {error}"
+                        ));
+                        if let Err(remove_error) = runtime
+                            .series_detail_cache
+                            .lock()
+                            .remove(&snapshot.session, &media_id)
+                        {
+                            log_error(&format!(
+                                "MediaStation invalid series detail snapshot could not be removed: {remove_error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            let detail = detail_payload(
                 &runtime
                     .api
                     .load_media_detail(&snapshot.session, &media_id)
                     .map_err(|error| catalog_failure(request.operation, &error))?,
+            );
+            let cache_write_failed = if detail
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some("Series")
+            {
+                if let Err(error) = runtime.series_detail_cache.lock().store_detail(
+                    &snapshot.session,
+                    &media_id,
+                    &detail,
+                ) {
+                    log_error(&format!(
+                        "MediaStation series detail snapshot write failed: {error}"
+                    ));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            with_series_detail_cache_status(
+                detail,
+                if refresh { "refreshed" } else { "miss" },
+                None,
+                cache_write_failed,
+            )
+        }
+        CatalogOperation::SeriesEpisodes => {
+            let series_id = required_param(&request.params, "seriesId")?;
+            let season_id = optional_param(&request.params, "seasonId")?;
+            let refresh = bool_param(&request.params, "refresh", false)?;
+            if let Some(season_id) = season_id.as_deref()
+                && !refresh
+            {
+                match runtime.series_detail_cache.lock().load_season(
+                    &snapshot.session,
+                    &series_id,
+                    season_id,
+                ) {
+                    Ok(Some(cached)) => {
+                        log_debug(&format!(
+                            "MediaStation series season snapshot hit: age_ms={}",
+                            unix_time_ms().saturating_sub(cached.saved_at_ms)
+                        ));
+                        runtime.ensure_generation(snapshot.generation)?;
+                        return Ok(with_series_detail_cache_status(
+                            cached.payload,
+                            "hit",
+                            Some(cached.saved_at_ms),
+                            false,
+                        ));
+                    }
+                    Ok(None) => log_debug("MediaStation series season snapshot miss"),
+                    Err(error) => {
+                        log_error(&format!(
+                            "MediaStation series season snapshot read failed: {error}"
+                        ));
+                        if let Err(remove_error) = runtime
+                            .series_detail_cache
+                            .lock()
+                            .remove(&snapshot.session, &series_id)
+                        {
+                            log_error(&format!(
+                                "MediaStation invalid series season snapshot could not be removed: {remove_error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            let episodes = runtime
+                .api
+                .load_series_episodes(&snapshot.session, &series_id, season_id.as_deref())
+                .map_err(|error| catalog_failure(request.operation, &error))?;
+            let episodes_payload =
+                Value::Array(episodes.iter().map(media_card_payload).collect::<Vec<_>>());
+            let payload = json!({ "episodes": &episodes_payload });
+            let cache_write_failed = if let Some(season_id) = season_id.as_deref() {
+                if let Err(error) = runtime.series_detail_cache.lock().store_season(
+                    &snapshot.session,
+                    &series_id,
+                    season_id,
+                    &episodes_payload,
+                ) {
+                    log_error(&format!(
+                        "MediaStation series season snapshot write failed: {error}"
+                    ));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            with_series_detail_cache_status(
+                payload,
+                if refresh { "refreshed" } else { "miss" },
+                None,
+                cache_write_failed,
             )
         }
         CatalogOperation::PersonItems => {
@@ -3209,6 +3376,25 @@ fn with_home_cache_status(
     payload
 }
 
+fn with_series_detail_cache_status(
+    mut payload: Value,
+    status: &'static str,
+    saved_at_ms: Option<u64>,
+    write_failed: bool,
+) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "cache".to_string(),
+            json!({
+                "status": status,
+                "savedAtMs": saved_at_ms,
+                "writeFailed": write_failed,
+            }),
+        );
+    }
+    payload
+}
+
 fn image_cache_stats_payload(stats: crate::mediastation_cache::ImageCacheStats) -> Value {
     json!({
         "imageBytes": stats.bytes,
@@ -3274,6 +3460,14 @@ fn detail_payload(detail: &MediaDetail) -> Value {
     json!({
         "item": media_card_payload(&detail.item),
         "episodes": detail.episodes.iter().map(media_card_payload).collect::<Vec<_>>(),
+        "seasons": detail.seasons.iter().map(|season| json!({
+            "id": season.id,
+            "title": season.title,
+            "indexNumber": season.index_number,
+            "episodeCount": season.episode_count,
+        })).collect::<Vec<_>>(),
+        "seasonCount": detail.season_count,
+        "episodeCount": detail.episode_count,
         "people": detail.people.iter().map(|person| json!({
             "id": person.id,
             "name": person.name,
@@ -7051,6 +7245,8 @@ mod tests {
             played: false,
             index_number: None,
             parent_index_number: None,
+            child_count: None,
+            recursive_item_count: None,
             parent_id: None,
             season_id: None,
             series_id: None,

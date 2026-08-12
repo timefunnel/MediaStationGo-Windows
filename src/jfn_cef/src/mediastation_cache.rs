@@ -7,10 +7,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
+use url::Url;
 
 const HOME_SCHEMA_VERSION: u64 = 1;
+const SERIES_DETAIL_SCHEMA_VERSION: u64 = 1;
 const IMAGE_SCHEMA_VERSION: u64 = 1;
 const MAX_HOME_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SERIES_DETAIL_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SERIES_DETAIL_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMAGE_METADATA_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug)]
@@ -139,6 +143,367 @@ impl HomeSnapshotCache {
             Err(error) => Err(CacheError::io("home_snapshot_remove", &error)),
         }
     }
+}
+
+pub(crate) struct SeriesDetailSnapshot {
+    pub(crate) saved_at_ms: u64,
+    pub(crate) payload: Value,
+}
+
+pub(crate) struct SeriesDetailSnapshotCache {
+    root: PathBuf,
+    maximum_bytes: u64,
+}
+
+impl SeriesDetailSnapshotCache {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            maximum_bytes: MAX_SERIES_DETAIL_CACHE_BYTES,
+        }
+    }
+
+    pub(crate) fn load(
+        &self,
+        session: &MediaStationSession,
+        series_id: &str,
+    ) -> Result<Option<SeriesDetailSnapshot>, CacheError> {
+        let account_key = account_cache_key(session);
+        let Some(entry) = self.read_entry(&account_key, series_id)? else {
+            return Ok(None);
+        };
+        let mut payload = entry.detail;
+        let object = payload.as_object_mut().ok_or_else(|| {
+            CacheError::invalid("series_detail_snapshot_decode", "detail is not an object")
+        })?;
+        object.insert(
+            "episodesBySeason".to_string(),
+            Value::Object(entry.episodes_by_season),
+        );
+        Ok(Some(SeriesDetailSnapshot {
+            saved_at_ms: entry.saved_at_ms,
+            payload,
+        }))
+    }
+
+    pub(crate) fn load_season(
+        &self,
+        session: &MediaStationSession,
+        series_id: &str,
+        season_id: &str,
+    ) -> Result<Option<SeriesDetailSnapshot>, CacheError> {
+        let account_key = account_cache_key(session);
+        let Some(entry) = self.read_entry(&account_key, series_id)? else {
+            return Ok(None);
+        };
+        let Some(episodes) = entry.episodes_by_season.get(season_id) else {
+            return Ok(None);
+        };
+        Ok(Some(SeriesDetailSnapshot {
+            saved_at_ms: entry.saved_at_ms,
+            payload: json!({ "episodes": episodes }),
+        }))
+    }
+
+    pub(crate) fn store_detail(
+        &self,
+        session: &MediaStationSession,
+        series_id: &str,
+        detail: &Value,
+    ) -> Result<(), CacheError> {
+        validate_series_detail_payload(detail, series_id)?;
+        let account_key = account_cache_key(session);
+        let episodes_by_season = self
+            .read_entry(&account_key, series_id)?
+            .map_or_else(serde_json::Map::new, |entry| entry.episodes_by_season);
+        self.write_entry(
+            &account_key,
+            series_id,
+            &SeriesDetailEntry {
+                saved_at_ms: now_ms(),
+                detail: detail.clone(),
+                episodes_by_season,
+            },
+        )?;
+        self.prune()
+    }
+
+    pub(crate) fn store_season(
+        &self,
+        session: &MediaStationSession,
+        series_id: &str,
+        season_id: &str,
+        episodes: &Value,
+    ) -> Result<(), CacheError> {
+        if !episodes.is_array() {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_write",
+                "episodes are not an array",
+            ));
+        }
+        let account_key = account_cache_key(session);
+        let Some(mut entry) = self.read_entry(&account_key, series_id)? else {
+            return Ok(());
+        };
+        entry.saved_at_ms = now_ms();
+        entry
+            .episodes_by_season
+            .insert(season_id.to_string(), episodes.clone());
+        self.write_entry(&account_key, series_id, &entry)?;
+        self.prune()
+    }
+
+    pub(crate) fn remove(
+        &self,
+        session: &MediaStationSession,
+        series_id: &str,
+    ) -> Result<(), CacheError> {
+        remove_file_if_present(
+            &self.path(&account_cache_key(session), series_id),
+            "series_detail_snapshot_remove",
+        )
+    }
+
+    pub(crate) fn remove_account(&self, base_url: &Url, user_id: &str) -> Result<(), CacheError> {
+        let account_key = account_cache_key_for_identity(base_url, user_id);
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(CacheError::io(
+                    "series_detail_snapshot_remove_account",
+                    &error,
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| CacheError::io("series_detail_snapshot_remove_account", &error))?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| CacheError::io("series_detail_snapshot_remove_account", &error))?;
+            if metadata.len() > MAX_SERIES_DETAIL_SNAPSHOT_BYTES {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| CacheError::io("series_detail_snapshot_remove_account", &error))?;
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if value.get("accountKey").and_then(Value::as_str) == Some(account_key.as_str()) {
+                remove_file_if_present(&path, "series_detail_snapshot_remove_account")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_entry(
+        &self,
+        account_key: &str,
+        series_id: &str,
+    ) -> Result<Option<SeriesDetailEntry>, CacheError> {
+        let path = self.path(account_key, series_id);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CacheError::io("series_detail_snapshot_metadata", &error));
+            }
+        };
+        if metadata.len() > MAX_SERIES_DETAIL_SNAPSHOT_BYTES {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_read",
+                "snapshot exceeds size limit",
+            ));
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| CacheError::io("series_detail_snapshot_read", &error))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| CacheError::invalid("series_detail_snapshot_decode", "invalid JSON"))?;
+        let object = value.as_object().ok_or_else(|| {
+            CacheError::invalid("series_detail_snapshot_decode", "root is not an object")
+        })?;
+        if object.get("schemaVersion").and_then(Value::as_u64) != Some(SERIES_DETAIL_SCHEMA_VERSION)
+        {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_decode",
+                "unsupported schema version",
+            ));
+        }
+        if object.get("accountKey").and_then(Value::as_str) != Some(account_key) {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_decode",
+                "account key mismatch",
+            ));
+        }
+        if object.get("seriesId").and_then(Value::as_str) != Some(series_id) {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_decode",
+                "series identifier mismatch",
+            ));
+        }
+        let saved_at_ms = object
+            .get("savedAtMs")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                CacheError::invalid("series_detail_snapshot_decode", "missing savedAtMs")
+            })?;
+        let detail = object
+            .get("detail")
+            .filter(|detail| detail.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                CacheError::invalid("series_detail_snapshot_decode", "missing detail")
+            })?;
+        validate_series_detail_payload(&detail, series_id)?;
+        let episodes_by_season = object
+            .get("episodesBySeason")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| {
+                CacheError::invalid("series_detail_snapshot_decode", "missing episodesBySeason")
+            })?;
+        if episodes_by_season
+            .values()
+            .any(|episodes| !episodes.is_array())
+        {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_decode",
+                "episodesBySeason contains a non-array value",
+            ));
+        }
+        Ok(Some(SeriesDetailEntry {
+            saved_at_ms,
+            detail,
+            episodes_by_season,
+        }))
+    }
+
+    fn write_entry(
+        &self,
+        account_key: &str,
+        series_id: &str,
+        entry: &SeriesDetailEntry,
+    ) -> Result<(), CacheError> {
+        let value = json!({
+            "schemaVersion": SERIES_DETAIL_SCHEMA_VERSION,
+            "accountKey": account_key,
+            "seriesId": series_id,
+            "savedAtMs": entry.saved_at_ms,
+            "detail": entry.detail,
+            "episodesBySeason": entry.episodes_by_season,
+        });
+        let bytes = serde_json::to_vec(&value).map_err(|_| {
+            CacheError::invalid("series_detail_snapshot_encode", "serialization failed")
+        })?;
+        if bytes.len() as u64 > MAX_SERIES_DETAIL_SNAPSHOT_BYTES {
+            return Err(CacheError::invalid(
+                "series_detail_snapshot_write",
+                "snapshot exceeds size limit",
+            ));
+        }
+        write_atomic(&self.root, &self.file_name(account_key, series_id), &bytes)
+    }
+
+    fn prune(&self) -> Result<(), CacheError> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(CacheError::io("series_detail_snapshot_prune", &error)),
+        };
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0_u64;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| CacheError::io("series_detail_snapshot_prune", &error))?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| CacheError::io("series_detail_snapshot_prune", &error))?;
+            if metadata.len() > MAX_SERIES_DETAIL_SNAPSHOT_BYTES {
+                remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+                continue;
+            }
+            let bytes = match read_limited(
+                &path,
+                MAX_SERIES_DETAIL_SNAPSHOT_BYTES,
+                "series_detail_snapshot_prune",
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+                    continue;
+                }
+            };
+            let value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => {
+                    remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+                    continue;
+                }
+            };
+            let Some(object) = value.as_object() else {
+                remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+                continue;
+            };
+            let Some(saved_at_ms) = object.get("savedAtMs").and_then(Value::as_u64) else {
+                remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+                continue;
+            };
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            candidates.push((saved_at_ms, path, metadata.len()));
+        }
+        candidates.sort_by_key(|(saved_at_ms, _, _)| *saved_at_ms);
+        for (_, path, byte_count) in candidates {
+            if total_bytes <= self.maximum_bytes {
+                break;
+            }
+            remove_file_if_present(&path, "series_detail_snapshot_prune")?;
+            total_bytes = total_bytes.saturating_sub(byte_count);
+        }
+        Ok(())
+    }
+
+    fn path(&self, account_key: &str, series_id: &str) -> PathBuf {
+        self.root.join(self.file_name(account_key, series_id))
+    }
+
+    fn file_name(&self, account_key: &str, series_id: &str) -> String {
+        hex_sha256(format!("{account_key}\n{series_id}").as_bytes()) + ".json"
+    }
+}
+
+struct SeriesDetailEntry {
+    saved_at_ms: u64,
+    detail: Value,
+    episodes_by_season: serde_json::Map<String, Value>,
+}
+
+fn validate_series_detail_payload(detail: &Value, series_id: &str) -> Result<(), CacheError> {
+    let item = detail
+        .get("item")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CacheError::invalid("series_detail_snapshot_decode", "missing item"))?;
+    if item.get("id").and_then(Value::as_str) != Some(series_id) {
+        return Err(CacheError::invalid(
+            "series_detail_snapshot_decode",
+            "detail item identifier mismatch",
+        ));
+    }
+    if item.get("type").and_then(Value::as_str) != Some("Series") {
+        return Err(CacheError::invalid(
+            "series_detail_snapshot_decode",
+            "detail item is not a series",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -389,14 +754,11 @@ pub(crate) fn image_cache_key(
 }
 
 fn account_cache_key(session: &MediaStationSession) -> String {
-    hex_sha256(
-        format!(
-            "{}\n{}",
-            session.base_url.as_str().trim_end_matches('/'),
-            session.user_id
-        )
-        .as_bytes(),
-    )
+    account_cache_key_for_identity(&session.base_url, &session.user_id)
+}
+
+fn account_cache_key_for_identity(base_url: &Url, user_id: &str) -> String {
+    hex_sha256(format!("{}\n{}", base_url.as_str().trim_end_matches('/'), user_id).as_bytes())
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -489,6 +851,94 @@ mod tests {
                 .load(&second)
                 .expect("cache lookup should succeed")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn series_detail_snapshots_preserve_cached_seasons_and_isolate_accounts() {
+        let root = tempdir().expect("temporary directory should be created");
+        let cache = SeriesDetailSnapshotCache::new(root.path().to_path_buf());
+        let first = session("first-user");
+        let second = session("second-user");
+        let detail = json!({
+            "item": { "id": "series-1", "type": "Series", "title": "A series" },
+            "seasons": [{ "id": "season-1", "indexNumber": 1 }],
+        });
+        let first_season = json!([{ "id": "episode-1" }]);
+        let second_season = json!([{ "id": "episode-2" }]);
+
+        cache
+            .store_detail(&first, "series-1", &detail)
+            .expect("detail snapshot should be stored");
+        cache
+            .store_season(&first, "series-1", "season-1", &first_season)
+            .expect("first season snapshot should be stored");
+        cache
+            .store_season(&first, "series-1", "season-2", &second_season)
+            .expect("second season snapshot should be stored");
+
+        let loaded = cache
+            .load(&first, "series-1")
+            .expect("snapshot lookup should succeed")
+            .expect("snapshot should exist");
+        assert_eq!(loaded.payload["item"]["id"], "series-1");
+        assert_eq!(loaded.payload["episodesBySeason"]["season-1"], first_season);
+        assert_eq!(
+            loaded.payload["episodesBySeason"]["season-2"],
+            second_season
+        );
+        assert!(
+            cache
+                .load(&second, "series-1")
+                .expect("other account lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn series_detail_snapshots_remove_only_the_selected_account() {
+        let root = tempdir().expect("temporary directory should be created");
+        let cache = SeriesDetailSnapshotCache::new(root.path().to_path_buf());
+        let first = session("first-user");
+        let second = session("second-user");
+        let detail = |series_id| {
+            json!({
+                "item": { "id": series_id, "type": "Series", "title": "A series" },
+                "seasons": [],
+            })
+        };
+
+        cache
+            .store_detail(&first, "series-1", &detail("series-1"))
+            .expect("first account series should be stored");
+        cache
+            .store_detail(&first, "series-2", &detail("series-2"))
+            .expect("second first-account series should be stored");
+        cache
+            .store_detail(&second, "series-1", &detail("series-1"))
+            .expect("second account series should be stored");
+
+        cache
+            .remove_account(&first.base_url, &first.user_id)
+            .expect("first account snapshots should be removed");
+
+        assert!(
+            cache
+                .load(&first, "series-1")
+                .expect("first account lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            cache
+                .load(&first, "series-2")
+                .expect("first account lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            cache
+                .load(&second, "series-1")
+                .expect("second account lookup should succeed")
+                .is_some()
         );
     }
 

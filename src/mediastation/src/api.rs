@@ -15,8 +15,10 @@ const HEADER_CONTENT_TYPE: &str = "content-type";
 const HEADER_LOCATION: &str = "location";
 const HEADER_USER_AGENT: &str = "user-agent";
 const MAX_EXTERNAL_RESOURCE_REDIRECTS: usize = 6;
-const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,People,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber";
+const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,People,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
+const BROWSE_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
 const MAX_CATALOG_PAGE_SIZE: usize = 100;
+const DETAIL_EPISODE_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 const MAX_PROTOCOL_EXTENSIONS: usize = 64;
 const PLAYBACK_PREFERENCES_EXTENSION_ID: &str = "playback-preferences";
@@ -308,6 +310,8 @@ pub struct MediaCard {
     pub played: bool,
     pub index_number: Option<i64>,
     pub parent_index_number: Option<i64>,
+    pub child_count: Option<usize>,
+    pub recursive_item_count: Option<usize>,
     pub parent_id: Option<String>,
     pub season_id: Option<String>,
     pub series_id: Option<String>,
@@ -360,7 +364,18 @@ pub struct MediaPage {
 pub struct MediaDetail {
     pub item: MediaCard,
     pub episodes: Vec<MediaCard>,
+    pub seasons: Vec<MediaSeason>,
+    pub season_count: usize,
+    pub episode_count: Option<usize>,
     pub people: Vec<MediaPerson>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSeason {
+    pub id: String,
+    pub title: String,
+    pub index_number: i64,
+    pub episode_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -842,26 +857,222 @@ impl MediaStationApiClient {
         let detail_payload = self.get_json(session, &url)?;
         let item = parse_media_card(&detail_payload)?;
         let people = parse_media_people(&detail_payload)?;
-        let mut episodes = if item.media_type == "Series" {
+        let seasons = if item.media_type == "Series" {
+            self.load_series_seasons(session, media_id)?
+        } else {
+            Vec::new()
+        };
+        let season_count = seasons
+            .iter()
+            .filter(|season| season.index_number > 0)
+            .count();
+        let episode_count = item.recursive_item_count.or_else(|| {
+            seasons
+                .iter()
+                .map(|season| season.episode_count)
+                .collect::<Option<Vec<_>>>()
+                .map(|counts| counts.into_iter().sum())
+        });
+        Ok(MediaDetail {
+            item,
+            episodes: Vec::new(),
+            seasons,
+            season_count,
+            episode_count,
+            people,
+        })
+    }
+
+    pub fn load_series_episodes(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+        season_id: Option<&str>,
+    ) -> Result<Vec<MediaCard>, ApiError> {
+        validate_identifier("media_id", media_id)?;
+        if let Some(season_id) = season_id {
+            validate_identifier("season_id", season_id)?;
+        }
+        let mut episodes = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut expected_total = None;
+
+        loop {
+            let start_index = episodes.len();
+            let limit = DETAIL_EPISODE_PAGE_SIZE.min(MAX_DETAIL_EPISODES - start_index);
             let mut episodes_url = series_episodes_endpoint(session, media_id)?;
             let mut episodes_query = episodes_url.query_pairs_mut();
             episodes_query
                 .append_pair("UserId", &session.user_id)
-                .append_pair("Limit", &MAX_DETAIL_EPISODES.to_string())
+                .append_pair("StartIndex", &start_index.to_string())
+                .append_pair("Limit", &limit.to_string())
                 .append_pair("SortBy", "ParentIndexNumber,IndexNumber,SortName")
                 .append_pair("SortOrder", "Ascending")
-                .append_pair("Fields", CATALOG_FIELDS);
+                .append_pair("Fields", BROWSE_FIELDS);
+            if let Some(season_id) = season_id {
+                episodes_query.append_pair("SeasonId", season_id);
+            }
             drop(episodes_query);
-            parse_media_cards(&self.get_json(session, &episodes_url)?)?
-        } else {
-            Vec::new()
-        };
-        inherit_episode_landscape_images(&item, &mut episodes);
-        Ok(MediaDetail {
-            item,
-            episodes,
-            people,
-        })
+
+            let payload = self.get_json(session, &episodes_url)?;
+            if payload
+                .get("TotalRecordCount")
+                .and_then(Value::as_u64)
+                .is_none()
+            {
+                return Err(ApiError::MissingField {
+                    field: "TotalRecordCount",
+                });
+            }
+            let page = parse_media_page(&payload, start_index)?;
+            if page.total_record_count > MAX_DETAIL_EPISODES {
+                return Err(ApiError::InvalidInput {
+                    field: "series_episodes",
+                    reason: format!(
+                        "server reported {} episodes, exceeding the supported maximum of {MAX_DETAIL_EPISODES}",
+                        page.total_record_count
+                    ),
+                });
+            }
+            if let Some(total) = expected_total {
+                if total != page.total_record_count {
+                    return Err(ApiError::InvalidInput {
+                        field: "series_episodes",
+                        reason: "server episode count changed during pagination".to_string(),
+                    });
+                }
+            } else {
+                expected_total = Some(page.total_record_count);
+            }
+
+            if page.items.is_empty() {
+                if start_index == page.total_record_count {
+                    break;
+                }
+                return Err(ApiError::InvalidInput {
+                    field: "series_episodes",
+                    reason: "server returned an empty page before all episodes were loaded"
+                        .to_string(),
+                });
+            }
+            for episode in page.items {
+                if !seen_ids.insert(episode.id.clone()) {
+                    return Err(ApiError::InvalidInput {
+                        field: "series_episodes",
+                        reason: "server returned a duplicate episode across pages".to_string(),
+                    });
+                }
+                episodes.push(episode);
+            }
+            if episodes.len() > page.total_record_count {
+                return Err(ApiError::InvalidInput {
+                    field: "series_episodes",
+                    reason: "server returned more episodes than its reported total".to_string(),
+                });
+            }
+            if episodes.len() == page.total_record_count {
+                break;
+            }
+        }
+
+        Ok(episodes)
+    }
+
+    fn load_series_seasons(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+    ) -> Result<Vec<MediaSeason>, ApiError> {
+        let mut seasons = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut expected_total = None;
+
+        loop {
+            let start_index = seasons.len();
+            let mut seasons_url = series_seasons_endpoint(session, media_id)?;
+            let mut seasons_query = seasons_url.query_pairs_mut();
+            seasons_query
+                .append_pair("UserId", &session.user_id)
+                .append_pair("StartIndex", &start_index.to_string())
+                .append_pair("Limit", &DETAIL_EPISODE_PAGE_SIZE.to_string())
+                .append_pair("SortBy", "IndexNumber,SortName")
+                .append_pair("SortOrder", "Ascending")
+                .append_pair("Fields", BROWSE_FIELDS);
+            drop(seasons_query);
+
+            let payload = self.get_json(session, &seasons_url)?;
+            if payload
+                .get("TotalRecordCount")
+                .and_then(Value::as_u64)
+                .is_none()
+            {
+                return Err(ApiError::MissingField {
+                    field: "TotalRecordCount",
+                });
+            }
+            let page = parse_media_page(&payload, start_index)?;
+            if page.total_record_count > MAX_DETAIL_EPISODES {
+                return Err(ApiError::InvalidInput {
+                    field: "series_seasons",
+                    reason: format!(
+                        "server reported {} seasons, exceeding the supported maximum of {MAX_DETAIL_EPISODES}",
+                        page.total_record_count
+                    ),
+                });
+            }
+            if let Some(total) = expected_total {
+                if total != page.total_record_count {
+                    return Err(ApiError::InvalidInput {
+                        field: "series_seasons",
+                        reason: "server season count changed during pagination".to_string(),
+                    });
+                }
+            } else {
+                expected_total = Some(page.total_record_count);
+            }
+
+            if page.items.is_empty() {
+                if start_index == page.total_record_count {
+                    break;
+                }
+                return Err(ApiError::InvalidInput {
+                    field: "series_seasons",
+                    reason: "server returned an empty page before all seasons were loaded"
+                        .to_string(),
+                });
+            }
+            for season in page.items {
+                if season.media_type != "Season" {
+                    return Err(ApiError::InvalidInput {
+                        field: "series_seasons",
+                        reason: "server returned a non-season item".to_string(),
+                    });
+                }
+                if !seen_ids.insert(season.id.clone()) {
+                    return Err(ApiError::InvalidInput {
+                        field: "series_seasons",
+                        reason: "server returned a duplicate season across pages".to_string(),
+                    });
+                }
+                seasons.push(MediaSeason {
+                    id: season.id,
+                    title: season.title,
+                    index_number: season.index_number.unwrap_or(0),
+                    episode_count: season.child_count,
+                });
+            }
+            if seasons.len() > page.total_record_count {
+                return Err(ApiError::InvalidInput {
+                    field: "series_seasons",
+                    reason: "server returned more seasons than its reported total".to_string(),
+                });
+            }
+            if seasons.len() == page.total_record_count {
+                break;
+            }
+        }
+
+        Ok(seasons)
     }
 
     pub fn download_media_image(
@@ -1336,6 +1547,7 @@ fn build_api_agent(proxy: Option<ureq::Proxy>) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
+#[cfg(test)]
 fn inherit_episode_landscape_images(series: &MediaCard, episodes: &mut [MediaCard]) {
     let Some(fallback) = series
         .backdrop_image
@@ -1685,6 +1897,14 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
             .unwrap_or(false),
         index_number: item.get("IndexNumber").and_then(Value::as_i64),
         parent_index_number: item.get("ParentIndexNumber").and_then(Value::as_i64),
+        child_count: item
+            .get("ChildCount")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        recursive_item_count: item
+            .get("RecursiveItemCount")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
         parent_id: optional_string(item.get("ParentId")),
         season_id: optional_string(item.get("SeasonId")),
         series_id: optional_string(item.get("SeriesId")),
@@ -2285,6 +2505,13 @@ fn series_episodes_endpoint(
     endpoint(&session.base_url, &["Shows", series_id, "Episodes"])
 }
 
+fn series_seasons_endpoint(
+    session: &MediaStationSession,
+    series_id: &str,
+) -> Result<Url, ApiError> {
+    endpoint(&session.base_url, &["Shows", series_id, "Seasons"])
+}
+
 fn resolve_server_url(base_url: &Url, raw: &str) -> Result<Url, ApiError> {
     if let Ok(absolute) = Url::parse(raw) {
         return Ok(absolute);
@@ -2508,6 +2735,40 @@ mod tests {
         )
     }
 
+    fn serve_sequence(responses: Vec<String>) -> (Url, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("address should resolve");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should be writable");
+                requests.push(String::from_utf8(request).expect("request should be UTF-8"));
+            }
+            requests
+        });
+        (
+            Url::parse(&format!("http://{address}")).expect("URL should parse"),
+            handle,
+        )
+    }
+
     #[test]
     fn authenticate_posts_credentials_without_exposing_the_token() {
         let body = json!({
@@ -2659,6 +2920,18 @@ mod tests {
                 .expect("SenPlayer episodes endpoint should build")
                 .path(),
             "/emby/Shows/series-1/Episodes"
+        );
+        assert_eq!(
+            series_seasons_endpoint(&default, "series-1")
+                .expect("default seasons endpoint should build")
+                .path(),
+            "/emby/Shows/series-1/Seasons"
+        );
+        assert_eq!(
+            series_seasons_endpoint(&senplayer, "series-1")
+                .expect("SenPlayer seasons endpoint should build")
+                .path(),
+            "/emby/Shows/series-1/Seasons"
         );
     }
 
@@ -2842,6 +3115,98 @@ mod tests {
         inherit_episode_landscape_images(&series, &mut episodes);
 
         assert_eq!(episodes[0].landscape_image, series.primary_image);
+    }
+
+    #[test]
+    fn series_detail_loads_season_directory_without_blocking_on_episodes() {
+        let response = |payload: Value| {
+            let body = payload.to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let detail_response = response(json!({
+            "Id": "series-1",
+            "Name": "Long Series",
+            "Type": "Series",
+            "RecursiveItemCount": 3
+        }));
+        let seasons_response = response(json!({
+            "StartIndex": 0,
+            "TotalRecordCount": 2,
+            "Items": [
+                { "Id": "season-1", "Name": "Season 1", "Type": "Season", "IndexNumber": 1, "ChildCount": 2 },
+                { "Id": "season-2", "Name": "Season 2", "Type": "Season", "IndexNumber": 2, "ChildCount": 1 }
+            ]
+        }));
+        let (base_url, server) = serve_sequence(vec![detail_response, seasons_response]);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let detail = client
+            .load_media_detail(&session(base_url), "series-1")
+            .expect("detail and season directory should load");
+        let requests = server.join().expect("server thread should finish");
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(detail.episode_count, Some(3));
+        assert_eq!(detail.season_count, 2);
+        assert!(detail.episodes.is_empty());
+        assert_eq!(detail.seasons.len(), 2);
+        assert_eq!(detail.seasons[0].episode_count, Some(2));
+        assert_eq!(detail.seasons[1].episode_count, Some(1));
+        assert!(requests[0].starts_with("GET /Users/user-1/Items/series-1?"));
+        assert!(requests[1].starts_with("GET /Shows/series-1/Seasons?"));
+        assert!(!requests.iter().any(|request| request.contains("/Episodes")));
+    }
+
+    #[test]
+    fn series_episode_load_can_target_one_season_or_the_complete_series() {
+        let response = |payload: Value| {
+            let body = payload.to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let first = response(json!({
+            "StartIndex": 0,
+            "TotalRecordCount": 1,
+            "Items": [{ "Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "ParentIndexNumber": 1, "IndexNumber": 1 }]
+        }));
+        let second = response(json!({
+            "StartIndex": 0,
+            "TotalRecordCount": 2,
+            "Items": [
+                { "Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "ParentIndexNumber": 1, "IndexNumber": 1 },
+                { "Id": "episode-2", "Name": "Episode 1", "Type": "Episode", "ParentIndexNumber": 2, "IndexNumber": 1 }
+            ]
+        }));
+        let (base_url, server) = serve_sequence(vec![first, second]);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+        let session = session(base_url);
+
+        let season = client
+            .load_series_episodes(&session, "series-1", Some("season-1"))
+            .expect("selected season should load");
+        let all = client
+            .load_series_episodes(&session, "series-1", None)
+            .expect("complete series should load");
+        let requests = server.join().expect("server thread should finish");
+
+        assert_eq!(season.len(), 1);
+        assert_eq!(all.len(), 2);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("SeasonId=season-1"));
+        assert!(!requests[1].contains("SeasonId="));
+        for request in requests {
+            assert!(request.contains("StartIndex=0"));
+            assert!(request.contains("Limit=100"));
+            assert!(request.contains("Fields="));
+            assert!(!request.contains("MediaSources"));
+        }
     }
 
     #[test]

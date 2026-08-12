@@ -19,6 +19,8 @@
     const imagePending = new Map();
     const imageQueue = [];
     const libraryCache = new Map();
+    const seriesDetailCache = new Map();
+    const detailRefreshRequests = new Set();
     const scrollMotions = new WeakMap();
     const history = [];
     const homeRefreshDelayMs = 1200;
@@ -26,6 +28,8 @@
     const heroCarouselMaxCards = 20;
     const libraryPageSize = 48;
     const maximumLibraryCacheEntries = 12;
+    const maximumSeriesDetailCacheEntries = 12;
+    const detailRefreshDelayMs = 1200;
     const playerPlaybackSettingsKey = 'MediaStationGo.Windows.playbackSettingsByMedia.v2';
     const legacyPlayerPlaybackSettingsKey = 'MediaStationGo.Windows.playbackSettingsByMedia.v1';
     const defaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v2';
@@ -844,6 +848,7 @@
         imageCache.clear();
         imagePending.clear();
         libraryCache.clear();
+        seriesDetailCache.clear();
         libraryPageObserver.disconnect();
         personPageObserver.disconnect();
         while (imageQueue.length) {
@@ -1550,7 +1555,7 @@
         return button;
     }
 
-    function createRowCarousel(row, title, controlsHost = null) {
+    function createRowCarousel(row, title, controlsHost = null, options = {}) {
         row.classList.add('carousel-row');
         const rowShell = element('div', 'media-row-carousel');
         if (row.classList.contains('episode-row')) rowShell.classList.add('episode-row-carousel');
@@ -1576,6 +1581,9 @@
         let active = false;
         let pendingDirection = 0;
         let generation = 0;
+        let initialScrollTarget = options.initialScrollTarget || null;
+        let carouselReady = false;
+        let pendingSmoothRequest = null;
         const refreshControls = () => {
             const atStart = maximumPage < 1 || pageIndex <= 0;
             const atEnd = maximumPage < 1 || pageIndex >= maximumPage;
@@ -1639,9 +1647,20 @@
             row.style.setProperty('--row-end-alignment', `${alignment}px`);
             const art = row.querySelector('.card-art');
             if (art) rowShell.style.setProperty('--row-button-center', `${art.getBoundingClientRect().height / 2}px`);
-            pageIndex = clamp(previousIndex, 0, maximumPage);
-            row.scrollLeft = pageIndex * pageDistance;
+            const requestedInitialPosition = initialScrollTarget?.();
+            initialScrollTarget = null;
+            if (Number.isFinite(requestedInitialPosition)) {
+                row.scrollLeft = clamp(requestedInitialPosition, 0, limit);
+                pageIndex = clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage);
+            } else {
+                pageIndex = clamp(previousIndex, 0, maximumPage);
+                row.scrollLeft = pageIndex * pageDistance;
+            }
             refreshControls();
+            carouselReady = true;
+            const pending = pendingSmoothRequest;
+            pendingSmoothRequest = null;
+            if (pending) startSmoothCarouselTo(pending.getPosition()).then(pending.resolve);
         };
         let refreshFrame = 0;
         row.addEventListener('scroll', () => {
@@ -1690,6 +1709,48 @@
         previous.addEventListener('click', () => moveToPage(pageIndex - 1));
         next.addEventListener('click', () => moveToPage(pageIndex + 1));
         row._refreshCarousel = alignEndToPage;
+        row._jumpCarouselTo = (requestedPosition) => {
+            generation += 1;
+            active = false;
+            pendingDirection = 0;
+            stopSmoothScroll(row);
+            row.scrollLeft = clamp(requestedPosition, 0, scrollLimit(row, 'x'));
+            pageIndex = pageDistance > 0
+                ? clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage)
+                : 0;
+            refreshControls();
+        };
+        const startSmoothCarouselTo = (requestedPosition) => {
+            const token = ++generation;
+            active = true;
+            pendingDirection = 0;
+            const target = clamp(requestedPosition, 0, scrollLimit(row, 'x'));
+            pageIndex = pageDistance > 0
+                ? clamp(Math.round(target / pageDistance), 0, maximumPage)
+                : 0;
+            refreshControls();
+            return smoothScrollTo(row, { left: target }, horizontalScrollDurationMs).then((completed) => {
+                if (token !== generation) return false;
+                active = false;
+                if (completed) {
+                    pageIndex = pageDistance > 0
+                        ? clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage)
+                        : 0;
+                }
+                refreshControls();
+                return completed;
+            });
+        };
+        row._smoothCarouselTo = (requestedPosition) => {
+            const getPosition = typeof requestedPosition === 'function'
+                ? requestedPosition
+                : () => requestedPosition;
+            if (carouselReady) return startSmoothCarouselTo(getPosition());
+            return new Promise((resolve) => {
+                if (pendingSmoothRequest) pendingSmoothRequest.resolve(false);
+                pendingSmoothRequest = { getPosition, resolve };
+            });
+        };
         row._revealCarouselNode = (node) => {
             const cards = [...row.querySelectorAll('.media-card')];
             const cardIndex = cards.indexOf(node.closest('.media-card'));
@@ -2546,6 +2607,70 @@
         }
     }
 
+    function seriesDetailCacheKey(seriesId) {
+        return [session?.baseUrl || '', session?.userId || '', seriesId].join('\n');
+    }
+
+    function getSeriesDetailCache(card) {
+        if (card?.type !== 'Series' || !card.id) return null;
+        const key = seriesDetailCacheKey(card.id);
+        const cached = seriesDetailCache.get(key);
+        if (!cached) return null;
+        seriesDetailCache.delete(key);
+        seriesDetailCache.set(key, cached);
+        return cached;
+    }
+
+    function putSeriesDetailCache(detail) {
+        if (detail?.item?.type !== 'Series' || !detail.item.id) return;
+        const key = seriesDetailCacheKey(detail.item.id);
+        seriesDetailCache.delete(key);
+        seriesDetailCache.set(key, detail);
+        while (seriesDetailCache.size > maximumSeriesDetailCacheEntries) {
+            seriesDetailCache.delete(seriesDetailCache.keys().next().value);
+        }
+    }
+
+    function normalizeSeasonEpisodes(detail, episodes) {
+        return Array.isArray(episodes)
+            ? episodes.map((episode) => ({
+                ...episode,
+                landscapeImage: episode.landscapeImage || detail.item.backdropImage || detail.item.landscapeImage || detail.item.primaryImage,
+            }))
+            : [];
+    }
+
+    function detailRefreshKey(detail) {
+        return [session?.baseUrl || '', session?.userId || '', detail?.item?.id || ''].join('\n');
+    }
+
+    function refreshSeriesDetailInBackground(detail) {
+        const seriesId = detail?.item?.id;
+        if (!seriesId) return;
+        const refreshKey = detailRefreshKey(detail);
+        if (detailRefreshRequests.has(refreshKey)) return;
+        detailRefreshRequests.add(refreshKey);
+        const expectedSession = session;
+        window.setTimeout(async () => {
+            try {
+                if (session !== expectedSession) return;
+                const refreshed = await nativeRequest('mediaStationCatalog', 'detail', [
+                    'detail', JSON.stringify({ mediaId: seriesId, refresh: true }),
+                ], 60000);
+                if (session !== expectedSession) return;
+                refreshed.episodesBySeason = detail.episodesBySeason || {};
+                refreshed.selectedSeasonId = detail.selectedSeasonId;
+                putSeriesDetailCache(refreshed);
+                if (currentView?.kind !== 'detail' || currentView.data !== detail) return;
+                applySeriesDetailRefresh(detail, refreshed);
+            } catch (error) {
+                console.error(`剧集详情后台刷新失败：${friendlyError(error)}`);
+            } finally {
+                detailRefreshRequests.delete(refreshKey);
+            }
+        }, detailRefreshDelayMs);
+    }
+
     function goHome() {
         if (!homeData) return;
         history.length = 0;
@@ -2558,12 +2683,20 @@
             return;
         }
         const captured = captureView();
+        const cached = getSeriesDetailCache(card);
+        if (cached) {
+            setCurrentView({ kind: 'detail', data: cached }, true, captured);
+            refreshSeriesDetailInBackground(cached);
+            return;
+        }
         const loadingView = beginLoadingView('detail-loading', captured, renderDetailLoading);
         try {
             const detail = await nativeRequest('mediaStationCatalog', 'detail', ['detail', JSON.stringify({ mediaId: card.id })]);
             if (currentView !== loadingView) return;
+            putSeriesDetailCache(detail);
             currentView = { kind: 'detail', data: detail, scrollTop: 0, rows: {}, focusKey: '' };
             renderCurrentView('forward');
+            if (detail.cache?.status === 'hit') refreshSeriesDetailInBackground(detail);
         } catch (error) {
             if (restoreLoadingSource(loadingView, captured)) showToast(friendlyError(error));
         }
@@ -2597,6 +2730,7 @@
         const card = detail.item;
         content.replaceChildren();
         const view = element('article', 'detail-view');
+        view.dataset.seriesId = card.type === 'Series' ? card.id : '';
         const backdrop = element('div', 'detail-backdrop');
         const backdropImage = element('span', 'detail-backdrop-image');
         backdrop.append(backdropImage);
@@ -2615,6 +2749,7 @@
         observeImage(posterImage, posterRef, imageWidthFor(posterRef, false));
         const copy = element('div', 'detail-copy');
         const title = element('h1', 'detail-title', card.title);
+        title.dataset.detailField = 'title';
         copy.append(title);
         if (card.logoImage) {
             const logo = document.createElement('img');
@@ -2639,44 +2774,27 @@
                 if (currentView?.data === detail) console.error(`Logo 加载失败：${friendlyError(error)}`);
             });
         }
-        const meta = element('div', 'hero-meta');
-        [card.year, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.dynamicRange]
-            .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
-        copy.append(meta);
+        copy.append(createDetailMeta(detail));
         if (card.overview) {
-            const overview = element('button', 'detail-overview overview-preview', card.overview);
-            overview.type = 'button';
-            overview.title = '查看完整简介';
-            overview.dataset.focusKey = `overview:${card.id}`;
-            overview.addEventListener('click', () => openOverview(card, overview));
-            copy.append(overview);
+            copy.append(createDetailOverview(detail));
         }
         const actions = element('div', 'detail-actions');
+        if (card.type === 'Series') actions.dataset.seriesId = card.id;
         const resumableEpisode = detail.episodes?.find((episode) => episode.resumePositionMs > 0);
         const playTarget = card.playable ? card : (resumableEpisode || detail.episodes?.[0]);
-        if (playTarget?.playable) {
-            const play = element('button', 'primary-command');
-            play.type = 'button';
-            play.dataset.focusKey = `play:${playTarget.id}`;
-            const position = playTarget.resumePositionMs ? ` ${formatTime(playTarget.resumePositionMs)}` : '';
-            const label = playTarget.type === 'Episode'
-                ? `播放 ${episodePosition(playTarget).replace(' · ', '')}${position}`
-                : (playTarget.resumePositionMs ? `继续播放${position}` : '开始播放');
-            play.append(element('span', '', '▶'), element('span', '', label));
-            play.addEventListener('click', () => startPlayback(playTarget, playTarget.resumePositionMs));
-            actions.append(play);
-            copy.append(actions);
-        }
+        if (playTarget?.playable) appendDetailPlayAction(actions, playTarget);
+        if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
         if (card.genres?.length) {
-            const tags = element('div', 'tag-list');
-            card.genres.slice(0, 8).forEach((genre) => tags.append(element('span', 'tag', genre)));
-            copy.append(tags);
+            copy.append(createDetailGenres(detail));
         }
         layout.append(poster, copy);
         body.append(back, layout);
         view.append(backdrop, body);
-        if (detail.people?.length) view.append(createPeopleSection(detail.people));
-        if (detail.episodes?.length) view.append(createEpisodes(detail.episodes));
+        const peopleHost = element('div', 'detail-people');
+        peopleHost.dataset.detailField = 'people';
+        if (detail.people?.length) peopleHost.append(createPeopleSection(detail.people));
+        view.append(peopleHost);
+        if (card.type === 'Series' && detail.seasons?.length) view.append(createEpisodes(detail));
         content.append(view);
         const ref = card.backdropImage || card.landscapeImage;
         const backdropRevision = appBackdropRevision;
@@ -2688,6 +2806,117 @@
                 if (backdropImage.isConnected && currentView?.data === detail) backdropImage.classList.add('image-ready');
             });
         }).catch((error) => console.error(`详情背景加载失败：${friendlyError(error)}`));
+    }
+
+    function replaceDetailField(detail, field, replacement) {
+        const selector = `[data-detail-field="${field}"]`;
+        const existing = content.querySelector(selector);
+        if (!existing) return false;
+        existing.replaceWith(replacement);
+        return true;
+    }
+
+    function createDetailMeta(detail) {
+        const card = detail.item;
+        const meta = element('div', 'hero-meta');
+        meta.dataset.detailField = 'meta';
+        const seriesMeta = card.type === 'Series'
+            ? [
+                Number.isFinite(detail.seasonCount) && detail.seasonCount > 0 ? `${detail.seasonCount} 季` : '',
+                Number.isFinite(detail.episodeCount) && detail.episodeCount > 0 ? `${detail.episodeCount} 集` : '',
+            ]
+            : [];
+        [card.year, ...seriesMeta, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.dynamicRange]
+            .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
+        return meta;
+    }
+
+    function createDetailOverview(detail) {
+        const overview = element('button', 'detail-overview overview-preview', detail.item.overview);
+        overview.type = 'button';
+        overview.title = '查看完整简介';
+        overview.dataset.detailField = 'overview';
+        overview.dataset.focusKey = `overview:${detail.item.id}`;
+        overview.addEventListener('click', () => openOverview(detail.item, overview));
+        return overview;
+    }
+
+    function createDetailGenres(detail) {
+        const tags = element('div', 'tag-list');
+        tags.dataset.detailField = 'genres';
+        detail.item.genres?.slice(0, 8).forEach((genre) => tags.append(element('span', 'tag', genre)));
+        return tags;
+    }
+
+    function applySeriesDetailRefresh(detail, refreshed) {
+        const previousItem = detail.item;
+        const previousMeta = JSON.stringify({
+            year: previousItem?.year,
+            seasonCount: detail.seasonCount,
+            episodeCount: detail.episodeCount,
+            durationMs: previousItem?.durationMs,
+            officialRating: previousItem?.officialRating,
+            communityRating: previousItem?.communityRating,
+            dynamicRange: previousItem?.dynamicRange,
+        });
+        const previousPeople = JSON.stringify(detail.people || []);
+        const previousGenres = JSON.stringify(previousItem?.genres || []);
+        const previousOverview = previousItem?.overview || '';
+        const previousEpisodes = detail.episodes;
+        Object.assign(detail, refreshed);
+        detail.episodesBySeason = refreshed.episodesBySeason || {};
+        detail.selectedSeasonId = refreshed.selectedSeasonId;
+        detail.episodes = previousEpisodes;
+        if (detail.item?.id !== previousItem?.id) return;
+        const current = currentView;
+        if (current?.kind !== 'detail' || current.data !== detail) return;
+        const view = content.querySelector(`.detail-view[data-series-id="${detail.item.id}"]`);
+        if (!view) return;
+
+        const title = view.querySelector('[data-detail-field="title"]');
+        if (title && previousItem?.title !== detail.item.title) title.textContent = detail.item.title;
+        const nextMeta = JSON.stringify({
+            year: detail.item.year,
+            seasonCount: detail.seasonCount,
+            episodeCount: detail.episodeCount,
+            durationMs: detail.item.durationMs,
+            officialRating: detail.item.officialRating,
+            communityRating: detail.item.communityRating,
+            dynamicRange: detail.item.dynamicRange,
+        });
+        if (previousMeta !== nextMeta) replaceDetailField(detail, 'meta', createDetailMeta(detail));
+        const existingOverview = view.querySelector('[data-detail-field="overview"]');
+        if (detail.item.overview) {
+            if (existingOverview && previousOverview !== detail.item.overview) {
+                replaceDetailField(detail, 'overview', createDetailOverview(detail));
+            } else if (!existingOverview) {
+                view.querySelector('.detail-actions')?.before(createDetailOverview(detail));
+            }
+        } else {
+            existingOverview?.remove();
+        }
+        const nextGenres = JSON.stringify(detail.item.genres || []);
+        const existingGenres = view.querySelector('[data-detail-field="genres"]');
+        if (detail.item.genres?.length) {
+            if (existingGenres && previousGenres !== nextGenres) {
+                replaceDetailField(detail, 'genres', createDetailGenres(detail));
+            } else if (!existingGenres) {
+                view.querySelector('.detail-actions')?.after(createDetailGenres(detail));
+            }
+        } else {
+            existingGenres?.remove();
+        }
+
+        const peopleHost = view.querySelector('[data-detail-field="people"]');
+        if (peopleHost && previousPeople !== JSON.stringify(detail.people || [])) {
+            peopleHost.replaceChildren(...(detail.people?.length ? [createPeopleSection(detail.people)] : []));
+        }
+        const episodesRoot = view.querySelector('[data-detail-field="episodes"]');
+        if (episodesRoot) {
+            episodesRoot._refreshEpisodes?.(detail);
+        } else if (detail.seasons?.length) {
+            view.append(createEpisodes(detail));
+        }
     }
 
     function createPeopleSection(people) {
@@ -2848,91 +3077,347 @@
         }
     }
 
-    function createEpisodes(episodes) {
+    function createEpisodes(detail) {
         const root = element('section', 'episodes');
-        const groups = new Map();
-        for (const episode of episodes) {
-            const season = episode.parentIndexNumber || 1;
-            if (!groups.has(season)) groups.set(season, []);
-            groups.get(season).push(episode);
-        }
-        for (const cards of groups.values()) {
-            cards.sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
-        }
-        const seasons = [...groups.keys()].sort((left, right) => left - right);
-        const resumable = episodes.find((episode) => episode.resumePositionMs > 0);
-        let selectedSeason = resumable?.parentIndexNumber || seasons[0];
+        root.dataset.detailField = 'episodes';
+        let seasons = normalizedSeasons(detail.seasons);
+        if (!seasons.length) return root;
+        const resumableEpisode = homeData?.resume?.find((episode) => (
+            episode?.seriesId === detail.item.id && episode.resumePositionMs > 0
+        ));
+        let selectedSeasonId = seasons.some((season) => season.id === detail.selectedSeasonId)
+            ? detail.selectedSeasonId
+            : seasons.some((season) => season.id === resumableEpisode?.seasonId)
+                ? resumableEpisode.seasonId
+            : seasons.find((season) => season.indexNumber > 0)?.id || seasons[0].id;
         const heading = element('div', 'episodes-heading');
         heading.append(element('h2', '', '选集'));
         const headingControls = element('div', 'episodes-heading-controls');
         const pagingControls = element('div', 'episodes-paging-controls');
-        const seasonTabs = element('div', 'segmented-control season-tabs');
-        seasonTabs.setAttribute('role', 'tablist');
+        const seasonPicker = element('div', 'season-picker');
+        const seasonMenuButton = element('button', 'season-picker-button');
+        seasonMenuButton.type = 'button';
+        seasonMenuButton.dataset.focusKey = `season-picker:${detail.item.id}`;
+        seasonMenuButton.setAttribute('aria-haspopup', 'listbox');
+        seasonMenuButton.setAttribute('aria-expanded', 'false');
+        seasonMenuButton.append(element('span', 'season-picker-label'));
+        const seasonMenu = element('div', 'season-picker-menu');
+        seasonMenu.setAttribute('role', 'listbox');
+        seasonMenu.setAttribute('aria-hidden', 'true');
+        seasonPicker.append(seasonMenuButton, seasonMenu);
         const stage = element('div', 'episode-stage');
+        const seasonOptions = new Map();
+        const loadingSeasonIds = new Set();
+        const refreshingSeasonIds = new Set();
+        let renderedSeasonId = null;
+        let renderedEpisodes = [];
 
-        const renderSeason = (season) => {
-            selectedSeason = season;
-            seasonTabs.querySelectorAll('button').forEach((button) => {
-                button.setAttribute('aria-selected', String(Number(button.dataset.season) === season));
+        const seasonLabel = (season) => {
+            const count = Number.isFinite(season.episodeCount) && season.episodeCount > 0
+                ? `${season.episodeCount} 集`
+                : '';
+            return [episodeSeasonLabel(season.indexNumber), count].filter(Boolean).join(' · ');
+        };
+        const dismissSeasonMenu = (event) => {
+            if (!seasonPicker.isConnected) {
+                document.removeEventListener('pointerdown', dismissSeasonMenu, true);
+                return;
+            }
+            if (!seasonPicker.contains(event.target)) {
+                closeSeasonMenu();
+                ensureSelectedSeasonLoaded();
+            }
+        };
+        const closeSeasonMenu = (returnFocus = false) => {
+            if (!seasonPicker.classList.contains('is-open')) return;
+            seasonPicker.classList.remove('is-open');
+            seasonMenu.setAttribute('aria-hidden', 'true');
+            seasonMenuButton.setAttribute('aria-expanded', 'false');
+            document.removeEventListener('pointerdown', dismissSeasonMenu, true);
+            if (returnFocus) focusElement(seasonMenuButton);
+        };
+        const syncSeasonPicker = () => {
+            const selected = seasons.find((season) => season.id === selectedSeasonId);
+            seasonMenuButton.querySelector('.season-picker-label').textContent = selected
+                ? seasonLabel(selected)
+                : '选择季';
+            seasonMenu.querySelectorAll('.season-picker-option').forEach((option) => {
+                const active = option.dataset.seasonId === selectedSeasonId;
+                option.setAttribute('aria-selected', String(active));
+                option.classList.toggle('selected', active);
             });
-            const cards = groups.get(season) || [];
-            const preferredIndex = Math.max(0, cards.findIndex((card) => card.resumePositionMs > 0));
-            let selectedChunk = Math.floor(preferredIndex / 50);
-            const chunks = [];
-            for (let start = 0; start < cards.length; start += 50) chunks.push(cards.slice(start, start + 50));
-            const rangeTabs = element('div', 'segmented-control episode-ranges');
-            const rowHost = element('div');
+        };
+        const selectSeasonOption = (option) => {
+            if (!option || option.dataset.seasonId === selectedSeasonId) return false;
+            const previous = seasonMenu.querySelector('.season-picker-option.selected');
+            selectedSeasonId = option.dataset.seasonId;
+            detail.selectedSeasonId = selectedSeasonId;
+            if (previous) {
+                previous.setAttribute('aria-selected', 'false');
+                previous.classList.remove('selected');
+            }
+            option.setAttribute('aria-selected', 'true');
+            option.classList.add('selected');
+            const selected = seasons.find((season) => season.id === selectedSeasonId);
+            seasonMenuButton.querySelector('.season-picker-label').textContent = selected
+                ? seasonLabel(selected)
+                : '选择季';
+            return true;
+        };
+        const openSeasonMenu = () => {
+            if (seasonPicker.classList.contains('is-open')) return;
+            syncSeasonPicker();
+            const selected = seasonMenu.querySelector('.season-picker-option.selected')
+                || seasonMenu.querySelector('.season-picker-option');
+            selected?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            seasonPicker.classList.add('is-open');
+            seasonMenu.setAttribute('aria-hidden', 'false');
+            seasonMenuButton.setAttribute('aria-expanded', 'true');
+            document.addEventListener('pointerdown', dismissSeasonMenu, true);
+        };
+        const createSeasonOption = (season) => {
+            const option = element('button', 'season-picker-option');
+            option.type = 'button';
+            option.tabIndex = -1;
+            option.dataset.seasonId = season.id;
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-label', seasonLabel(season));
+            option.title = seasonLabel(season);
+            option.append(element('span', 'season-picker-option-label', episodeSeasonLabel(season.indexNumber)));
+            option.addEventListener('click', () => {
+                selectSeasonOption(option);
+                closeSeasonMenu();
+                ensureSelectedSeasonLoaded();
+            });
+            return option;
+        };
+        const syncSeasonDirectory = (nextSeasons) => {
+            seasons = normalizedSeasons(nextSeasons);
+            const seasonIds = new Set(seasons.map((season) => season.id));
+            for (const [seasonId, option] of seasonOptions) {
+                if (seasonIds.has(seasonId)) continue;
+                option.remove();
+                seasonOptions.delete(seasonId);
+            }
+            for (const season of seasons) {
+                let option = seasonOptions.get(season.id);
+                if (!option) {
+                    option = createSeasonOption(season);
+                    seasonOptions.set(season.id, option);
+                }
+                const label = seasonLabel(season);
+                option.setAttribute('aria-label', label);
+                option.title = label;
+                option.querySelector('.season-picker-option-label').textContent = episodeSeasonLabel(season.indexNumber);
+                seasonMenu.append(option);
+            }
+            if (!seasonIds.has(selectedSeasonId)) {
+                selectedSeasonId = seasons.find((season) => season.indexNumber > 0)?.id || seasons[0]?.id || null;
+                detail.selectedSeasonId = selectedSeasonId;
+            }
+            syncSeasonPicker();
+            if (seasons.length > 1) {
+                if (!seasonPicker.isConnected) headingControls.prepend(seasonPicker);
+            } else {
+                closeSeasonMenu();
+                seasonPicker.remove();
+            }
+        };
+        syncSeasonDirectory(seasons);
+        syncSeasonPicker();
 
-            const renderChunk = (chunkIndex) => {
-                selectedChunk = chunkIndex;
+        const renderSeason = (seasonId, episodes) => {
+            renderedSeasonId = seasonId;
+            renderedEpisodes = episodes;
+            syncSeasonPicker();
+            const cards = episodes.slice().sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
+            const preferredIndex = Math.max(0, cards.findIndex((card) => card.resumePositionMs > 0));
+            const ranges = buildEpisodeRanges(cards);
+            let selectedRange = Math.floor(preferredIndex / 10);
+            const rangeTabs = element('div', 'segmented-control episode-ranges');
+            rangeTabs.setAttribute('role', 'tablist');
+            const row = element('div', 'media-row landscape episode-row');
+            row.dataset.rowKey = `season-${seasonId}`;
+            row.dataset.rowIndex = '0';
+            cards.forEach((card, index) => row.append(createMediaCard(card, {
+                landscape: true,
+                episodePicker: true,
+                omitSeriesName: true,
+                index,
+                onClick: (item) => startPlayback(item, item.resumePositionMs),
+            })));
+            pagingControls.replaceChildren();
+            const carousel = createRowCarousel(row, '选集', pagingControls, {
+                initialScrollTarget: selectedRange > 0
+                    ? () => {
+                        const target = row.querySelector(`.media-card[data-card-index="${ranges[selectedRange]?.start || 0}"]`);
+                        return target ? revealTarget(row, target, 'x', 'start') : 0;
+                    }
+                    : null,
+            });
+
+            const selectRange = (rangeIndex, scroll = true) => {
+                selectedRange = rangeIndex;
                 rangeTabs.querySelectorAll('button').forEach((button) => {
-                    button.setAttribute('aria-selected', String(Number(button.dataset.chunk) === chunkIndex));
+                    button.setAttribute('aria-selected', String(Number(button.dataset.range) === rangeIndex));
                 });
-                const row = element('div', 'media-row landscape episode-row');
-                row.dataset.rowKey = `season-${season}-chunk-${chunkIndex}`;
-                row.dataset.rowIndex = '0';
-                (chunks[chunkIndex] || []).forEach((card, index) => row.append(createMediaCard(card, {
-                    landscape: true,
-                    episodePicker: true,
-                    omitSeriesName: true,
-                    index,
-                    onClick: (item) => startPlayback(item, item.resumePositionMs),
-                })));
-                pagingControls.replaceChildren();
-                rowHost.replaceChildren(createRowCarousel(row, '选集', pagingControls));
+                if (!scroll) return;
+                const target = row.querySelector(`.media-card[data-card-index="${ranges[rangeIndex]?.start || 0}"]`);
+                if (target) {
+                    row._smoothCarouselTo?.(() => revealTarget(row, target, 'x', 'start'));
+                }
             };
 
-            if (chunks.length > 1) {
-                chunks.forEach((chunk, index) => {
-                    const first = chunk[0]?.indexNumber || index * 50 + 1;
-                    const last = chunk.at(-1)?.indexNumber || first + chunk.length - 1;
-                    const button = element('button', 'segment-button episode-range', `${first}-${last}`);
+            if (ranges.length > 1) {
+                ranges.forEach((range, index) => {
+                    const button = element('button', 'segment-button episode-range', range.label);
                     button.type = 'button';
-                    button.dataset.chunk = String(index);
-                    button.addEventListener('click', () => renderChunk(index));
+                    button.dataset.range = String(index);
+                    button.dataset.start = String(range.start);
+                    button.setAttribute('role', 'tab');
+                    button.addEventListener('click', () => selectRange(index));
                     rangeTabs.append(button);
                 });
             }
             stage.replaceChildren();
-            if (chunks.length > 1) stage.append(rangeTabs);
-            stage.append(rowHost);
-            renderChunk(selectedChunk);
+            if (ranges.length > 1) stage.append(rangeTabs);
+            stage.append(carousel);
+            selectRange(selectedRange, false);
         };
 
-        seasons.forEach((season) => {
-            const button = element('button', 'segment-button season-tab', `第 ${season} 季`);
-            button.type = 'button';
-            button.dataset.season = String(season);
-            button.setAttribute('role', 'tab');
-            button.addEventListener('click', () => renderSeason(season));
-            seasonTabs.append(button);
+        const setDetailPlayAction = (episodes) => {
+            const target = episodes.find((episode) => episode.resumePositionMs > 0) || episodes[0];
+            if (!target?.playable) return;
+            const actions = content.querySelector(`.detail-actions[data-series-id="${detail.item.id}"]`);
+            if (!actions) return;
+            actions.querySelector('.primary-command')?.remove();
+            appendDetailPlayAction(actions, target);
+        };
+
+        const renderLoading = () => {
+            stage.replaceChildren(element('div', 'episode-stage-state', '正在读取剧集...'));
+        };
+        const renderError = (error) => {
+            const retry = element('button', 'secondary-command', '重试');
+            retry.type = 'button';
+            retry.addEventListener('click', () => loadSeason(selectedSeasonId));
+            stage.replaceChildren(element('div', 'episode-stage-state', friendlyError(error)), retry);
+        };
+        const refreshSeasonInBackground = (seasonId) => {
+            if (refreshingSeasonIds.has(seasonId)) return;
+            refreshingSeasonIds.add(seasonId);
+            const expectedSession = session;
+            window.setTimeout(async () => {
+                try {
+                    if (session !== expectedSession) return;
+                    const result = await nativeRequest('mediaStationCatalog', 'series_episodes', [
+                        'series_episodes', JSON.stringify({ seriesId: detail.item.id, seasonId, refresh: true }),
+                    ], 60000);
+                    if (session !== expectedSession) return;
+                    const episodes = normalizeSeasonEpisodes(detail, result.episodes);
+                    detail.episodesBySeason ||= {};
+                    detail.episodesBySeason[seasonId] = episodes;
+                    if (selectedSeasonId !== seasonId || renderedSeasonId !== seasonId) return;
+                    if (JSON.stringify(renderedEpisodes) === JSON.stringify(episodes)) return;
+                    detail.episodes = episodes;
+                    renderSeason(seasonId, episodes);
+                    setDetailPlayAction(episodes);
+                } catch (error) {
+                    console.error(`剧集列表后台刷新失败：${friendlyError(error)}`);
+                } finally {
+                    refreshingSeasonIds.delete(seasonId);
+                }
+            }, detailRefreshDelayMs);
+        };
+        const loadSeason = async (seasonId) => {
+            const season = seasons.find((candidate) => candidate.id === seasonId);
+            if (!season) return;
+            const cached = detail.episodesBySeason?.[seasonId];
+            if (Array.isArray(cached)) {
+                renderSeason(seasonId, cached);
+                refreshSeasonInBackground(seasonId);
+                return;
+            }
+            if (loadingSeasonIds.has(seasonId)) return;
+            loadingSeasonIds.add(seasonId);
+            renderLoading();
+            try {
+                const result = await nativeRequest('mediaStationCatalog', 'series_episodes', [
+                    'series_episodes', JSON.stringify({ seriesId: detail.item.id, seasonId }),
+                ]);
+                if (currentView?.kind !== 'detail' || currentView.data !== detail || selectedSeasonId !== seasonId) return;
+                const episodes = normalizeSeasonEpisodes(detail, result.episodes);
+                detail.episodesBySeason ||= {};
+                detail.episodesBySeason[seasonId] = episodes;
+                detail.episodes = episodes;
+                renderSeason(seasonId, episodes);
+                setDetailPlayAction(episodes);
+                if (result.cache?.status === 'hit') refreshSeasonInBackground(seasonId);
+            } catch (error) {
+                if (currentView?.kind === 'detail' && currentView.data === detail && selectedSeasonId === seasonId) renderError(error);
+            } finally {
+                loadingSeasonIds.delete(seasonId);
+            }
+        };
+        const ensureSelectedSeasonLoaded = () => {
+            if (renderedSeasonId !== selectedSeasonId) loadSeason(selectedSeasonId);
+        };
+
+        seasonMenuButton.addEventListener('click', () => {
+            if (!seasonPicker.classList.contains('is-open')) openSeasonMenu();
+            else {
+                closeSeasonMenu();
+                ensureSelectedSeasonLoaded();
+            }
         });
-        if (seasons.length > 1) headingControls.append(seasonTabs);
+        if (seasons.length > 1) headingControls.append(seasonPicker);
         headingControls.append(pagingControls);
         heading.append(headingControls);
         root.append(heading, stage);
-        renderSeason(selectedSeason);
+        loadSeason(selectedSeasonId);
+        root._refreshEpisodes = (refreshedDetail) => {
+            const previousSelectedSeasonId = selectedSeasonId;
+            syncSeasonDirectory(refreshedDetail.seasons);
+            const currentSeasonId = selectedSeasonId;
+            if (!currentSeasonId) {
+                stage.replaceChildren();
+                return;
+            }
+            if (currentSeasonId !== previousSelectedSeasonId || renderedSeasonId !== currentSeasonId) {
+                loadSeason(currentSeasonId);
+                return;
+            }
+            const currentEpisodes = refreshedDetail.episodesBySeason?.[currentSeasonId];
+            if (!Array.isArray(currentEpisodes) || renderedSeasonId !== currentSeasonId) return;
+            const episodes = normalizeSeasonEpisodes(refreshedDetail, currentEpisodes);
+            refreshedDetail.episodesBySeason[currentSeasonId] = episodes;
+            if (JSON.stringify(renderedEpisodes) === JSON.stringify(episodes)) return;
+            refreshedDetail.episodes = episodes;
+            renderSeason(currentSeasonId, episodes);
+            setDetailPlayAction(episodes);
+        };
         return root;
+    }
+
+    function normalizedSeasons(value) {
+        return Array.isArray(value)
+            ? value.filter((season) => season?.id && Number.isFinite(season.indexNumber))
+                .slice()
+                .sort((left, right) => left.indexNumber - right.indexNumber)
+            : [];
+    }
+
+    function appendDetailPlayAction(actions, target) {
+        const play = element('button', 'primary-command');
+        play.type = 'button';
+        play.dataset.focusKey = `play:${target.id}`;
+        const position = target.resumePositionMs ? ` ${formatTime(target.resumePositionMs)}` : '';
+        const label = target.type === 'Episode'
+            ? `播放 ${episodePosition(target).replace(' · ', '')}${position}`
+            : (target.resumePositionMs ? `继续播放${position}` : '开始播放');
+        play.append(element('span', '', '▶'), element('span', '', label));
+        play.addEventListener('click', () => startPlayback(target, target.resumePositionMs));
+        actions.append(play);
     }
 
     function openOverview(card, trigger) {
@@ -3623,9 +4108,9 @@
     }
 
     function cachedSeriesEpisodes(card) {
-        const detail = currentView?.kind === 'detail' ? currentView.data : null;
-        if (card?.type !== 'Episode' || !card.seriesId || detail?.item?.id !== card.seriesId) return null;
-        return Array.isArray(detail.episodes) ? detail.episodes.slice() : null;
+        // Detail pages cache one season at a time. The player needs a complete
+        // series for cross-season switching and automatic continuation.
+        return null;
     }
 
     async function startPlayback(card, startMs = 0) {
@@ -4597,6 +5082,24 @@
         return season === 0 ? '特别篇' : `第 ${season} 季`;
     }
 
+    function buildEpisodeRanges(episodes, rangeSize = 10) {
+        const ranges = [];
+        for (let start = 0; start < episodes.length; start += rangeSize) {
+            const end = Math.min(start + rangeSize, episodes.length) - 1;
+            const firstNumber = Number.isFinite(episodes[start]?.indexNumber)
+                ? episodes[start].indexNumber
+                : start + 1;
+            const lastNumber = Number.isFinite(episodes[end]?.indexNumber)
+                ? episodes[end].indexNumber
+                : end + 1;
+            ranges.push({
+                start,
+                label: firstNumber === lastNumber ? `第 ${firstNumber} 集` : `${firstNumber}-${lastNumber}`,
+            });
+        }
+        return ranges;
+    }
+
     function episodeOptionTitle(episode) {
         const index = Number.isFinite(episode?.indexNumber) ? `第 ${episode.indexNumber} 集` : '剧集';
         return episode?.title ? `${index} · ${episode.title}` : index;
@@ -4918,8 +5421,8 @@
             try {
                 const detail = await nativeRequest(
                     'mediaStationCatalog',
-                    'detail',
-                    ['detail', JSON.stringify({ mediaId: seriesId })],
+                    'series_episodes',
+                    ['series_episodes', JSON.stringify({ seriesId })],
                     30000,
                 );
                 if (player !== activePlayer || activePlayer.exiting || activePlayer.card.seriesId !== seriesId) return [];
@@ -5724,7 +6227,7 @@
             if (!targetRow) {
                 if (event.key === 'ArrowUp') {
                     const target = row.classList.contains('episode-row')
-                        ? content.querySelector('.episode-ranges [aria-selected="true"], .season-tabs [aria-selected="true"]')
+                        ? content.querySelector('.episode-ranges [aria-selected="true"], .season-tabs [aria-selected="true"], .season-picker-button')
                         : row.classList.contains('people-row')
                             ? content.querySelector('.detail-actions button, .detail-overview, .detail-back')
                             : content.querySelector('.hero-actions button');

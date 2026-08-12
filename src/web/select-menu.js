@@ -1,6 +1,7 @@
 // In-page replacement for the native <select> popup. 
 // A dirty hack, but more succinct+less_finnicky than dealing with layering native popups on X11
 (function () {
+
     var open = null;
 
     function isDropdown(el) {
