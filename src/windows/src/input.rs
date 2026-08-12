@@ -965,11 +965,17 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     let physical_w = rc.right - rc.left;
     let physical_h = rc.bottom - rc.top;
     let scale = crate::platform::win_get_scale().max(1.0);
-    STATE.lock().geometry = InputGeometry {
+    let fallback_geometry = InputGeometry {
         logical_w: (physical_w as f32 / scale).round() as i32,
         logical_h: (physical_h as f32 / scale).round() as i32,
         physical_w,
         physical_h,
+    };
+    let geometry = {
+        let mut state = STATE.lock();
+        let geometry = initial_geometry(state.geometry, fallback_geometry);
+        state.geometry = geometry;
+        geometry
     };
 
     let input_hwnd = unsafe {
@@ -980,8 +986,8 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
             0,
             0,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
+            geometry.physical_w,
+            geometry.physical_h,
             Some(mpv),
             Some(HMENU(std::ptr::null_mut())),
             Some(hinst.into()),
@@ -1020,6 +1026,22 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     }
     let _ = unsafe { UnregisterClassW(CLASS_NAME, Some(hinst.into())) };
     STATE.lock().thread_id = 0;
+}
+
+fn initial_geometry(current: InputGeometry, fallback: InputGeometry) -> InputGeometry {
+    // A WindowExtent notification can arrive after the input thread starts but
+    // before this child window is created. Keep that exact CEF geometry when
+    // it matches the parent client bounds; otherwise Win32 is the only source
+    // available for the initial physical size.
+    if current.logical_w > 0
+        && current.logical_h > 0
+        && current.physical_w == fallback.physical_w
+        && current.physical_h == fallback.physical_h
+    {
+        current
+    } else {
+        fallback
+    }
 }
 
 pub fn jfn_input_windows_stop_input_thread() {
@@ -1105,7 +1127,7 @@ pub fn jfn_input_windows_set_ime_composition_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        InputGeometry, build_ime_underlines, composition_target_range,
+        InputGeometry, build_ime_underlines, composition_target_range, initial_geometry,
         parse_keyboard_layout_language_id,
     };
     use jfn_platform_abi::{ImeUnderline, JfnRect};
@@ -1121,6 +1143,42 @@ mod tests {
 
         assert_eq!(geometry.map_point(169, 603), (135, 482));
         assert_eq!(geometry.map_point(1310, 688), (1047, 550));
+    }
+
+    #[test]
+    fn preserves_mpv_extent_geometry_during_input_thread_startup() {
+        let synced = InputGeometry {
+            logical_w: 874,
+            logical_h: 491,
+            physical_w: 1311,
+            physical_h: 736,
+        };
+        let stale_scale_fallback = InputGeometry {
+            logical_w: 1049,
+            logical_h: 589,
+            physical_w: 1311,
+            physical_h: 736,
+        };
+
+        assert_eq!(initial_geometry(synced, stale_scale_fallback), synced);
+    }
+
+    #[test]
+    fn startup_uses_parent_bounds_when_synced_extent_is_stale() {
+        let stale = InputGeometry {
+            logical_w: 1049,
+            logical_h: 589,
+            physical_w: 1311,
+            physical_h: 736,
+        };
+        let parent_bounds = InputGeometry {
+            logical_w: 1280,
+            logical_h: 720,
+            physical_w: 1600,
+            physical_h: 900,
+        };
+
+        assert_eq!(initial_geometry(stale, parent_bounds), parent_bounds);
     }
 
     #[test]

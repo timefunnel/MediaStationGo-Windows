@@ -5,20 +5,6 @@
 $ErrorActionPreference = "Stop"
 $RepoRootEnv = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 
-if (-not $env:CARGO_TARGET_DIR -and $RepoRootEnv -match '[^\x00-\x7F]') {
-    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $PathBytes = [System.Text.Encoding]::UTF8.GetBytes($RepoRootEnv.ToLowerInvariant())
-        $HashBytes = $Sha256.ComputeHash($PathBytes)
-    } finally {
-        $Sha256.Dispose()
-    }
-    $RepoHash = -join ($HashBytes | ForEach-Object { $_.ToString("x2") })
-    $env:CARGO_TARGET_DIR = "C:\codex-target\jellium-$($RepoHash.Substring(0, 12))"
-    Write-Host "Non-ASCII repository path detected." -ForegroundColor Yellow
-    Write-Host "Using CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR for CEF/CMake compatibility."
-}
-
 if (-not $env:VSINSTALLDIR) {
     Write-Host "MSVC environment not detected." -ForegroundColor Yellow
     Write-Host "Attempting to load vcvars64.bat..."

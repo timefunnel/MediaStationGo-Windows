@@ -36,7 +36,10 @@ use jfn_mpv::api::{
     jfn_mpv_set_window_minimized, jfn_mpv_toggle_fullscreen,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
-use jfn_platform_abi::geometry::{Bounds, WindowGeometry, clamp_to_bounds};
+use jfn_platform_abi::{
+    WindowExtent,
+    geometry::{Bounds, WindowGeometry, clamp_to_bounds},
+};
 use jfn_playback::ingest_driver::{jfn_playback_display_scale, jfn_playback_fullscreen};
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
@@ -126,6 +129,51 @@ pub fn win_get_scale() -> f32 {
 pub fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
     let dpi = unsafe { GetDpiForSystem() };
     if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
+}
+
+/// Keep Win32 input in the same coordinate space as CEF. Both consumers read
+/// the mpv-owned `WindowExtent`; this callback is needed because a display
+/// scale change can update that extent without producing a `WM_SIZE`.
+fn sync_input_geometry_from_mpv_extent() {
+    let Some(extent) = jfn_playback::ingest_driver::jfn_playback_window_extent() else {
+        return;
+    };
+    let Some((logical_w, logical_h, physical_w, physical_h)) = input_geometry_from_extent(extent)
+    else {
+        return;
+    };
+    tracing::debug!(
+        logical_w,
+        logical_h,
+        physical_w,
+        physical_h,
+        "synchronizing Windows input geometry from mpv WindowExtent"
+    );
+    jfn_input_windows_resize_to_parent(logical_w, logical_h, physical_w, physical_h);
+}
+
+fn input_geometry_for_parent_size(
+    physical_w: c_int,
+    physical_h: c_int,
+) -> Option<(c_int, c_int, c_int, c_int)> {
+    let extent = jfn_playback::ingest_driver::jfn_playback_window_extent()?;
+    let geometry = input_geometry_from_extent(extent)?;
+    input_geometry_matches_parent(geometry, physical_w, physical_h).then_some(geometry)
+}
+
+fn input_geometry_from_extent(extent: WindowExtent) -> Option<(c_int, c_int, c_int, c_int)> {
+    let logical = extent.logical();
+    let physical = extent.physical();
+    (logical.w > 0 && logical.h > 0 && physical.w > 0 && physical.h > 0)
+        .then_some((logical.w, logical.h, physical.w, physical.h))
+}
+
+fn input_geometry_matches_parent(
+    geometry: (c_int, c_int, c_int, c_int),
+    physical_w: c_int,
+    physical_h: c_int,
+) -> bool {
+    geometry.2 == physical_w && geometry.3 == physical_h
 }
 
 // =====================================================================
@@ -241,10 +289,19 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                 let pw = (lparam & 0xFFFF) as c_int;
                 let ph = ((lparam >> 16) & 0xFFFF) as c_int;
                 if pw > 0 && ph > 0 {
-                    let cached = STATE.lock().cached_scale;
-                    let scale = if cached > 0.0 { cached } else { 1.0 };
-                    let lw = (pw as f32 / scale).round() as c_int;
-                    let lh = (ph as f32 / scale).round() as c_int;
+                    // Prefer the same exact extent CEF receives. WM_SIZE may
+                    // race mpv's OSD update, so only use it when the physical
+                    // dimensions match and otherwise retain the old fallback.
+                    let (lw, lh) = input_geometry_for_parent_size(pw, ph)
+                        .map(|(lw, lh, _, _)| (lw, lh))
+                        .unwrap_or_else(|| {
+                            let cached = STATE.lock().cached_scale;
+                            let scale = if cached > 0.0 { cached } else { 1.0 };
+                            (
+                                (pw as f32 / scale).round() as c_int,
+                                (ph as f32 / scale).round() as c_int,
+                            )
+                        });
                     jfn_input_windows_resize_to_parent(lw, lh, pw, ph);
 
                     let style =
@@ -391,6 +448,12 @@ pub fn win_init(_mpv: *mut c_void) -> bool {
     });
     STATE.lock().input_thread = Some(join);
 
+    // CEF already resizes from this payload-free notification. Subscribe the
+    // input layer to the same source so a scale-only change cannot leave its
+    // physical-to-logical mapping behind CEF's view size.
+    jfn_platform_abi::subscribe_window_changed(sync_input_geometry_from_mpv_extent);
+    sync_input_geometry_from_mpv_extent();
+
     tracing::info!("Windows DirectComposition compositor initialized");
     true
 }
@@ -471,4 +534,77 @@ pub fn win_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, y:
     let (nx, ny) = g.raw_position();
     *x = nx;
     *y = ny;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{input_geometry_from_extent, input_geometry_matches_parent};
+    use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
+
+    #[test]
+    fn input_geometry_uses_the_exact_cef_window_extent() {
+        let extent = WindowExtent::with_logical(
+            PhysicalSize { w: 1311, h: 736 },
+            Scale(1.25),
+            LogicalSize { w: 1049, h: 589 },
+        );
+
+        assert_eq!(
+            input_geometry_from_extent(extent),
+            Some((1049, 589, 1311, 736))
+        );
+    }
+
+    #[test]
+    fn scale_only_extent_change_updates_input_logical_size() {
+        let old = WindowExtent::with_logical(
+            PhysicalSize { w: 1311, h: 736 },
+            Scale(1.25),
+            LogicalSize { w: 1049, h: 589 },
+        );
+        let new = WindowExtent::with_logical(
+            PhysicalSize { w: 1311, h: 736 },
+            Scale(1.5),
+            LogicalSize { w: 874, h: 491 },
+        );
+
+        assert_eq!(
+            input_geometry_from_extent(old),
+            Some((1049, 589, 1311, 736))
+        );
+        assert_eq!(input_geometry_from_extent(new), Some((874, 491, 1311, 736)));
+    }
+
+    #[test]
+    fn parent_resize_rejects_a_stale_mpv_extent() {
+        let matching = WindowExtent::with_logical(
+            PhysicalSize { w: 1311, h: 736 },
+            Scale(1.25),
+            LogicalSize { w: 1048, h: 589 },
+        );
+        let different_size = WindowExtent::with_logical(
+            PhysicalSize { w: 1600, h: 900 },
+            Scale(1.25),
+            LogicalSize { w: 1280, h: 720 },
+        );
+
+        assert_eq!(
+            input_geometry_from_extent(matching),
+            Some((1048, 589, 1311, 736))
+        );
+        assert_eq!(
+            input_geometry_from_extent(different_size),
+            Some((1280, 720, 1600, 900))
+        );
+        assert!(input_geometry_matches_parent(
+            (1048, 589, 1311, 736),
+            1311,
+            736
+        ));
+        assert!(!input_geometry_matches_parent(
+            (1280, 720, 1600, 900),
+            1311,
+            736
+        ));
+    }
 }
