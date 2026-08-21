@@ -1578,6 +1578,20 @@ impl MediaStationRuntime {
         Ok(active.source.clone())
     }
 
+    fn active_playback_media_id(
+        &self,
+        snapshot: &SessionSnapshot,
+    ) -> Result<Option<String>, LoadFailure> {
+        let state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            return Err(session_changed());
+        }
+        Ok(state
+            .active_report
+            .as_ref()
+            .map(|active| active.source.media_id.clone()))
+    }
+
     fn merge_active_playback_metadata(
         &self,
         snapshot: &SessionSnapshot,
@@ -4228,6 +4242,7 @@ fn frame_interpolation_plan(
     source: &PlaybackSource,
     mode: InterpolationMode,
     model: InterpolationModel,
+    runtime_source_fps: Option<f64>,
 ) -> Result<Option<InterpolationPlan>, LoadFailure> {
     if mode == InterpolationMode::Off {
         return Ok(None);
@@ -4246,28 +4261,60 @@ fn frame_interpolation_plan(
         .height
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(0);
+    let (source_fps, source_fps_origin) =
+        select_interpolation_source_fps(video.frame_rate, runtime_source_fps);
     let request = PlanRequest {
         mode,
         model,
         width,
         height,
-        source_fps: video.frame_rate.unwrap_or(0.0),
+        source_fps,
         display_fps: jfn_playback::ingest_driver::jfn_playback_display_hz(),
         dynamic_range: video.dynamic_range.clone(),
         color_space: video.color_space.clone(),
         color_transfer: video.color_transfer.clone(),
         color_range: video.color_range.clone(),
     };
-    prepare_plan(request).map_err(|error| {
-        log_error(&format!(
-            "RTX frame interpolation plan rejected: code={} detail={}",
-            error.code, error.detail
-        ));
-        LoadFailure::new(
-            error.code,
-            "Frame interpolation could not be enabled for this video",
-        )
-    })
+    match prepare_plan(request) {
+        Ok(plan) => {
+            log_debug(&format!(
+                "RIFE source frame rate selected: media_id={} origin={} source_fps={source_fps:.6}",
+                source.media_id, source_fps_origin
+            ));
+            Ok(plan)
+        }
+        Err(error) => {
+            log_error(&format!(
+                "RTX frame interpolation plan rejected: code={} detail={} fps_origin={} source_fps={source_fps:.6}",
+                error.code, error.detail, source_fps_origin
+            ));
+            Err(LoadFailure::new(
+                error.code,
+                "Frame interpolation could not be enabled for this video",
+            ))
+        }
+    }
+}
+
+fn select_interpolation_source_fps(
+    playback_info_fps: Option<f64>,
+    runtime_source_fps: Option<f64>,
+) -> (f64, &'static str) {
+    if let Some(value) = runtime_source_fps.filter(|value| value.is_finite() && *value > 0.0) {
+        return (value, "mpv_container");
+    }
+    (playback_info_fps.unwrap_or(0.0), "playback_info")
+}
+
+fn runtime_container_fps_for_media(
+    active_media_id: Option<&str>,
+    requested_media_id: &str,
+    container_fps: Option<f64>,
+) -> Option<f64> {
+    if active_media_id != Some(requested_media_id) {
+        return None;
+    }
+    container_fps.filter(|value| value.is_finite() && *value > 0.0)
 }
 
 pub(crate) fn handle_load_message(layer: Option<Arc<Inner>>, args: Option<&ListValue>) -> bool {
@@ -5730,10 +5777,28 @@ fn execute_load(
     request: &LoadRequest,
 ) -> Result<Value, LoadFailure> {
     runtime.ensure_generation(snapshot.generation)?;
+    let active_media_id_before = runtime.active_playback_media_id(snapshot)?;
+    let runtime_source_fps = if request.interpolation_mode == InterpolationMode::Off {
+        None
+    } else if active_media_id_before.as_deref() == Some(request.media_id.as_str()) {
+        runtime_container_fps_for_media(
+            active_media_id_before.as_deref(),
+            &request.media_id,
+            mpv_property_double(c"container-fps"),
+        )
+    } else {
+        None
+    };
     let source = runtime
         .api
         .load_playback_source(&snapshot.session, &request.media_id)
         .map_err(|error| api_failure("playback_info_failed", &error))?;
+    let active_media_id_after = runtime.active_playback_media_id(snapshot)?;
+    let runtime_source_fps = runtime_container_fps_for_media(
+        active_media_id_after.as_deref(),
+        &request.media_id,
+        runtime_source_fps,
+    );
     let audio_summary = source
         .audio_tracks
         .iter()
@@ -5760,6 +5825,7 @@ fn execute_load(
         &source,
         request.interpolation_mode,
         request.interpolation_model,
+        runtime_source_fps,
     )?;
     log_debug(&format!(
         "MediaStation playback interpolation request: media_id={} mode={} model={}",
@@ -6942,6 +7008,42 @@ mod tests {
                 .expect_err("only the playback control's explicit values are accepted");
             assert_eq!(error.code, "frame_interpolation_mode_invalid");
         }
+    }
+
+    #[test]
+    fn runtime_container_fps_is_scoped_to_the_active_media() {
+        assert_eq!(
+            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(23.976)),
+            Some(23.976)
+        );
+        assert_eq!(
+            runtime_container_fps_for_media(Some("media-1"), "media-2", Some(23.976)),
+            None
+        );
+        assert_eq!(
+            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(0.0)),
+            None
+        );
+        assert_eq!(
+            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(f64::NAN)),
+            None
+        );
+    }
+
+    #[test]
+    fn interpolation_source_fps_prefers_valid_runtime_container_metadata() {
+        assert_eq!(
+            select_interpolation_source_fps(Some(0.0), Some(23.976)),
+            (23.976, "mpv_container")
+        );
+        assert_eq!(
+            select_interpolation_source_fps(Some(24.0), None),
+            (24.0, "playback_info")
+        );
+        assert_eq!(
+            select_interpolation_source_fps(Some(24.0), Some(0.0)),
+            (24.0, "playback_info")
+        );
     }
 
     #[test]

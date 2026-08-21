@@ -11,8 +11,14 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-08-05，分支 `codex/mediastation-windows-spike`。均衡档精度图
-实现检查点 `aa760f2`、验证记录 `db88468` 和画质门禁 `95a4cff` 已推送；
+最近更新：2026-08-21，分支 `main`。同一媒体播放中开启或更换 RIFE 时，
+插帧规划现在使用与活动媒体 ID 绑定的 mpv `container-fps`，不再因
+`PlaybackInfo` 的帧率为 `0` 而拒绝已经完成运行时探测的片源；首次播放和跨媒体
+切换仍使用目标媒体自身的预加载元数据，不复用上一媒体帧率。实现与自动化验证已
+完成，常规 Release staging 和《阿甘正传》真实播放验收均通过，当前未提交或推送。
+
+此前 2026-08-05 的进度：均衡档精度图实现检查点 `aa760f2`、验证记录
+`db88468` 和画质门禁 `95a4cff` 已推送；
 任务 1 完成。任务 2 的 profile 集合冻结、通用合同实现、正式 mpv/Release
 重建和真实 4K HDR10 播放器验收均已完成，实现提交为 `fdda0a4`。任务 3 停止交付：
 NVIDIA 下 `d3d11va` 直通会阻断 VRR，而正式 RIFE 链路必须保留 D3D11 P010
@@ -60,6 +66,36 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   不得用隐藏回退或伪成功推进台账。
 - 后续任务在上下文压缩或干净续接后，应先读取本文和当前工作区真实状态，
   不重新推断已经有证据的结论。
+
+### 2026-08-21 同媒体重载使用运行时源帧率
+
+- 已诊断：播放器信息面板通过 mpv `container-fps` 能看到实际源帧率，但开启
+  插帧会重新请求 `PlaybackInfo`，并在重新加载 mpv 前只用服务端帧率构建计划。
+  《阿甘正传》的实际容器帧率为 `23.976`，`PlaybackInfo` 返回 `0`，因此旧链路
+  在已有正确运行时数据的情况下仍报 `frame_interpolation_source_fps_invalid`。
+- 已实现：仅当活动播放媒体 ID 与本次重载媒体 ID 相同时读取
+  `container-fps`，并在 `PlaybackInfo` 请求前后再次核对活动媒体 ID。有效的
+  mpv 容器帧率优先用于严格 2 倍插帧计划；属性不可用时保持原有预加载元数据
+  校验。切集或切换其他媒体不会继承上一媒体帧率，也不使用滤镜输出属性
+  `estimated-vf-fps`。
+- 可观测性：成功和拒绝日志现在明确记录帧率来源 `mpv_container` 或
+  `playback_info` 及具体数值，不添加猜测、固定 `23.976`、模型切换或隐藏回退。
+- 自动化验证：新增“运行时帧率必须绑定活动媒体”和“有效运行时帧率优先于
+  `PlaybackInfo`”两条回归测试；`jfn-cef` 单测 `83 passed / 2 ignored`，本包
+  `cargo clippy --no-deps -- -D warnings` 与 `rustfmt --check` 均通过。全依赖
+  Clippy 仍被既有 `src/mpv/src/stream_cb.rs:339`
+  `clippy::not_unsafe_ptr_arg_deref` 阻断，与本次改动无关。
+- Release 与实播验证：旧播放器退出后，`cargo xtask build` 完成常规 staging；
+  Cargo Release 与 `build/jellium-desktop.exe` 均为 `5037056` 字节，SHA-256 同为
+  `EC6C35ACC4C166D6F3B62248DD4EF36EDA9C345EFBC0ABB726052F245BEA4B78`。
+  服务端数据库仍保持该媒体 `frame_rate=0 / media_probe_version=1`，新客户端从
+  实际 mpv 容器取得 `23.976` 并成功启用均衡档，目标输出
+  `47.952047952047955 fps`；播放信息显示
+  `container/VF/display = 23.976/47.619/152.000`，输出和解码丢帧均为 `0`。
+  原生日志确认 RIFE v4.26 `scale=0.5`、D3D11 P010、TensorRT-RTX FP16、
+  profile `2`；关闭插帧时 summary 为 `pairs=34 inferred=34 scene-cuts=0 failures=0`，
+  随后无 RIFE 重载正常播放并正常关闭应用。当前状态为“已诊断、已实现、自动化
+  验证通过、Release staging 通过、同片真实播放验收通过；未提交、未推送”。
 
 ### 2026-08-05 播放退出后的 UI 帧率修复
 
