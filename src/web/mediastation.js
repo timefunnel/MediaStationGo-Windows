@@ -360,9 +360,11 @@
         if (!node) return;
         const row = node.closest('.media-row');
         const filterOptions = node.closest('.library-filter-options');
+        const segmented = node.closest('.segmented-control');
         if (row?._revealCarouselNode) row._revealCarouselNode(node);
         else if (row) smoothScrollTo(row, { left: revealTarget(row, node, 'x', inline) });
         else if (filterOptions) smoothScrollTo(filterOptions, { left: revealTarget(filterOptions, node, 'x', inline) });
+        else if (segmented) smoothScrollTo(segmented, { left: revealTarget(segmented, node, 'x', inline) });
         const verticalAlignment = node.closest('.people-row .person-card') ? 'center' : block;
         smoothScrollTo(content, { top: revealTarget(content, node, 'y', verticalAlignment) });
         focusElement(node);
@@ -1056,18 +1058,21 @@
             : (status === 'ready' || status === 'up_to_date' ? 'ready' : '');
         const downloading = status === 'downloading';
         const applying = status === 'verifying' || status === 'installing';
+        const canResumeDownload = status === 'error' && payload.canResume === true;
         checkButton.disabled = status === 'checking';
         checkButton.dataset.busy = String(status === 'checking');
         checkButton.textContent = status === 'checking'
             ? '正在检查...'
             : status === 'error' ? '重试检查' : status === 'idle' ? '检查更新' : '重新检查';
-        checkButton.classList.toggle('hidden', downloading || applying);
+        checkButton.classList.toggle('hidden', downloading || applying || canResumeDownload);
         downloadButton.disabled = downloading;
         downloadButton.dataset.busy = String(downloading);
         downloadButton.textContent = downloading
             ? `正在下载 ${Math.max(0, Math.min(100, Number(payload.percent) || 0))}%`
+            : canResumeDownload
+                ? `继续下载 ${displayAppVersion(payload.version)}`
             : `下载 ${displayAppVersion(payload.version)}`;
-        downloadButton.classList.toggle('hidden', status !== 'available' && !downloading);
+        downloadButton.classList.toggle('hidden', status !== 'available' && !downloading && !canResumeDownload);
         installButton.disabled = applying;
         installButton.dataset.busy = String(applying);
         installButton.textContent = status === 'verifying'
@@ -2805,7 +2810,7 @@
         peopleHost.dataset.detailField = 'people';
         if (detail.people?.length) peopleHost.append(createPeopleSection(detail.people));
         view.append(peopleHost);
-        if (card.type === 'Series' && detail.seasons?.length) view.append(createEpisodes(detail));
+        if (card.type === 'Series' && detail.seasons?.length) view.append(createEpisodes(detail, actions));
         content.append(view);
         const ref = card.backdropImage || card.landscapeImage;
         const backdropRevision = appBackdropRevision;
@@ -3088,7 +3093,7 @@
         }
     }
 
-    function createEpisodes(detail) {
+    function createEpisodes(detail, detailActions) {
         const root = element('section', 'episodes');
         root.dataset.detailField = 'episodes';
         let seasons = normalizedSeasons(detail.seasons);
@@ -3299,10 +3304,8 @@
         const setDetailPlayAction = (episodes) => {
             const target = episodes.find((episode) => episode.resumePositionMs > 0) || episodes[0];
             if (!target?.playable) return;
-            const actions = content.querySelector(`.detail-actions[data-series-id="${detail.item.id}"]`);
-            if (!actions) return;
-            actions.querySelector('.primary-command')?.remove();
-            appendDetailPlayAction(actions, target);
+            detailActions.querySelector('.primary-command')?.remove();
+            appendDetailPlayAction(detailActions, target);
         };
 
         const renderLoading = () => {
@@ -3346,6 +3349,7 @@
             const cached = detail.episodesBySeason?.[seasonId];
             if (Array.isArray(cached)) {
                 renderSeason(seasonId, cached);
+                setDetailPlayAction(cached);
                 refreshSeasonInBackground(seasonId);
                 return;
             }

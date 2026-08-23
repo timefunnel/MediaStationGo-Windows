@@ -622,7 +622,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .segment-button:first-child { border-left: 0; }
 .segment-button:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .segment-button[aria-selected="true"] { color: var(--text); background: transparent; box-shadow: inset 0 -2px var(--accent); font-weight: 700; }
-.episode-ranges { margin-bottom: 12px; }
+.episode-ranges { display: flex; width: 100%; margin-bottom: 12px; overflow: visible; flex-wrap: wrap; }
+.episode-ranges .segment-button { flex: 1 1 96px; }
 .episode-row { --row-card-width: max(190px, calc((90vw - 75px) / 6)); --row-gutter: 0px; padding-right: 0; padding-left: 0; }
 .episode-row::before { display: none; }
 .episode-row::after { display: block; flex-basis: var(--row-end-alignment, 0px); margin-left: calc(-1 * var(--row-gap)); }
@@ -808,11 +809,16 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .update-status-panel .component-status::before { position: absolute; top: 0.55em; left: 0; width: 6px; height: 6px; content: ""; border-radius: 50%; background: rgba(255,255,255,0.28); }
 .update-status-panel .component-status[data-state="ready"]::before { background: #78c9aa; box-shadow: 0 0 0 3px rgba(120,201,170,0.1); }
 .update-status-panel .component-status[data-state="error"]::before { background: #e78f84; box-shadow: 0 0 0 3px rgba(231,143,132,0.1); }
+.update-action-row { display: flex; align-items: stretch; gap: 10px; min-width: 0; }
+.update-action-row button { min-width: 0; flex: 1 1 0; justify-content: center; }
+.update-action-row .primary-command { margin-top: 0; }
 .setting-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .setting-actions button { min-height: 34px; }
 .update-settings .setting-actions button[data-busy="true"] { cursor: wait; }
-.update-confirm { display: grid; gap: 8px; padding-top: 4px; }
+.update-confirm { display: grid; gap: 12px; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 9px; background: rgba(8,8,12,0.24); }
 .update-confirm p { margin: 0; }
+.update-confirm-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.update-confirm-actions button { width: 100%; }
 
 .modal-scrim { position: fixed; z-index: 90; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(0,0,0,0.68); }
 .reading-panel { width: min(720px, 92vw); max-height: min(76vh, 720px); overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: #14191c; box-shadow: 0 26px 76px rgba(0,0,0,0.5); }
@@ -1347,4 +1353,6 @@ html[data-ui-theme="ember"] { --accent: #e18a63; --accent-strong: #ffc09d; --acc
   .theme-grid { grid-template-columns: 1fr; }
   .settings-section .setting-select-row { align-items: flex-start; flex-direction: column; gap: 8px; }
   .settings-section .setting-select-row select { width: 100%; }
+  .update-action-row { flex-direction: column; }
+  .update-action-row button { width: 100%; flex: none; }
 }

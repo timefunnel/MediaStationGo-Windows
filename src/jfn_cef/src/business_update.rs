@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -15,6 +15,7 @@ use crate::client::{Inner, RendererValue, post_renderer_message};
 const GITHUB_RELEASE_API_URL: &str =
     "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/latest";
 const RELEASE_REPOSITORY_PATH: &str = "/timefunnel/MediaStationGo-Windows/releases/";
+const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://ghproxy.net/";
 const USER_AGENT: &str = "MediaStationGo-Windows-Updater";
 const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS.txt";
 const PORTABLE_MARKER_NAME: &str = ".mediastation-portable";
@@ -110,8 +111,6 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
             return;
         }
         state.checking = true;
-        state.release = None;
-        state.downloaded = None;
     }
     post_status(Arc::clone(&inner), "checking", json!({}));
 
@@ -130,6 +129,7 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
                         let mut state = STATE.lock();
                         state.checking = false;
                         state.release = Some(release.clone());
+                        state.downloaded = None;
                     }
                     post_status(
                         worker_inner,
@@ -145,7 +145,11 @@ pub(crate) fn check_for_updates(inner: Arc<Inner>) {
                     );
                 }
                 Ok((release, false)) => {
-                    STATE.lock().checking = false;
+                    let mut state = STATE.lock();
+                    state.checking = false;
+                    state.release = None;
+                    state.downloaded = None;
+                    drop(state);
                     post_status(
                         worker_inner,
                         "up_to_date",
@@ -196,9 +200,9 @@ pub(crate) fn download_update(inner: Arc<Inner>) {
         Arc::clone(&inner),
         "downloading",
         json!({
-            "downloadedBytes": 0,
+            "downloadedBytes": retained_download_bytes(&release),
             "totalBytes": release.asset_size,
-            "percent": 0,
+            "percent": retained_download_bytes(&release).saturating_mul(100) / release.asset_size,
         }),
     );
 
@@ -226,7 +230,7 @@ pub(crate) fn download_update(inner: Arc<Inner>) {
                 Err(error) => {
                     state.downloaded = None;
                     drop(state);
-                    post_error(worker_inner, error);
+                    post_download_error(worker_inner, error, &release);
                 }
             }
         });
@@ -322,6 +326,8 @@ fn fetch_release(
     let metadata = get_text(&agent, metadata_url, MAX_METADATA_BYTES)?;
     let mut release = parse_release_metadata(&metadata, package_kind)?;
     let checksum_asset_url = checksum_asset_url(&metadata)?;
+    // The package travels through the download proxy, but the checksum stays
+    // on GitHub so the proxy cannot replace both the package and its hash.
     let checksums = get_text(&agent, &checksum_asset_url, MAX_CHECKSUM_BYTES)?;
     release.sha256 = checksum_for_asset(&checksums, &release.asset_name)?;
     Ok(release)
@@ -522,6 +528,27 @@ fn validate_asset_url(raw: &str, tag: &str, asset_name: &str) -> Result<(), Upda
     Ok(())
 }
 
+fn proxied_github_download_url(github_url: &str) -> Result<String, UpdateError> {
+    let url = Url::parse(github_url).map_err(|error| {
+        UpdateError::new("asset_url_invalid", format!("发布文件地址无效：{error}"))
+    })?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.path().starts_with(RELEASE_REPOSITORY_PATH)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(UpdateError::new(
+            "asset_url_untrusted",
+            "发布文件不属于受信任的 GitHub Release",
+        ));
+    }
+    Ok(format!("{GITHUB_DOWNLOAD_PROXY_PREFIX}{github_url}"))
+}
+
 fn checksum_for_asset(checksums: &str, asset_name: &str) -> Result<String, UpdateError> {
     for line in checksums.lines() {
         let mut fields = line.split_whitespace();
@@ -619,20 +646,68 @@ fn download_update_package(
     }
 
     let temporary = update_dir.join(format!("{}.download", release.asset_name));
-    if temporary.exists() {
+    if temporary.is_file()
+        && fs::metadata(&temporary)
+            .map_err(|error| {
+                UpdateError::new(
+                    "update_temp_metadata_failed",
+                    format!("无法读取未完成更新文件：{error}"),
+                )
+            })?
+            .len()
+            > release.asset_size
+    {
         fs::remove_file(&temporary).map_err(|error| {
             UpdateError::new(
                 "update_temp_cleanup_failed",
-                format!("无法清理未完成的更新文件：{error}"),
+                format!("无法清理超过正式版本大小的未完成更新文件：{error}"),
+            )
+        })?;
+    }
+
+    if temporary.exists() && !temporary.is_file() {
+        return Err(UpdateError::new(
+            "update_temp_invalid",
+            "未完成更新文件路径不是普通文件",
+        ));
+    }
+
+    if temporary.is_file()
+        && fs::metadata(&temporary)
+            .map_err(|error| {
+                UpdateError::new(
+                    "update_temp_metadata_failed",
+                    format!("无法读取未完成更新文件：{error}"),
+                )
+            })?
+            .len()
+            == release.asset_size
+    {
+        if verify_file_sha256(&temporary, &release.sha256).is_ok() {
+            if destination.exists() {
+                fs::remove_file(&destination).map_err(|error| {
+                    UpdateError::new(
+                        "update_replace_failed",
+                        format!("无法替换旧的更新包：{error}"),
+                    )
+                })?;
+            }
+            fs::rename(&temporary, &destination).map_err(|error| {
+                UpdateError::new("update_finalize_failed", format!("无法保存更新包：{error}"))
+            })?;
+            cleanup_old_update_packages(&update_dir, &destination);
+            return Ok(destination);
+        }
+        fs::remove_file(&temporary).map_err(|error| {
+            UpdateError::new(
+                "update_temp_cleanup_failed",
+                format!("无法清理校验失败的未完成更新文件：{error}"),
             )
         })?;
     }
 
     let result = download_update_package_to(&temporary, release, inner);
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
+    result?;
     if destination.exists() {
         fs::remove_file(&destination).map_err(|error| {
             UpdateError::new(
@@ -654,22 +729,39 @@ fn download_update_package_to(
     inner: &Arc<Inner>,
 ) -> Result<(), UpdateError> {
     let agent = github_agent(Duration::from_secs(20 * 60));
-    let response = github_request(&agent, &release.asset_url)?;
+    let downloaded = retained_download_bytes(release);
+    let asset_url = proxied_github_download_url(&release.asset_url)?;
+    let response = download_response(&agent, &asset_url, downloaded, release.asset_size)?;
     let mut reader = response.into_body().into_reader();
-    let mut file = File::create(destination).map_err(|error| {
-        UpdateError::new(
-            "update_file_create_failed",
-            format!("无法创建更新文件：{error}"),
-        )
-    })?;
-    let mut hasher = Sha256::new();
+    let mut file = if downloaded == 0 {
+        File::create(destination).map_err(|error| {
+            UpdateError::new(
+                "update_file_create_failed",
+                format!("无法创建更新文件：{error}"),
+            )
+        })?
+    } else {
+        OpenOptions::new()
+            .append(true)
+            .open(destination)
+            .map_err(|error| {
+                UpdateError::new(
+                    "update_file_open_failed",
+                    format!("无法打开未完成更新文件：{error}"),
+                )
+            })?
+    };
+    let mut hasher = hash_file(destination)?;
     let mut buffer = vec![0_u8; 256 * 1024];
-    let mut downloaded = 0_u64;
-    let mut last_percent = 0_u64;
+    let mut downloaded = downloaded;
+    let mut last_percent = downloaded.saturating_mul(100) / release.asset_size;
 
     loop {
         let count = reader.read(&mut buffer).map_err(|error| {
-            UpdateError::new("update_download_failed", format!("更新包下载失败：{error}"))
+            UpdateError::new(
+                "update_download_failed",
+                format!("更新包下载失败，已保留 {downloaded} 字节，可继续下载：{error}"),
+            )
         })?;
         if count == 0 {
             break;
@@ -727,6 +819,117 @@ fn download_update_package_to(
         ));
     }
     Ok(())
+}
+
+fn retained_download_bytes(release: &ReleaseInfo) -> u64 {
+    let path = jfn_paths::cache_dir()
+        .join("updates")
+        .join(format!("{}.download", release.asset_name));
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() < release.asset_size => metadata.len(),
+        _ => 0,
+    }
+}
+
+fn download_response(
+    agent: &ureq::Agent,
+    url: &str,
+    offset: u64,
+    expected_size: u64,
+) -> Result<ureq::http::Response<ureq::Body>, UpdateError> {
+    let mut request = agent
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/octet-stream");
+    if offset > 0 {
+        request = request.header("Range", format!("bytes={offset}-"));
+    }
+    let response = request.call().map_err(|error| {
+        UpdateError::new(
+            "update_request_failed",
+            format!("更新包下载请求失败：{error}"),
+        )
+    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(UpdateError::new(
+            "update_http_error",
+            format!("更新包服务器返回 HTTP {status}"),
+        ));
+    }
+    if offset > 0 {
+        if status != 206 {
+            return Err(UpdateError::new(
+                "update_resume_unsupported",
+                "下载代理未返回断点续传响应，已保留当前进度",
+            ));
+        }
+        let content_range = response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok());
+        validate_content_range(content_range, offset, expected_size)?;
+    }
+    Ok(response)
+}
+
+fn validate_content_range(
+    value: Option<&str>,
+    expected_offset: u64,
+    expected_size: u64,
+) -> Result<(), UpdateError> {
+    let value = value.ok_or_else(|| {
+        UpdateError::new("update_resume_invalid", "断点续传响应缺少 Content-Range")
+    })?;
+    let bytes = value.strip_prefix("bytes ").ok_or_else(|| {
+        UpdateError::new("update_resume_invalid", "断点续传响应的 Content-Range 无效")
+    })?;
+    let (range, total) = bytes.split_once('/').ok_or_else(|| {
+        UpdateError::new("update_resume_invalid", "断点续传响应的 Content-Range 无效")
+    })?;
+    let (start, end) = range.split_once('-').ok_or_else(|| {
+        UpdateError::new("update_resume_invalid", "断点续传响应的 Content-Range 无效")
+    })?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| UpdateError::new("update_resume_invalid", "断点续传响应的起始位置无效"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| UpdateError::new("update_resume_invalid", "断点续传响应的结束位置无效"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| UpdateError::new("update_resume_invalid", "断点续传响应的总大小无效"))?;
+    if start != expected_offset || end < start || end >= expected_size || total != expected_size {
+        return Err(UpdateError::new(
+            "update_resume_invalid",
+            "断点续传响应与正式版本大小不一致，已保留当前进度",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<Sha256, UpdateError> {
+    let mut file = File::open(path).map_err(|error| {
+        UpdateError::new(
+            "update_file_read_failed",
+            format!("无法读取未完成更新文件：{error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            UpdateError::new(
+                "update_file_read_failed",
+                format!("无法读取未完成更新文件：{error}"),
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher)
 }
 
 fn verify_file_sha256(path: &Path, expected: &str) -> Result<(), UpdateError> {
@@ -938,6 +1141,31 @@ fn post_error(inner: Arc<Inner>, error: UpdateError) {
     );
 }
 
+fn post_download_error(inner: Arc<Inner>, error: UpdateError, release: &ReleaseInfo) {
+    jfn_logging::log(
+        jfn_logging::CATEGORY_CEF,
+        jfn_logging::LEVEL_ERROR,
+        &format!(
+            "MediaStation update download failed: {}: {}",
+            error.code, error.message
+        ),
+    );
+    let downloaded = retained_download_bytes(release);
+    post_status(
+        inner,
+        "error",
+        json!({
+            "code": error.code,
+            "message": error.message,
+            "version": release.version,
+            "downloadedBytes": downloaded,
+            "totalBytes": release.asset_size,
+            "percent": downloaded.saturating_mul(100) / release.asset_size,
+            "canResume": true,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1329,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn package_downloads_use_the_configured_github_proxy() {
+        let github_url = "https://github.com/timefunnel/MediaStationGo-Windows/releases/download/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe";
+        assert_eq!(
+            proxied_github_download_url(github_url).unwrap(),
+            format!("{GITHUB_DOWNLOAD_PROXY_PREFIX}{github_url}")
+        );
+        assert!(proxied_github_download_url("https://example.com/update.exe").is_err());
+    }
+
+    #[test]
+    fn resume_response_requires_the_exact_partial_range() {
+        assert!(validate_content_range(Some("bytes 1024-2047/4096"), 1024, 4096).is_ok());
+        assert!(validate_content_range(Some("bytes 0-2047/4096"), 1024, 4096).is_err());
+        assert!(validate_content_range(Some("bytes 1024-4096/4096"), 1024, 4096).is_err());
+        assert!(validate_content_range(None, 1024, 4096).is_err());
     }
 }
