@@ -11,6 +11,16 @@ on:
         description: Stable release tag, for example v0.1.1
         required: true
         type: string
+      replace_existing:
+        description: Replace an existing release and move its tag to the verified candidate
+        required: false
+        default: false
+        type: boolean
+      release_notes:
+        description: Full release notes; required when replacing an existing release
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -136,19 +146,46 @@ jobs:
           done
           (cd dist/public && sha256sum --check --strict "$normalized_sums")
 
-      - name: Create or verify release tag
+      - name: Prepare release tag
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          REPLACE_EXISTING: ${{ inputs.replace_existing }}
         run: |
           set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release already exists: $RELEASE_TAG" >&2
-            exit 1
+            if [[ "$REPLACE_EXISTING" != "true" ]]; then
+              echo "Release already exists: $RELEASE_TAG" >&2
+              exit 1
+            fi
+
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            tagged_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            archive_tag="archive/${RELEASE_TAG#v}-${tagged_sha:0:7}"
+            if git ls-remote --exit-code --tags origin "refs/tags/$archive_tag" >/dev/null 2>&1; then
+              git fetch --force origin "refs/tags/$archive_tag:refs/tags/$archive_tag"
+              archive_sha="$(git rev-list -n 1 "$archive_tag")"
+              if [[ "$archive_sha" != "$tagged_sha" ]]; then
+                echo "Archive tag $archive_tag points to $archive_sha, expected $tagged_sha" >&2
+                exit 1
+              fi
+            else
+              git tag -a "$archive_tag" "$tagged_sha" -m "Archived $RELEASE_TAG before replacement"
+              git push origin "refs/tags/$archive_tag"
+            fi
+
+            echo "existing=true" >> "$GITHUB_OUTPUT"
+            echo "Replacing $RELEASE_TAG; previous target archived as $archive_tag"
+            exit 0
           fi
+
+          echo "existing=false" >> "$GITHUB_OUTPUT"
 
           if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
@@ -159,8 +196,6 @@ jobs:
             fi
             echo "Using existing tag $RELEASE_TAG at $tagged_sha"
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "$RELEASE_TAG" "$CANDIDATE_SHA" -m "MediaStationGo $RELEASE_TAG"
             git push origin "refs/tags/$RELEASE_TAG"
           fi
@@ -170,10 +205,80 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          EXISTING_RELEASE: ${{ steps.release.outputs.existing }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" dist/public/* \
+
+          if [[ "$EXISTING_RELEASE" == "true" ]]; then
+            if [[ -z "$RELEASE_NOTES" ]]; then
+              echo "release_notes is required when replacing an existing release" >&2
+              exit 1
+            fi
+
+            notes_file="$(mktemp)"
+            trap 'rm -f "$notes_file"' EXIT
+            printf '%s\n' "$RELEASE_NOTES" > "$notes_file"
+
+            gh release upload "$RELEASE_TAG" dist/public/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes_file" \
+              --latest
+
+            git tag -f -a "$RELEASE_TAG" "$CANDIDATE_SHA" -m "MediaStationGo $RELEASE_TAG"
+            git push --force origin "refs/tags/$RELEASE_TAG"
+          else
+            if [[ -n "$RELEASE_NOTES" ]]; then
+              notes_file="$(mktemp)"
+              trap 'rm -f "$notes_file"' EXIT
+              printf '%s\n' "$RELEASE_NOTES" > "$notes_file"
+              gh release create "$RELEASE_TAG" dist/public/* \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --notes-file "$notes_file" \
+                --title "$RELEASE_TAG"
+            else
+              gh release create "$RELEASE_TAG" dist/public/* \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --generate-notes \
+                --title "$RELEASE_TAG"
+            fi
+          fi
+
+      - name: Verify published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [[ "$tagged_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "Published tag points to $tagged_sha, expected $CANDIDATE_SHA" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          expected="$(printf '%s\n' \
+            "MediaStationGo-${version}-windows-x64-portable.zip" \
+            "MediaStationGo-${version}-windows-x64-setup.exe" \
+            "MediaStationGo-${version}-windows-x64-source.zip" \
+            "SHA256SUMS.txt")"
+          actual="$(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
-            --title "$RELEASE_TAG"
+            --json assets \
+            --jq '.assets[].name' | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Published release assets do not match the expected set" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+            exit 1
+          fi
