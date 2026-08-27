@@ -26,6 +26,7 @@
     const homeRefreshDelayMs = 1200;
     const heroRotationIntervalMs = 9000;
     const heroCarouselMaxCards = 20;
+    const maximumContinueWatchingItems = 20;
     const libraryPageSize = 48;
     const maximumLibraryCacheEntries = 12;
     const maximumSeriesDetailCacheEntries = 12;
@@ -1429,7 +1430,7 @@
 
     function updateImageCacheStatus() {
         const diskSize = formatBytes(imageDiskStats.imageBytes);
-        byId('settings-image-cache-status').textContent = `磁盘 ${diskSize} · 本次 ${imageCache.size} 张`;
+        byId('settings-image-cache-status').textContent = `磁盘 ${diskSize}`;
     }
 
     async function refreshImageCacheStatus() {
@@ -1504,9 +1505,13 @@
         return [season, episode].filter(Boolean).join(' · ');
     }
 
-    function cardSubtitle(card, omitSeriesName = false) {
+    function cardSubtitle(card, omitSeriesName = false, includeEpisodeTitle = false) {
         if (card.type === 'Episode') {
-            return [omitSeriesName ? '' : card.seriesName, episodePosition(card)].filter(Boolean).join(' · ');
+            return [
+                omitSeriesName ? '' : card.seriesName,
+                episodePosition(card),
+                includeEpisodeTitle ? card.title : '',
+            ].filter(Boolean).join(' · ');
         }
         return card.year ? String(card.year) : '';
     }
@@ -1542,7 +1547,11 @@
         img.alt = '';
         img.decoding = 'async';
         art.append(fallback, img);
-        const ref = options.landscape ? (card.landscapeImage || card.primaryImage) : (card.primaryImage || card.landscapeImage);
+        const ref = rowKey === 'resume' && card.type === 'Episode'
+            ? (card.primaryImage || card.landscapeImage)
+            : options.landscape
+                ? (card.landscapeImage || card.primaryImage)
+                : (card.primaryImage || card.landscapeImage);
         observeImage(img, ref, imageWidthFor(ref, options.landscape));
         if (options.episodePicker && card.indexNumber) {
             art.append(element('span', 'episode-badge', `第 ${card.indexNumber} 集`));
@@ -1563,7 +1572,11 @@
         } else {
             const subtitle = options.episodePicker
                 ? formatDuration(card.durationMs)
-                : cardSubtitle(card, options.omitSeriesName ?? options.episodeAsSeries);
+                : cardSubtitle(
+                    card,
+                    options.omitSeriesName ?? options.episodeAsSeries,
+                    rowKey === 'resume',
+                );
             button.append(art, element('span', 'card-title', title), element('span', 'card-subtitle', subtitle));
         }
         button.addEventListener('focus', () => options.onFocus?.(card));
@@ -2088,6 +2101,9 @@
     function renderHome(data) {
         stopHeroCarousel();
         content.replaceChildren();
+        const resumeItems = Array.isArray(data.resume)
+            ? data.resume.slice(0, maximumContinueWatchingItems)
+            : [];
         const latestSections = Array.isArray(data.latestSections)
             ? data.latestSections.filter((section) => section?.library && section.items?.length)
             : [];
@@ -2105,8 +2121,8 @@
             secondBackdrop,
             element('div', 'hero-copy'),
         );
-        const heroCards = shuffledHeroCards(data, latestSections);
-        const fallback = data.resume?.[0] || latestSections[0]?.items?.[0] || data.latest?.[0] || data.libraries?.[0];
+        const heroCards = shuffledHeroCards({ ...data, resume: resumeItems }, latestSections);
+        const fallback = resumeItems[0] || latestSections[0]?.items?.[0] || data.latest?.[0] || data.libraries?.[0];
         const carousel = heroCards.length
             ? startHeroCarousel(hero, heroCards)
             : { select: (card) => updateHero(hero, card), previous: () => {}, next: () => {} };
@@ -2139,17 +2155,17 @@
             key: 'libraries', rowIndex: 0, landscape: true, library: true, onFocus: focusHero,
             onClick: openLibrary, more: () => setCurrentView({ kind: 'libraries', data: data.libraries }),
         });
-        const resume = createSection('继续观看', data.resume, {
+        const resume = createSection('继续观看', resumeItems, {
             key: 'resume', rowIndex: 1, landscape: true, episodeAsSeries: true, onFocus: focusHero,
             onClick: (card) => card.playable ? startPlayback(card, card.resumePositionMs) : openDetail(card),
         });
         const latestRows = latestSections.length
             ? latestSections.map((section, index) => createSection(`最近添加 · ${section.library.title}`, section.items, {
-                key: `latest:${section.library.id}`, rowIndex: index + 2, landscape: true,
+                key: `latest:${section.library.id}`, rowIndex: index + 2,
                 onFocus: focusHero, onClick: openDetail,
             }))
             : [createSection('最近添加', data.latest, {
-                key: 'latest', rowIndex: 2, landscape: true, onFocus: focusHero, onClick: openDetail,
+                key: 'latest', rowIndex: 2, onFocus: focusHero, onClick: openDetail,
             })];
         [libraries, resume, ...latestRows].filter(Boolean).forEach((section) => band.append(section));
         if (!band.childElementCount) band.append(element('div', 'empty-state', '媒体库暂无内容'));
@@ -3302,7 +3318,9 @@
         };
 
         const setDetailPlayAction = (episodes) => {
-            const target = episodes.find((episode) => episode.resumePositionMs > 0) || episodes[0];
+            const target = episodes.find((episode) => episode.id === resumableEpisode?.id)
+                || episodes.find((episode) => episode.resumePositionMs > 0)
+                || episodes[0];
             if (!target?.playable) return;
             detailActions.querySelector('.primary-command')?.remove();
             appendDetailPlayAction(detailActions, target);
@@ -5777,6 +5795,7 @@
                 }
                 if (index >= 0) homeData.resume.splice(index, 1);
                 homeData.resume.unshift(item);
+                homeData.resume.splice(maximumContinueWatchingItems);
                 invalidateHomeRefresh();
             }
         }
@@ -5986,10 +6005,10 @@
             renderCurrentView();
             restoreViewState(currentView);
             updateImageCacheStatus();
-            showToast('图片缓存已清除');
+            showToast('缓存已清除');
         } catch (error) {
             console.error(`图片缓存清理失败：${friendlyError(error)}`);
-            showToast(`图片缓存清理失败：${friendlyError(error)}`);
+            showToast(`缓存清理失败：${friendlyError(error)}`);
         } finally {
             button.disabled = false;
         }

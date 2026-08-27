@@ -18,6 +18,7 @@ const MAX_EXTERNAL_RESOURCE_REDIRECTS: usize = 6;
 const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,People,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
 const BROWSE_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
 const MAX_CATALOG_PAGE_SIZE: usize = 100;
+const HOME_RESUME_LIMIT: usize = 20;
 const DETAIL_EPISODE_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 const MAX_PROTOCOL_EXTENSIONS: usize = 64;
@@ -661,9 +662,12 @@ impl MediaStationApiClient {
         resume_url
             .query_pairs_mut()
             .append_pair("UserId", &session.user_id)
-            .append_pair("Limit", "24")
+            .append_pair("Limit", &HOME_RESUME_LIMIT.to_string())
             .append_pair("Fields", CATALOG_FIELDS);
-        let resume = parse_media_cards(&self.get_json(session, &resume_url)?)?;
+        let resume = parse_media_cards(&self.get_json(session, &resume_url)?)?
+            .into_iter()
+            .take(HOME_RESUME_LIMIT)
+            .collect();
 
         let latest_by_library = libraries
             .iter()
@@ -2976,6 +2980,52 @@ mod tests {
         assert!(params.contains_key("Fields"));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].media_type, "Movie");
+    }
+
+    #[test]
+    fn home_limits_continue_watching_request_and_result_to_twenty_items() {
+        let response = |payload: Value| {
+            let body = payload.to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let resume_items = (1..=21)
+            .map(|index| {
+                json!({
+                    "Id": format!("episode-{index}"),
+                    "Name": format!("Episode {index}"),
+                    "Type": "Episode"
+                })
+            })
+            .collect::<Vec<_>>();
+        let (base_url, server) = serve_sequence(vec![
+            response(json!({ "Items": [] })),
+            response(json!({ "Items": resume_items })),
+        ]);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let home = client
+            .load_home(&session(base_url))
+            .expect("home should load");
+        let requests = server.join().expect("server thread should finish");
+        let resume_target = requests[1]
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("resume request target should exist");
+        let resume_url = Url::parse(&format!("http://localhost{resume_target}"))
+            .expect("resume request target should parse");
+        let params = resume_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(resume_url.path(), "/Users/user-1/Items/Resume");
+        assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("20"));
+        assert_eq!(home.resume.len(), 20);
+        assert_eq!(home.resume[19].id, "episode-20");
     }
 
     #[test]

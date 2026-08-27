@@ -38,7 +38,7 @@ $PreviewShim = @'
         return imageMap.get(key);
     };
 
-    const ref = (key, title) => ({ key, type: 'backdrop', title });
+    const ref = (key, title, type = 'backdrop') => ({ key, type, title });
     const episode = (index, title, resumePositionMs = 0) => ({
         id: `episode-${index}`,
         type: 'Episode',
@@ -51,13 +51,20 @@ $PreviewShim = @'
         durationMs: 2680000,
         resumePositionMs,
         playable: true,
-        landscapeImage: ref(`episode-${index}`, `第 ${index} 集`),
-        primaryImage: ref(`episode-${index}`, `第 ${index} 集`),
+        landscapeImage: ref('series-night-archive-landscape', '剧集公共背景'),
+        primaryImage: ref(`episode-${index}`, `第 ${index} 集`, 'primary'),
     });
     const episodeTitles = ['潮汐线', '无人电台', '灰色航标', '最后一班船', '风暴之前', '远方来信', '沉默坐标', '夜航终点'];
     const episodes = Array.from({ length: 181 }, (_, offset) => {
         const index = offset + 1;
-        return episode(index, episodeTitles[offset % episodeTitles.length], index === 121 ? 224000 : 0);
+        const resumePositionMs = index === 1
+            ? 97042
+            : index === 121
+                ? 224000
+                : index === 151
+                    ? 250383
+                    : 0;
+        return episode(index, episodeTitles[offset % episodeTitles.length], resumePositionMs);
     });
     const series = {
         id: 'series-night-archive',
@@ -90,7 +97,13 @@ $PreviewShim = @'
     };
     const home = {
         libraries: [library],
-        resume: [episodes[120]],
+        resume: [
+            episodes[150],
+            ...episodes.slice(0, 20).map((item) => ({
+                ...item,
+                resumePositionMs: item.resumePositionMs || 120000,
+            })),
+        ],
         latest: [series, movie, episodes[0]],
         latestSections: [{ library, items: [series, movie, episodes[0], episodes[2]] }],
         cache: { status: 'miss' },
