@@ -270,6 +270,21 @@
               </div>
             </div>
             <label class="update-preference-row" for="settings-auto-update-check"><span><strong>自动检查更新</strong><small>应用启动后自动确认是否有新版本</small></span><input id="settings-auto-update-check" type="checkbox" role="switch"></label>
+            <div class="update-source-settings setting-block">
+              <label><strong>下载源策略</strong><small>服务器策略会随媒体服务器连接更新；不可用时使用本机缓存和内置源。失败时按顺序自动切换，最后尝试 GitHub 直连。</small></label>
+              <div class="settings-option-cards update-source-mode-cards" role="radiogroup" aria-label="下载源策略">
+                <label><input type="radio" name="settings-update-source-mode" value="server"><span><strong>服务器策略</strong><small>由 MediaStationGo 维护</small></span></label>
+                <label><input type="radio" name="settings-update-source-mode" value="builtin"><span><strong>内置默认</strong><small>使用应用内置列表</small></span></label>
+                <label><input type="radio" name="settings-update-source-mode" value="custom"><span><strong>本地自定义</strong><small>使用本机编辑的列表</small></span></label>
+              </div>
+              <label for="settings-update-download-sources"><strong>本地自定义列表</strong><small>每行填写一个 HTTPS 前缀；仅填写 direct 可跳过加速源。</small></label>
+              <textarea id="settings-update-download-sources" rows="5" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+              <div class="setting-actions">
+                <button id="settings-save-update-download-sources" class="secondary-command" type="button">保存下载源</button>
+                <button id="settings-reset-update-download-sources" class="secondary-command" type="button">恢复默认</button>
+              </div>
+              <p id="settings-update-download-sources-status" class="component-status" role="status" aria-live="polite"></p>
+            </div>
             <div class="update-status-panel">
               <p id="settings-app-update-status" class="component-status" role="status" aria-live="polite">尚未检查更新</p>
               <div class="update-action-row" aria-label="更新操作">

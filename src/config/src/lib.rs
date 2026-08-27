@@ -13,9 +13,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
+use url::Url;
 
 const DEVICE_NAME_MAX: usize = 64;
 const FRAME_INTERPOLATION_MODEL_DEFAULT: &str = "rife-v4.26";
+pub const DEFAULT_UPDATE_DOWNLOAD_SOURCES: &str = "https://gh-proxy.com/\nhttps://ghfast.top/\nhttps://gh.ddlc.top/\nhttps://gh.xmly.dev/\nhttps://proxy.vvvv.ee/\nhttps://cors.isteed.cc/\nhttps://ghproxy.imciel.com/\nhttps://ghproxy.cxkpro.top/";
+const MAX_UPDATE_DOWNLOAD_SOURCES: usize = 8;
 #[cfg(target_os = "windows")]
 const HWDEC_DEFAULT: &str = "auto";
 #[cfg(not(target_os = "windows"))]
@@ -66,6 +69,10 @@ struct SettingsData {
     frame_interpolation_model: String,
     auto_update_check: bool,
     media_station_proxy_mode: String,
+    update_download_source_mode: String,
+    update_download_sources: String,
+    cached_update_download_sources: String,
+    cached_update_download_sources_expires_at: u64,
 }
 
 impl Default for SettingsData {
@@ -87,6 +94,10 @@ impl Default for SettingsData {
             frame_interpolation_model: String::new(),
             auto_update_check: true,
             media_station_proxy_mode: String::new(),
+            update_download_source_mode: String::new(),
+            update_download_sources: String::new(),
+            cached_update_download_sources: String::new(),
+            cached_update_download_sources_expires_at: 0,
         }
     }
 }
@@ -188,6 +199,31 @@ impl SettingsData {
                 String::new()
             };
         }
+        if let Some(sources) = v.get("updateDownloadSources").and_then(Value::as_str)
+            && let Some(normalized) = normalize_update_download_sources(sources)
+        {
+            self.update_download_sources = normalized;
+        }
+        if let Some(mode) = v.get("updateDownloadSourceMode").and_then(Value::as_str)
+            && matches!(mode, "server" | "custom" | "builtin")
+        {
+            self.update_download_source_mode = if mode == "server" {
+                String::new()
+            } else {
+                mode.to_string()
+            };
+        }
+        if let Some(sources) = v.get("cachedUpdateDownloadSources").and_then(Value::as_str)
+            && let Some(normalized) = normalize_update_download_sources(sources)
+        {
+            self.cached_update_download_sources = normalized;
+        }
+        if let Some(expires_at) = v
+            .get("cachedUpdateDownloadSourcesExpiresAt")
+            .and_then(Value::as_u64)
+        {
+            self.cached_update_download_sources_expires_at = expires_at;
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -272,6 +308,30 @@ impl SettingsData {
                 Value::String(self.media_station_proxy_mode.clone()),
             );
         }
+        if !self.update_download_sources.is_empty() {
+            o.insert(
+                "updateDownloadSources".into(),
+                Value::String(self.update_download_sources.clone()),
+            );
+        }
+        if !self.update_download_source_mode.is_empty() {
+            o.insert(
+                "updateDownloadSourceMode".into(),
+                Value::String(self.update_download_source_mode.clone()),
+            );
+        }
+        if !self.cached_update_download_sources.is_empty()
+            && self.cached_update_download_sources_expires_at > 0
+        {
+            o.insert(
+                "cachedUpdateDownloadSources".into(),
+                Value::String(self.cached_update_download_sources.clone()),
+            );
+            o.insert(
+                "cachedUpdateDownloadSourcesExpiresAt".into(),
+                Value::from(self.cached_update_download_sources_expires_at),
+            );
+        }
         Value::Object(o)
     }
 
@@ -329,6 +389,18 @@ impl SettingsData {
             } else {
                 self.media_station_proxy_mode.clone()
             }),
+        );
+        o.insert(
+            "updateDownloadSourceMode".into(),
+            Value::String(if self.update_download_source_mode.is_empty() {
+                "server".to_string()
+            } else {
+                self.update_download_source_mode.clone()
+            }),
+        );
+        o.insert(
+            "updateDownloadSources".into(),
+            Value::String(self.update_download_sources.clone()),
         );
         let opts: Vec<Value> = hwdec_opts
             .iter()
@@ -639,6 +711,109 @@ pub fn media_station_proxy_mode() -> String {
     }
 }
 
+pub fn update_download_source_mode() -> String {
+    let configured = state().lock().data.update_download_source_mode.clone();
+    if configured.is_empty() {
+        "server".to_string()
+    } else {
+        configured
+    }
+}
+
+pub fn set_update_download_source_mode(mode: &str) -> bool {
+    let value = match mode {
+        "server" => String::new(),
+        "custom" | "builtin" => mode.to_string(),
+        _ => return false,
+    };
+    state().lock().data.update_download_source_mode = value;
+    true
+}
+
+pub fn update_download_sources() -> String {
+    state().lock().data.update_download_sources.clone()
+}
+
+pub fn cached_update_download_sources() -> (String, u64) {
+    let state = state().lock();
+    let data = &state.data;
+    (
+        data.cached_update_download_sources.clone(),
+        data.cached_update_download_sources_expires_at,
+    )
+}
+
+pub fn set_cached_update_download_sources(raw: &str, expires_at: u64) -> bool {
+    let Some(normalized) = normalize_update_download_sources(raw) else {
+        return false;
+    };
+    if normalized.is_empty() || expires_at == 0 {
+        return false;
+    }
+    let mut state = state().lock();
+    state.data.cached_update_download_sources = normalized;
+    state.data.cached_update_download_sources_expires_at = expires_at;
+    true
+}
+
+pub fn clear_cached_update_download_sources() -> bool {
+    let mut state = state().lock();
+    if state.data.cached_update_download_sources.is_empty()
+        && state.data.cached_update_download_sources_expires_at == 0
+    {
+        return false;
+    }
+    state.data.cached_update_download_sources.clear();
+    state.data.cached_update_download_sources_expires_at = 0;
+    true
+}
+
+/// Stores one source per line. `direct` is a valid explicit source and means
+/// GitHub without a download proxy. Empty lines are ignored and duplicate
+/// entries are collapsed.
+pub fn set_update_download_sources(raw: &str) -> bool {
+    let Some(normalized) = normalize_update_download_sources(raw) else {
+        return false;
+    };
+    if normalized.is_empty() {
+        return false;
+    }
+    state().lock().data.update_download_sources = normalized;
+    true
+}
+
+fn normalize_update_download_sources(raw: &str) -> Option<String> {
+    let mut values = Vec::new();
+    for value in raw.lines().map(str::trim).filter(|value| !value.is_empty()) {
+        if value != "direct" && !valid_update_download_source(value) {
+            return None;
+        }
+        if !values.iter().any(|existing| existing == value) {
+            values.push(value.to_string());
+        }
+    }
+    if values.len() > MAX_UPDATE_DOWNLOAD_SOURCES {
+        return None;
+    }
+    Some(values.join("\n"))
+}
+
+fn valid_update_download_source(value: &str) -> bool {
+    if !value.ends_with('/') {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 /// Returns false without changing state when the caller supplies a mode outside
 /// the two explicit connection modes accepted by the MediaStation runtime.
 pub fn set_media_station_proxy_mode(mode: &str) -> bool {
@@ -696,8 +871,10 @@ fn normalize_device_name(raw: &str, platform_default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HWDEC_DEFAULT, SettingsData, normalize_device_name};
-    use serde_json::json;
+    use super::{
+        HWDEC_DEFAULT, SettingsData, normalize_device_name, normalize_update_download_sources,
+    };
+    use serde_json::{Value, json};
 
     const PLATFORM: &str = "platform-host";
 
@@ -860,5 +1037,36 @@ mod tests {
 
         settings.overlay_json(&json!({ "mediaStationProxyMode": "invalid" }));
         assert!(settings.to_json().get("mediaStationProxyMode").is_none());
+    }
+
+    #[test]
+    fn update_download_sources_normalize_and_limit_entries() {
+        assert_eq!(
+            normalize_update_download_sources(
+                " https://one.example/\nhttps://one.example/\ndirect\n"
+            ),
+            Some("https://one.example/\ndirect".to_string())
+        );
+        assert!(normalize_update_download_sources("http://one.example/").is_none());
+        assert!(normalize_update_download_sources("https://one.example").is_none());
+        assert!(normalize_update_download_sources("https://one.example/path").is_none());
+        assert!(
+            normalize_update_download_sources(
+                &(0..9)
+                    .map(|index| format!("https://{index}.example/"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn update_download_sources_default_is_not_persisted_as_custom() {
+        let settings = SettingsData::default();
+        let cli: Value = serde_json::from_str(&settings.cli_json(&[])).unwrap();
+        assert_eq!(cli["updateDownloadSourceMode"], "server");
+        assert_eq!(cli["updateDownloadSources"], "");
+        assert!(settings.to_json().get("updateDownloadSources").is_none());
     }
 }

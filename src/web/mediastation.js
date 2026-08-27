@@ -142,6 +142,8 @@
     let playerPlaybackRate = 1;
     let preferredInterpolationModel = 'rife-v4.26';
     let autoUpdateCheckEnabled = window.jmpInfo?.settings?.advanced?.autoUpdateCheck !== false;
+    let updateDownloadSources = window.jmpInfo?.settings?.advanced?.updateDownloadSources || '';
+    let updateDownloadSourceMode = window.jmpInfo?.settings?.advanced?.updateDownloadSourceMode || 'server';
     let globalProxyMode = window.jmpInfo?.settings?.advanced?.mediaStationProxyMode === 'system'
         ? 'system'
         : 'direct';
@@ -1025,7 +1027,8 @@
             const downloaded = formatBytes(payload.downloadedBytes);
             const total = formatBytes(payload.totalBytes);
             const progress = downloaded && total ? ` · ${downloaded} / ${total}` : '';
-            return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%${progress}`;
+            const source = payload.source ? ` · ${payload.source}` : '';
+            return `正在下载更新 ${Math.max(0, Math.min(100, percent))}%${progress}${source}`;
         }
         if (status === 'verifying') return '正在校验更新包...';
         if (status === 'ready') return `${displayAppVersion(payload.version)} 已下载并校验完成，可以应用更新`;
@@ -3616,6 +3619,70 @@
         status.dataset.state = state;
     }
 
+    function normalizeUpdateDownloadSources(raw) {
+        const values = [];
+        for (const line of String(raw || '').split(/\r?\n/)) {
+            const value = line.trim();
+            if (!value || values.includes(value)) continue;
+            if (value === 'direct') {
+                values.push(value);
+                continue;
+            }
+            let url;
+            try { url = new URL(value); } catch { return null; }
+            if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash || !value.endsWith('/')) {
+                return null;
+            }
+            values.push(value);
+        }
+        return values.length <= 8 ? values.join('\n') : null;
+    }
+
+    function refreshUpdateDownloadSourceControls() {
+        const input = byId('settings-update-download-sources');
+        const save = byId('settings-save-update-download-sources');
+        const status = byId('settings-update-download-sources-status');
+        if (!input || !save || !status) return;
+        input.value = updateDownloadSources;
+        document.querySelectorAll('input[name="settings-update-source-mode"]').forEach((radio) => {
+            radio.checked = radio.value === updateDownloadSourceMode;
+        });
+        input.disabled = updateDownloadSourceMode !== 'custom';
+        save.disabled = updateDownloadSourceMode !== 'custom';
+        status.textContent = '失败时会按顺序切换下载源，最后尝试 GitHub 直连。';
+        status.dataset.state = '';
+    }
+
+    function saveUpdateDownloadSources() {
+        const input = byId('settings-update-download-sources');
+        const status = byId('settings-update-download-sources-status');
+        if (!input || !status) return;
+        const normalized = normalizeUpdateDownloadSources(input.value);
+        if (!normalized) {
+            status.textContent = '下载源格式无效：至少填写一个 HTTPS 前缀或 direct，每行一个，最多 8 个。';
+            status.dataset.state = 'error';
+            return;
+        }
+        updateDownloadSources = normalized;
+        updateDownloadSourceMode = 'custom';
+        window.jmpNative?.setSettingValue?.('advanced', 'updateDownloadSourceMode', updateDownloadSourceMode);
+        window.jmpNative?.setSettingValue?.('advanced', 'updateDownloadSources', normalized);
+        input.value = normalized;
+        status.textContent = '下载源已保存。';
+        status.dataset.state = 'ready';
+    }
+
+    function resetUpdateDownloadSources() {
+        updateDownloadSourceMode = 'server';
+        window.jmpNative?.setSettingValue?.('advanced', 'updateDownloadSourceMode', updateDownloadSourceMode);
+        refreshUpdateDownloadSourceControls();
+        const status = byId('settings-update-download-sources-status');
+        if (status) {
+            status.textContent = '已恢复默认下载源。';
+            status.dataset.state = 'ready';
+        }
+    }
+
     function selectSettingsSection(section) {
         const settings = byId('settings-drawer');
         const signedIn = Boolean(session);
@@ -3630,6 +3697,7 @@
         settings.querySelectorAll('[data-settings-section]').forEach((button) => {
             button.classList.toggle('is-active', button.dataset.settingsSection === activeSettingsSection);
         });
+        if (activeSettingsSection === 'update') refreshUpdateDownloadSourceControls();
     }
 
     function proxyModeInputs() {
@@ -5970,6 +6038,23 @@
         }
     });
     byId('settings-check-app-update').addEventListener('click', requestUpdateCheck);
+    document.querySelectorAll('input[name="settings-update-source-mode"]').forEach((radio) => {
+        radio.addEventListener('change', () => {
+            updateDownloadSourceMode = radio.value;
+            window.jmpNative?.setSettingValue?.('advanced', 'updateDownloadSourceMode', updateDownloadSourceMode);
+            refreshUpdateDownloadSourceControls();
+            const status = byId('settings-update-download-sources-status');
+            if (status) {
+                status.textContent = updateDownloadSourceMode === 'server'
+                    ? '已切换为服务器策略。'
+                    : updateDownloadSourceMode === 'builtin' ? '已切换为内置默认源。' : '已切换为本地自定义列表。';
+                status.dataset.state = 'ready';
+            }
+        });
+    });
+    byId('settings-save-update-download-sources').addEventListener('click', saveUpdateDownloadSources);
+    byId('settings-reset-update-download-sources').addEventListener('click', resetUpdateDownloadSources);
+    refreshUpdateDownloadSourceControls();
     byId('settings-download-app-update').addEventListener('click', () => {
         if (!window.jmpNative?.updateDownload) return;
         appUpdateState = { status: 'downloading', payload: appUpdateState.payload };

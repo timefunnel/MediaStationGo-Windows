@@ -2277,6 +2277,7 @@ dependencies = [
  "jfn-platform-abi",
  "parking_lot",
  "serde_json",
+ "url",
 ]
 
 [[package]]

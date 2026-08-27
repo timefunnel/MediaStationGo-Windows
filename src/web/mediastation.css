@@ -804,6 +804,16 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .update-preference-row > span { display: grid; gap: 3px; }
 .update-preference-row strong { color: var(--text); font-size: 14px; font-weight: 620; }
 .update-preference-row small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.update-source-settings { padding-top: 4px; }
+.update-source-settings > label { display: grid; gap: 4px; }
+.update-source-settings > label strong { color: var(--text); font-size: 14px; font-weight: 620; }
+.update-source-settings > label small { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.settings-option-cards.update-source-mode-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.update-source-settings textarea { width: 100%; min-height: 116px; resize: vertical; padding: 10px 11px; border: 1px solid rgba(255,255,255,0.16); border-radius: 4px; outline: 0; color: var(--text); background: #20272a; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.update-source-settings textarea:hover { border-color: rgba(255,255,255,0.3); }
+.update-source-settings textarea:focus-visible { border-color: rgba(255,255,255,0.52); box-shadow: 0 0 0 2px rgba(255,255,255,0.08); }
+.update-source-settings textarea:disabled { cursor: not-allowed; opacity: 0.54; }
+.update-source-settings .component-status { min-height: 18px; margin: 0; }
 .update-status-panel { display: grid; gap: 12px; padding-top: 4px; }
 .update-status-panel .component-status { position: relative; padding-left: 14px; }
 .update-status-panel .component-status::before { position: absolute; top: 0.55em; left: 0; width: 6px; height: 6px; content: ""; border-radius: 50%; background: rgba(255,255,255,0.28); }
@@ -1347,6 +1357,7 @@ html[data-ui-theme="ember"] { --accent: #e18a63; --accent-strong: #ffc09d; --acc
   .login-intro { min-height: 218px; }
   .login-panel { padding: 26px 20px; }
   .login-option-cards, .settings-option-cards { grid-template-columns: 1fr; }
+  .settings-option-cards.update-source-mode-cards { grid-template-columns: 1fr; }
   .settings-modal { padding: 12px; }
   .settings-preferences { max-height: calc(100vh - 24px); }
   .settings-modal-header { min-height: 62px; padding-left: 20px; }

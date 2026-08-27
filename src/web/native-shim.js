@@ -106,6 +106,8 @@
                 windowDecorations: __WINDOW_DECORATIONS__,
                 hideScrollbar: _savedSettings.hideScrollbar !== false,
                 autoUpdateCheck: _savedSettings.autoUpdateCheck !== false,
+                updateDownloadSourceMode: _savedSettings.updateDownloadSourceMode || 'server',
+                updateDownloadSources: _savedSettings.updateDownloadSources || '',
                 mediaStationProxyMode: _savedSettings.mediaStationProxyMode === 'system' ? 'system' : 'direct',
                 logLevel: _savedSettings.logLevel || '',
                 deviceName: _savedSettings.deviceName || ''

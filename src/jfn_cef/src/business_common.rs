@@ -76,6 +76,24 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         // the empty string. Neither caller has the live hostname handy here.
         "deviceName" => jfn_config::set_device_name(value, ""),
         "autoUpdateCheck" => jfn_config::set_auto_update_check(value == "true"),
+        "updateDownloadSourceMode" => {
+            if !jfn_config::set_update_download_source_mode(value) {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_WARN,
+                    "Invalid update download source mode; keeping the previous value",
+                );
+            }
+        }
+        "updateDownloadSources" => {
+            if !jfn_config::set_update_download_sources(value) {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_WARN,
+                    "Invalid update download source list; keeping the previous value",
+                );
+            }
+        }
         _ => jfn_logging::log(
             jfn_logging::CATEGORY_CEF,
             jfn_logging::LEVEL_WARN,

@@ -23,6 +23,10 @@ const DETAIL_EPISODE_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 const MAX_PROTOCOL_EXTENSIONS: usize = 64;
 const PLAYBACK_PREFERENCES_EXTENSION_ID: &str = "playback-preferences";
+const UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID: &str = "update-download-sources";
+const MAX_UPDATE_DOWNLOAD_SOURCES: usize = 8;
+const MIN_UPDATE_POLICY_MAX_AGE_SECONDS: u64 = 300;
+const MAX_UPDATE_POLICY_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaStationClientProfile {
@@ -100,15 +104,26 @@ impl MediaStationProxyMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmbyProtocolExtensions {
     playback_preferences_v1: bool,
+    update_download_policy_v1: Option<UpdateDownloadPolicy>,
 }
 
 impl EmbyProtocolExtensions {
-    pub const fn supports_playback_preferences(self) -> bool {
+    pub const fn supports_playback_preferences(&self) -> bool {
         self.playback_preferences_v1
     }
+
+    pub const fn update_download_policy(&self) -> Option<&UpdateDownloadPolicy> {
+        self.update_download_policy_v1.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateDownloadPolicy {
+    pub sources: Vec<String>,
+    pub max_age_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,8 +249,8 @@ impl MediaStationSession {
         &self.token
     }
 
-    pub const fn protocol_extensions(&self) -> EmbyProtocolExtensions {
-        self.protocol_extensions
+    pub const fn protocol_extensions(&self) -> &EmbyProtocolExtensions {
+        &self.protocol_extensions
     }
 
     pub fn set_protocol_extensions(&mut self, extensions: EmbyProtocolExtensions) {
@@ -1752,7 +1767,10 @@ fn parse_protocol_extensions(payload: &Value) -> Result<EmbyProtocolExtensions, 
                 field: "ProtocolExtensions[].Id",
                 reason: "must be a non-empty string".to_string(),
             })?;
-        if id != PLAYBACK_PREFERENCES_EXTENSION_ID {
+        if !matches!(
+            id,
+            PLAYBACK_PREFERENCES_EXTENSION_ID | UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID
+        ) {
             continue;
         }
         let version = object
@@ -1762,11 +1780,96 @@ fn parse_protocol_extensions(payload: &Value) -> Result<EmbyProtocolExtensions, 
                 field: "ProtocolExtensions[].Version",
                 reason: "must be an unsigned integer".to_string(),
             })?;
-        if version == 1 {
-            parsed.playback_preferences_v1 = true;
+        if version != 1 {
+            continue;
         }
+        if id == PLAYBACK_PREFERENCES_EXTENSION_ID {
+            parsed.playback_preferences_v1 = true;
+            continue;
+        }
+        if parsed.update_download_policy_v1.is_some() {
+            return Err(ApiError::InvalidServerContract {
+                field: "ProtocolExtensions[].Id",
+                reason: format!("contains duplicate {UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID}"),
+            });
+        }
+        parsed.update_download_policy_v1 = Some(parse_update_download_policy(object)?);
     }
     Ok(parsed)
+}
+
+fn parse_update_download_policy(
+    object: &serde_json::Map<String, Value>,
+) -> Result<UpdateDownloadPolicy, ApiError> {
+    let sources = object
+        .get("Sources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::InvalidServerContract {
+            field: "ProtocolExtensions[].Sources",
+            reason: "must be a non-empty array".to_string(),
+        })?;
+    if sources.is_empty() || sources.len() > MAX_UPDATE_DOWNLOAD_SOURCES {
+        return Err(ApiError::InvalidServerContract {
+            field: "ProtocolExtensions[].Sources",
+            reason: format!("must contain between 1 and {MAX_UPDATE_DOWNLOAD_SOURCES} entries"),
+        });
+    }
+    let mut parsed_sources = Vec::with_capacity(sources.len());
+    for source in sources {
+        let value = source
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::InvalidServerContract {
+                field: "ProtocolExtensions[].Sources[]",
+                reason: "must be a non-empty string".to_string(),
+            })?;
+        if !valid_update_download_source(value) {
+            return Err(ApiError::InvalidServerContract {
+                field: "ProtocolExtensions[].Sources[]",
+                reason: "must be direct or an HTTPS prefix ending with /".to_string(),
+            });
+        }
+        if !parsed_sources.iter().any(|existing| existing == value) {
+            parsed_sources.push(value.to_string());
+        }
+    }
+    let max_age_seconds = object
+        .get("MaxAgeSeconds")
+        .and_then(Value::as_u64)
+        .filter(|value| {
+            (MIN_UPDATE_POLICY_MAX_AGE_SECONDS..=MAX_UPDATE_POLICY_MAX_AGE_SECONDS)
+                .contains(value)
+        })
+        .ok_or_else(|| ApiError::InvalidServerContract {
+            field: "ProtocolExtensions[].MaxAgeSeconds",
+            reason: format!(
+                "must be between {MIN_UPDATE_POLICY_MAX_AGE_SECONDS} and {MAX_UPDATE_POLICY_MAX_AGE_SECONDS}"
+            ),
+        })?;
+    Ok(UpdateDownloadPolicy {
+        sources: parsed_sources,
+        max_age_seconds,
+    })
+}
+
+fn valid_update_download_source(value: &str) -> bool {
+    if value == "direct" {
+        return true;
+    }
+    if !value.ends_with('/') {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn parse_media_cards(payload: &Value) -> Result<Vec<MediaCard>, ApiError> {
@@ -3755,6 +3858,7 @@ mod tests {
         let mut session = session(base_url.clone());
         session.set_protocol_extensions(EmbyProtocolExtensions {
             playback_preferences_v1: true,
+            ..EmbyProtocolExtensions::default()
         });
         let source = parse_playback_source(
             &session,
@@ -3793,12 +3897,25 @@ mod tests {
             "ProtocolExtensions": [
                 { "Id": "unknown-extension", "Version": "ignored" },
                 { "Id": "playback-preferences", "Version": 2 },
-                { "Id": "playback-preferences", "Version": 1 }
+                { "Id": "playback-preferences", "Version": 1 },
+                {
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": ["https://one.example/", "direct"],
+                    "MaxAgeSeconds": 3600
+                }
             ]
         }))
         .expect("known v1 extension should parse while unknown extensions are ignored");
 
         assert!(extensions.supports_playback_preferences());
+        assert_eq!(
+            extensions.update_download_policy(),
+            Some(&UpdateDownloadPolicy {
+                sources: vec!["https://one.example/".to_string(), "direct".to_string()],
+                max_age_seconds: 3600,
+            })
+        );
         assert!(
             !parse_protocol_extensions(&json!({}))
                 .expect("missing extension list should mean no extensions")
@@ -3820,6 +3937,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn update_download_source_extension_rejects_unsafe_policy() {
+        for payload in [
+            json!({
+                "ProtocolExtensions": [{
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": ["http://one.example/"],
+                    "MaxAgeSeconds": 3600
+                }]
+            }),
+            json!({
+                "ProtocolExtensions": [{
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": ["https://one.example"],
+                    "MaxAgeSeconds": 3600
+                }]
+            }),
+            json!({
+                "ProtocolExtensions": [{
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": ["https://one.example/?token=secret"],
+                    "MaxAgeSeconds": 3600
+                }]
+            }),
+            json!({
+                "ProtocolExtensions": [{
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": [],
+                    "MaxAgeSeconds": 3600
+                }]
+            }),
+            json!({
+                "ProtocolExtensions": [{
+                    "Id": "update-download-sources",
+                    "Version": 1,
+                    "Sources": ["direct"],
+                    "MaxAgeSeconds": 60
+                }]
+            }),
+        ] {
+            assert!(parse_protocol_extensions(&payload).is_err());
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::client::{Inner, RendererValue, post_renderer_message};
@@ -15,7 +15,6 @@ use crate::client::{Inner, RendererValue, post_renderer_message};
 const GITHUB_RELEASE_API_URL: &str =
     "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/latest";
 const RELEASE_REPOSITORY_PATH: &str = "/timefunnel/MediaStationGo-Windows/releases/";
-const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://ghproxy.net/";
 const USER_AGENT: &str = "MediaStationGo-Windows-Updater";
 const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS.txt";
 const PORTABLE_MARKER_NAME: &str = ".mediastation-portable";
@@ -56,6 +55,28 @@ struct ReleaseInfo {
     asset_size: u64,
     sha256: String,
     package_kind: PackageKind,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadSource {
+    label: String,
+    prefix: Option<String>,
+}
+
+impl DownloadSource {
+    fn direct() -> Self {
+        Self {
+            label: "GitHub 直连".to_string(),
+            prefix: None,
+        }
+    }
+
+    fn url(&self, github_url: &str) -> String {
+        self.prefix.as_deref().map_or_else(
+            || github_url.to_string(),
+            |prefix| format!("{prefix}{github_url}"),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -326,8 +347,8 @@ fn fetch_release(
     let metadata = get_text(&agent, metadata_url, MAX_METADATA_BYTES)?;
     let mut release = parse_release_metadata(&metadata, package_kind)?;
     let checksum_asset_url = checksum_asset_url(&metadata)?;
-    // The package travels through the download proxy, but the checksum stays
-    // on GitHub so the proxy cannot replace both the package and its hash.
+    // The package rotates through configured download sources, while the
+    // checksum stays on GitHub so a source cannot replace both package and hash.
     let checksums = get_text(&agent, &checksum_asset_url, MAX_CHECKSUM_BYTES)?;
     release.sha256 = checksum_for_asset(&checksums, &release.asset_name)?;
     Ok(release)
@@ -528,25 +549,105 @@ fn validate_asset_url(raw: &str, tag: &str, asset_name: &str) -> Result<(), Upda
     Ok(())
 }
 
-fn proxied_github_download_url(github_url: &str) -> Result<String, UpdateError> {
-    let url = Url::parse(github_url).map_err(|error| {
-        UpdateError::new("asset_url_invalid", format!("发布文件地址无效：{error}"))
-    })?;
+fn download_sources() -> Vec<DownloadSource> {
+    let mode = jfn_config::update_download_source_mode();
+    let custom = jfn_config::update_download_sources();
+    let (cached, expires_at) = jfn_config::cached_update_download_sources();
+    let cache_valid = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => !cached.is_empty() && elapsed.as_secs() < expires_at,
+        Err(error) => {
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_WARN,
+                &format!("Update download policy cache clock failed: {error}"),
+            );
+            false
+        }
+    };
+    if !matches!(mode.as_str(), "custom" | "builtin" | "server") {
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_ERROR,
+            &format!("Unknown update download source mode {mode:?}; using direct download only"),
+        );
+    }
+    download_sources_from(&mode, &custom, &cached, cache_valid)
+}
+
+fn download_sources_from(
+    mode: &str,
+    custom: &str,
+    cached: &str,
+    cache_valid: bool,
+) -> Vec<DownloadSource> {
+    let mut sources = Vec::new();
+    match mode {
+        "custom" => append_download_sources(&mut sources, custom),
+        "builtin" => {
+            append_download_sources(&mut sources, jfn_config::DEFAULT_UPDATE_DOWNLOAD_SOURCES)
+        }
+        "server" => {
+            if cache_valid {
+                append_download_sources(&mut sources, cached);
+            }
+            append_download_sources(&mut sources, jfn_config::DEFAULT_UPDATE_DOWNLOAD_SOURCES);
+        }
+        _ => {}
+    }
+    sources.push(DownloadSource::direct());
+    sources
+}
+
+fn append_download_sources(sources: &mut Vec<DownloadSource>, raw_sources: &str) {
+    for raw in raw_sources.lines() {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value == "direct" {
+            continue;
+        }
+        let Some(source) = parse_download_source(value) else {
+            log_invalid_download_source(value, "必须是无认证、无参数且以 / 结尾的 HTTPS 前缀");
+            continue;
+        };
+        if sources
+            .iter()
+            .any(|existing: &DownloadSource| existing.prefix == source.prefix)
+        {
+            continue;
+        }
+        sources.push(source);
+    }
+}
+
+fn parse_download_source(value: &str) -> Option<DownloadSource> {
+    if !value.ends_with('/') {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
     if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || !url.path().starts_with(RELEASE_REPOSITORY_PATH)
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.port().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(UpdateError::new(
-            "asset_url_untrusted",
-            "发布文件不属于受信任的 GitHub Release",
-        ));
+        return None;
     }
-    Ok(format!("{GITHUB_DOWNLOAD_PROXY_PREFIX}{github_url}"))
+    Some(DownloadSource {
+        label: url.host_str().unwrap_or(value).to_string(),
+        prefix: Some(value.to_string()),
+    })
+}
+
+fn log_invalid_download_source(value: &str, reason: &str) {
+    jfn_logging::log(
+        jfn_logging::CATEGORY_CEF,
+        jfn_logging::LEVEL_WARN,
+        &format!("Ignoring invalid update download source {value:?}: {reason}"),
+    );
 }
 
 fn checksum_for_asset(checksums: &str, asset_name: &str) -> Result<String, UpdateError> {
@@ -706,31 +807,75 @@ fn download_update_package(
         })?;
     }
 
-    let result = download_update_package_to(&temporary, release, inner);
-    result?;
-    if destination.exists() {
-        fs::remove_file(&destination).map_err(|error| {
-            UpdateError::new(
-                "update_replace_failed",
-                format!("无法替换旧的更新包：{error}"),
-            )
-        })?;
+    let mut failures = Vec::new();
+    for source in download_sources() {
+        let retained = retained_download_bytes(release);
+        post_status(
+            Arc::clone(inner),
+            "downloading",
+            json!({
+                "downloadedBytes": retained,
+                "totalBytes": release.asset_size,
+                "percent": retained.saturating_mul(100) / release.asset_size,
+                "source": source.label.clone(),
+            }),
+        );
+        match download_update_package_to(&temporary, release, &source, inner) {
+            Ok(()) => {
+                if destination.exists() {
+                    fs::remove_file(&destination).map_err(|error| {
+                        UpdateError::new(
+                            "update_replace_failed",
+                            format!("无法替换旧的更新包：{error}"),
+                        )
+                    })?;
+                }
+                fs::rename(&temporary, &destination).map_err(|error| {
+                    UpdateError::new("update_finalize_failed", format!("无法保存更新包：{error}"))
+                })?;
+                cleanup_old_update_packages(&update_dir, &destination);
+                return Ok(destination);
+            }
+            Err(error) => {
+                let message = format!("{}：{}", source.label, error.message);
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_WARN,
+                    &format!("MediaStation update source failed: {message}"),
+                );
+                if !is_retryable_download_error(error.code) {
+                    return Err(UpdateError::new(error.code, message));
+                }
+                if matches!(
+                    error.code,
+                    "update_checksum_mismatch" | "update_size_invalid"
+                ) {
+                    fs::remove_file(&temporary).map_err(|cleanup_error| {
+                        UpdateError::new(
+                            "update_temp_cleanup_failed",
+                            format!("下载源返回了无效内容，且无法清理临时文件：{cleanup_error}"),
+                        )
+                    })?;
+                }
+                failures.push(message);
+            }
+        }
     }
-    fs::rename(&temporary, &destination).map_err(|error| {
-        UpdateError::new("update_finalize_failed", format!("无法保存更新包：{error}"))
-    })?;
-    cleanup_old_update_packages(&update_dir, &destination);
-    Ok(destination)
+    Err(UpdateError::new(
+        "update_download_failed_all",
+        format!("所有更新下载源均失败：{}", failures.join("；")),
+    ))
 }
 
 fn download_update_package_to(
     destination: &Path,
     release: &ReleaseInfo,
+    source: &DownloadSource,
     inner: &Arc<Inner>,
 ) -> Result<(), UpdateError> {
     let agent = github_agent(Duration::from_secs(20 * 60));
     let downloaded = retained_download_bytes(release);
-    let asset_url = proxied_github_download_url(&release.asset_url)?;
+    let asset_url = source.url(&release.asset_url);
     let response = download_response(&agent, &asset_url, downloaded, release.asset_size)?;
     let mut reader = response.into_body().into_reader();
     let mut file = if downloaded == 0 {
@@ -791,6 +936,7 @@ fn download_update_package_to(
                     "downloadedBytes": downloaded,
                     "totalBytes": release.asset_size,
                     "percent": percent,
+                    "source": source.label.clone(),
                 }),
             );
         }
@@ -819,6 +965,20 @@ fn download_update_package_to(
         ));
     }
     Ok(())
+}
+
+fn is_retryable_download_error(code: &'static str) -> bool {
+    matches!(
+        code,
+        "update_request_failed"
+            | "update_http_error"
+            | "update_resume_unsupported"
+            | "update_resume_invalid"
+            | "update_download_failed"
+            | "update_size_invalid"
+            | "update_size_mismatch"
+            | "update_checksum_mismatch"
+    )
 }
 
 fn retained_download_bytes(release: &ReleaseInfo) -> u64 {
@@ -1332,13 +1492,68 @@ mod tests {
     }
 
     #[test]
-    fn package_downloads_use_the_configured_github_proxy() {
+    fn download_sources_validate_prefixes_and_keep_direct_fallback() {
         let github_url = "https://github.com/timefunnel/MediaStationGo-Windows/releases/download/v0.1.2/MediaStationGo-0.1.2-windows-x64-setup.exe";
+        let prefix = "https://ghfast.top/";
+        let source = DownloadSource {
+            label: "ghfast.top".to_string(),
+            prefix: Some(prefix.to_string()),
+        };
+        assert_eq!(source.url(github_url), format!("{prefix}{github_url}"));
+        assert_eq!(DownloadSource::direct().url(github_url), github_url);
+    }
+
+    #[test]
+    fn configured_download_sources_reject_unsafe_prefixes() {
+        assert!(parse_download_source("http://example.com/").is_none());
+        assert!(parse_download_source("https://example.com").is_none());
+        assert!(parse_download_source("https://example.com/path").is_none());
+        assert!(parse_download_source("https://user@example.com/").is_none());
+        assert!(parse_download_source("https://example.com/?token=secret").is_none());
         assert_eq!(
-            proxied_github_download_url(github_url).unwrap(),
-            format!("{GITHUB_DOWNLOAD_PROXY_PREFIX}{github_url}")
+            parse_download_source("https://example.com/").unwrap().label,
+            "example.com"
         );
-        assert!(proxied_github_download_url("https://example.com/update.exe").is_err());
+    }
+
+    #[test]
+    fn server_download_sources_precede_builtins_and_end_with_direct() {
+        let sources = download_sources_from(
+            "server",
+            "",
+            "https://priority.example/\ndirect\nhttps://ghfast.top/",
+            true,
+        );
+        let prefixes = sources
+            .iter()
+            .map(|source| source.prefix.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes[0], Some("https://priority.example/"));
+        assert_eq!(prefixes[1], Some("https://ghfast.top/"));
+        assert_eq!(prefixes.last(), Some(&None));
+        assert_eq!(prefixes.iter().filter(|prefix| prefix.is_none()).count(), 1);
+        assert_eq!(
+            prefixes
+                .iter()
+                .filter(|prefix| **prefix == Some("https://ghfast.top/"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn expired_server_policy_uses_builtins_before_direct() {
+        let sources = download_sources_from("server", "", "https://expired.example/", false);
+        assert!(
+            !sources
+                .iter()
+                .any(|source| { source.prefix.as_deref() == Some("https://expired.example/") })
+        );
+        assert_eq!(
+            sources.first().and_then(|source| source.prefix.as_deref()),
+            Some("https://gh-proxy.com/")
+        );
+        assert!(sources.last().is_some_and(|source| source.prefix.is_none()));
     }
 
     #[test]

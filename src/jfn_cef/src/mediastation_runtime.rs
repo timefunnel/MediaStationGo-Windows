@@ -3785,6 +3785,26 @@ fn discover_session_protocol_extensions(
     mut session: MediaStationSession,
 ) -> Result<MediaStationSession, ApiError> {
     let extensions = api.load_protocol_extensions(&session)?;
+    if let Some(policy) = extensions.update_download_policy() {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => {
+                let expires_at = elapsed.as_secs().saturating_add(policy.max_age_seconds);
+                if jfn_config::set_cached_update_download_sources(
+                    &policy.sources.join("\n"),
+                    expires_at,
+                ) {
+                    jfn_config::settings_save_async();
+                } else {
+                    log_error("MediaStation server update download policy could not be cached");
+                }
+            }
+            Err(error) => log_error(&format!(
+                "MediaStation server update download policy cache clock failed: {error}"
+            )),
+        }
+    } else if jfn_config::clear_cached_update_download_sources() {
+        jfn_config::settings_save_async();
+    }
     session.set_protocol_extensions(extensions);
     Ok(session)
 }
