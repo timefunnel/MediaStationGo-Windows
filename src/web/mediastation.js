@@ -3642,13 +3642,15 @@
         const input = byId('settings-update-download-sources');
         const save = byId('settings-save-update-download-sources');
         const status = byId('settings-update-download-sources-status');
-        if (!input || !save || !status) return;
+        const customSources = byId('settings-update-custom-sources');
+        if (!input || !save || !status || !customSources) return;
         input.value = updateDownloadSources;
         document.querySelectorAll('input[name="settings-update-source-mode"]').forEach((radio) => {
             radio.checked = radio.value === updateDownloadSourceMode;
         });
-        input.disabled = updateDownloadSourceMode !== 'custom';
-        save.disabled = updateDownloadSourceMode !== 'custom';
+        customSources.classList.toggle('hidden', updateDownloadSourceMode !== 'custom');
+        input.disabled = false;
+        save.disabled = false;
         status.textContent = '失败时会按顺序切换下载源，最后尝试 GitHub 直连。';
         status.dataset.state = '';
     }

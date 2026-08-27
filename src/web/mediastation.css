@@ -813,6 +813,10 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .update-source-settings textarea:hover { border-color: rgba(255,255,255,0.3); }
 .update-source-settings textarea:focus-visible { border-color: rgba(255,255,255,0.52); box-shadow: 0 0 0 2px rgba(255,255,255,0.08); }
 .update-source-settings textarea:disabled { cursor: not-allowed; opacity: 0.54; }
+.update-custom-sources { display: grid; gap: 10px; }
+.update-custom-sources > label { display: grid; gap: 4px; }
+.update-custom-sources > label strong { color: var(--text); font-size: 14px; font-weight: 620; }
+.update-custom-sources > label small { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .update-source-settings .component-status { min-height: 18px; margin: 0; }
 .update-status-panel { display: grid; gap: 12px; padding-top: 4px; }
 .update-status-panel .component-status { position: relative; padding-left: 14px; }
