@@ -324,6 +324,8 @@ pub struct MediaCard {
     pub duration_ms: u64,
     pub resume_position_ms: u64,
     pub played: bool,
+    /// Emby UserData.LastPlayedDate（RFC3339 原文），用于“最近在看优先”选集。
+    pub last_played_at: Option<String>,
     pub index_number: Option<i64>,
     pub parent_index_number: Option<i64>,
     pub child_count: Option<usize>,
@@ -2002,6 +2004,8 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
             .and_then(|data| data.get("Played"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        last_played_at: user_data
+            .and_then(|data| optional_string(data.get("LastPlayedDate"))),
         index_number: item.get("IndexNumber").and_then(Value::as_i64),
         parent_index_number: item.get("ParentIndexNumber").and_then(Value::as_i64),
         child_count: item
@@ -3165,7 +3169,8 @@ mod tests {
             "RunTimeTicks": 18_000_000_000_u64,
             "UserData": {
                 "PlaybackPositionTicks": 6_000_000_000_u64,
-                "Played": false
+                "Played": false,
+                "LastPlayedDate": "2026-08-29T17:11:24.714877Z"
             },
             "ImageTags": {
                 "Primary": "primary-tag",
@@ -3190,6 +3195,10 @@ mod tests {
 
         assert_eq!(card.resume_position_ms, 600_000);
         assert_eq!(card.duration_ms, 1_800_000);
+        assert_eq!(
+            card.last_played_at.as_deref(),
+            Some("2026-08-29T17:11:24.714877Z")
+        );
         assert_eq!(card.parent_index_number, Some(1));
         assert_eq!(card.index_number, Some(2));
         assert_eq!(card.dynamic_range.as_deref(), Some("HDR10"));

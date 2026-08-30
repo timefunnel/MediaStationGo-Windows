@@ -1528,6 +1528,26 @@
         return Math.max(0, Math.min(100, card.resumePositionMs / card.durationMs * 100));
     }
 
+    // 对齐标准 Emby NextUp 语义：优先“最近在看”的单集（按 LastPlayedDate），
+    // 没有在看中的就给第一个未看完/未看的，最后才回落到第 1 集。
+    function playedAtTimestamp(episode) {
+        const raw = episode?.lastPlayedAt;
+        if (!raw) return 0;
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function pickContinueEpisode(episodes) {
+        if (!Array.isArray(episodes) || episodes.length === 0) return null;
+        const inProgress = episodes.filter((episode) => episode.resumePositionMs > 0 && !episode.played);
+        if (inProgress.length > 0) {
+            return inProgress.reduce((latest, episode) => (
+                playedAtTimestamp(episode) > playedAtTimestamp(latest) ? episode : latest
+            ));
+        }
+        return episodes.find((episode) => !episode.played) ?? null;
+    }
+
     function createMediaCard(card, options = {}) {
         const title = cardTitle(card, options.episodeAsSeries);
         const isLibrary = options.library || (options.landscape && card.type === 'CollectionFolder');
@@ -2815,8 +2835,7 @@
         }
         const actions = element('div', 'detail-actions');
         if (card.type === 'Series') actions.dataset.seriesId = card.id;
-        const resumableEpisode = detail.episodes?.find((episode) => episode.resumePositionMs > 0);
-        const playTarget = card.playable ? card : (resumableEpisode || detail.episodes?.[0]);
+        const playTarget = card.playable ? card : (pickContinueEpisode(detail.episodes) || detail.episodes?.[0]);
         if (playTarget?.playable) appendDetailPlayAction(actions, playTarget);
         if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
         if (card.genres?.length) {
