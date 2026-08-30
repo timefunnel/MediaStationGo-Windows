@@ -1677,6 +1677,10 @@
             );
         };
         const alignEndToPage = () => {
+            // Player mode hides the app shell with display:none. Native window
+            // changes can still emit resize events while it is hidden, so do
+            // not replace the last valid card metrics with zero-width values.
+            if (!row.isConnected || row.clientWidth <= 0 || !row.getClientRects().length) return;
             const previousDistance = pageDistance;
             const previousIndex = previousDistance > 0
                 ? Math.round(row.scrollLeft / previousDistance)
@@ -1814,6 +1818,10 @@
         (controlsHost || rowShell).append(controls);
         window.requestAnimationFrame(alignEndToPage);
         return rowShell;
+    }
+
+    function refreshMediaRowCarousels() {
+        content.querySelectorAll('.carousel-row').forEach((row) => row._refreshCarousel?.());
     }
 
     function createSection(title, cards, options = {}) {
@@ -5906,6 +5914,7 @@
         refreshPlayerCursor();
         setPlayerMode(false);
         appShell.classList.remove('hidden');
+        window.requestAnimationFrame(refreshMediaRowCarousels);
         // Re-render immediately from the player state. The native
         // "home_stale" event is emitted only after the stopped report succeeds;
         // that later refresh verifies and reconciles the local update.
@@ -6424,7 +6433,7 @@
     }, { capture: true, passive: true });
 
     window.addEventListener('resize', () => {
-        content.querySelectorAll('.carousel-row').forEach((row) => row._refreshCarousel?.());
+        refreshMediaRowCarousels();
         content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
         positionPlayerPanel();
     }, { passive: true });
