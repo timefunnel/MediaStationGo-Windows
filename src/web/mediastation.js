@@ -3348,8 +3348,10 @@
         };
 
         const setDetailPlayAction = (episodes) => {
-            const target = episodes.find((episode) => episode.id === resumableEpisode?.id)
-                || episodes.find((episode) => episode.resumePositionMs > 0)
+            // 与标准 Emby NextUp 一致：最近在看优先；首页“继续观看”列表
+            // 只是次要回退（条目被移出最近观看时不能影响剧集页定位）。
+            const target = pickContinueEpisode(episodes)
+                || episodes.find((episode) => episode.id === resumableEpisode?.id)
                 || episodes[0];
             if (!target?.playable) return;
             detailActions.querySelector('.primary-command')?.remove();
