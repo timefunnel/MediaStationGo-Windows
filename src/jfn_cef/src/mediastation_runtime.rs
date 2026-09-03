@@ -9,7 +9,7 @@ use jfn_mediastation::{
     MediaStationClientProfile, MediaStationConnectionProfile, MediaStationProxyMode,
     MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
     PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
-    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport,
+    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream,
     build_playback_track_plan, chinese_subtitle_preference_rank,
 };
 use jfn_mpv::api::{
@@ -521,6 +521,12 @@ struct MpvRuntimeTrack {
     external: bool,
     is_default: bool,
     is_forced: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RuntimeMediaMetadata {
+    container: Option<String>,
+    video: Option<VideoStream>,
 }
 
 struct RequestGuard {
@@ -4593,7 +4599,8 @@ fn execute_tracks_request(
             }
         }
     }
-    let mut catalog = current_runtime_track_catalog(&source)?;
+    let mut runtime_track_list = current_runtime_track_list()?;
+    let mut catalog = runtime_track_catalog(&source, &runtime_track_list)?;
     if restore_pending_embedded_subtitle_preference(
         runtime,
         snapshot,
@@ -4601,8 +4608,10 @@ fn execute_tracks_request(
         &catalog,
         &request.media_id,
     )? {
-        catalog = current_runtime_track_catalog(&source)?;
+        runtime_track_list = current_runtime_track_list()?;
+        catalog = runtime_track_catalog(&source, &runtime_track_list)?;
     }
+    let runtime_video = current_runtime_video_metadata(&runtime_track_list);
     runtime.active_playback_source(snapshot, &request.media_id)?;
     log_debug(&format!(
         "MediaStation runtime tracks: media_id={} audio_count={} subtitle_count={} subtitle_selected={}",
@@ -4614,6 +4623,7 @@ fn execute_tracks_request(
     Ok(runtime_tracks_payload(
         &catalog,
         Some(&source),
+        Some(&runtime_video),
         metadata_refresh_error,
     ))
 }
@@ -6163,7 +6173,12 @@ fn subtitle_tracks_payload(source: &PlaybackSource) -> Value {
 fn current_runtime_track_catalog(
     source: &PlaybackSource,
 ) -> Result<RuntimeTrackCatalog, LoadFailure> {
-    let node = jfn_mpv_get_property_node(c"track-list").map_err(|error| {
+    let node = current_runtime_track_list()?;
+    runtime_track_catalog(source, &node)
+}
+
+fn current_runtime_track_list() -> Result<jfn_mpv::Node, LoadFailure> {
+    jfn_mpv_get_property_node(c"track-list").map_err(|error| {
         log_error(&format!(
             "MediaStation runtime track-list read failed: code={}",
             error.code
@@ -6172,8 +6187,7 @@ fn current_runtime_track_catalog(
             "runtime_tracks_unavailable",
             "The player runtime track list is unavailable",
         )
-    })?;
-    runtime_track_catalog(source, &node)
+    })
 }
 
 fn runtime_track_catalog(
@@ -6345,6 +6359,187 @@ fn runtime_node_flag(node: &jfn_mpv::Node, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn current_runtime_video_metadata(track_list: &jfn_mpv::Node) -> RuntimeMediaMetadata {
+    let decoder_params = jfn_mpv_get_property_node(c"video-dec-params").ok();
+    runtime_video_metadata(
+        track_list,
+        decoder_params.as_ref(),
+        mpv_property_double(c"container-fps"),
+        mpv_property_string(c"file-format"),
+    )
+}
+
+fn runtime_video_metadata(
+    track_list: &jfn_mpv::Node,
+    decoder_params: Option<&jfn_mpv::Node>,
+    container_fps: Option<f64>,
+    container: Option<String>,
+) -> RuntimeMediaMetadata {
+    let video_track = track_list.as_array().and_then(|tracks| {
+        tracks
+            .iter()
+            .find(|track| runtime_video_track(track) && runtime_node_flag(track, "selected"))
+            .or_else(|| tracks.iter().find(|track| runtime_video_track(track)))
+    });
+    let runtime_string = |key| decoder_params.and_then(|node| runtime_node_string(node, key));
+    let pixel_format = ["hw-pixelformat", "pixelformat"]
+        .into_iter()
+        .filter_map(runtime_string)
+        .chain(video_track.and_then(|track| runtime_node_string(track, "format-name")))
+        .find_map(|value| pixel_format_bit_depth(&value));
+    let dolby_vision_profile = video_track
+        .and_then(|track| track.get("dolby-vision-profile"))
+        .and_then(jfn_mpv::Node::as_int)
+        .filter(|value| *value >= 0);
+    let dolby_vision_level = video_track
+        .and_then(|track| track.get("dolby-vision-level"))
+        .and_then(jfn_mpv::Node::as_int)
+        .filter(|value| *value >= 0);
+    let color_transfer = runtime_string("gamma");
+    let dynamic_range = runtime_dynamic_range(dolby_vision_profile, color_transfer.as_deref());
+    let range_type = dynamic_range.as_ref().map(|_| "HDR".to_string());
+    let video = VideoStream {
+        dynamic_range,
+        range_type,
+        codec: video_track.and_then(|track| runtime_node_string(track, "codec")),
+        profile: video_track.and_then(|track| runtime_node_string(track, "codec-profile")),
+        level: None,
+        width: decoder_params
+            .and_then(|node| runtime_node_u64(node, "w"))
+            .or_else(|| video_track.and_then(|track| runtime_node_u64(track, "demux-w"))),
+        height: decoder_params
+            .and_then(|node| runtime_node_u64(node, "h"))
+            .or_else(|| video_track.and_then(|track| runtime_node_u64(track, "demux-h"))),
+        frame_rate: video_track
+            .and_then(|track| runtime_node_positive_f64(track, "demux-fps"))
+            .or_else(|| container_fps.filter(|value| value.is_finite() && *value > 0.0)),
+        color_space: runtime_string("colormatrix"),
+        color_transfer,
+        color_range: runtime_string("colorlevels"),
+        bit_depth: pixel_format,
+        max_content_light_level: decoder_params
+            .and_then(|node| runtime_node_rounded_u64(node, "max-cll")),
+        max_frame_average_light_level: decoder_params
+            .and_then(|node| runtime_node_rounded_u64(node, "max-fall")),
+        dolby_vision_profile,
+        dolby_vision_level,
+        dolby_vision_base_layer_present: None,
+        dolby_vision_compatibility_id: None,
+    };
+    RuntimeMediaMetadata {
+        container: normalized_runtime_string(container),
+        video: runtime_video_has_values(&video).then_some(video),
+    }
+}
+
+fn runtime_video_track(node: &jfn_mpv::Node) -> bool {
+    node.get("type").and_then(jfn_mpv::Node::as_str) == Some("video")
+        && !runtime_node_flag(node, "image")
+        && !runtime_node_flag(node, "albumart")
+}
+
+fn runtime_node_u64(node: &jfn_mpv::Node, key: &str) -> Option<u64> {
+    node.get(key)
+        .and_then(jfn_mpv::Node::as_int)
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn runtime_node_positive_f64(node: &jfn_mpv::Node, key: &str) -> Option<f64> {
+    node.get(key)
+        .and_then(jfn_mpv::Node::as_double)
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn runtime_node_rounded_u64(node: &jfn_mpv::Node, key: &str) -> Option<u64> {
+    node.get(key)
+        .and_then(jfn_mpv::Node::as_double)
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
+        .map(|value| value.round() as u64)
+}
+
+fn normalized_runtime_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn runtime_dynamic_range(
+    dolby_vision_profile: Option<i64>,
+    color_transfer: Option<&str>,
+) -> Option<String> {
+    if dolby_vision_profile.is_some() {
+        return Some("Dolby Vision".to_string());
+    }
+    match color_transfer
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pq" | "smpte2084") => Some("HDR10".to_string()),
+        Some("hlg" | "arib-std-b67") => Some("HLG".to_string()),
+        _ => None,
+    }
+}
+
+fn pixel_format_bit_depth(value: &str) -> Option<u64> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let explicit_depths = [
+        ("p016", 16),
+        ("p014", 14),
+        ("p012", 12),
+        ("p010", 10),
+        ("p16", 16),
+        ("p14", 14),
+        ("p12", 12),
+        ("p10", 10),
+        ("y216", 16),
+        ("y212", 12),
+        ("y210", 10),
+        ("v410", 10),
+        ("v210", 10),
+        ("gray16", 16),
+        ("gray14", 14),
+        ("gray12", 12),
+        ("gray10", 10),
+        ("rgb48", 16),
+        ("bgr48", 16),
+        ("rgba64", 16),
+        ("bgra64", 16),
+        ("x2rgb10", 10),
+        ("x2bgr10", 10),
+    ];
+    if let Some((_, depth)) = explicit_depths
+        .iter()
+        .find(|(marker, _)| normalized.contains(marker))
+    {
+        return Some(*depth);
+    }
+    [
+        "yuv", "yuva", "nv12", "nv21", "rgb", "bgr", "rgba", "bgra", "argb", "abgr", "gray", "gbr",
+        "pal8", "monow", "monob", "yuyv", "uyvy",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+    .then_some(8)
+}
+
+fn runtime_video_has_values(video: &VideoStream) -> bool {
+    video.dynamic_range.is_some()
+        || video.codec.is_some()
+        || video.profile.is_some()
+        || video.width.is_some()
+        || video.height.is_some()
+        || video.frame_rate.is_some()
+        || video.color_space.is_some()
+        || video.color_transfer.is_some()
+        || video.color_range.is_some()
+        || video.bit_depth.is_some()
+        || video.max_content_light_level.is_some()
+        || video.max_frame_average_light_level.is_some()
+        || video.dolby_vision_profile.is_some()
+}
+
 fn runtime_fallback_track_key(track: &MpvRuntimeTrack, ordinal: usize) -> String {
     if track.kind == RuntimeTrackKind::Subtitle {
         return runtime_subtitle_fallback_track_key_v2(track, ordinal);
@@ -6426,6 +6621,7 @@ fn merge_playback_source_metadata(current: &mut PlaybackSource, refreshed: &Play
 fn runtime_tracks_payload(
     catalog: &RuntimeTrackCatalog,
     source: Option<&PlaybackSource>,
+    runtime_video: Option<&RuntimeMediaMetadata>,
     metadata_refresh_error: Option<&str>,
 ) -> Value {
     json!({
@@ -6434,8 +6630,14 @@ fn runtime_tracks_payload(
         "subtitleEnabled": catalog.subtitles.iter().any(|track| track.selected),
         "audioTracks": catalog.audio.iter().map(runtime_audio_track_payload).collect::<Vec<_>>(),
         "subtitleTracks": catalog.subtitles.iter().map(runtime_subtitle_track_payload).collect::<Vec<_>>(),
-        "sourceVideo": source.map_or(Value::Null, source_video_payload),
-        "container": source.and_then(|value| value.container.as_deref()),
+        "sourceVideo": merged_source_video_payload(
+            source.and_then(|value| value.video.as_ref()),
+            runtime_video.and_then(|value| value.video.as_ref()),
+        ),
+        "container": preferred_string(
+            source.and_then(|value| value.container.as_deref()),
+            runtime_video.and_then(|value| value.container.as_deref()),
+        ),
         "bitrate": source.and_then(|value| value.bitrate),
         "mediaMetadataPending": source.is_some_and(playback_source_metadata_pending),
         "metadataRefreshErrorCode": metadata_refresh_error,
@@ -6465,29 +6667,106 @@ fn runtime_subtitle_track_payload(track: &RuntimeTrack) -> Value {
 }
 
 fn source_video_payload(source: &PlaybackSource) -> Value {
-    let Some(video) = source.video.as_ref() else {
+    merged_source_video_payload(source.video.as_ref(), None)
+}
+
+fn merged_source_video_payload(
+    server: Option<&VideoStream>,
+    runtime: Option<&VideoStream>,
+) -> Value {
+    if server.is_none() && runtime.is_none() {
         return Value::Null;
-    };
+    }
     json!({
-        "codec": video.codec,
-        "profile": video.profile,
-        "level": video.level,
-        "width": video.width,
-        "height": video.height,
-        "frameRate": video.frame_rate,
-        "dynamicRange": video.dynamic_range,
-        "rangeType": video.range_type,
-        "colorSpace": video.color_space,
-        "colorTransfer": video.color_transfer,
-        "colorRange": video.color_range,
-        "bitDepth": video.bit_depth,
-        "maxCll": video.max_content_light_level,
-        "maxFall": video.max_frame_average_light_level,
-        "dolbyVisionProfile": video.dolby_vision_profile,
-        "dolbyVisionLevel": video.dolby_vision_level,
-        "dolbyVisionBaseLayerPresent": video.dolby_vision_base_layer_present,
-        "dolbyVisionCompatibilityId": video.dolby_vision_compatibility_id,
+        "codec": preferred_string(
+            server.and_then(|value| value.codec.as_deref()),
+            runtime.and_then(|value| value.codec.as_deref()),
+        ),
+        "profile": preferred_string(
+            server.and_then(|value| value.profile.as_deref()),
+            runtime.and_then(|value| value.profile.as_deref()),
+        ),
+        "level": server.and_then(|value| value.level).or_else(|| runtime.and_then(|value| value.level)),
+        "width": preferred_positive_u64(
+            server.and_then(|value| value.width),
+            runtime.and_then(|value| value.width),
+        ),
+        "height": preferred_positive_u64(
+            server.and_then(|value| value.height),
+            runtime.and_then(|value| value.height),
+        ),
+        "frameRate": preferred_positive_f64(
+            server.and_then(|value| value.frame_rate),
+            runtime.and_then(|value| value.frame_rate),
+        ),
+        "dynamicRange": preferred_string(
+            server.and_then(|value| value.dynamic_range.as_deref()),
+            runtime.and_then(|value| value.dynamic_range.as_deref()),
+        ),
+        "rangeType": preferred_string(
+            server.and_then(|value| value.range_type.as_deref()),
+            runtime.and_then(|value| value.range_type.as_deref()),
+        ),
+        "colorSpace": preferred_string(
+            server.and_then(|value| value.color_space.as_deref()),
+            runtime.and_then(|value| value.color_space.as_deref()),
+        ),
+        "colorTransfer": preferred_string(
+            server.and_then(|value| value.color_transfer.as_deref()),
+            runtime.and_then(|value| value.color_transfer.as_deref()),
+        ),
+        "colorRange": preferred_string(
+            server.and_then(|value| value.color_range.as_deref()),
+            runtime.and_then(|value| value.color_range.as_deref()),
+        ),
+        "bitDepth": preferred_positive_u64(
+            server.and_then(|value| value.bit_depth),
+            runtime.and_then(|value| value.bit_depth),
+        ),
+        "maxCll": preferred_positive_u64(
+            server.and_then(|value| value.max_content_light_level),
+            runtime.and_then(|value| value.max_content_light_level),
+        ),
+        "maxFall": preferred_positive_u64(
+            server.and_then(|value| value.max_frame_average_light_level),
+            runtime.and_then(|value| value.max_frame_average_light_level),
+        ),
+        "dolbyVisionProfile": server
+            .and_then(|value| value.dolby_vision_profile)
+            .or_else(|| runtime.and_then(|value| value.dolby_vision_profile)),
+        "dolbyVisionLevel": server
+            .and_then(|value| value.dolby_vision_level)
+            .or_else(|| runtime.and_then(|value| value.dolby_vision_level)),
+        "dolbyVisionBaseLayerPresent": server
+            .and_then(|value| value.dolby_vision_base_layer_present)
+            .or_else(|| runtime.and_then(|value| value.dolby_vision_base_layer_present)),
+        "dolbyVisionCompatibilityId": server
+            .and_then(|value| value.dolby_vision_compatibility_id)
+            .or_else(|| runtime.and_then(|value| value.dolby_vision_compatibility_id)),
     })
+}
+
+fn preferred_string(server: Option<&str>, runtime: Option<&str>) -> Option<String> {
+    server
+        .and_then(|value| usable_metadata_string(value))
+        .or_else(|| runtime.and_then(|value| usable_metadata_string(value)))
+}
+
+fn usable_metadata_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("unknown")).then(|| value.to_string())
+}
+
+fn preferred_positive_u64(server: Option<u64>, runtime: Option<u64>) -> Option<u64> {
+    server
+        .filter(|value| *value > 0)
+        .or_else(|| runtime.filter(|value| *value > 0))
+}
+
+fn preferred_positive_f64(server: Option<f64>, runtime: Option<f64>) -> Option<f64> {
+    server
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .or_else(|| runtime.filter(|value| value.is_finite() && *value > 0.0))
 }
 
 fn prepare_external_subtitle(
@@ -7563,13 +7842,137 @@ mod tests {
         assert!(!catalog.subtitles[0].external);
         assert!(catalog.subtitles[2].external);
 
-        let payload = runtime_tracks_payload(&catalog, Some(&source), None);
+        let payload = runtime_tracks_payload(&catalog, Some(&source), None, None);
         let text = payload.to_string().to_ascii_lowercase();
         assert!(payload["audioTracks"][0].get("id").is_none());
         assert!(payload["audioTracks"][0].get("mpvId").is_none());
         assert!(!text.contains("media.example"));
         assert!(!text.contains("private"));
         assert!(!text.contains("token"));
+    }
+
+    #[test]
+    fn runtime_video_metadata_reads_the_decoded_mkv_source() {
+        let track_list = jfn_mpv::Node::Array(vec![jfn_mpv::Node::Map(vec![
+            (
+                "type".to_string(),
+                jfn_mpv::Node::String("video".to_string()),
+            ),
+            ("id".to_string(), jfn_mpv::Node::Int(1)),
+            ("selected".to_string(), jfn_mpv::Node::Flag(true)),
+            (
+                "codec".to_string(),
+                jfn_mpv::Node::String("hevc".to_string()),
+            ),
+            (
+                "codec-profile".to_string(),
+                jfn_mpv::Node::String("Main 10".to_string()),
+            ),
+            ("demux-w".to_string(), jfn_mpv::Node::Int(3840)),
+            ("demux-h".to_string(), jfn_mpv::Node::Int(1608)),
+            ("demux-fps".to_string(), jfn_mpv::Node::Double(23.976)),
+            (
+                "format-name".to_string(),
+                jfn_mpv::Node::String("yuv420p10le".to_string()),
+            ),
+        ])]);
+        let decoder = jfn_mpv::Node::Map(vec![
+            ("w".to_string(), jfn_mpv::Node::Int(3840)),
+            ("h".to_string(), jfn_mpv::Node::Int(1608)),
+            (
+                "hw-pixelformat".to_string(),
+                jfn_mpv::Node::String("p010".to_string()),
+            ),
+            (
+                "colormatrix".to_string(),
+                jfn_mpv::Node::String("bt.2020-ncl".to_string()),
+            ),
+            ("gamma".to_string(), jfn_mpv::Node::String("pq".to_string())),
+            (
+                "colorlevels".to_string(),
+                jfn_mpv::Node::String("limited".to_string()),
+            ),
+            ("max-cll".to_string(), jfn_mpv::Node::Double(1000.0)),
+            ("max-fall".to_string(), jfn_mpv::Node::Double(400.0)),
+        ]);
+
+        let metadata = runtime_video_metadata(
+            &track_list,
+            Some(&decoder),
+            Some(24.0),
+            Some("matroska,webm".to_string()),
+        );
+        let video = metadata.video.expect("runtime video metadata");
+
+        assert_eq!(metadata.container.as_deref(), Some("matroska,webm"));
+        assert_eq!(video.codec.as_deref(), Some("hevc"));
+        assert_eq!(video.profile.as_deref(), Some("Main 10"));
+        assert_eq!(video.width, Some(3840));
+        assert_eq!(video.height, Some(1608));
+        assert_eq!(video.frame_rate, Some(23.976));
+        assert_eq!(video.dynamic_range.as_deref(), Some("HDR10"));
+        assert_eq!(video.color_space.as_deref(), Some("bt.2020-ncl"));
+        assert_eq!(video.color_transfer.as_deref(), Some("pq"));
+        assert_eq!(video.color_range.as_deref(), Some("limited"));
+        assert_eq!(video.bit_depth, Some(10));
+        assert_eq!(video.max_content_light_level, Some(1000));
+        assert_eq!(video.max_frame_average_light_level, Some(400));
+    }
+
+    #[test]
+    fn playback_video_payload_prefers_server_fields_and_fills_only_missing_values() {
+        let server = VideoStream {
+            dynamic_range: Some("SDR".to_string()),
+            range_type: Some("SDR".to_string()),
+            codec: Some("av1".to_string()),
+            profile: None,
+            level: Some(41),
+            width: Some(1920),
+            height: Some(0),
+            frame_rate: None,
+            color_space: None,
+            color_transfer: None,
+            color_range: None,
+            bit_depth: Some(0),
+            max_content_light_level: None,
+            max_frame_average_light_level: None,
+            dolby_vision_profile: None,
+            dolby_vision_level: None,
+            dolby_vision_base_layer_present: None,
+            dolby_vision_compatibility_id: None,
+        };
+        let runtime = VideoStream {
+            dynamic_range: Some("HDR10".to_string()),
+            range_type: Some("HDR".to_string()),
+            codec: Some("hevc".to_string()),
+            profile: Some("Main 10".to_string()),
+            level: None,
+            width: Some(3840),
+            height: Some(1608),
+            frame_rate: Some(23.976),
+            color_space: Some("bt.2020-ncl".to_string()),
+            color_transfer: Some("pq".to_string()),
+            color_range: Some("limited".to_string()),
+            bit_depth: Some(10),
+            max_content_light_level: Some(1000),
+            max_frame_average_light_level: Some(400),
+            dolby_vision_profile: None,
+            dolby_vision_level: None,
+            dolby_vision_base_layer_present: None,
+            dolby_vision_compatibility_id: None,
+        };
+
+        let payload = merged_source_video_payload(Some(&server), Some(&runtime));
+
+        assert_eq!(payload["codec"], "av1");
+        assert_eq!(payload["width"], 1920);
+        assert_eq!(payload["dynamicRange"], "SDR");
+        assert_eq!(payload["height"], 1608);
+        assert_eq!(payload["frameRate"], 23.976);
+        assert_eq!(payload["profile"], "Main 10");
+        assert_eq!(payload["bitDepth"], 10);
+        assert_eq!(payload["colorTransfer"], "pq");
+        assert_eq!(payload["maxCll"], 1000);
     }
 
     #[test]

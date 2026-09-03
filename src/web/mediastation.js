@@ -4373,15 +4373,15 @@
     function schedulePlaybackMetadataRefresh(activePlayer) {
         if (player !== activePlayer
             || !activePlayer.started
-            || !activePlayer.loadInfo?.mediaMetadataPending
+            || !activePlayer.loadInfo
             || activePlayer.exiting) return;
         const mediaId = activePlayer.card?.id;
         if (!mediaId || activePlayer.metadataRefreshMediaId === mediaId) return;
         activePlayer.metadataRefreshMediaId = mediaId;
-        void refreshUnprobedPlaybackMetadata(activePlayer, mediaId);
+        void refreshPlaybackMetadata(activePlayer, mediaId);
     }
 
-    async function refreshUnprobedPlaybackMetadata(activePlayer, mediaId) {
+    async function refreshPlaybackMetadata(activePlayer, mediaId) {
         const retryDelaysMs = [0, 1000, 2000, 4000];
         for (const retryDelayMs of retryDelaysMs) {
             if (retryDelayMs > 0) {
@@ -4389,8 +4389,8 @@
             }
             if (player !== activePlayer
                 || activePlayer.exiting
-                || activePlayer.card?.id !== mediaId
-                || !activePlayer.loadInfo?.mediaMetadataPending) return;
+                || activePlayer.card?.id !== mediaId) return;
+            if (retryDelayMs > 0 && !activePlayer.loadInfo?.mediaMetadataPending) return;
             try {
                 const tracks = await nativeRequest(
                     'mediaStationTracks',
@@ -4403,8 +4403,9 @@
                 if (tracks.metadataRefreshErrorCode) {
                     console.error(`Playback metadata refresh failed: ${tracks.metadataRefreshErrorCode}`);
                 }
+                refreshPlayerTools();
+                if (activePlayer.panelKind === 'info') renderPlayerPanel();
                 if (!activePlayer.loadInfo.mediaMetadataPending) {
-                    refreshPlayerTools();
                     return;
                 }
             } catch (error) {
@@ -4415,7 +4416,7 @@
             && !activePlayer.exiting
             && activePlayer.card?.id === mediaId
             && activePlayer.loadInfo?.mediaMetadataPending) {
-            console.warn(`Playback metadata remained pending after bounded refresh: media_id=${mediaId}`);
+            console.warn(`Server playback metadata remained pending after bounded refresh: media_id=${mediaId}`);
         }
     }
 
