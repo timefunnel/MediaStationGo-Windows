@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+use crate::danmaku::{
+    DanmakuParseError, MediaDanmakuState, danmaku_query, parse_danmaku_response,
+};
 use crate::playback_session::{PlaybackSessionError, ResolveInput, ServerAuth};
 
 const HEADER_EMBY_AUTHORIZATION: &str = "x-emby-authorization";
@@ -1525,8 +1528,64 @@ impl MediaStationApiClient {
         self.post_json_empty(session, &url, &Value::Object(payload))
     }
 
-    fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {
+    /// Fetch danmaku for one media item.
+    ///
+    /// The server keeps "matched", "nothing matched" and "danmaku unavailable"
+    /// apart; those states survive here instead of collapsing into an empty
+    /// comment list, because the UI has to explain them differently.
+    pub fn fetch_media_danmaku(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+        ch_convert: u8,
+        offset_seconds: Option<f64>,
+    ) -> Result<MediaDanmakuState, ApiError> {
+        validate_non_empty("media_id", media_id)?;
+        let mut url = endpoint(&session.base_url, &["api", "danmaku", media_id])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in danmaku_query(ch_convert, offset_seconds) {
+                pairs.append_pair(&key, &value);
+            }
+        }
         let agent = self.agent_for_session(session)?;
+        let mut response = agent
+            .get(url.as_str())
+            .header(
+                HEADER_USER_AGENT,
+                self.user_agent_for_profile(session.connection),
+            )
+            .header(HEADER_EMBY_TOKEN, &session.token)
+            .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
+            .call()
+            .map_err(|error| transport_error(&url, error))?;
+        let status_code = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| ApiError::Transport {
+                url: redacted_url(&url),
+                message: error.to_string(),
+            })?;
+        parse_danmaku_response(status_code, &body).map_err(|error| match error {
+            DanmakuParseError::InvalidJson { message } => ApiError::InvalidJson {
+                url: redacted_url(&url),
+                message,
+            },
+            DanmakuParseError::MissingField { field } => ApiError::MissingField { field },
+            DanmakuParseError::InvalidField { field } => ApiError::InvalidServerContract {
+                field,
+                reason: "danmaku responses must carry an array of comments".to_string(),
+            },
+            DanmakuParseError::UnexpectedStatus { status } => ApiError::HttpStatus {
+                url: redacted_url(&url),
+                status_code: status,
+                message: format!("HTTP {status}"),
+            },
+        })
+    }
+
+    fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {        let agent = self.agent_for_session(session)?;
         let response = agent
             .get(url.as_str())
             .header(
