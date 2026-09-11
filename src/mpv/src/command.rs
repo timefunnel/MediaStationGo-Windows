@@ -132,7 +132,6 @@ impl LoadFileCommand {
 fn empty_node() -> sys::mpv_node {
     unsafe { std::mem::zeroed() }
 }
-
 fn string_node(value: &CStr) -> sys::mpv_node {
     let mut node = empty_node();
     node.format = sys::mpv_format::MPV_FORMAT_STRING;
@@ -157,3 +156,147 @@ fn list_node(format: sys::mpv_format, list: &mut sys::mpv_node_list) -> sys::mpv
 // SAFETY: all raw pointers refer to owned heap allocations retained by the
 // command. libmpv only reads the tree during the command API call.
 unsafe impl Send for LoadFileCommand {}
+
+/// Named arguments for `osd-overlay`.
+///
+/// mpv documents that `osd-overlay` should be called with named arguments
+/// because `res_x`/`res_y`/`z`/`hidden`/`compute_bounds` are all optional;
+/// passing `data = None` removes the overlay again (`format=none`).
+pub(crate) fn overlay_arguments(
+    id: i64,
+    data: Option<&str>,
+    res_x: i32,
+    res_y: i32,
+    z: i32,
+) -> Vec<(String, String)> {
+    match data {
+        Some(text) => vec![
+            ("id".to_string(), id.to_string()),
+            ("format".to_string(), "ass-events".to_string()),
+            ("data".to_string(), text.to_string()),
+            ("res_x".to_string(), res_x.to_string()),
+            ("res_y".to_string(), res_y.to_string()),
+            ("z".to_string(), z.to_string()),
+        ],
+        None => vec![
+            ("id".to_string(), id.to_string()),
+            ("format".to_string(), "none".to_string()),
+        ],
+    }
+}
+
+/// Owned command tree for any `command <name> <map>` call made through
+/// `mpv_command_node_async`. Same lifetime rules as [`LoadFileCommand`].
+pub(crate) struct NamedArgsCommand {
+    // Kept alive so the pointers inside `root` stay valid; same convention as
+    // `LoadFileCommand` above.
+    _strings: Vec<CString>,
+    _keys: Vec<CString>,
+    _values: Vec<CString>,
+    _value_nodes: Vec<sys::mpv_node>,
+    _key_ptrs: Vec<*mut c_char>,
+    _map: Box<sys::mpv_node_list>,
+    _arguments: Vec<sys::mpv_node>,
+    _argument_list: Box<sys::mpv_node_list>,
+    root: sys::mpv_node,
+}
+
+impl NamedArgsCommand {
+    pub(crate) fn new(name: &str, args: &[(String, String)]) -> Result<Self, NulError> {
+        let strings = vec![CString::new(name)?];
+        let keys = args
+            .iter()
+            .map(|(key, _)| CString::new(key.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = args
+            .iter()
+            .map(|(_, value)| CString::new(value.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut value_nodes: Vec<sys::mpv_node> = values.iter().map(|v| string_node(v)).collect();
+        let mut key_ptrs = keys
+            .iter()
+            .map(|k| k.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        let mut map = Box::new(sys::mpv_node_list {
+            num: value_nodes.len() as i32,
+            values: value_nodes.as_mut_ptr(),
+            keys: key_ptrs.as_mut_ptr(),
+        });
+        let mut arguments = vec![
+            string_node(&strings[0]),
+            list_node(sys::mpv_format::MPV_FORMAT_NODE_MAP, map.as_mut()),
+        ];
+        let mut argument_list = Box::new(sys::mpv_node_list {
+            num: arguments.len() as i32,
+            values: arguments.as_mut_ptr(),
+            keys: std::ptr::null_mut(),
+        });
+        let root = list_node(
+            sys::mpv_format::MPV_FORMAT_NODE_ARRAY,
+            argument_list.as_mut(),
+        );
+        Ok(Self {
+            _strings: strings,
+            _keys: keys,
+            _values: values,
+            _value_nodes: value_nodes,
+            _key_ptrs: key_ptrs,
+            _map: map,
+            _arguments: arguments,
+            _argument_list: argument_list,
+            root,
+        })
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut sys::mpv_node {
+        &mut self.root
+    }
+}
+
+// SAFETY: see [`LoadFileCommand`]; every pointer refers to storage owned here.
+unsafe impl Send for NamedArgsCommand {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_arguments_use_named_arguments_including_resolution_and_z() {
+        let args = overlay_arguments(100, Some("{\\pos(1,2)}hi"), 1920, 1080, 1);
+        let pairs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("id", "100"),
+                ("format", "ass-events"),
+                ("data", "{\\pos(1,2)}hi"),
+                ("res_x", "1920"),
+                ("res_y", "1080"),
+                ("z", "1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_an_overlay_only_sends_the_id() {
+        let args = overlay_arguments(101, None, 1920, 1080, 0);
+        let pairs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(pairs, vec![("id", "101"), ("format", "none")]);
+    }
+
+    #[test]
+    fn named_args_command_builds_a_two_element_array_with_a_map() {
+        let args = overlay_arguments(7, Some("x"), 1280, 720, 0);
+        let mut command = NamedArgsCommand::new("osd-overlay", &args).expect("command");
+        let root = unsafe { &*command.as_mut_ptr() };
+        assert_eq!(root.format, sys::mpv_format::MPV_FORMAT_NODE_ARRAY);
+        let list = unsafe { &*root.u.list };
+        assert_eq!(list.num, 2);
+        assert!(list.keys.is_null(), "the argument array must be positional");
+        let map_node = unsafe { &*list.values.add(1) };
+        assert_eq!(map_node.format, sys::mpv_format::MPV_FORMAT_NODE_MAP);
+        let map = unsafe { &*map_node.u.list };
+        assert_eq!(map.num as usize, args.len());
+        assert!(!map.keys.is_null(), "the argument map must carry keys");
+    }
+}

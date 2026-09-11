@@ -28,7 +28,10 @@ use parking_lot::Mutex;
 use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
 
-use crate::{command::LoadFileCommand, sys};
+use crate::{
+    command::{LoadFileCommand, NamedArgsCommand, overlay_arguments},
+    sys,
+};
 
 // =============================================================================
 // Internal helpers
@@ -452,6 +455,52 @@ pub unsafe fn jfn_mpv_audio_add(url: *const c_char) {
         return;
     };
     cmd(&[c"audio-add", u, c"select"]);
+}
+
+// =============================================================================
+// Danmaku OSD overlays (ass-events)
+// =============================================================================
+
+/// Push one danmaku overlay frame.
+///
+/// The caller recomputes positions every tick (`jfn-danmaku` does the layout)
+/// and calls this with the assembled ASS event lines; `data = NULL` removes the
+/// overlay again. Overlays live above mpv's builtin OSD, so subtitles are never
+/// displaced by danmaku.
+pub unsafe fn jfn_mpv_danmaku_overlay(
+    id: i64,
+    data: *const c_char,
+    res_x: i32,
+    res_y: i32,
+    z: i32,
+) {
+    let text = if data.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(data) }.to_str().ok()
+    };
+    let args = overlay_arguments(id, text, res_x, res_y, z);
+    if let Err(error) = named_command_async("osd-overlay", &args) {
+        tracing::warn!(%error, "danmaku overlay command rejected");
+    }
+}
+
+/// Remove a danmaku overlay (equivalent to pushing `format=none`).
+pub fn jfn_mpv_danmaku_overlay_remove(id: i64) {
+    let args = overlay_arguments(id, None, 0, 0, 0);
+    if let Err(error) = named_command_async("osd-overlay", &args) {
+        tracing::warn!(%error, "danmaku overlay removal rejected");
+    }
+}
+
+fn named_command_async(name: &str, args: &[(String, String)]) -> crate::Result<()> {
+    // libmpv's MPV_ERROR_INVALID_PARAMETER; only reachable if a command
+    // argument contains an interior NUL (danmaku text is player content).
+    const MPV_ERROR_INVALID_PARAMETER: i32 = -4;
+    let handle = checked_raw()?;
+    let mut command = NamedArgsCommand::new(name, args)
+        .map_err(|_| crate::Error::new(MPV_ERROR_INVALID_PARAMETER))?;
+    crate::error::check(unsafe { sys::mpv_command_node_async(handle, 0, command.as_mut_ptr()) })
 }
 
 // =============================================================================
