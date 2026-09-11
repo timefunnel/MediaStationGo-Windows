@@ -518,6 +518,15 @@ fn handle_message(message: BrowserMessage) -> bool {
                 unsafe { jfn_mpv_set_aspect_mode(c.as_ptr()) };
             }
         }),
+        "playerSetDanmaku" => with_args(args, |a| {
+            let enabled = a.bool(0) != 0;
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_INFO,
+                &format!("playerSetDanmaku: {enabled}"),
+            );
+            crate::mediastation_runtime::set_danmaku_enabled(enabled);
+        }),
         "playerOsdActive" => with_args(args, |a| {
             let active = a.bool(0) != 0;
             let mut g = INSTANCE.lock();

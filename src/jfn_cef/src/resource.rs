@@ -260,4 +260,38 @@ mod tests {
             assert!(!resource.bytes.is_empty());
         }
     }
+
+    /// The danmaku switch is a contract between two embedded files: the settings
+    /// markup and the script that wires it to `jmpNative`. An id that only exists
+    /// in one of them fails at runtime, in a window nobody can inspect.
+    #[test]
+    fn mediastation_shell_ships_the_danmaku_switch() {
+        let html = String::from_utf8(
+            lookup("resources/mediastation.html")
+                .expect("shell html")
+                .bytes
+                .to_vec(),
+        )
+        .expect("shell html is utf-8");
+        assert!(
+            html.contains(r#"id="settings-danmaku-enabled""#),
+            "the playback settings need a danmaku toggle"
+        );
+
+        let js = String::from_utf8(
+            lookup("resources/mediastation.js")
+                .expect("shell script")
+                .bytes
+                .to_vec(),
+        )
+        .expect("shell script is utf-8");
+        assert!(
+            js.contains("byId('settings-danmaku-enabled')"),
+            "the toggle must be wired to its markup id"
+        );
+        assert!(
+            js.contains("playerSetDanmaku"),
+            "the toggle must reach the native player"
+        );
+    }
 }

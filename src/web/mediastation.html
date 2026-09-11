@@ -250,7 +250,12 @@
             </div>
           </section>
           <section class="settings-section setting-block default-subtitle-settings settings-authenticated" data-settings-section="playback">
-            <p class="eyebrow">播放与字幕</p><h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
+            <p class="eyebrow">播放与字幕</p><h3>弹幕</h3><p>弹幕由服务端匹配后下发，绘制在字幕之上，不会挤掉字幕轨。关闭后立即从画面移除，后续剧集也不再显示。</p>
+            <div class="setting-toggle-row">
+              <label for="settings-danmaku-enabled">显示弹幕</label>
+              <input id="settings-danmaku-enabled" type="checkbox" role="switch">
+            </div>
+            <h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
             <label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
             <label class="setting-range-row" for="settings-subtitle-bottom-offset"><span>距底部</span><input id="settings-subtitle-bottom-offset" type="range" min="0" max="30" step="1"><output id="settings-subtitle-bottom-offset-value" for="settings-subtitle-bottom-offset"></output></label>
             <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>

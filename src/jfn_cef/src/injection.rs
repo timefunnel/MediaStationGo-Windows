@@ -36,6 +36,7 @@ pub(crate) enum NativeFunction {
     PlayerSetSubtitleStyle,
     PlayerSetAspectMode,
     PlayerOsdActive,
+    PlayerSetDanmaku,
     OpenConfigDir,
     SaveServerUrl,
     NotifyMetadata,
@@ -104,6 +105,7 @@ impl NativeFunction {
             "playerSetSubtitleStyle" => Self::PlayerSetSubtitleStyle,
             "playerSetAspectMode" => Self::PlayerSetAspectMode,
             "playerOsdActive" => Self::PlayerOsdActive,
+            "playerSetDanmaku" => Self::PlayerSetDanmaku,
             "openConfigDir" => Self::OpenConfigDir,
             "saveServerUrl" => Self::SaveServerUrl,
             "notifyMetadata" => Self::NotifyMetadata,
@@ -173,6 +175,7 @@ impl NativeFunction {
             Self::PlayerSetSubtitleStyle => "playerSetSubtitleStyle",
             Self::PlayerSetAspectMode => "playerSetAspectMode",
             Self::PlayerOsdActive => "playerOsdActive",
+            Self::PlayerSetDanmaku => "playerSetDanmaku",
             Self::OpenConfigDir => "openConfigDir",
             Self::SaveServerUrl => "saveServerUrl",
             Self::NotifyMetadata => "notifyMetadata",
@@ -297,6 +300,7 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayerSetSubtitleStyle,
     NativeFunction::PlayerSetAspectMode,
     NativeFunction::PlayerOsdActive,
+    NativeFunction::PlayerSetDanmaku,
     NativeFunction::OpenConfigDir,
     NativeFunction::SaveServerUrl,
     NativeFunction::NotifyMetadata,
@@ -640,5 +644,24 @@ pub(crate) fn build_for_kind(
             ctx_menu,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeFunction, WEB_FUNCTIONS};
+
+    #[test]
+    fn the_danmaku_switch_is_reachable_from_the_web_ui() {
+        // The name string is the whole contract with JavaScript: a typo here
+        // makes `jmpNative.playerSetDanmaku(...)` silently undefined.
+        let function =
+            NativeFunction::from_name("playerSetDanmaku").expect("playerSetDanmaku must exist");
+        assert_eq!(function, NativeFunction::PlayerSetDanmaku);
+        assert_eq!(function.name(), "playerSetDanmaku");
+        assert!(
+            WEB_FUNCTIONS.contains(&function),
+            "the player UI must be allowed to call the danmaku switch"
+        );
     }
 }

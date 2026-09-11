@@ -35,6 +35,7 @@
     const legacyPlayerPlaybackSettingsKey = 'MediaStationGo.Windows.playbackSettingsByMedia.v1';
     const defaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v2';
     const legacyDefaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v1';
+    const danmakuEnabledSettingKey = 'MediaStationGo.Windows.danmakuEnabled.v1';
     const seriesPlaybackSettingsKey = 'MediaStationGo.Windows.seriesPlaybackSettings.v1';
     const uiThemeSettingKey = 'MediaStationGo.Windows.uiTheme.v1';
     const playerSubtitleStyleDefaults = Object.freeze({ fontSize: 36, bottomOffset: 8 });
@@ -135,6 +136,7 @@
     let searchRevision = 0;
     let playerPlaybackSettings = loadPlayerPlaybackSettings();
     let defaultPlayerSubtitleStyle = loadDefaultPlayerSubtitleStyle();
+    let danmakuEnabled = loadDanmakuEnabled();
     let seriesPlaybackSettings = loadSeriesPlaybackSettings();
     let playerVolume = 100;
     let lastAudiblePlayerVolume = 100;
@@ -466,6 +468,44 @@
             console.error(`MediaStation default subtitle style could not be read: ${error}`);
         }
         return { ...playerSubtitleStyleDefaults };
+    }
+
+    // 弹幕开关：由这个 UI 负责持久化，native 只记住当前值并作用到正在播放以及
+    // 之后新起的弹幕会话上（换集、重新加载都沿用）。
+    function loadDanmakuEnabled() {
+        try {
+            const value = window.localStorage.getItem(danmakuEnabledSettingKey);
+            if (value === null) return true;
+            if (value === 'true') return true;
+            if (value === 'false') return false;
+            console.error('MediaStation danmaku switch is invalid');
+        } catch (error) {
+            console.error(`MediaStation danmaku switch could not be read: ${error}`);
+        }
+        return true;
+    }
+
+    function pushDanmakuEnabled() {
+        if (window.jmpNative?.playerSetDanmaku) window.jmpNative.playerSetDanmaku(danmakuEnabled);
+    }
+
+    function refreshDanmakuControls() {
+        const toggle = byId('settings-danmaku-enabled');
+        if (toggle) toggle.checked = danmakuEnabled;
+    }
+
+    function applyDanmakuEnabled(enabled, persist = false) {
+        danmakuEnabled = enabled === true;
+        if (persist) {
+            try {
+                window.localStorage.setItem(danmakuEnabledSettingKey, String(danmakuEnabled));
+            } catch (error) {
+                console.error(`MediaStation danmaku switch could not be saved: ${error}`);
+                showToast('弹幕开关保存失败');
+            }
+        }
+        pushDanmakuEnabled();
+        refreshDanmakuControls();
     }
 
     function refreshDefaultSubtitleStyleControls() {
@@ -6209,6 +6249,13 @@
         applyDefaultPlayerSubtitleStyle(playerSubtitleStyleDefaults, true);
     });
     refreshDefaultSubtitleStyleControls();
+    const danmakuToggle = byId('settings-danmaku-enabled');
+    danmakuToggle.addEventListener('change', () => {
+        applyDanmakuEnabled(danmakuToggle.checked, true);
+    });
+    refreshDanmakuControls();
+    // 让 native 一开始就知道当前选择，否则它会按默认（开）启动这一集的弹幕。
+    pushDanmakuEnabled();
     const autoUpdateToggle = byId('settings-auto-update-check');
     autoUpdateToggle.checked = autoUpdateCheckEnabled;
     autoUpdateToggle.addEventListener('change', () => {

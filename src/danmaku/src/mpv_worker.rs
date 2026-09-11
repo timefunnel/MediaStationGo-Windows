@@ -27,9 +27,43 @@ const IDLE_TICK_MILLIS: u64 = 250;
 const DEFAULT_PLAY_RES_X: u32 = 1920;
 const DEFAULT_PLAY_RES_Y: u32 = 1080;
 
+/// The player UI's danmaku switch, shared with the worker thread.
+///
+/// Cheap to clone: the flag lives behind an `Arc`, so the UI can flip it while
+/// the worker is mid-tick without any locking.
+#[derive(Clone, Debug)]
+pub struct DanmakuControls {
+    enabled: Arc<AtomicBool>,
+}
+
+impl DanmakuControls {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Switching off takes effect on the next tick, which clears whatever is on
+    /// screen; switching back on redraws from the current position.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+}
+
+impl Default for DanmakuControls {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 /// A running danmaku worker for one playback item.
 pub struct DanmakuSession {
     stop: Arc<AtomicBool>,
+    controls: DanmakuControls,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -37,20 +71,31 @@ impl DanmakuSession {
     /// Spawn the worker. `on_error` receives human readable problems (a frame
     /// containing a NUL byte, a rejected overlay command) so the caller can log
     /// them in its own logging category instead of the failure being swallowed.
+    ///
+    /// `controls` is shared with the caller, so the player UI can switch danmaku
+    /// off (and on again) while this session runs.
     pub fn start(
         comments: Vec<DanmakuComment>,
         style: DanmakuStyle,
+        controls: DanmakuControls,
         on_error: impl Fn(&str) + Send + 'static,
     ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let worker_controls = controls.clone();
         let worker = thread::Builder::new()
             .name("danmaku-overlay".to_string())
-            .spawn(move || worker_loop(worker_stop, comments, style, on_error))?;
+            .spawn(move || worker_loop(worker_stop, worker_controls, comments, style, on_error))?;
         Ok(Self {
             stop,
+            controls,
             worker: Some(worker),
         })
+    }
+
+    /// The switch this session reads; callers keep a clone to control it.
+    pub fn controls(&self) -> DanmakuControls {
+        self.controls.clone()
     }
 
     /// Ask the worker to stop without waiting for it. Used on paths that hold a
@@ -101,8 +146,33 @@ impl OverlaySink for MpvOverlaySink<'_> {
     }
 }
 
+/// What the worker should do on one tick.
+///
+/// Kept separate from the loop so the three cases (draw / no timeline / switched
+/// off) can be tested without an mpv handle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TickAction {
+    /// Draw the frame for this position on the media timeline.
+    Draw(f64),
+    /// No timeline yet (loading, stopping, between files): clear what is shown.
+    Clear,
+    /// Danmaku is switched off by the player UI: clear once, then stay quiet.
+    Off,
+}
+
+fn tick_action(enabled: bool, position: Option<f64>) -> TickAction {
+    if !enabled {
+        return TickAction::Off;
+    }
+    match position {
+        Some(position) => TickAction::Draw(position),
+        None => TickAction::Clear,
+    }
+}
+
 fn worker_loop<F>(
     stop: Arc<AtomicBool>,
+    controls: DanmakuControls,
     comments: Vec<DanmakuComment>,
     style: DanmakuStyle,
     on_error: F,
@@ -113,27 +183,25 @@ fn worker_loop<F>(
     let mut sink = MpvOverlaySink {
         on_error: &on_error,
     };
-    let mut had_timeline = true;
+    // Whether anything of ours may still be on screen. mpv keeps an overlay
+    // until it is removed, so both "no timeline" and "switched off" have to clear
+    // it exactly once instead of every tick.
+    let mut overlays_live = false;
     while !stop.load(Ordering::Relaxed) {
-        match mpv_property_double(c"time-pos") {
-            Some(position) => {
-                if !had_timeline {
-                    // The worker cleared its overlays while idle; make sure a
-                    // fresh timeline starts from a clean state.
-                    driver.stop(&mut sink);
-                    had_timeline = true;
-                }
+        match tick_action(controls.enabled(), mpv_property_double(c"time-pos")) {
+            TickAction::Draw(position) => {
                 let paused = mpv_property_int(c"pause").unwrap_or(0) != 0;
                 let (res_x, res_y) = render_resolution();
                 driver.tick(position, paused, res_x, res_y, &mut sink);
+                overlays_live = true;
                 thread::sleep(Duration::from_millis(TICK_MILLIS));
             }
-            None => {
-                // No timeline yet (loading, stopping, between files): never
-                // leave comments from the previous position on screen.
-                if had_timeline {
+            TickAction::Clear | TickAction::Off => {
+                if overlays_live {
+                    // Never leave comments from the previous position (or from
+                    // before the switch was flipped) on screen.
                     driver.stop(&mut sink);
-                    had_timeline = false;
+                    overlays_live = false;
                 }
                 thread::sleep(Duration::from_millis(IDLE_TICK_MILLIS));
             }
@@ -172,4 +240,30 @@ fn mpv_property_int(name: &CStr) -> Option<i64> {
     let mut value = 0;
     (unsafe { jfn_mpv::api::jfn_mpv_get_property_int(name.as_ptr(), &mut value) } >= 0)
         .then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controls_start_enabled_and_can_be_flipped_from_another_handle() {
+        let controls = DanmakuControls::default();
+        assert!(controls.enabled());
+        let ui = controls.clone();
+        ui.set_enabled(false);
+        assert!(!controls.enabled(), "the worker sees the UI's switch");
+        controls.set_enabled(true);
+        assert!(ui.enabled());
+    }
+
+    #[test]
+    fn tick_action_draws_clears_or_stays_off() {
+        assert_eq!(tick_action(true, Some(12.5)), TickAction::Draw(12.5));
+        assert_eq!(tick_action(true, None), TickAction::Clear);
+        // Switched off wins over a live timeline: this is what removes the
+        // overlay from the screen when the user turns danmaku off.
+        assert_eq!(tick_action(false, Some(12.5)), TickAction::Off);
+        assert_eq!(tick_action(false, None), TickAction::Off);
+    }
 }

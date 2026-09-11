@@ -33,6 +33,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::thread::JoinHandle;
@@ -443,6 +444,10 @@ struct MediaStationRuntime {
     home_cache: HomeSnapshotCache,
     series_detail_cache: Mutex<SeriesDetailSnapshotCache>,
     image_cache: Mutex<ImageDiskCache>,
+    /// The player UI's danmaku switch. It lives outside the per-item session so
+    /// the choice survives episode changes, and so a switch flipped before a
+    /// load still applies to the session that load starts.
+    danmaku_controls: jfn_danmaku::DanmakuControls,
     state: Mutex<RuntimeState>,
 }
 
@@ -631,6 +636,9 @@ impl MediaStationRuntime {
                 cache_root.join(IMAGE_CACHE_DIRECTORY),
                 MAX_IMAGE_CACHE_BYTES,
             )),
+            danmaku_controls: jfn_danmaku::DanmakuControls::new(
+                DANMAKU_ENABLED.load(Ordering::Relaxed),
+            ),
             state: Mutex::new(RuntimeState {
                 session: None,
                 session_profile: None,
@@ -1617,9 +1625,14 @@ impl MediaStationRuntime {
                 )
             })
             .collect();
-        let session = match DanmakuSession::start(comments, DanmakuStyle::default(), |message| {
-            log_error(&format!("MediaStation danmaku: {message}"));
-        }) {
+        let session = match DanmakuSession::start(
+            comments,
+            DanmakuStyle::default(),
+            self.danmaku_controls.clone(),
+            |message| {
+                log_error(&format!("MediaStation danmaku: {message}"));
+            },
+        ) {
             Ok(session) => session,
             Err(error) => {
                 log_error(&format!(
@@ -2117,6 +2130,10 @@ fn report_job(active: &ActivePlaybackReport, kind: ReportKind) -> ReportJob {
 
 static RUNTIME: OnceLock<Result<Arc<MediaStationRuntime>, ()>> = OnceLock::new();
 
+/// The player UI's danmaku switch before/without a runtime. See
+/// [`set_danmaku_enabled`].
+static DANMAKU_ENABLED: AtomicBool = AtomicBool::new(true);
+
 fn runtime() -> Result<Arc<MediaStationRuntime>, LoadFailure> {
     match RUNTIME.get_or_init(|| {
         let runtime = Arc::new(MediaStationRuntime::new().map_err(|_| ())?);
@@ -2144,6 +2161,23 @@ fn install_playback_cleanup(runtime: Weak<MediaStationRuntime>) {
 pub(crate) fn release_playback_resources() {
     if let Some(Ok(runtime)) = RUNTIME.get() {
         runtime.release_playback_resources();
+    }
+}
+
+/// Turn danmaku on or off from the player UI.
+///
+/// The switch is remembered by this runtime, so it applies to the session that is
+/// playing right now *and* to every session started later (next episode, next
+/// load). The UI owns persisting the user's choice across app restarts.
+///
+/// It is kept in a static as well, because the UI pushes its saved preference as
+/// soon as the settings page loads — before any MediaStation session (and
+/// therefore before the runtime) exists. Reading it here must not build the
+/// runtime just to store a boolean.
+pub(crate) fn set_danmaku_enabled(enabled: bool) {
+    DANMAKU_ENABLED.store(enabled, Ordering::Relaxed);
+    if let Some(Ok(runtime)) = RUNTIME.get() {
+        runtime.danmaku_controls.set_enabled(enabled);
     }
 }
 

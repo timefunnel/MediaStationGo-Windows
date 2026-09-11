@@ -31,7 +31,10 @@
 //! cargo test -p jfn-danmaku --features mpv --test mpv_overlay_live -- --ignored --nocapture
 //! ```
 
-use jfn_danmaku::{DanmakuComment, DanmakuDriver, DanmakuStyle, OverlaySink, TickOutcome};
+use jfn_danmaku::{
+    DanmakuComment, DanmakuControls, DanmakuDriver, DanmakuSession, DanmakuStyle, OverlaySink,
+    TickOutcome,
+};
 use jfn_mpv::api::{
     WaitEvent, jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove, jfn_mpv_get_property_int,
     jfn_mpv_get_property_string, jfn_mpv_wait_event, wait_event_owned,
@@ -46,6 +49,7 @@ use std::fs;
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,6 +68,19 @@ const PROBE_REPLY: u64 = 0x6461_6e6d_0001;
 const FRAME_REPLY: u64 = 0x6461_6e6d_0002;
 const LIVE_TEXT: &str = "DANMAKU OVERLAY LIVE TEST";
 const SUBTITLE_TEXT: &str = "SUBTITLE COEXISTENCE TEST";
+
+/// libmpv's handle is process-global (`jfn_mpv_handle_init` keeps it in a slot)
+/// and the video output can only belong to one of them, so the live tests in
+/// this file must not overlap even though cargo runs them as threads of one
+/// process.
+static MPV_GUARD: Mutex<()> = Mutex::new(());
+
+/// Serialize against the other live test in this file.
+fn lock_mpv() -> std::sync::MutexGuard<'static, ()> {
+    MPV_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Write a solid navy PPM. mpv reads PPM through its image demuxer, so this
 /// gives us a deterministic frame source without shipping a video fixture or
@@ -318,21 +335,43 @@ impl Frame {
 }
 
 /// Read the current composited frame (video + subtitles + external OSD).
+///
+/// Retries a rejected request: right after a load mpv can still be creating its
+/// video output, and "no frame yet" (`MPV_ERROR_COMMAND` from
+/// `screenshot_get()`) is transient. A persistent failure still panics, with the
+/// last error mpv gave.
 #[allow(
     clippy::expect_used,
     clippy::panic,
     reason = "a live test must fail loudly when mpv cannot produce a frame"
 )]
 fn screenshot_raw() -> Frame {
-    run_command_with_reply(
-        &[
-            "screenshot-raw".to_string(),
-            "window".to_string(),
-            "bgr0".to_string(),
-        ],
-        FRAME_REPLY,
-    );
     let deadline = Instant::now() + TIMEOUT;
+    let mut last_error = 0;
+    while Instant::now() < deadline {
+        run_command_with_reply(
+            &[
+                "screenshot-raw".to_string(),
+                "window".to_string(),
+                "bgr0".to_string(),
+            ],
+            FRAME_REPLY,
+        );
+        if let Some(frame) = frame_reply(deadline, &mut last_error) {
+            return frame;
+        }
+    }
+    panic!("mpv never returned a raw frame (last error {last_error})");
+}
+
+/// Wait for the reply to `screenshot-raw`. `None` means mpv rejected it (the
+/// error is recorded) or the deadline passed.
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a live test must fail loudly when mpv cannot produce a frame"
+)]
+fn frame_reply(deadline: Instant, last_error: &mut i32) -> Option<Frame> {
     while Instant::now() < deadline {
         // SAFETY: the returned event is decoded before the next wait call.
         let raw = jfn_mpv_wait_event(0.2);
@@ -345,7 +384,11 @@ fn screenshot_raw() -> Frame {
         {
             continue;
         }
-        assert_eq!(event.error, 0, "mpv should return a raw frame");
+        if event.error != 0 {
+            println!("screenshot-raw rejected with error {}", event.error);
+            *last_error = event.error;
+            return None;
+        }
         assert!(!event.data.is_null(), "the raw frame reply carries no data");
         let node = unsafe { Node::from_raw(event.data as *const jfn_mpv::sys::mpv_node) };
         let number = |key: &str| node.get(key).and_then(|value| value.as_int());
@@ -371,14 +414,14 @@ fn screenshot_raw() -> Frame {
             stride * height,
             "the frame should hold one stride per row"
         );
-        return Frame {
+        return Some(Frame {
             width,
             height,
             stride,
             data: data.clone(),
-        };
+        });
     }
-    panic!("mpv never returned a raw frame");
+    None
 }
 
 /// Rectangle mpv reports for a pushed overlay, in the units of `res_x`/`res_y`.
@@ -628,6 +671,7 @@ fn assert_same_geometry(name: &str, reference: &Frame, other: &Frame) {
     reason = "a live test must fail loudly when its input is missing"
 )]
 fn danmaku_overlay_is_rendered_into_the_video_output() {
+    let _guard = lock_mpv();
     let video = match env::var("DANMAKU_LIVE_VIDEO") {
         Ok(path) => PathBuf::from(path),
         Err(_) => {
@@ -759,5 +803,122 @@ fn danmaku_overlay_is_rendered_into_the_video_output() {
          {}..={}, and each layer kept identical pixels with the other one present",
         subtitle_rows.first().copied().unwrap_or(0),
         subtitle_rows.last().copied().unwrap_or(0),
+    );
+}
+
+/// Poll the composited frame until it differs from (or matches) `reference`.
+///
+/// Returns the last frame it saw; the caller asserts on it, so a timeout shows
+/// the frame it gave up on instead of a bare "timed out".
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a live test must fail loudly when mpv stops producing frames"
+)]
+fn wait_for_frame(reference: &Frame, want_same: bool, timeout: Duration) -> Frame {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let frame = screenshot_raw();
+        let same = frame.differing_rows(reference).is_empty();
+        if same == want_same || Instant::now() >= deadline {
+            return frame;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The player UI's danmaku switch has to work during playback: flipping it off
+/// removes the overlay from the video output, flipping it on brings it back, and
+/// neither disturbs the video itself.
+///
+/// Unlike the other live test this one drives `DanmakuSession` (the real worker,
+/// reading `time-pos` from mpv) rather than ticking the driver by hand, so it
+/// also proves the worker stops and resumes with the switch.
+#[test]
+#[ignore = "needs libmpv and a desktop session"]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a live test must fail loudly when its input is missing"
+)]
+fn the_danmaku_switch_clears_and_restores_the_overlay() {
+    let _guard = lock_mpv();
+    let video = match env::var("DANMAKU_LIVE_VIDEO") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let generated = env::temp_dir().join("danmaku-overlay-live-clip.ppm");
+            write_clip(&generated);
+            generated
+        }
+    };
+    assert!(video.is_file(), "clip not found: {}", video.display());
+
+    let dir = run_dir("switch");
+    fs::create_dir_all(&dir).expect("capture directory");
+    let _handle = boot(&dir);
+    loadfile(&video);
+    let (loaded, reconfigured) = wait_for_load();
+    assert!(loaded, "the clip should load: {}", video.display());
+    assert!(reconfigured, "mpv should configure a video output");
+    set_property("vid", "1");
+    let (_res_x, _res_y) = wait_for_video_size();
+
+    // Nothing of ours is on screen yet, and the clip is a still image, so this
+    // frame is the reference the switch has to restore.
+    let baseline = screenshot_raw();
+
+    let controls = DanmakuControls::new(true);
+    let comments = vec![DanmakuComment::new("live-1", 0.0, 5, 0x00_FF_00, LIVE_TEXT)];
+    let style = DanmakuStyle {
+        font_size: 32.0,
+        display_area: 0.5,
+        // Long enough that the comment cannot expire while the test polls.
+        fixed_seconds: 600.0,
+        ..DanmakuStyle::default()
+    };
+    let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink_failures = Arc::clone(&failures);
+    let mut session = DanmakuSession::start(comments, style, controls.clone(), move |message| {
+        if let Ok(mut collected) = sink_failures.lock() {
+            collected.push(message.to_string());
+        }
+    })
+    .expect("the danmaku worker should start");
+
+    let with_danmaku = wait_for_frame(&baseline, false, Duration::from_secs(10));
+    let shown = with_danmaku.differing_rows(&baseline);
+    assert!(
+        !shown.is_empty(),
+        "the worker did not draw anything: the frame never changed (is time-pos available?)"
+    );
+
+    controls.set_enabled(false);
+    let cleared = wait_for_frame(&with_danmaku, false, Duration::from_secs(10));
+    assert_eq!(
+        cleared.data, baseline.data,
+        "switching danmaku off should remove the overlay and restore the frame exactly"
+    );
+
+    controls.set_enabled(true);
+    let restored = wait_for_frame(&baseline, false, Duration::from_secs(10));
+    assert_eq!(
+        restored.data, with_danmaku.data,
+        "switching danmaku back on should draw the same frame again"
+    );
+
+    session.stop();
+    let after_stop = wait_for_frame(&baseline, true, Duration::from_secs(10));
+    assert_eq!(
+        after_stop.data, baseline.data,
+        "stopping the session should clear the overlay"
+    );
+    jfn_mpv_handle_terminate();
+
+    let failures = failures.lock().expect("failure list").clone();
+    assert!(failures.is_empty(), "the worker reported: {failures:?}");
+    println!(
+        "the switch changed rows {}..={} while on and restored the frame byte for byte when off",
+        shown.first().copied().unwrap_or(0),
+        shown.last().copied().unwrap_or(0),
     );
 }
