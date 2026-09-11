@@ -1,20 +1,26 @@
 #![cfg(feature = "mpv")]
-//! Live verification that danmaku actually reaches mpv's video output.
+//! Live verification that danmaku reaches mpv's video output *and* coexists with
+//! the normal subtitle track.
 //!
 //! `osd-overlay` (`format=ass-events`) is drawn by the video output, not by the
 //! subtitle renderer, so unit tests can only prove that mpv *accepted* the
-//! command. This test proves pixels: the same clip is rendered twice through the
-//! player's own video output and the screenshots must differ.
+//! command. This test proves pixels: the same clip is rendered through the
+//! player's own video output in four configurations and the frames are compared
+//! region by region.
 //!
-//! Two independent facts are asserted:
+//! Facts asserted:
 //!
-//! * `screenshot-to-file <file> window` renders video + subtitles + OSD through
-//!   the VO. In `vo_gpu_next.c` that mode is `subs = osd = true`, i.e.
-//!   `osd_flags = 0`, so libass-drawn *external* OSD overlays are composited
-//!   exactly like they are in the player's window.
-//! * `osd-overlay ... compute_bounds=yes` makes mpv report the rectangle libass
-//!   rasterized the pushed events into, so the test can check that a
-//!   top-anchored comment really lands in the upper half of the frame.
+//! * `screenshot-raw window` reads the composited image straight out of the VO.
+//!   In `vo_gpu_next.c` that mode is `subs = osd = true`, i.e. `osd_flags = 0`,
+//!   so libass-drawn *external* OSD overlays and subtitles are composited exactly
+//!   like they are in the player's window.
+//! * the danmaku changes rows in the upper half of the frame and the subtitle
+//!   changes rows in the lower half;
+//! * each layer's pixels are *identical* whether or not the other layer is
+//!   present — the danmaku neither displaces nor covers the subtitle;
+//! * `osd-overlay ... compute_bounds=yes` reports the rectangle libass
+//!   rasterized, which must land inside the rows that actually changed;
+//! * clearing the overlay restores the frame byte for byte.
 //!
 //! Ignored by default: it needs libmpv and a desktop session (mpv opens its own
 //! window for a few seconds). The clip is generated on the spot — a still PPM,
@@ -27,8 +33,8 @@
 
 use jfn_danmaku::{DanmakuComment, DanmakuDriver, DanmakuStyle, OverlaySink, TickOutcome};
 use jfn_mpv::api::{
-    WaitEvent, jfn_mpv_command_async, jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove,
-    jfn_mpv_get_property_int, jfn_mpv_get_property_string, jfn_mpv_wait_event, wait_event_owned,
+    WaitEvent, jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove, jfn_mpv_get_property_int,
+    jfn_mpv_get_property_string, jfn_mpv_wait_event, wait_event_owned,
 };
 use jfn_mpv::boot::{
     DisplayBackend, JfnMpvBoot, jfn_mpv_handle_get, jfn_mpv_handle_init, jfn_mpv_handle_terminate,
@@ -46,15 +52,18 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const CLIP_WIDTH: usize = 320;
 const CLIP_HEIGHT: usize = 240;
 /// mpv holds a still image this long; the test is done long before it ends, so
-/// `video_screenshot` never runs against an end-of-file frame queue.
+/// the screenshot never runs against an end-of-file frame queue.
 const CLIP_SECONDS: &str = "30";
 /// Overlay id used for the `compute_bounds` probe. The driver owns its own ids.
 const PROBE_ID: i64 = 999;
 /// `reply_userdata` of the bounds probe, so its reply is unambiguous: every
 /// other command in this test (including the player's danmaku pushes) uses 0.
 const PROBE_REPLY: u64 = 0x6461_6e6d_0001;
+/// `reply_userdata` of the raw screenshot request, which returns the frame
+/// itself as a `MPV_FORMAT_BYTE_ARRAY`.
+const FRAME_REPLY: u64 = 0x6461_6e6d_0002;
 const LIVE_TEXT: &str = "DANMAKU OVERLAY LIVE TEST";
-const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+const SUBTITLE_TEXT: &str = "SUBTITLE COEXISTENCE TEST";
 
 /// Write a solid navy PPM. mpv reads PPM through its image demuxer, so this
 /// gives us a deterministic frame source without shipping a video fixture or
@@ -73,6 +82,18 @@ fn write_clip(path: &Path) {
         fs::create_dir_all(parent).expect("clip directory");
     }
     fs::write(path, bytes).expect("clip fixture");
+}
+
+/// A subtitle cue covering the whole (still) clip, so the video output has a
+/// second, independent OSD layer to compare against.
+#[allow(
+    clippy::expect_used,
+    reason = "a live test must fail loudly when it cannot write its fixture"
+)]
+fn write_subtitle(path: &Path) -> String {
+    let text = format!("1\n00:00:00,000 --> 00:00:29,000\n{SUBTITLE_TEXT}\n");
+    fs::write(path, text).expect("subtitle fixture");
+    path.to_string_lossy().into_owned()
 }
 
 /// Set a property synchronously and fail loudly when mpv rejects it.
@@ -94,13 +115,45 @@ fn set_property(name: &str, value: &str) {
     );
 }
 
+/// Fire an async command. `reply` becomes the reply's `reply_userdata`, which is
+/// how a caller recognizes its own asynchronous result.
+#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
+fn run_command_with_reply(fields: &[String], reply: u64) {
+    let owned: Vec<CString> = fields
+        .iter()
+        .map(|field| CString::new(field.as_str()).expect("command argument"))
+        .collect();
+    let mut pointers: Vec<*const c_char> = owned.iter().map(|field| field.as_ptr()).collect();
+    assert!(!pointers.is_empty(), "a command needs a name");
+    pointers.push(ptr::null());
+    let handle = jfn_mpv_handle_get();
+    assert!(!handle.is_null(), "the mpv handle should be alive");
+    // SAFETY: `pointers` is NULL terminated and outlives the call; mpv copies
+    // the arguments before returning.
+    unsafe {
+        jfn_mpv::sys::mpv_command_async(handle, reply, pointers.as_ptr() as *mut *const c_char);
+    }
+}
+
+#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
+fn run_command(fields: &[String]) {
+    run_command_with_reply(fields, 0);
+}
+
 #[allow(clippy::expect_used, reason = "a live test must fail loudly")]
 fn loadfile(path: &Path) {
-    let command = CString::new("loadfile").expect("command");
-    let file = CString::new(path.to_string_lossy().as_bytes()).expect("path");
-    let args = [command.as_ptr(), file.as_ptr()];
-    // SAFETY: both CStrings outlive the call.
-    unsafe { jfn_mpv_command_async(args.as_ptr(), args.len()) };
+    run_command(&["loadfile".to_string(), path.to_string_lossy().into_owned()]);
+}
+
+/// Add an external subtitle file and select it, like the player does for a
+/// server-provided subtitle track.
+#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
+fn add_subtitle(path: &str) {
+    run_command(&[
+        "sub-add".to_string(),
+        path.to_string(),
+        "select".to_string(),
+    ]);
 }
 
 #[allow(clippy::expect_used, reason = "a live test must fail loudly")]
@@ -123,7 +176,7 @@ fn print_log(message: &jfn_mpv::LogMessage) {
 }
 
 /// Drain queued events for `duration`, forwarding mpv's log lines so a failing
-/// live test explains itself instead of only reporting "no screenshot".
+/// live test explains itself instead of only reporting "no frame".
 ///
 /// Returns the error codes of every command mpv rejected: mpv accepts a command
 /// into its queue before it parses it, so a rejected command only shows up as an
@@ -212,8 +265,8 @@ fn wait_for_video_size() -> (u32, u32) {
     );
 }
 
-/// Boot mpv the way the player does. `screenshot_dir` is used for mpv's own
-/// diagnostics only; the test writes its screenshot to an explicit path.
+/// Boot mpv the way the player does. `_screenshot_dir` is unused today but kept
+/// so the helper signature matches the player boot path it mirrors.
 #[allow(
     clippy::expect_used,
     clippy::panic,
@@ -236,30 +289,96 @@ fn boot(_screenshot_dir: &Path) -> *mut jfn_mpv::sys::mpv_handle {
     let raw = unsafe { jfn_mpv_handle_init(&boot) };
     assert!(!raw.is_null(), "libmpv should initialize");
     // The clip is a still PPM, so mpv's one-second default would end playback
-    // before the screenshot is taken.
+    // before the frames are read.
     set_property("image-display-duration", CLIP_SECONDS);
     raw
 }
 
-/// `screenshot-to-file <path> window`: video + subtitles + external OSD.
-#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
-fn screenshot(dest: &Path) -> bool {
-    let _ = fs::remove_file(dest);
-    let command = CString::new("screenshot-to-file").expect("command");
-    let path = CString::new(dest.to_string_lossy().as_bytes()).expect("path");
-    let flags = CString::new("window").expect("flags");
-    let args = [command.as_ptr(), path.as_ptr(), flags.as_ptr()];
-    // SAFETY: all three CStrings outlive the call.
-    unsafe { jfn_mpv_command_async(args.as_ptr(), args.len()) };
+/// One composited frame straight out of the video output (`screenshot-raw`).
+struct Frame {
+    width: usize,
+    height: usize,
+    stride: usize,
+    data: Vec<u8>,
+}
 
+impl Frame {
+    fn row(&self, row: usize) -> Option<&[u8]> {
+        let start = row.checked_mul(self.stride)?;
+        let end = start.checked_add(self.stride)?;
+        self.data.get(start..end)
+    }
+
+    /// Rows whose pixels differ between two frames.
+    fn differing_rows(&self, other: &Self) -> Vec<usize> {
+        (0..self.height.min(other.height))
+            .filter(|row| self.row(*row) != other.row(*row))
+            .collect()
+    }
+}
+
+/// Read the current composited frame (video + subtitles + external OSD).
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a live test must fail loudly when mpv cannot produce a frame"
+)]
+fn screenshot_raw() -> Frame {
+    run_command_with_reply(
+        &[
+            "screenshot-raw".to_string(),
+            "window".to_string(),
+            "bgr0".to_string(),
+        ],
+        FRAME_REPLY,
+    );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
-        drain(Duration::from_millis(100));
-        if dest.is_file() {
-            return true;
+        // SAFETY: the returned event is decoded before the next wait call.
+        let raw = jfn_mpv_wait_event(0.2);
+        if raw.is_null() {
+            continue;
         }
+        let event = unsafe { &*raw };
+        if event.event_id != jfn_mpv::sys::mpv_event_id::MPV_EVENT_COMMAND_REPLY
+            || event.reply_userdata != FRAME_REPLY
+        {
+            continue;
+        }
+        assert_eq!(event.error, 0, "mpv should return a raw frame");
+        assert!(!event.data.is_null(), "the raw frame reply carries no data");
+        let node = unsafe { Node::from_raw(event.data as *const jfn_mpv::sys::mpv_node) };
+        let number = |key: &str| node.get(key).and_then(|value| value.as_int());
+        let (Some(width), Some(height), Some(stride)) =
+            (number("w"), number("h"), number("stride"))
+        else {
+            panic!("the raw frame reply should describe its geometry: {node:?}");
+        };
+        let Some(Node::ByteArray(data)) = node.get("data") else {
+            panic!("the raw frame reply should carry pixel data");
+        };
+        let (width, height, stride) = (
+            usize::try_from(width).expect("width fits usize"),
+            usize::try_from(height).expect("height fits usize"),
+            usize::try_from(stride).expect("stride fits usize"),
+        );
+        assert!(
+            stride >= width * 4,
+            "bgr0 rows are at least 4 bytes per pixel (stride {stride}, width {width})"
+        );
+        assert_eq!(
+            data.len(),
+            stride * height,
+            "the frame should hold one stride per row"
+        );
+        return Frame {
+            width,
+            height,
+            stride,
+            data: data.clone(),
+        };
     }
-    false
+    panic!("mpv never returned a raw frame");
 }
 
 /// Rectangle mpv reports for a pushed overlay, in the units of `res_x`/`res_y`.
@@ -368,23 +487,30 @@ impl OverlaySink for RecordingSink {
     }
 }
 
+/// What a capture run asks for: the layers of the player's UI under test.
+#[derive(Clone, Copy, Default)]
+struct Scenario {
+    danmaku: bool,
+    subtitles: bool,
+}
+
 struct Capture {
-    png: Vec<u8>,
-    /// Screenshot taken after the overlays were cleared again.
-    cleared: Option<Vec<u8>>,
+    frame: Frame,
+    /// Frame after the overlays were cleared again.
+    cleared: Frame,
     bounds: Option<Bounds>,
     payload: Option<String>,
 }
 
-/// Render `video` once through the player's video output, optionally with one
-/// live danmaku comment, and return the screenshot plus what mpv reported.
+/// Render `video` once through the player's video output with the requested
+/// layers, and return the composited frame plus what mpv reported.
 #[allow(
     clippy::expect_used,
     clippy::panic,
     reason = "a live test must fail loudly when rendering does not complete"
 )]
-fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
-    fs::create_dir_all(dir).expect("screenshot directory");
+fn capture(dir: &Path, video: &Path, scenario: Scenario) -> Capture {
+    fs::create_dir_all(dir).expect("capture directory");
     let _handle = boot(dir);
     loadfile(video);
     let (loaded, reconfigured) = wait_for_load();
@@ -399,10 +525,15 @@ fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
     // explicitly before any frame can be rendered.
     set_property("vid", "1");
     let (res_x, res_y) = wait_for_video_size();
+
+    if scenario.subtitles {
+        add_subtitle(&write_subtitle(&dir.join("coexistence.srt")));
+    }
+
     let mut sink = RecordingSink::default();
-    let mut driver = match comment {
-        Some(text) => {
-            let comments = vec![DanmakuComment::new("live-1", 0.0, 5, 0x00_FF_00, text)];
+    let mut driver = match scenario.danmaku {
+        true => {
+            let comments = vec![DanmakuComment::new("live-1", 0.0, 5, 0x00_FF_00, LIVE_TEXT)];
             let style = DanmakuStyle {
                 font_size: 32.0,
                 display_area: 0.5,
@@ -419,10 +550,10 @@ fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
             );
             Some(driver)
         }
-        None => None,
+        false => None,
     };
     // mpv parses queued commands on its own thread, so a rejected danmaku
-    // overlay would otherwise go unnoticed until the screenshot comparison.
+    // overlay would otherwise go unnoticed until the frame comparison.
     let rejected = drain_commands(Duration::from_millis(600));
     assert!(
         rejected.is_empty(),
@@ -434,9 +565,14 @@ fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
         .as_deref()
         .and_then(|ass| measure_bounds(ass, res_x, res_y));
     if payload.is_some() {
-        // Drop the probe overlay again so the screenshot only shows what the
-        // player itself pushed.
-        remove_probe();
+        // Drop the probe overlay again so the frame only shows what the player
+        // itself pushed.
+        run_command(&[
+            "osd-overlay".to_string(),
+            PROBE_ID.to_string(),
+            "none".to_string(),
+            String::new(),
+        ]);
         let rejected = drain_commands(Duration::from_millis(200));
         assert!(
             rejected.is_empty(),
@@ -444,13 +580,7 @@ fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
         );
     }
 
-    let png_path = dir.join("frame.png");
-    assert!(
-        screenshot(&png_path),
-        "mpv should write a window screenshot to {}",
-        png_path.display()
-    );
-    let png = fs::read(&png_path).expect("screenshot bytes");
+    let frame = screenshot_raw();
 
     if let Some(driver) = driver.as_mut() {
         driver.stop(&mut sink);
@@ -461,53 +591,33 @@ fn capture(dir: &Path, video: &Path, comment: Option<&str>) -> Capture {
         "mpv rejected command(s) while clearing the overlay: errors {rejected:?}"
     );
     // A cleared overlay has to leave the frame exactly as it was before.
-    let cleared_path = dir.join("cleared.png");
-    let cleared = screenshot(&cleared_path).then(|| fs::read(&cleared_path).ok());
+    let cleared = screenshot_raw();
     jfn_mpv_handle_terminate();
 
     Capture {
-        png,
-        cleared: cleared.flatten(),
+        frame,
+        cleared,
         bounds,
         payload,
     }
-}
-
-/// Removes the `compute_bounds` probe overlay again.
-///
-/// The array form of `osd-overlay` needs every argument up to `data`, so the
-/// empty string is passed explicitly.
-#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
-fn remove_probe() {
-    let fields = [
-        "osd-overlay".to_string(),
-        PROBE_ID.to_string(),
-        "none".to_string(),
-        String::new(),
-    ];
-    let owned: Vec<CString> = fields
-        .iter()
-        .map(|field| CString::new(field.as_str()).expect("command argument"))
-        .collect();
-    let pointers: Vec<*const c_char> = owned.iter().map(|field| field.as_ptr()).collect();
-    // SAFETY: the CStrings outlive the call.
-    unsafe { jfn_mpv_command_async(pointers.as_ptr(), pointers.len()) };
-}
-
-/// PNG dimensions from the IHDR chunk, plus a signature check.
-fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.get(..8)? != PNG_SIGNATURE || bytes.get(12..16)? != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
-    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
-    Some((width, height))
 }
 
 fn run_dir(name: &str) -> PathBuf {
     let dir = env::temp_dir().join(format!("danmaku-overlay-live-{name}"));
     let _ = fs::remove_dir_all(&dir);
     dir
+}
+
+#[allow(
+    clippy::panic,
+    reason = "a live test must fail loudly on its own input"
+)]
+fn assert_same_geometry(name: &str, reference: &Frame, other: &Frame) {
+    assert_eq!(
+        (reference.width, reference.height, reference.stride),
+        (other.width, other.height, other.stride),
+        "{name} should render the same frame geometry"
+    );
 }
 
 #[test]
@@ -528,31 +638,78 @@ fn danmaku_overlay_is_rendered_into_the_video_output() {
     };
     assert!(video.is_file(), "clip not found: {}", video.display());
 
-    let baseline = capture(&run_dir("baseline"), &video, None);
-    let with_overlay = capture(&run_dir("overlay"), &video, Some(LIVE_TEXT));
-
-    let base_size = png_size(&baseline.png).expect("baseline screenshot should be a PNG");
-    let overlay_size = png_size(&with_overlay.png).expect("overlay screenshot should be a PNG");
-    assert_eq!(
-        base_size, overlay_size,
-        "both runs must render the same frame geometry"
+    let baseline = capture(&run_dir("baseline"), &video, Scenario::default());
+    let with_danmaku = capture(
+        &run_dir("danmaku"),
+        &video,
+        Scenario {
+            danmaku: true,
+            subtitles: false,
+        },
     );
-    let differing = baseline
-        .png
-        .iter()
-        .zip(with_overlay.png.iter())
-        .filter(|(left, right)| left != right)
-        .count();
+    let with_subtitles = capture(
+        &run_dir("subtitles"),
+        &video,
+        Scenario {
+            danmaku: false,
+            subtitles: true,
+        },
+    );
+    let with_both = capture(
+        &run_dir("both"),
+        &video,
+        Scenario {
+            danmaku: true,
+            subtitles: true,
+        },
+    );
+
+    let height = baseline.frame.height;
+    for (name, capture) in [
+        ("the danmaku run", &with_danmaku),
+        ("the subtitle run", &with_subtitles),
+        ("the combined run", &with_both),
+    ] {
+        assert_same_geometry(name, &baseline.frame, &capture.frame);
+        assert_same_geometry(name, &baseline.frame, &capture.cleared);
+    }
+
+    // Rows each layer touches on its own.
+    let danmaku_rows = baseline.frame.differing_rows(&with_danmaku.frame);
+    let subtitle_rows = baseline.frame.differing_rows(&with_subtitles.frame);
     assert!(
-        differing > 0,
-        "the danmaku overlay did not reach the video output: both screenshots are identical \
-         ({}x{} PNG, {} bytes)",
-        base_size.0,
-        base_size.1,
-        baseline.png.len()
+        !danmaku_rows.is_empty(),
+        "the danmaku overlay did not reach the video output: the frame is identical to the baseline"
+    );
+    assert!(
+        !subtitle_rows.is_empty(),
+        "the subtitle track did not render, so coexistence cannot be checked"
     );
 
-    let payload = with_overlay
+    let half = height / 2;
+    assert!(
+        danmaku_rows.iter().all(|row| *row < half),
+        "a top-anchored comment should only touch the upper half: rows {danmaku_rows:?}"
+    );
+    assert!(
+        subtitle_rows.iter().all(|row| *row >= half),
+        "the subtitle should only touch the lower half: rows {subtitle_rows:?}"
+    );
+
+    // Coexistence: each layer draws the same pixels whether or not the other one
+    // is present, i.e. neither displaces nor covers the other.
+    let only_danmaku = with_both.frame.differing_rows(&with_subtitles.frame);
+    assert_eq!(
+        only_danmaku, danmaku_rows,
+        "with a subtitle present the danmaku should still change exactly the same rows"
+    );
+    let only_subtitle = with_both.frame.differing_rows(&with_danmaku.frame);
+    assert_eq!(
+        only_subtitle, subtitle_rows,
+        "with danmaku present the subtitle should still change exactly the same rows"
+    );
+
+    let payload = with_danmaku
         .payload
         .as_deref()
         .expect("the driver should have pushed ASS events");
@@ -561,50 +718,46 @@ fn danmaku_overlay_is_rendered_into_the_video_output() {
         "the pushed payload should carry the comment text: {payload}"
     );
 
-    let bounds = with_overlay
+    let bounds = with_danmaku
         .bounds
         .expect("mpv should report the rasterized bounds of the pushed overlay");
-    let (width, height) = (f64::from(base_size.0), f64::from(base_size.1));
+    let (width, height_f) = (baseline.frame.width as f64, baseline.frame.height as f64);
     assert!(
         bounds.x0 < bounds.x1 && bounds.y0 < bounds.y1,
         "the overlay should rasterize to a non-empty box: {bounds:?}"
     );
     assert!(
-        bounds.x0 >= 0.0 && bounds.y0 >= 0.0 && bounds.x1 <= width && bounds.y1 <= height,
-        "the overlay should stay inside the {width}x{height} frame: {bounds:?}"
+        bounds.x0 >= 0.0 && bounds.y0 >= 0.0 && bounds.x1 <= width && bounds.y1 <= height_f,
+        "the overlay should stay inside the {width}x{height_f} frame: {bounds:?}"
     );
     assert!(
-        bounds.y1 <= height / 2.0,
+        bounds.y1 <= height_f / 2.0,
         "a top-anchored comment should stay in the upper half of the frame: {bounds:?}"
     );
-
-    // Clearing the overlays must remove the danmaku from the video output again
-    // (and, with a still clip, reproduce the baseline frame byte for byte).
-    let cleared = with_overlay
-        .cleared
-        .as_deref()
-        .expect("mpv should still write a screenshot after the overlays are cleared");
-    assert_eq!(
-        png_size(cleared),
-        Some(base_size),
-        "the cleared screenshot should keep the frame geometry"
-    );
-    assert_ne!(
-        cleared, with_overlay.png,
-        "clearing the overlays did not remove the danmaku from the video output"
-    );
-    let cleared_matches_baseline = cleared == baseline.png;
+    // The rectangle mpv measured for the overlay must contain the rows that
+    // actually changed (the box is the union of the glyph bitmaps, so it can be
+    // taller than the ink it contains).
+    let first = danmaku_rows.first().copied().unwrap_or(0) as f64;
+    let last = danmaku_rows.last().copied().unwrap_or(0) as f64;
     assert!(
-        cleared_matches_baseline,
-        "the cleared frame should be identical to the baseline ({} vs {} PNG bytes)",
-        cleared.len(),
-        baseline.png.len()
+        first >= bounds.y0 - 1.0 && last <= bounds.y1 + 1.0,
+        "the rows that changed ({first}..={last}) should lie inside the reported box {bounds:?}"
+    );
+
+    // Clearing the overlays must restore the frame the player had before.
+    assert_eq!(
+        with_danmaku.cleared.data, baseline.frame.data,
+        "clearing the danmaku should reproduce the baseline frame"
+    );
+    assert_eq!(
+        with_both.cleared.data, with_subtitles.frame.data,
+        "clearing the danmaku should leave the subtitle frame untouched"
     );
 
     println!(
-        "overlay rasterized to {bounds:?} in a {width}x{height} frame; \
-         {differing} of {} PNG bytes differ from the baseline, and the cleared frame \
-         is byte-identical to it",
-        baseline.png.len()
+        "danmaku changed rows {first}..={last} (box {bounds:?}), the subtitle changed rows \
+         {}..={}, and each layer kept identical pixels with the other one present",
+        subtitle_rows.first().copied().unwrap_or(0),
+        subtitle_rows.last().copied().unwrap_or(0),
     );
 }
