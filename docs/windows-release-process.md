@@ -6,15 +6,27 @@ application.
 
 ## 1. Batch development changes
 
-- Develop on a feature branch and accumulate a coherent batch of commits.
+All Windows client work accumulates on the single long-lived development
+branch, `codex/mediastation-windows-spike`, mirrored to
+`mediastation/codex/mediastation-windows-spike`. It is the only branch that
+receives feature and fix commits.
+
+- Do not create or keep `release/*` branches. A published version is a tag
+  created by the promotion workflow, not a branch; a version branch would only
+  drift away from the development branch, and the candidate workflow does not
+  need one. The retired `release/v1.0.3` branch is not a precedent to follow.
+- `main` receives stage-stable batches only. A release candidate does not have
+  to be on `main`: promote the exact commit that was built and tested.
+- Accumulate a coherent batch of commits on the development branch.
 - Run focused local checks for the changed code before requesting a candidate.
 - Keep unrelated or untracked local files out of the release commits.
 - Update `src/Cargo.toml` to the intended release version before the candidate
   build. The stable release tag must be the same version with a `v` prefix.
 
-The Windows workflow still runs for pull requests and pushes to `main`. For a
-feature branch, run `build-windows` manually only when the batch is ready for
-end-to-end packaging.
+`build-windows` runs automatically for pull requests and pushes to `main`. For
+the development branch, dispatch it manually only when the batch is ready for
+end-to-end packaging, and pass the development branch (or the exact commit) as
+the workflow ref.
 
 ## 2. Build a candidate once
 
