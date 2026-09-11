@@ -8742,6 +8742,7 @@ mod tests {
             active_image_request_ids: HashSet::new(),
             active_subtitle: None,
             active_interpolation: None,
+            active_danmaku: None,
             active_report: None,
         };
         let preference = PlaybackTrackPreference {
