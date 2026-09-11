@@ -187,7 +187,7 @@ fn decodes_first_live_video_frame_through_native_load_path() {
     let session = live_session(&api, profile);
     let media_id = live_media_id(&api, &session);
     let source = api
-        .load_playback_source(&session, &media_id)
+        .load_playback_source(&session, &media_id, None)
         .expect("live PlaybackInfo should load");
     let preference = api
         .load_playback_preference(&session, &media_id, &source)

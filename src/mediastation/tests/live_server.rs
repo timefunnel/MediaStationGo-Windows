@@ -178,7 +178,7 @@ fn exercises_live_catalog_image_subtitle_and_playback_contract() {
         .expect("live media image should download");
 
     let source = client
-        .load_playback_source(&session, &playback_card.id)
+        .load_playback_source(&session, &playback_card.id, None)
         .expect("live PlaybackInfo should load");
     let preference = client
         .load_playback_preference(&session, &playback_card.id, &source)
@@ -374,7 +374,7 @@ fn resolves_live_playback_session_without_exposing_credentials() {
     let api = MediaStationApiClient::new(user_agent).expect("API client should initialize");
 
     let source = api
-        .load_playback_source(&session, &media_id)
+        .load_playback_source(&session, &media_id, None)
         .expect("live PlaybackInfo should load");
     let preference = api
         .load_playback_preference(&session, &media_id, &source)

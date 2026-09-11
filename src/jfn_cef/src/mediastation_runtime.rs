@@ -5,7 +5,7 @@ use jfn_frame_interpolation::{
 };
 use jfn_mediastation::{
     ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
-    MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaStationApiClient,
+    MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaSourceOption, MediaStationApiClient,
     MediaStationClientProfile, MediaStationConnectionProfile, MediaStationProxyMode,
     MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
     PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
@@ -3495,6 +3495,24 @@ fn detail_payload(detail: &MediaDetail) -> Value {
             "type": person.person_type,
             "primaryImage": person.primary_image.as_ref().map(image_ref_payload),
         })).collect::<Vec<_>>(),
+        "sources": detail.sources.iter().map(media_source_option_payload).collect::<Vec<_>>(),
+    })
+}
+
+/// 片源版本选择所需的元数据。服务端文件系统 `Path` 与播放直链都不下发。
+fn media_source_option_payload(source: &MediaSourceOption) -> Value {
+    json!({
+        "id": source.id,
+        "container": source.container,
+        "width": source.width,
+        "height": source.height,
+        "videoCodec": source.video_codec,
+        "dynamicRange": source.dynamic_range,
+        "bitDepth": source.bit_depth,
+        "bitrate": source.bitrate,
+        "sizeBytes": source.size_bytes,
+        "isRemote": source.is_remote,
+        "supportsDirectPlay": source.supports_direct_play,
     })
 }
 
@@ -4578,10 +4596,14 @@ fn execute_tracks_request(
     let mut source = runtime.active_playback_source(snapshot, &request.media_id)?;
     let mut metadata_refresh_error = None;
     if playback_source_metadata_pending(&source) {
-        match runtime
-            .api
-            .load_playback_source(&snapshot.session, &request.media_id)
-        {
+        // 元数据刷新必须留在正在播放的那个版本上，否则服务端的偏好排序会把
+        // 另一个版本排到首位，音轨/字幕表就会与当前播放内容不符。
+        let active_source_id = source.media_source_id.clone();
+        match runtime.api.load_playback_source(
+            &snapshot.session,
+            &request.media_id,
+            active_source_id.as_deref(),
+        ) {
             Ok(refreshed) => {
                 source = runtime.merge_active_playback_metadata(
                     snapshot,
@@ -5604,6 +5626,8 @@ struct LoadRequest {
     interpolation_model: InterpolationModel,
     subtitle_font_size: f64,
     subtitle_position: f64,
+    /// 用户选定的片源版本；为空表示沿用服务端偏好顺序中的第一个版本。
+    media_source_id: Option<String>,
 }
 
 fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadFailure)> {
@@ -5653,6 +5677,8 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
         .map_err(|failure| (request_id.clone(), failure))?;
     let (subtitle_font_size, subtitle_position) =
         parse_subtitle_style(args).map_err(|failure| (request_id.clone(), failure))?;
+    let media_source_id =
+        parse_load_media_source_id(args).map_err(|failure| (request_id.clone(), failure))?;
     Ok(LoadRequest {
         request_id,
         media_id,
@@ -5662,7 +5688,37 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
         interpolation_model,
         subtitle_font_size,
         subtitle_position,
+        media_source_id,
     })
+}
+
+/// 第 9 个参数（下标 8）为用户选定的片源版本。旧版前端不传该参数，此时保持
+/// `None` 并由服务端偏好顺序决定版本。
+fn parse_load_media_source_id(args: &ListValue) -> Result<Option<String>, LoadFailure> {
+    if args.size() < 9 {
+        return Ok(None);
+    }
+    let value_type = args.get_type(8);
+    if value_type.as_ref() == &sys::cef_value_type_t::VTYPE_NULL {
+        return Ok(None);
+    }
+    if value_type.as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "invalid_media_source_id",
+            "The media version identifier is invalid",
+        ));
+    }
+    let value = list_string(args, 8);
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !valid_identifier(&value, MAX_MEDIA_ID_LEN) {
+        return Err(LoadFailure::new(
+            "invalid_media_source_id",
+            "The media version identifier is invalid",
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn parse_preference_scope_id(args: &ListValue, media_id: &str) -> Result<String, LoadFailure> {
@@ -5822,7 +5878,11 @@ fn execute_load(
     };
     let source = runtime
         .api
-        .load_playback_source(&snapshot.session, &request.media_id)
+        .load_playback_source(
+            &snapshot.session,
+            &request.media_id,
+            request.media_source_id.as_deref(),
+        )
         .map_err(|error| api_failure("playback_info_failed", &error))?;
     let active_media_id_after = runtime.active_playback_media_id(snapshot)?;
     let runtime_source_fps = runtime_container_fps_for_media(
@@ -7673,6 +7733,135 @@ mod tests {
         assert!(!text.contains("token"));
         assert!(!text.contains("https://"));
         assert!(!text.contains("http://"));
+    }
+
+    #[test]
+    fn media_source_option_payload_exposes_only_version_descriptors() {
+        let option = MediaSourceOption {
+            id: "version-2160p".to_string(),
+            container: Some("mkv".to_string()),
+            width: Some(3_840),
+            height: Some(2_160),
+            video_codec: Some("hevc".to_string()),
+            dynamic_range: Some("HDR10".to_string()),
+            bit_depth: Some(10),
+            bitrate: Some(20_000_000),
+            size_bytes: Some(30_000_000_000),
+            is_remote: true,
+            supports_direct_play: true,
+        };
+
+        let payload = media_source_option_payload(&option);
+
+        assert_eq!(
+            payload.get("id").and_then(Value::as_str),
+            Some("version-2160p")
+        );
+        assert_eq!(payload.get("width").and_then(Value::as_u64), Some(3_840));
+        assert_eq!(payload.get("height").and_then(Value::as_u64), Some(2_160));
+        assert_eq!(
+            payload.get("videoCodec").and_then(Value::as_str),
+            Some("hevc")
+        );
+        assert_eq!(
+            payload.get("dynamicRange").and_then(Value::as_str),
+            Some("HDR10")
+        );
+        assert_eq!(payload.get("isRemote").and_then(Value::as_bool), Some(true));
+        // 服务端文件系统 Path 与任何播放直链都不能进入渲染进程。
+        let text = payload.to_string().to_ascii_lowercase();
+        assert!(!text.contains("path"));
+        assert!(!text.contains("http://"));
+        assert!(!text.contains("https://"));
+        assert!(!text.contains("token"));
+    }
+
+    #[test]
+    fn detail_payload_lists_every_selectable_version() {
+        let card = MediaCard {
+            id: "movie-1".to_string(),
+            title: "Dune".to_string(),
+            media_type: "Movie".to_string(),
+            overview: String::new(),
+            collection_type: None,
+            year: Some(2021),
+            duration_ms: 9_000_000,
+            resume_position_ms: 0,
+            played: false,
+            last_played_at: None,
+            index_number: None,
+            parent_index_number: None,
+            child_count: None,
+            recursive_item_count: None,
+            parent_id: None,
+            season_id: None,
+            series_id: None,
+            series_name: None,
+            community_rating: None,
+            official_rating: None,
+            genres: Vec::new(),
+            video_codec: Some("hevc".to_string()),
+            video_profile: None,
+            video_width: Some(3_840),
+            video_height: Some(2_160),
+            dynamic_range: Some("HDR10".to_string()),
+            primary_image: None,
+            landscape_image: None,
+            backdrop_image: None,
+            logo_image: None,
+        };
+        let detail = MediaDetail {
+            item: card,
+            episodes: Vec::new(),
+            seasons: Vec::new(),
+            season_count: 0,
+            episode_count: None,
+            people: Vec::new(),
+            sources: vec![
+                MediaSourceOption {
+                    id: "version-1080p".to_string(),
+                    container: Some("mkv".to_string()),
+                    width: Some(1_920),
+                    height: Some(1_080),
+                    video_codec: Some("h264".to_string()),
+                    dynamic_range: None,
+                    bit_depth: Some(8),
+                    bitrate: None,
+                    size_bytes: None,
+                    is_remote: false,
+                    supports_direct_play: true,
+                },
+                MediaSourceOption {
+                    id: "version-2160p".to_string(),
+                    container: Some("mkv".to_string()),
+                    width: Some(3_840),
+                    height: Some(2_160),
+                    video_codec: Some("hevc".to_string()),
+                    dynamic_range: Some("HDR10".to_string()),
+                    bit_depth: Some(10),
+                    bitrate: None,
+                    size_bytes: None,
+                    is_remote: true,
+                    supports_direct_play: true,
+                },
+            ],
+        };
+
+        let payload = detail_payload(&detail);
+        let sources = payload
+            .get("sources")
+            .and_then(Value::as_array)
+            .expect("detail payload should carry the selectable versions");
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].get("id").and_then(Value::as_str),
+            Some("version-1080p")
+        );
+        assert_eq!(
+            sources[1].get("id").and_then(Value::as_str),
+            Some("version-2160p")
+        );
     }
 
     #[test]

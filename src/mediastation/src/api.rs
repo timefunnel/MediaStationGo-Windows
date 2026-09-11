@@ -386,6 +386,26 @@ pub struct MediaDetail {
     pub season_count: usize,
     pub episode_count: Option<usize>,
     pub people: Vec<MediaPerson>,
+    pub sources: Vec<MediaSourceOption>,
+}
+
+/// 同一影片的一个可选片源版本（Emby `MediaSources[]` 的一项）。
+///
+/// 只保留选择与展示所需的元数据。服务端文件系统 `Path` 和任何播放直链都不
+/// 进入渲染进程，版本之间的区分依靠分辨率、编码、动态范围、容器与体积。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSourceOption {
+    pub id: String,
+    pub container: Option<String>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub video_codec: Option<String>,
+    pub dynamic_range: Option<String>,
+    pub bit_depth: Option<u64>,
+    pub bitrate: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub is_remote: bool,
+    pub supports_direct_play: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -901,6 +921,7 @@ impl MediaStationApiClient {
             season_count,
             episode_count,
             people,
+            sources: parse_media_source_options(&detail_payload),
         })
     }
 
@@ -1197,18 +1218,32 @@ impl MediaStationApiClient {
         })
     }
 
+    /// 请求播放信息。`media_source_id` 为用户选定的片源版本。
+    ///
+    /// 该调用只发生在真实起播时，因此固定发送 `IsPlayback=true`：服务端据此
+    /// 把这次版本选择记为用户偏好，下次打开同一影片时该版本排在首位。
     pub fn load_playback_source(
         &self,
         session: &MediaStationSession,
         media_id: &str,
+        media_source_id: Option<&str>,
     ) -> Result<PlaybackSource, ApiError> {
         validate_non_empty("media_id", media_id)?;
+        if let Some(media_source_id) = media_source_id {
+            validate_identifier("media_source_id", media_source_id)?;
+        }
         let mut url = endpoint(&session.base_url, &["Items", media_id, "PlaybackInfo"])?;
-        url.query_pairs_mut()
+        let mut query = url.query_pairs_mut();
+        query
             .append_pair("UserId", &session.user_id)
-            .append_pair("AutoOpenLiveStream", "false");
+            .append_pair("AutoOpenLiveStream", "false")
+            .append_pair("IsPlayback", "true");
+        if let Some(media_source_id) = media_source_id {
+            query.append_pair("MediaSourceId", media_source_id);
+        }
+        drop(query);
         let payload = self.get_json(session, &url)?;
-        parse_playback_source(session, media_id, &payload)
+        parse_playback_source(session, media_id, &payload, media_source_id)
     }
 
     pub fn report_playing(
@@ -2004,8 +2039,7 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
             .and_then(|data| data.get("Played"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        last_played_at: user_data
-            .and_then(|data| optional_string(data.get("LastPlayedDate"))),
+        last_played_at: user_data.and_then(|data| optional_string(data.get("LastPlayedDate"))),
         index_number: item.get("IndexNumber").and_then(Value::as_i64),
         parent_index_number: item.get("ParentIndexNumber").and_then(Value::as_i64),
         child_count: item
@@ -2217,18 +2251,85 @@ fn validate_page(start_index: usize, limit: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn parse_playback_source(
-    session: &MediaStationSession,
-    media_id: &str,
-    payload: &Value,
-) -> Result<PlaybackSource, ApiError> {
-    let sources = payload
+/// 解析条目的可选片源版本。没有 `Id` 的项无法被选择，直接跳过。
+fn parse_media_source_options(payload: &Value) -> Vec<MediaSourceOption> {
+    payload
         .get("MediaSources")
         .and_then(Value::as_array)
-        .ok_or(ApiError::MissingField {
-            field: "MediaSources",
-        })?;
-    let source = sources
+        .map(|sources| {
+            sources
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(parse_media_source_option)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_media_source_option(source: &Map<String, Value>) -> Option<MediaSourceOption> {
+    let id = optional_string(source.get("Id"))?;
+    let video = source
+        .get("MediaStreams")
+        .and_then(Value::as_array)
+        .and_then(|streams| {
+            streams
+                .iter()
+                .filter_map(Value::as_object)
+                .find(|stream| type_is(stream, "Video"))
+        })
+        .map(parse_video_stream);
+    Some(MediaSourceOption {
+        id,
+        container: optional_string(source.get("Container")),
+        width: video.as_ref().and_then(|video| video.width),
+        height: video.as_ref().and_then(|video| video.height),
+        video_codec: video.as_ref().and_then(|video| video.codec.clone()),
+        dynamic_range: video.as_ref().and_then(|video| video.dynamic_range.clone()),
+        bit_depth: video.as_ref().and_then(|video| video.bit_depth),
+        bitrate: source.get("Bitrate").and_then(Value::as_u64),
+        size_bytes: source.get("Size").and_then(Value::as_u64),
+        is_remote: source
+            .get("IsRemote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        supports_direct_play: source
+            .get("SupportsDirectPlay")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    })
+}
+
+/// 选出要播放的片源版本。
+///
+/// 客户端明确指定版本时必须原样播放：找不到该版本或它无法直连时显式失败，
+/// 不能静默回退到另一个版本。未指定时保持既有行为（优先带 `DirectStreamUrl`
+/// 的源，其次是未明确禁用直连的源）。
+fn select_playback_source<'a>(
+    sources: &'a [Value],
+    requested_source_id: Option<&str>,
+) -> Result<&'a Map<String, Value>, ApiError> {
+    if let Some(requested) = requested_source_id {
+        let selected = sources
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|source| optional_string(source.get("Id")).as_deref() == Some(requested))
+            .ok_or(ApiError::InvalidInput {
+                field: "media_source_id",
+                reason: "the selected media version is not offered by PlaybackInfo".to_string(),
+            })?;
+        let playable = optional_string(selected.get("DirectStreamUrl")).is_some()
+            || selected
+                .get("SupportsDirectPlay")
+                .is_none_or(|value| value.as_bool() != Some(false));
+        if !playable {
+            return Err(ApiError::InvalidInput {
+                field: "media_source_id",
+                reason: "the selected media version does not support direct playback".to_string(),
+            });
+        }
+        return Ok(selected);
+    }
+    sources
         .iter()
         .filter_map(Value::as_object)
         .find(|source| optional_string(source.get("DirectStreamUrl")).is_some())
@@ -2241,7 +2342,22 @@ fn parse_playback_source(
         })
         .ok_or(ApiError::MissingField {
             field: "MediaSources[0].SupportsDirectPlay",
+        })
+}
+
+fn parse_playback_source(
+    session: &MediaStationSession,
+    media_id: &str,
+    payload: &Value,
+    requested_source_id: Option<&str>,
+) -> Result<PlaybackSource, ApiError> {
+    let sources = payload
+        .get("MediaSources")
+        .and_then(Value::as_array)
+        .ok_or(ApiError::MissingField {
+            field: "MediaSources",
         })?;
+    let source = select_playback_source(sources, requested_source_id)?;
     let media_source_id = optional_string(source.get("Id"));
     let play_session_id = optional_string(payload.get("PlaySessionId"));
     let direct_stream_url = optional_string(source.get("DirectStreamUrl"));
@@ -3324,6 +3440,62 @@ mod tests {
     }
 
     #[test]
+    fn movie_detail_exposes_every_selectable_version() {
+        let body = json!({
+            "Id": "movie-1",
+            "Name": "Dune",
+            "Type": "Movie",
+            "MediaSources": [
+                {
+                    "Id": "version-1080p",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": true,
+                    "MediaStreams": [{
+                        "Type": "Video",
+                        "Index": 0,
+                        "Codec": "h264",
+                        "Width": 1920,
+                        "Height": 1080
+                    }]
+                },
+                {
+                    "Id": "version-2160p",
+                    "Container": "mkv",
+                    "IsRemote": true,
+                    "SupportsDirectPlay": true,
+                    "MediaStreams": [{
+                        "Type": "Video",
+                        "Index": 0,
+                        "Codec": "hevc",
+                        "Width": 3840,
+                        "Height": 2160
+                    }]
+                }
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = serve_once(response);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let detail = client
+            .load_media_detail(&session(base_url), "movie-1")
+            .expect("movie detail should load");
+        let _ = server.join().expect("server thread should finish");
+
+        assert_eq!(detail.item.media_type, "Movie");
+        assert_eq!(detail.sources.len(), 2);
+        assert_eq!(detail.sources[0].id, "version-1080p");
+        assert_eq!(detail.sources[1].id, "version-2160p");
+        assert!(detail.sources[1].is_remote);
+        assert!(detail.seasons.is_empty());
+    }
+
+    #[test]
     fn series_episode_load_can_target_one_season_or_the_complete_series() {
         let response = |payload: Value| {
             let body = payload.to_string();
@@ -3687,7 +3859,7 @@ mod tests {
             MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
 
         let source = client
-            .load_playback_source(&session(base_url), "media-1")
+            .load_playback_source(&session(base_url), "media-1", None)
             .expect("PlaybackInfo should parse");
         let request = server.join().expect("server thread should finish");
         let request_lower = request.to_ascii_lowercase();
@@ -3750,7 +3922,7 @@ mod tests {
             ]
         });
 
-        let source = parse_playback_source(&session, "media-1", &payload)
+        let source = parse_playback_source(&session, "media-1", &payload, None)
             .expect("standard Emby PlaybackInfo should parse");
         let query = source
             .url
@@ -3777,6 +3949,220 @@ mod tests {
     }
 
     #[test]
+    fn playback_info_requests_and_plays_the_selected_version() {
+        let body = json!({
+            "PlaySessionId": "play-session-versions",
+            "MediaSources": [
+                {
+                    "Id": "version-1080p",
+                    "Container": "mkv",
+                    "DirectStreamUrl": "/Videos/version-1080p/stream.mkv",
+                    "SupportsDirectPlay": true
+                },
+                {
+                    "Id": "version-2160p",
+                    "Container": "mkv",
+                    "DirectStreamUrl": "/Videos/version-2160p/stream.mkv",
+                    "SupportsDirectPlay": true
+                }
+            ]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = serve_once(response);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let source = client
+            .load_playback_source(&session(base_url), "media-1", Some("version-2160p"))
+            .expect("selected version should parse");
+        let request = server.join().expect("server thread should finish");
+
+        assert!(request.starts_with("GET /Items/media-1/PlaybackInfo?"));
+        assert!(request.contains("MediaSourceId=version-2160p"));
+        // 只有真实起播才会调用 PlaybackInfo；服务端据此记忆用户的版本选择。
+        assert!(request.contains("IsPlayback=true"));
+        assert_eq!(source.media_source_id.as_deref(), Some("version-2160p"));
+        assert_eq!(source.url.path(), "/Videos/version-2160p/stream.mkv");
+    }
+
+    #[test]
+    fn selected_version_without_direct_stream_url_builds_its_own_standard_url() {
+        let session = session(Url::parse("https://media.example/emby").expect("URL should parse"));
+        let source = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "PlaySessionId": "play-session-versions",
+                "MediaSources": [
+                    {
+                        "Id": "version-1080p",
+                        "Container": "mkv",
+                        "DirectStreamUrl": "/Videos/version-1080p/stream.mkv",
+                        "SupportsDirectPlay": true
+                    },
+                    {
+                        "Id": "version-2160p",
+                        "Container": "mp4",
+                        "SupportsDirectPlay": true,
+                        "DefaultAudioStreamIndex": 2
+                    }
+                ]
+            }),
+            Some("version-2160p"),
+        )
+        .expect("selected version should parse");
+        let query = source
+            .url
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(source.url.path(), "/emby/Videos/media-1/stream");
+        assert_eq!(query.get("Container").map(String::as_str), Some("mp4"));
+        assert_eq!(
+            query.get("MediaSourceId").map(String::as_str),
+            Some("version-2160p")
+        );
+        assert_eq!(source.media_source_id.as_deref(), Some("version-2160p"));
+        assert_eq!(source.default_audio_stream_index, Some(2));
+        assert!(source.standard_emby_stream);
+        assert!(!source.url.as_str().contains("version-1080p"));
+    }
+
+    #[test]
+    fn unknown_selected_version_fails_instead_of_playing_another_version() {
+        let session = session(Url::parse("https://media.example").expect("URL should parse"));
+        let error = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "MediaSources": [{
+                    "Id": "version-1080p",
+                    "Container": "mkv",
+                    "DirectStreamUrl": "/Videos/version-1080p/stream.mkv",
+                    "SupportsDirectPlay": true
+                }]
+            }),
+            Some("version-2160p"),
+        )
+        .expect_err("an unknown version must not fall back to another source");
+
+        assert!(matches!(
+            error,
+            ApiError::InvalidInput {
+                field: "media_source_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn selected_version_that_cannot_direct_play_fails_explicitly() {
+        let session = session(Url::parse("https://media.example").expect("URL should parse"));
+        let error = parse_playback_source(
+            &session,
+            "media-1",
+            &json!({
+                "MediaSources": [
+                    {
+                        "Id": "version-1080p",
+                        "Container": "mkv",
+                        "DirectStreamUrl": "/Videos/version-1080p/stream.mkv",
+                        "SupportsDirectPlay": true
+                    },
+                    {
+                        "Id": "version-2160p",
+                        "Container": "mkv",
+                        "SupportsDirectPlay": false
+                    }
+                ]
+            }),
+            Some("version-2160p"),
+        )
+        .expect_err("a version without direct playback must fail instead of redirecting");
+
+        assert!(matches!(
+            error,
+            ApiError::InvalidInput {
+                field: "media_source_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn media_source_options_describe_every_selectable_version() {
+        let payload = json!({
+            "MediaSources": [
+                {
+                    "Id": "version-1080p",
+                    "Path": "/media/movies/Dune.2021.1080p.mkv",
+                    "Container": "mkv",
+                    "Size": 8_000_000_000_u64,
+                    "Bitrate": 6_000_000,
+                    "IsRemote": false,
+                    "SupportsDirectPlay": true,
+                    "MediaStreams": [{
+                        "Type": "Video",
+                        "Index": 0,
+                        "Codec": "h264",
+                        "Width": 1920,
+                        "Height": 1080,
+                        "BitDepth": 8
+                    }]
+                },
+                {
+                    "Id": "version-2160p",
+                    "Path": "cloud://openlist/movies/Dune.2021.2160p.mkv",
+                    "Container": "mkv",
+                    "Size": 30_000_000_000_u64,
+                    "IsRemote": true,
+                    "SupportsDirectPlay": true,
+                    "MediaStreams": [{
+                        "Type": "Video",
+                        "Index": 0,
+                        "Codec": "hevc",
+                        "Width": 3840,
+                        "Height": 2160,
+                        "VideoRange": "HDR",
+                        "VideoRangeType": "HDR10",
+                        "BitDepth": 10
+                    }]
+                },
+                { "Container": "mkv", "MediaStreams": [] }
+            ]
+        });
+
+        let options = parse_media_source_options(&payload);
+
+        // 没有 Id 的源无法被选择，直接丢弃。
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].id, "version-1080p");
+        assert_eq!(options[0].container.as_deref(), Some("mkv"));
+        assert_eq!(options[0].width, Some(1920));
+        assert_eq!(options[0].height, Some(1080));
+        assert_eq!(options[0].video_codec.as_deref(), Some("h264"));
+        assert_eq!(options[0].bit_depth, Some(8));
+        assert_eq!(options[0].size_bytes, Some(8_000_000_000));
+        assert_eq!(options[0].bitrate, Some(6_000_000));
+        assert!(!options[0].is_remote);
+        assert!(options[0].supports_direct_play);
+        assert_eq!(options[1].id, "version-2160p");
+        assert_eq!(options[1].width, Some(3840));
+        assert_eq!(options[1].dynamic_range.as_deref(), Some("HDR10"));
+        assert!(options[1].is_remote);
+    }
+
+    #[test]
+    fn media_source_options_are_empty_without_media_sources() {
+        assert!(parse_media_source_options(&json!({ "Id": "movie-1" })).is_empty());
+    }
+
+    #[test]
     fn standard_emby_rejects_sources_that_explicitly_disable_direct_play() {
         let session = session(Url::parse("https://media.example").expect("URL should parse"));
         let error = parse_playback_source(
@@ -3789,6 +4175,7 @@ mod tests {
                     "SupportsDirectPlay": false
                 }]
             }),
+            None,
         )
         .expect_err("transcode-only standard sources must fail explicitly");
 
@@ -3826,6 +4213,7 @@ mod tests {
                     ]
                 }]
             }),
+            None,
         )
         .expect("standard source should parse");
         let client =
@@ -3878,6 +4266,7 @@ mod tests {
                     "DirectStreamUrl": "/Videos/media-1/stream"
                 }]
             }),
+            None,
         )
         .expect("extension source should parse");
         let client =
@@ -4248,7 +4637,7 @@ mod tests {
             }]
         });
 
-        let source = parse_playback_source(&session, "media-1", &payload)
+        let source = parse_playback_source(&session, "media-1", &payload, None)
             .expect("same-origin credential query should be removed");
 
         assert_eq!(

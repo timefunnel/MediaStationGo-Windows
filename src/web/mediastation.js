@@ -112,6 +112,7 @@
     let player = null;
     let playerPanelTrigger = null;
     let overviewTrigger = null;
+    let sourcePickerTrigger = null;
     let loginCanCancel = false;
     let loginReturnFocus = null;
     let loginMode = 'add';
@@ -1166,6 +1167,10 @@
     }
 
     function goBack() {
+        if (!byId('source-scrim').classList.contains('hidden')) {
+            closeSourcePicker();
+            return;
+        }
         if (!byId('overview-scrim').classList.contains('hidden')) {
             closeOverview();
             return;
@@ -2844,7 +2849,7 @@
         const actions = element('div', 'detail-actions');
         if (card.type === 'Series') actions.dataset.seriesId = card.id;
         const playTarget = card.playable ? card : (pickContinueEpisode(detail.episodes) || detail.episodes?.[0]);
-        if (playTarget?.playable) appendDetailPlayAction(actions, playTarget);
+        if (playTarget?.playable) appendDetailPlayAction(actions, playTarget, detail);
         if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
         if (card.genres?.length) {
             copy.append(createDetailGenres(detail));
@@ -2888,8 +2893,20 @@
                 Number.isFinite(detail.episodeCount) && detail.episodeCount > 0 ? `${detail.episodeCount} 集` : '',
             ]
             : [];
-        [card.year, ...seriesMeta, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.dynamicRange]
+        // 片源类型跟随所选版本，切换片源后这里显示的就是即将播放的版本。
+        const { options, selected } = detailSourceState(detail);
+        const dynamicRange = selected?.dynamicRange || card.dynamicRange;
+        [card.year, ...seriesMeta, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', dynamicRange]
             .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
+        if (options.length > 1) {
+            const switchButton = element('button', 'meta-switch', '切换片源');
+            switchButton.type = 'button';
+            switchButton.title = '选择片源版本';
+            switchButton.dataset.focusKey = `sources:${card.id}`;
+            switchButton.setAttribute('aria-haspopup', 'dialog');
+            switchButton.addEventListener('click', () => openSourcePicker(detail, switchButton));
+            meta.append(switchButton);
+        }
         return meta;
     }
 
@@ -3355,7 +3372,7 @@
                 || episodes[0];
             if (!target?.playable) return;
             detailActions.querySelector('.primary-command')?.remove();
-            appendDetailPlayAction(detailActions, target);
+            appendDetailPlayAction(detailActions, target, detail);
         };
 
         const renderLoading = () => {
@@ -3472,7 +3489,137 @@
             : [];
     }
 
-    function appendDetailPlayAction(actions, target) {
+    // 同一影片的多个片源版本（服务端 MediaSources）。版本之间没有独立名称，
+    // 只能用分辨率、动态范围、编码、容器与体积区分。
+    function detailVersionOptions(detail, target) {
+        if (target?.type !== 'Movie') return [];
+        return Array.isArray(detail?.sources) ? detail.sources.filter((source) => source?.id) : [];
+    }
+
+    function versionResolutionLabel(source) {
+        const height = Number(source?.height) || 0;
+        const width = Number(source?.width) || 0;
+        if (height >= 2000 || width >= 3800) return '4K';
+        if (height >= 1000 || width >= 1800) return '1080p';
+        if (height >= 700 || width >= 1200) return '720p';
+        if (height > 0) return `${height}p`;
+        // 只有宽度时无法给出可靠档位，交给容器名兜底。
+        return '';
+    }
+
+    function versionCodecLabel(codec) {
+        const normalized = String(codec || '').trim().toLowerCase();
+        if (['hevc', 'h265', 'h.265'].includes(normalized)) return 'HEVC';
+        if (['h264', 'avc', 'h.264'].includes(normalized)) return 'H.264';
+        if (normalized === 'av1') return 'AV1';
+        if (normalized === 'vp9') return 'VP9';
+        if (normalized === 'mpeg2video') return 'MPEG-2';
+        return normalized ? normalized.toUpperCase() : '';
+    }
+
+    function versionRangeLabel(source) {
+        const range = String(source?.dynamicRange || '').trim();
+        if (/dolby\s*vision|dovi/i.test(range)) return '杜比视界';
+        if (/hdr10\+/i.test(range)) return 'HDR10+';
+        if (/hdr10/i.test(range)) return 'HDR10';
+        if (/hlg/i.test(range)) return 'HLG';
+        if (/^hdr$/i.test(range)) return 'HDR';
+        return '';
+    }
+
+    function versionSizeLabel(bytes) {
+        const value = Number(bytes) || 0;
+        if (value <= 0) return '';
+        const gigabytes = value / (1024 ** 3);
+        if (gigabytes >= 1) return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`;
+        const megabytes = value / (1024 ** 2);
+        return megabytes >= 1 ? `${Math.round(megabytes)} MB` : '';
+    }
+
+    function detailVersionTitle(source, index) {
+        const primary = [versionResolutionLabel(source), versionRangeLabel(source)].filter(Boolean).join(' ');
+        if (primary) return primary;
+        const container = String(source?.container || '').trim().toUpperCase();
+        return container || `版本 ${index + 1}`;
+    }
+
+    function detailVersionMeta(source) {
+        return [
+            versionCodecLabel(source?.videoCodec),
+            String(source?.container || '').trim().toUpperCase(),
+            versionSizeLabel(source?.sizeBytes),
+            source?.isRemote ? '云盘' : '本地',
+            source?.supportsDirectPlay === false ? '不可直连' : '',
+        ].filter(Boolean).join(' · ');
+    }
+
+    /// 当前选中的片源版本。服务端已按该用户偏好排序，首个可直连版本即默认值。
+    function detailSourceState(detail) {
+        const versions = detailVersionOptions(detail, detail?.item);
+        const options = versions.length > 1 ? versions : [];
+        const playable = options.filter((source) => source.supportsDirectPlay !== false);
+        if (!playable.length) return { options, playable, selected: null };
+        const selected = playable.find((source) => source.id === detail.selectedSourceId) || playable[0];
+        detail.selectedSourceId = selected.id;
+        return { options, playable, selected };
+    }
+
+    function createSourceOption(source, index, selected, onSelect) {
+        const option = element('button', 'track-option');
+        option.type = 'button';
+        option.setAttribute('role', 'radio');
+        option.setAttribute('aria-checked', String(selected));
+        option.dataset.sourceId = source.id;
+        option.disabled = source.supportsDirectPlay === false;
+        const copy = element('span');
+        copy.append(element('strong', '', detailVersionTitle(source, index)));
+        const meta = detailVersionMeta(source);
+        if (meta) copy.append(element('small', '', meta));
+        option.append(copy);
+        if (selected) option.append(element('span', 'selection-mark', '✓'));
+        option.addEventListener('click', onSelect);
+        return option;
+    }
+
+    function renderSourceOptions(detail) {
+        const { options, selected } = detailSourceState(detail);
+        const host = byId('source-options');
+        host.replaceChildren();
+        options.forEach((source, index) => {
+            host.append(createSourceOption(source, index, selected?.id === source.id, () => selectDetailSource(detail, source.id)));
+        });
+    }
+
+    function selectDetailSource(detail, sourceId) {
+        const changed = Boolean(detail) && detail.selectedSourceId !== sourceId;
+        if (changed) detail.selectedSourceId = sourceId;
+        closeSourcePicker();
+        if (!changed) return;
+        const meta = createDetailMeta(detail);
+        if (!replaceDetailField(detail, 'meta', meta)) content.querySelector('.detail-copy')?.append(meta);
+        focusElement(content.querySelector('[data-detail-field="meta"] .meta-switch'));
+    }
+
+    function openSourcePicker(detail, trigger) {
+        sourcePickerTrigger = trigger;
+        renderSourceOptions(detail);
+        byId('source-scrim').classList.remove('hidden');
+        requestAnimationFrame(() => {
+            const host = byId('source-options');
+            focusElement(host.querySelector('[aria-checked="true"]:not(:disabled)') || host.querySelector('.track-option:not(:disabled)'));
+        });
+    }
+
+    function closeSourcePicker() {
+        if (byId('source-scrim').classList.contains('hidden')) return;
+        byId('source-scrim').classList.add('hidden');
+        const trigger = sourcePickerTrigger;
+        sourcePickerTrigger = null;
+        focusElement(trigger);
+    }
+
+    function appendDetailPlayAction(actions, target, detail) {
+        detailSourceState(detail);
         const play = element('button', 'primary-command');
         play.type = 'button';
         play.dataset.focusKey = `play:${target.id}`;
@@ -3481,7 +3628,7 @@
             ? `播放 ${episodePosition(target).replace(' · ', '')}${position}`
             : (target.resumePositionMs ? `继续播放${position}` : '开始播放');
         play.append(element('span', '', '▶'), element('span', '', label));
-        play.addEventListener('click', () => startPlayback(target, target.resumePositionMs));
+        play.addEventListener('click', () => startPlayback(target, target.resumePositionMs, detail?.selectedSourceId || ''));
         actions.append(play);
     }
 
@@ -4245,7 +4392,7 @@
         return null;
     }
 
-    async function startPlayback(card, startMs = 0) {
+    async function startPlayback(card, startMs = 0, mediaSourceId = '') {
         if (!card?.id || !card.playable) {
             showToast('该项目不能直接播放');
             return;
@@ -4336,6 +4483,7 @@
                     playbackPreferenceScope(card),
                     playerSubtitleStyle.fontSize,
                     playerSubtitlePosition(),
+                    mediaSourceId || '',
                 ],
                 60000,
             );
@@ -6031,6 +6179,10 @@
     byId('overview-close').addEventListener('click', closeOverview);
     byId('overview-scrim').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeOverview();
+    });
+    byId('source-close').addEventListener('click', () => closeSourcePicker());
+    byId('source-scrim').addEventListener('click', (event) => {
+        if (event.target === event.currentTarget) closeSourcePicker();
     });
     byId('change-account-button').addEventListener('click', () => beginAddAccount(session?.baseUrl || ''));
     byId('login-add-account').addEventListener('click', (event) => beginAddAccount('', false, event.currentTarget));
