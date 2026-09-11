@@ -161,7 +161,10 @@ unsafe impl Send for LoadFileCommand {}
 ///
 /// mpv documents that `osd-overlay` should be called with named arguments
 /// because `res_x`/`res_y`/`z`/`hidden`/`compute_bounds` are all optional;
-/// passing `data = None` removes the overlay again (`format=none`).
+/// passing `format = none` removes the overlay again. `data` is a *required*
+/// argument (`finish_cmd()` in input/cmd.c rejects the command without it), so a
+/// removal sends it empty — the docs' "mostly ignored" for `format = none` does
+/// not extend to omitting the field.
 pub(crate) fn overlay_arguments(
     id: i64,
     data: Option<&str>,
@@ -181,69 +184,57 @@ pub(crate) fn overlay_arguments(
         None => vec![
             ("id".to_string(), id.to_string()),
             ("format".to_string(), "none".to_string()),
+            ("data".to_string(), String::new()),
         ],
     }
 }
 
-/// Owned command tree for any `command <name> <map>` call made through
+/// Owned command tree for a named-argument call made through
 /// `mpv_command_node_async`. Same lifetime rules as [`LoadFileCommand`].
+///
+/// mpv's named-argument form *is* the map: `mpv_command_node()` takes
+/// `MPV_FORMAT_NODE_MAP` as the root, with the command name in a `_name` string
+/// field (DOCS/man/input.rst, "Named arguments"; DOCS/man/ipc.rst, "Commands
+/// with named arguments"). An array root is parsed positionally instead, so
+/// `["osd-overlay", {..}]` is handed to the first declared argument and mpv
+/// rejects it with "argument id has incompatible type".
 pub(crate) struct NamedArgsCommand {
     // Kept alive so the pointers inside `root` stay valid; same convention as
     // `LoadFileCommand` above.
-    _strings: Vec<CString>,
     _keys: Vec<CString>,
     _values: Vec<CString>,
-    _value_nodes: Vec<sys::mpv_node>,
+    _nodes: Vec<sys::mpv_node>,
     _key_ptrs: Vec<*mut c_char>,
     _map: Box<sys::mpv_node_list>,
-    _arguments: Vec<sys::mpv_node>,
-    _argument_list: Box<sys::mpv_node_list>,
     root: sys::mpv_node,
 }
 
 impl NamedArgsCommand {
     pub(crate) fn new(name: &str, args: &[(String, String)]) -> Result<Self, NulError> {
-        let strings = vec![CString::new(name)?];
-        let keys = args
-            .iter()
-            .map(|(key, _)| CString::new(key.as_str()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let values = args
-            .iter()
-            .map(|(_, value)| CString::new(value.as_str()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut value_nodes: Vec<sys::mpv_node> = values.iter().map(|v| string_node(v)).collect();
+        // The command name takes part in the map as `_name`.
+        let mut keys: Vec<CString> = vec![CString::new("_name")?];
+        let mut values: Vec<CString> = vec![CString::new(name)?];
+        for (key, value) in args {
+            keys.push(CString::new(key.as_str())?);
+            values.push(CString::new(value.as_str())?);
+        }
+        let mut nodes: Vec<sys::mpv_node> = values.iter().map(|v| string_node(v)).collect();
         let mut key_ptrs = keys
             .iter()
             .map(|k| k.as_ptr().cast_mut())
             .collect::<Vec<_>>();
         let mut map = Box::new(sys::mpv_node_list {
-            num: value_nodes.len() as i32,
-            values: value_nodes.as_mut_ptr(),
+            num: nodes.len() as i32,
+            values: nodes.as_mut_ptr(),
             keys: key_ptrs.as_mut_ptr(),
         });
-        let mut arguments = vec![
-            string_node(&strings[0]),
-            list_node(sys::mpv_format::MPV_FORMAT_NODE_MAP, map.as_mut()),
-        ];
-        let mut argument_list = Box::new(sys::mpv_node_list {
-            num: arguments.len() as i32,
-            values: arguments.as_mut_ptr(),
-            keys: std::ptr::null_mut(),
-        });
-        let root = list_node(
-            sys::mpv_format::MPV_FORMAT_NODE_ARRAY,
-            argument_list.as_mut(),
-        );
+        let root = list_node(sys::mpv_format::MPV_FORMAT_NODE_MAP, map.as_mut());
         Ok(Self {
-            _strings: strings,
             _keys: keys,
             _values: values,
-            _value_nodes: value_nodes,
+            _nodes: nodes,
             _key_ptrs: key_ptrs,
             _map: map,
-            _arguments: arguments,
-            _argument_list: argument_list,
             root,
         })
     }
@@ -278,25 +269,55 @@ mod tests {
     }
 
     #[test]
-    fn removing_an_overlay_only_sends_the_id() {
+    fn removing_an_overlay_sends_the_required_data_field_empty() {
         let args = overlay_arguments(101, None, 1920, 1080, 0);
         let pairs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(pairs, vec![("id", "101"), ("format", "none")]);
+        assert_eq!(pairs, vec![("id", "101"), ("format", "none"), ("data", "")]);
     }
 
     #[test]
-    fn named_args_command_builds_a_two_element_array_with_a_map() {
+    fn named_args_command_is_a_map_rooted_at_the_command_name() {
         let args = overlay_arguments(7, Some("x"), 1280, 720, 0);
         let mut command = NamedArgsCommand::new("osd-overlay", &args).expect("command");
         let root = unsafe { &*command.as_mut_ptr() };
-        assert_eq!(root.format, sys::mpv_format::MPV_FORMAT_NODE_ARRAY);
-        let list = unsafe { &*root.u.list };
-        assert_eq!(list.num, 2);
-        assert!(list.keys.is_null(), "the argument array must be positional");
-        let map_node = unsafe { &*list.values.add(1) };
-        assert_eq!(map_node.format, sys::mpv_format::MPV_FORMAT_NODE_MAP);
-        let map = unsafe { &*map_node.u.list };
-        assert_eq!(map.num as usize, args.len());
+        assert_eq!(
+            root.format,
+            sys::mpv_format::MPV_FORMAT_NODE_MAP,
+            "named arguments must be the command node itself, not an array entry"
+        );
+        let map = unsafe { &*root.u.list };
+        assert_eq!(
+            map.num as usize,
+            args.len() + 1,
+            "_name plus every argument"
+        );
         assert!(!map.keys.is_null(), "the argument map must carry keys");
+
+        let entry = |index: usize| -> (String, sys::mpv_node) {
+            let key = unsafe { *map.keys.add(index) };
+            let key = unsafe { std::ffi::CStr::from_ptr(key) }
+                .to_string_lossy()
+                .into_owned();
+            let value = unsafe { *map.values.add(index) };
+            (key, value)
+        };
+
+        let (name_key, name_value) = entry(0);
+        assert_eq!(name_key, "_name");
+        assert_eq!(name_value.format, sys::mpv_format::MPV_FORMAT_STRING);
+        let name = unsafe { std::ffi::CStr::from_ptr(name_value.u.string) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, "osd-overlay");
+
+        for (index, (key, value)) in args.iter().enumerate() {
+            let (entry_key, entry_value) = entry(index + 1);
+            assert_eq!(&entry_key, key);
+            assert_eq!(entry_value.format, sys::mpv_format::MPV_FORMAT_STRING);
+            let text = unsafe { std::ffi::CStr::from_ptr(entry_value.u.string) }
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(&text, value);
+        }
     }
 }
