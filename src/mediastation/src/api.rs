@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::danmaku::{
-    DanmakuParseError, MediaDanmakuState, danmaku_query, parse_danmaku_response,
-};
+use crate::danmaku::{DanmakuParseError, MediaDanmakuState, danmaku_query, parse_danmaku_response};
 use crate::playback_session::{PlaybackSessionError, ResolveInput, ServerAuth};
 
 const HEADER_EMBY_AUTHORIZATION: &str = "x-emby-authorization";
@@ -1585,7 +1583,8 @@ impl MediaStationApiClient {
         })
     }
 
-    fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {        let agent = self.agent_for_session(session)?;
+    fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {
+        let agent = self.agent_for_session(session)?;
         let response = agent
             .get(url.as_str())
             .header(

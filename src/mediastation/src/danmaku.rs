@@ -44,11 +44,15 @@ pub struct MediaDanmaku {
 pub enum MediaDanmakuState {
     Matched(Box<MediaDanmaku>),
     /// The server matched nothing; `message` explains what it tried.
-    Unmatched { message: String },
+    Unmatched {
+        message: String,
+    },
     /// Danmaku is disabled, unconfigured, or the upstream is unreachable.
     /// Deliberately distinct from `Unmatched`: a configuration problem must not
     /// look like "this episode has no danmaku".
-    Unavailable { message: String },
+    Unavailable {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +67,12 @@ impl std::fmt::Display for DanmakuParseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidJson { message } => write!(formatter, "invalid danmaku JSON: {message}"),
-            Self::MissingField { field } => write!(formatter, "danmaku response is missing {field}"),
-            Self::InvalidField { field } => write!(formatter, "danmaku response has an invalid {field}"),
+            Self::MissingField { field } => {
+                write!(formatter, "danmaku response is missing {field}")
+            }
+            Self::InvalidField { field } => {
+                write!(formatter, "danmaku response has an invalid {field}")
+            }
             Self::UnexpectedStatus { status } => {
                 write!(formatter, "unexpected danmaku response status {status}")
             }
@@ -85,19 +93,27 @@ pub fn danmaku_query(ch_convert: u8, offset_seconds: Option<f64>) -> Vec<(String
 }
 
 /// Turn an HTTP response into the server state it represents.
-pub fn parse_danmaku_response(status: u16, body: &str) -> Result<MediaDanmakuState, DanmakuParseError> {
+pub fn parse_danmaku_response(
+    status: u16,
+    body: &str,
+) -> Result<MediaDanmakuState, DanmakuParseError> {
     match status {
         200 => Ok(MediaDanmakuState::Matched(Box::new(parse_matched(body)?))),
-        404 => Ok(MediaDanmakuState::Unmatched { message: error_message(body) }),
-        503 => Ok(MediaDanmakuState::Unavailable { message: error_message(body) }),
+        404 => Ok(MediaDanmakuState::Unmatched {
+            message: error_message(body),
+        }),
+        503 => Ok(MediaDanmakuState::Unavailable {
+            message: error_message(body),
+        }),
         other => Err(DanmakuParseError::UnexpectedStatus { status: other }),
     }
 }
 
 fn parse_matched(body: &str) -> Result<MediaDanmaku, DanmakuParseError> {
-    let value: Value = serde_json::from_str(body).map_err(|error| DanmakuParseError::InvalidJson {
-        message: error.to_string(),
-    })?;
+    let value: Value =
+        serde_json::from_str(body).map_err(|error| DanmakuParseError::InvalidJson {
+            message: error.to_string(),
+        })?;
     let comments = value
         .get("comments")
         .ok_or(DanmakuParseError::MissingField { field: "comments" })?
@@ -120,7 +136,10 @@ fn parse_matched(body: &str) -> Result<MediaDanmaku, DanmakuParseError> {
         total: usize_field(&value, "total", parsed.len()),
         filtered: usize_field(&value, "filtered", 0),
         skipped: usize_field(&value, "skipped", 0),
-        truncated: value.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        truncated: value
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         comments: parsed,
     })
 }
@@ -129,11 +148,16 @@ fn parse_comment(value: &Value) -> Result<DanmakuComment, DanmakuParseError> {
     let text = value
         .get("m")
         .and_then(Value::as_str)
-        .ok_or(DanmakuParseError::MissingField { field: "comments[].m" })?;
-    let time = value
-        .get("time")
-        .and_then(Value::as_f64)
-        .ok_or(DanmakuParseError::MissingField { field: "comments[].time" })?;
+        .ok_or(DanmakuParseError::MissingField {
+            field: "comments[].m",
+        })?;
+    let time =
+        value
+            .get("time")
+            .and_then(Value::as_f64)
+            .ok_or(DanmakuParseError::MissingField {
+                field: "comments[].time",
+            })?;
     // The server sends cid as a string because it exceeds the JS safe integer
     // range; accept a number too so a stale server cannot break playback.
     let cid = match value.get("cid") {
@@ -309,7 +333,9 @@ mod tests {
         let body = serde_json::json!({ "comments": [{ "cid": "1", "time": 1.0 }] }).to_string();
         assert_eq!(
             parse_danmaku_response(200, &body),
-            Err(DanmakuParseError::MissingField { field: "comments[].m" })
+            Err(DanmakuParseError::MissingField {
+                field: "comments[].m"
+            })
         );
     }
 
