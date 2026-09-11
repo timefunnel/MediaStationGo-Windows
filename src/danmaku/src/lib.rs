@@ -11,6 +11,10 @@
 //! Everything here is pure computation: no mpv, no I/O, so the layout rules can
 //! be unit tested without a player.
 
+mod driver;
+
+pub use driver::{DanmakuDriver, OverlayIds, OverlaySink, TickOutcome};
+
 /// Danmaku modes as used by dandanplay/Bilibili payloads.
 pub const MODE_SCROLL: u8 = 1;
 pub const MODE_BOTTOM: u8 = 4;
