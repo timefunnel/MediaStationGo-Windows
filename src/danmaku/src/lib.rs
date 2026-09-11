@@ -13,7 +13,13 @@
 
 mod driver;
 
+#[cfg(feature = "mpv")]
+mod mpv_worker;
+
 pub use driver::{DanmakuDriver, OverlayIds, OverlaySink, TickOutcome};
+
+#[cfg(feature = "mpv")]
+pub use mpv_worker::DanmakuSession;
 
 /// Danmaku modes as used by dandanplay/Bilibili payloads.
 pub const MODE_SCROLL: u8 = 1;

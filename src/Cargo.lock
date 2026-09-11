@@ -2238,6 +2238,7 @@ dependencies = [
  "gix",
  "jfn-color",
  "jfn-config",
+ "jfn-danmaku",
  "jfn-frame-interpolation",
  "jfn-input",
  "jfn-jellyfin",
@@ -2283,6 +2284,9 @@ dependencies = [
 [[package]]
 name = "jfn-danmaku"
 version = "1.0.6"
+dependencies = [
+ "jfn-mpv",
+]
 
 [[package]]
 name = "jfn-frame-interpolation"

@@ -1,16 +1,18 @@
 use base64::Engine as _;
 use cef::{ImplListValue, ListValue, sys};
+use jfn_danmaku::{DanmakuSession, DanmakuStyle};
 use jfn_frame_interpolation::{
     InterpolationMode, InterpolationModel, InterpolationPlan, PlanRequest, prepare_plan,
 };
 use jfn_mediastation::{
-    ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
-    MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaSourceOption, MediaStationApiClient,
-    MediaStationClientProfile, MediaStationConnectionProfile, MediaStationProxyMode,
-    MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
-    PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
-    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream,
-    build_playback_track_plan, chinese_subtitle_preference_rank,
+    ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard,
+    MediaDanmakuState, MediaDetail, MediaHome, MediaImageRef, MediaImageType, MediaPage,
+    MediaSourceOption, MediaStationApiClient, MediaStationClientProfile,
+    MediaStationConnectionProfile, MediaStationProxyMode, MediaStationSession,
+    PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError, PlaybackSessionResolver,
+    PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference, PlaybackTrackPreferenceUpdate,
+    SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream, build_playback_track_plan,
+    chinese_subtitle_preference_rank,
 };
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
@@ -413,6 +415,7 @@ struct RuntimeState {
     active_image_request_ids: HashSet<String>,
     active_subtitle: Option<PreparedExternalSubtitle>,
     active_interpolation: Option<ActiveInterpolation>,
+    active_danmaku: Option<DanmakuSession>,
     active_report: Option<ActivePlaybackReport>,
 }
 
@@ -1557,7 +1560,81 @@ impl MediaStationRuntime {
         );
         drop(state);
         self.enqueue_report(stopped);
+        self.start_active_danmaku(load.snapshot, load.media_id);
         Ok(())
+    }
+
+    /// Fetch danmaku for the item that just started and run it for as long as
+    /// playback lasts. Failure is logged and leaves danmaku off: a missing
+    /// danmaku source must never break playback.
+    fn start_active_danmaku(&self, snapshot: &SessionSnapshot, media_id: &str) {
+        // Join the previous worker first so its final overlay clear cannot land
+        // after the new session pushed a frame.
+        let previous = self.state.lock().active_danmaku.take();
+        if let Some(mut previous) = previous {
+            previous.stop();
+        }
+
+        let payload = match self
+            .api
+            .fetch_media_danmaku(&snapshot.session, media_id, 0, None)
+        {
+            Ok(MediaDanmakuState::Matched(payload)) => payload,
+            Ok(MediaDanmakuState::Unmatched { message }) => {
+                log_warn(&format!(
+                    "MediaStation danmaku has no match for {media_id}: {message}"
+                ));
+                return;
+            }
+            Ok(MediaDanmakuState::Unavailable { message }) => {
+                log_warn(&format!(
+                    "MediaStation danmaku unavailable for {media_id}: {message}"
+                ));
+                return;
+            }
+            Err(error) => {
+                log_warn(&format!(
+                    "MediaStation danmaku fetch failed for {media_id}: {error}"
+                ));
+                return;
+            }
+        };
+        if payload.comments.is_empty() {
+            return;
+        }
+
+        let comments = payload
+            .comments
+            .into_iter()
+            .map(|comment| {
+                jfn_danmaku::DanmakuComment::new(
+                    comment.cid,
+                    comment.time,
+                    comment.mode,
+                    comment.color,
+                    comment.text,
+                )
+            })
+            .collect();
+        let session = match DanmakuSession::start(comments, DanmakuStyle::default(), |message| {
+            log_error(&format!("MediaStation danmaku: {message}"));
+        }) {
+            Ok(session) => session,
+            Err(error) => {
+                log_error(&format!(
+                    "MediaStation danmaku worker could not start for {media_id}: {error}"
+                ));
+                return;
+            }
+        };
+        let mut state = self.state.lock();
+        if state.generation != snapshot.generation || state.session.is_none() {
+            drop(state);
+            let mut session = session;
+            session.stop();
+            return;
+        }
+        state.active_danmaku = Some(session);
     }
 
     fn active_playback_source(
@@ -2014,6 +2091,13 @@ fn plan_playback_reports(
 }
 
 fn take_stopped_report(state: &mut RuntimeState) -> Option<ReportJob> {
+    // Every path that ends or replaces playback funnels through here, so the
+    // danmaku worker is torn down here too. It is only signalled (not joined)
+    // because callers hold the state lock; the worker clears its overlays as it
+    // exits, and a session that starts later joins the old one explicitly.
+    if let Some(mut danmaku) = state.active_danmaku.take() {
+        danmaku.detach();
+    }
     let active = state.active_report.take()?;
     active
         .started
@@ -7079,7 +7163,7 @@ fn dispatch_response(
     }
 }
 
-fn log_error(message: &str) {
+pub(crate) fn log_error(message: &str) {
     jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_ERROR, message);
 }
 
