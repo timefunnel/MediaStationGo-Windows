@@ -699,8 +699,12 @@ impl MediaStationApiClient {
         let mut resume_url = resume_endpoint(session)?;
         resume_url
             .query_pairs_mut()
-            .append_pair("UserId", &session.user_id)
             .append_pair("Limit", &HOME_RESUME_LIMIT.to_string())
+            .append_pair("Recursive", "true")
+            .append_pair("IncludeItemTypes", "Movie,Episode")
+            .append_pair("Filters", "IsResumable")
+            .append_pair("SortBy", "DatePlayed")
+            .append_pair("SortOrder", "Descending")
             .append_pair("Fields", CATALOG_FIELDS);
         let resume = parse_media_cards(&self.get_json(session, &resume_url)?)?
             .into_iter()
@@ -2770,10 +2774,7 @@ fn endpoint_from_path(base_url: &Url, path: &str) -> Result<Url, ApiError> {
 }
 
 fn resume_endpoint(session: &MediaStationSession) -> Result<Url, ApiError> {
-    endpoint(
-        &session.base_url,
-        &["Users", &session.user_id, "Items", "Resume"],
-    )
+    endpoint(&session.base_url, &["Users", &session.user_id, "Items"])
 }
 
 fn media_detail_endpoint(session: &MediaStationSession, media_id: &str) -> Result<Url, ApiError> {
@@ -3151,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_endpoint_uses_standard_emby_contract_for_every_identity() {
+    fn resume_query_endpoint_uses_standard_emby_contract_for_every_identity() {
         let base_url = Url::parse("https://media.example/emby").expect("URL should parse");
         let default = session(base_url.clone());
         let senplayer = session_with_profile(
@@ -3163,13 +3164,13 @@ mod tests {
             resume_endpoint(&default)
                 .expect("default endpoint should build")
                 .path(),
-            "/emby/Users/user-1/Items/Resume"
+            "/emby/Users/user-1/Items"
         );
         assert_eq!(
             resume_endpoint(&senplayer)
                 .expect("SenPlayer endpoint should build")
                 .path(),
-            "/emby/Users/user-1/Items/Resume"
+            "/emby/Users/user-1/Items"
         );
     }
 
@@ -3303,8 +3304,28 @@ mod tests {
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(resume_url.path(), "/Users/user-1/Items/Resume");
+        assert_eq!(resume_url.path(), "/Users/user-1/Items");
         assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("20"));
+        assert_eq!(
+            params.get("Recursive").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie,Episode")
+        );
+        assert_eq!(
+            params.get("Filters").map(|value| value.as_ref()),
+            Some("IsResumable")
+        );
+        assert_eq!(
+            params.get("SortBy").map(|value| value.as_ref()),
+            Some("DatePlayed")
+        );
+        assert_eq!(
+            params.get("SortOrder").map(|value| value.as_ref()),
+            Some("Descending")
+        );
         assert_eq!(home.resume.len(), 20);
         assert_eq!(home.resume[19].id, "episode-20");
     }
