@@ -40,7 +40,7 @@ pub(crate) fn status() -> Value {
     }
 }
 
-fn prepare(state: &mut OperationState, install: bool) -> Result<(), Failure> {
+fn available(state: &OperationState) -> Result<(), Failure> {
     if !component::SUPPORTED {
         return Err((
             "frame_interpolation_platform_unsupported",
@@ -53,6 +53,11 @@ fn prepare(state: &mut OperationState, install: bool) -> Result<(), Failure> {
             "组件正在下载或校验，请稍候".into(),
         ));
     }
+    Ok(())
+}
+
+fn prepare(state: &mut OperationState, install: bool) -> Result<(), Failure> {
+    available(state)?;
     let status = component::status(&cache_root()).map_err(|error| (error.code, error.detail))?;
     if status["restartRequired"] == true {
         return Err((
@@ -128,4 +133,13 @@ pub(crate) fn uninstall() -> Result<(), Failure> {
     let mut state = STATE.lock();
     prepare(&mut state, false)?;
     component::queue_uninstall(&cache_root()).map_err(|error| (error.code, error.detail))
+}
+
+pub(crate) fn cancel_install() -> Result<(), Failure> {
+    let mut state = STATE.lock();
+    available(&state)?;
+    component::cancel_pending_install(&cache_root()).map_err(|error| (error.code, error.detail))?;
+    state.error = None;
+    state.progress = None;
+    Ok(())
 }

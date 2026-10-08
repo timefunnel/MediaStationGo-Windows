@@ -4919,6 +4919,11 @@ pub(crate) fn handle_frame_interpolation_message(
         "frame_interpolation_component_uninstall" => crate::business_interpolation::uninstall()
             .map(|()| frame_interpolation_status_payload())
             .map_err(|(code, detail)| LoadFailure::dynamic(code, detail)),
+        "frame_interpolation_component_cancel_install" => {
+            crate::business_interpolation::cancel_install()
+                .map(|()| frame_interpolation_status_payload())
+                .map_err(|(code, detail)| LoadFailure::dynamic(code, detail))
+        }
         "frame_interpolation_set_model" => set_frame_interpolation_model(args),
         "frame_interpolation_diagnostics" => {
             let media_id = (args.size() >= 3

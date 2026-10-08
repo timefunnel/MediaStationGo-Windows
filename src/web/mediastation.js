@@ -85,6 +85,7 @@
     let imageDiskStats = { imageBytes: 0, imageCount: 0 };
     let imageStatsTimer = 0;
     let interpolationComponentTimer = 0;
+    let interpolationComponentTracking = false;
     let requestSequence = 0;
     let toastTimer = 0;
     let drawerTrigger = null;
@@ -886,6 +887,7 @@
         imageStatsTimer = 0;
         window.clearTimeout(interpolationComponentTimer);
         interpolationComponentTimer = 0;
+        interpolationComponentTracking = false;
         homeData = null;
         currentView = null;
         history.length = 0;
@@ -1510,8 +1512,12 @@
         byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
         byId('settings-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
         byId('settings-confirm-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
+        const pendingInstall = component.pendingOperation === 'install';
+        byId('settings-pending-frame-interpolation-install').classList.toggle('hidden', !pendingInstall);
+        byId('settings-cancel-install-frame-interpolation').disabled = Boolean(component.supported === false || component.busy || !pendingInstall);
         window.clearTimeout(interpolationComponentTimer);
         interpolationComponentTimer = 0;
+        interpolationComponentTracking = Boolean(component.busy);
         if (interpolationModels[status.selectedModel]) {
             preferredInterpolationModel = status.selectedModel;
         }
@@ -1524,7 +1530,7 @@
                 ? `正在下载：${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${progress.source}`
                 : progress.phase === 'verifying' ? '正在校验并准备安装组件...' : '正在查询组件发行包...';
             label.dataset.state = 'pending';
-            interpolationComponentTimer = window.setTimeout(refreshFrameInterpolationStatus, 1500);
+            scheduleFrameInterpolationStatusRefresh();
         } else if (component.restartRequired) {
             label.textContent = component.pendingOperation === 'uninstall'
                 ? '已排队卸载：退出所有播放器实例并重新启动后生效。'
@@ -1554,11 +1560,20 @@
         }
     }
 
-    async function changeFrameInterpolationComponent(install) {
+    function scheduleFrameInterpolationStatusRefresh(delayMs = 1500) {
+        window.clearTimeout(interpolationComponentTimer);
+        interpolationComponentTimer = window.setTimeout(() => {
+            interpolationComponentTimer = 0;
+            return refreshFrameInterpolationStatus();
+        }, delayMs);
+    }
+
+    async function changeFrameInterpolationComponent(operation) {
+        interpolationComponentTracking = true;
         byId('settings-install-frame-interpolation').disabled = true;
         byId('settings-uninstall-frame-interpolation').disabled = true;
         byId('settings-confirm-uninstall-frame-interpolation').disabled = true;
-        const operation = install ? 'frame_interpolation_component_install' : 'frame_interpolation_component_uninstall';
+        byId('settings-cancel-install-frame-interpolation').disabled = true;
         try {
             const status = await nativeRequest('mediaStationFrameInterpolation', operation, [operation], 15000);
             updateFrameInterpolationStatus(status);
@@ -1583,6 +1598,10 @@
             const label = byId('settings-frame-interpolation-status');
             label.textContent = friendlyError(error);
             label.dataset.state = 'error';
+            if (interpolationComponentTracking) {
+                label.textContent += '；正在重新查询后台组件任务状态。';
+                scheduleFrameInterpolationStatusRefresh(3000);
+            }
         }
     }
 
@@ -6362,7 +6381,8 @@
         refreshUpdateControls();
         window.jmpNative.updateInstall();
     });
-    byId('settings-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent(true));
+    byId('settings-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_install'));
+    byId('settings-cancel-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_cancel_install'));
     byId('settings-uninstall-frame-interpolation').addEventListener('click', () => {
         byId('settings-confirm-frame-interpolation-uninstall').classList.remove('hidden');
         byId('settings-confirm-uninstall-frame-interpolation').focus();
@@ -6371,7 +6391,7 @@
         byId('settings-confirm-frame-interpolation-uninstall').classList.add('hidden');
         byId('settings-uninstall-frame-interpolation').focus();
     });
-    byId('settings-confirm-uninstall-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent(false));
+    byId('settings-confirm-uninstall-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_uninstall'));
     byId('settings-clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;

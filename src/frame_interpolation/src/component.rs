@@ -14,6 +14,8 @@ pub const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub const SUPPORTED: bool = cfg!(all(windows, target_arch = "x86_64"));
 const MAX_UNPACKED_BYTES: u64 = 768 * 1024 * 1024;
 const MANIFEST: &str = "component-manifest.json";
+const STAGING_OWNER: &str = "staging-owner.txt";
+const STAGING_IDENTITY: &[u8] = b"MediaStationGo RIFE operation staging v1\n";
 const FILES: &[&str] = &[
     "rife_runtime.dll",
     "cudart64_12.dll",
@@ -229,15 +231,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<BTreeMap<String, (u64, String)>, Inter
 pub fn validate_directory(directory: &Path) -> Result<(), InterpolationError> {
     reject_links(directory)?;
     validate_file_set(directory, directory)?;
-    let manifest_path = directory.join(MANIFEST);
-    reject_links(&manifest_path)?;
-    let mut bytes = Vec::new();
-    File::open(&manifest_path)
-        .map_err(|cause| io_error("Open component manifest", cause))?
-        .take(65537)
-        .read_to_end(&mut bytes)
-        .map_err(|cause| io_error("Read component manifest", cause))?;
-    for (name, (size, hash)) in parse_manifest(&bytes)? {
+    for (name, (size, hash)) in manifest_files(directory)? {
         let path = directory.join(name);
         for ancestor in path
             .ancestors()
@@ -255,6 +249,18 @@ pub fn validate_directory(directory: &Path) -> Result<(), InterpolationError> {
         }
     }
     Ok(())
+}
+
+fn manifest_files(directory: &Path) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
+    let manifest_path = directory.join(MANIFEST);
+    reject_links(&manifest_path)?;
+    let mut bytes = Vec::new();
+    File::open(&manifest_path)
+        .map_err(|cause| io_error("Open component manifest", cause))?
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|cause| io_error("Read component manifest", cause))?;
+    parse_manifest(&bytes)
 }
 
 fn validate_file_set(root: &Path, directory: &Path) -> Result<(), InterpolationError> {
@@ -385,6 +391,146 @@ fn check_tree(path: &Path) -> Result<(), InterpolationError> {
     Ok(())
 }
 
+// Only call while holding operations.lock, including staging creation: no
+// live install can be mistaken for an abandoned operation in another process.
+fn operation_staging(paths: &Paths) -> Result<tempfile::TempDir, InterpolationError> {
+    let staging = tempfile::Builder::new()
+        .prefix("operation-")
+        .tempdir_in(&paths.root)
+        .map_err(|cause| io_error("Create component operation staging", cause))?;
+    write_staging_identity(staging.path())?;
+    Ok(staging)
+}
+
+fn write_staging_identity(directory: &Path) -> Result<(), InterpolationError> {
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(STAGING_OWNER))
+        .map_err(|cause| io_error("Create component staging identity", cause))?;
+    marker
+        .write_all(STAGING_IDENTITY)
+        .map_err(|cause| io_error("Write component staging identity", cause))?;
+    marker
+        .sync_all()
+        .map_err(|cause| io_error("Sync component staging identity", cause))?;
+    // No payload is created until this identity has been durably written.
+    Ok(())
+}
+
+fn validate_staging_contents(
+    directory: &Path,
+    allow_cancelled: bool,
+) -> Result<(), InterpolationError> {
+    reject_links(directory)?;
+    for child in fs::read_dir(directory)
+        .map_err(|cause| io_error("Inspect abandoned staging contents", cause))?
+    {
+        let child = child.map_err(|cause| io_error("Inspect staging content", cause))?;
+        reject_links(&child.path())?;
+        let kind = child
+            .file_type()
+            .map_err(|cause| io_error("Inspect staging content type", cause))?;
+        match child.file_name().to_str() {
+            Some("runtime") if kind.is_dir() => {
+                validate_file_set(&child.path(), &child.path())?;
+            }
+            Some("cancelled-install") if allow_cancelled && kind.is_dir() => {
+                validate_staging_contents(&child.path(), false)?;
+            }
+            Some(STAGING_OWNER | "action.json") if kind.is_file() => {}
+            _ => return Err(error("Unexpected content in abandoned component staging")),
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_staging(directory: &Path) -> Result<(), InterpolationError> {
+    validate_staging_contents(directory, true)?;
+    for child in fs::read_dir(directory)
+        .map_err(|cause| io_error("Inspect component staging cleanup", cause))?
+    {
+        let child = child.map_err(|cause| io_error("Inspect staging cleanup entry", cause))?;
+        if child.file_name() == STAGING_OWNER {
+            continue;
+        }
+        if child
+            .file_type()
+            .map_err(|cause| io_error("Inspect staging cleanup type", cause))?
+            .is_dir()
+        {
+            remove_tree(&child.path())?;
+        } else {
+            fs::remove_file(child.path())
+                .map_err(|cause| io_error("Remove staging file", cause))?;
+        }
+    }
+    // Keep ownership after partial/blocked cleanup, so the next attempt can
+    // safely reclaim the remaining payload even if its manifest was deleted.
+    fs::remove_file(directory.join(STAGING_OWNER))
+        .map_err(|cause| io_error("Remove staging identity", cause))?;
+    fs::remove_dir(directory).map_err(|cause| io_error("Remove empty component staging", cause))
+}
+
+fn cleanup_abandoned_staging(paths: &Paths) -> Result<(), InterpolationError> {
+    let mut owned = Vec::new();
+    for entry in fs::read_dir(&paths.root)
+        .map_err(|cause| io_error("Inspect abandoned component staging", cause))?
+    {
+        let entry = entry.map_err(|cause| io_error("Inspect component staging", cause))?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("operation-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        reject_links(&path)?;
+        if !entry
+            .file_type()
+            .map_err(|cause| io_error("Inspect component staging type", cause))?
+            .is_dir()
+        {
+            continue;
+        }
+        let marker = path.join(STAGING_OWNER);
+        let runtime = path.join("runtime");
+        if exists(&marker)? {
+            reject_links(&marker)?;
+            let mut bytes = Vec::new();
+            File::open(marker)
+                .map_err(|cause| io_error("Read component staging identity", cause))?
+                .take(STAGING_IDENTITY.len() as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|cause| io_error("Read component staging identity", cause))?;
+            if bytes != STAGING_IDENTITY {
+                // Incomplete/foreign identities cannot establish ownership.
+                continue;
+            }
+        } else if exists(&runtime.join(MANIFEST))? {
+            // Legacy staging had no identity marker. A complete, supported
+            // manifest plus only known payload paths identifies its ownership;
+            // payload files may still be incomplete after an interrupted copy.
+            reject_links(&runtime)?;
+            manifest_files(&runtime)?;
+        } else {
+            // A matching directory prefix alone never authorizes deletion.
+            continue;
+        }
+        validate_staging_contents(&path, true)?;
+        owned.push(path);
+    }
+    // Validate all candidates before deleting any of them.
+    for path in owned {
+        if !exists(&path.join(STAGING_OWNER))? {
+            write_staging_identity(&path)?;
+        }
+        remove_owned_staging(&path)?;
+    }
+    Ok(())
+}
+
 /// Called before loading any RIFE DLL. Hold the returned read lease for the
 /// entire process: the native DLL intentionally pins itself until process exit.
 pub fn startup(cache_root: &Path) -> Result<(PathBuf, File), InterpolationError> {
@@ -398,6 +544,7 @@ pub fn startup(cache_root: &Path) -> Result<(PathBuf, File), InterpolationError>
     managed_root(&paths)?;
     {
         let _operation = lock(&paths, "operations.lock", true)?;
+        cleanup_abandoned_staging(&paths)?;
         if let Some(action) = read_action(&paths)? {
             let _exclusive = lock(&paths, "use.lock", true)?;
             match action["operation"].as_str() {
@@ -451,6 +598,27 @@ pub fn startup(cache_root: &Path) -> Result<(PathBuf, File), InterpolationError>
     }
 }
 
+/// Explicitly discard only the queued install. An already-activated component
+/// and all Engine/download caches are preserved, even after activation crashed.
+pub fn cancel_pending_install(cache_root: &Path) -> Result<(), InterpolationError> {
+    let paths = Paths::new(cache_root)?;
+    managed_root(&paths)?;
+    let _operation = lock(&paths, "operations.lock", true)?;
+    let action =
+        read_action(&paths)?.ok_or_else(|| error("No component installation is pending"))?;
+    if action["operation"] != "install" {
+        return Err(error("Only a pending component install can be cancelled"));
+    }
+    validate_staging_contents(&paths.pending, false)?;
+    let staging = operation_staging(&paths)?;
+    fs::rename(&paths.pending, staging.path().join("cancelled-install"))
+        .map_err(|cause| io_error("Cancel pending component installation", cause))?;
+    // The queue is removed atomically; preserve the owned staging directory
+    // if cleanup fails, rather than leaving a half-deleted pending action.
+    let directory = staging.keep();
+    remove_owned_staging(&directory)
+}
+
 fn commit_action(
     paths: &Paths,
     staging: tempfile::TempDir,
@@ -485,10 +653,8 @@ pub fn queue_uninstall(cache_root: &Path) -> Result<(), InterpolationError> {
     if !paths.active.is_dir() {
         return Err(error("No component is installed"));
     }
-    let staging = tempfile::Builder::new()
-        .prefix("operation-")
-        .tempdir_in(&paths.root)
-        .map_err(|cause| io_error("Create uninstall staging", cause))?;
+    cleanup_abandoned_staging(&paths)?;
+    let staging = operation_staging(&paths)?;
     commit_action(
         &paths,
         staging,
@@ -523,10 +689,8 @@ pub fn queue_install(
             "A component is already installed; uninstall it first",
         ));
     }
-    let staging = tempfile::Builder::new()
-        .prefix("operation-")
-        .tempdir_in(&paths.root)
-        .map_err(|cause| io_error("Create component staging", cause))?;
+    cleanup_abandoned_staging(&paths)?;
+    let staging = operation_staging(&paths)?;
     let runtime = staging.path().join("runtime");
     fs::create_dir(&runtime).map_err(|cause| io_error("Create package runtime staging", cause))?;
     let mut archive = zip::ZipArchive::new(
@@ -783,6 +947,196 @@ mod tests {
         drop(download);
         let (_, lease) = startup(&cache).unwrap();
         assert!(!active.exists());
+        drop(lease);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn failed_pending_install_can_be_cancelled_and_requeued() {
+        for damage in ["missing-file", "bad-hash", "bad-manifest"] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("frame-interpolation");
+            let paths = Paths::new(&cache).unwrap();
+            let (archive, sha) = package(temp.path(), None, false);
+            queue_install(&cache, &archive, &sha).unwrap();
+            let incoming = paths.pending.join("runtime");
+            match damage {
+                "missing-file" => fs::remove_file(incoming.join("rife_runtime.dll")).unwrap(),
+                "bad-hash" => fs::write(incoming.join("rife_runtime.dll"), b"changed").unwrap(),
+                _ => fs::write(incoming.join(MANIFEST), b"invalid JSON").unwrap(),
+            }
+            fs::create_dir_all(&paths.cache).unwrap();
+            fs::write(paths.cache.join("keep.engine"), b"keep engine").unwrap();
+            let downloads = download_directory(&cache).unwrap();
+            fs::write(downloads.join("keep.zip"), b"keep download").unwrap();
+            assert_eq!(
+                startup(&cache).unwrap_err().code,
+                "frame_interpolation_component_invalid"
+            );
+            assert_eq!(status(&cache).unwrap()["restartRequired"], true);
+            cancel_pending_install(&cache).unwrap();
+            assert!(!paths.pending.exists());
+            assert!(!paths.active.exists());
+            assert_eq!(status(&cache).unwrap()["restartRequired"], false);
+            assert_eq!(
+                fs::read(paths.cache.join("keep.engine")).unwrap(),
+                b"keep engine"
+            );
+            assert_eq!(
+                fs::read(downloads.join("keep.zip")).unwrap(),
+                b"keep download"
+            );
+            queue_install(&cache, &archive, &sha).unwrap();
+            let (active, lease) = startup(&cache).unwrap();
+            validate_directory(&active).unwrap();
+            drop(lease);
+            temp.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_preserves_activated_runtime_and_never_cancels_uninstall() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        let paths = Paths::new(&cache).unwrap();
+        let (archive, sha) = package(temp.path(), None, false);
+        queue_install(&cache, &archive, &sha).unwrap();
+        fs::rename(paths.pending.join("runtime"), &paths.active).unwrap();
+        let mut action = read_action(&paths).unwrap().unwrap();
+        action["manifestSha256"] = json!("0".repeat(64));
+        fs::write(
+            paths.pending.join("action.json"),
+            serde_json::to_vec(&action).unwrap(),
+        )
+        .unwrap();
+        assert!(startup(&cache).is_err());
+        let active_lease = lock(&paths, "use.lock", false).unwrap();
+        cancel_pending_install(&cache).unwrap();
+        validate_directory(&paths.active).unwrap();
+        assert!(!paths.pending.exists());
+        assert!(cancel_pending_install(&cache).is_err());
+        let (_, lease) = startup(&cache).unwrap();
+        queue_uninstall(&cache).unwrap();
+        assert!(cancel_pending_install(&cache).is_err());
+        assert_eq!(status(&cache).unwrap()["pendingOperation"], "uninstall");
+        drop(lease);
+        drop(active_lease);
+        let (_, lease) = startup(&cache).unwrap();
+        assert!(!paths.active.exists());
+        drop(lease);
+        temp.close().unwrap();
+    }
+
+    fn abandoned_partial_staging(paths: &Paths) -> PathBuf {
+        let _operation = lock(paths, "operations.lock", true).unwrap();
+        let staging = operation_staging(paths).unwrap();
+        fs::create_dir(staging.path().join("runtime")).unwrap();
+        fs::write(staging.path().join("runtime/rife_runtime.dll"), b"partial").unwrap();
+        // Simulate process termination: no TempDir destructor runs.
+        staging.keep()
+    }
+
+    #[test]
+    fn startup_and_uninstall_reclaim_only_owned_abandoned_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        let paths = Paths::new(&cache).unwrap();
+        let (archive, sha) = package(temp.path(), None, false);
+        queue_install(&cache, &archive, &sha).unwrap();
+        let legacy = paths.root.join("operation-legacy");
+        fs::rename(&paths.pending, &legacy).unwrap();
+        fs::remove_file(legacy.join(STAGING_OWNER)).unwrap();
+        fs::remove_file(legacy.join("runtime/rife_runtime.dll")).unwrap();
+        let marked = abandoned_partial_staging(&paths);
+        let unknown = paths.root.join("operation-user-data");
+        fs::create_dir(&unknown).unwrap();
+        fs::write(unknown.join("keep.txt"), b"user data").unwrap();
+        let incomplete = paths.root.join("operation-incomplete-marker");
+        fs::create_dir(&incomplete).unwrap();
+        fs::write(incomplete.join(STAGING_OWNER), b"incomplete identity").unwrap();
+        let (_, lease) = startup(&cache).unwrap();
+        assert!(!marked.exists());
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(unknown.join("keep.txt")).unwrap(), b"user data");
+        assert!(incomplete.exists());
+        queue_install(&cache, &archive, &sha).unwrap();
+        drop(lease);
+        let (_, lease) = startup(&cache).unwrap();
+        let next_orphan = abandoned_partial_staging(&paths);
+        queue_uninstall(&cache).unwrap();
+        assert!(!next_orphan.exists());
+        assert!(paths.active.exists());
+        drop(lease);
+        let (_, lease) = startup(&cache).unwrap();
+        assert!(!paths.active.exists());
+        assert!(unknown.exists());
+        drop(lease);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn staging_cleanup_cannot_race_a_live_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        let paths = Paths::new(&cache).unwrap();
+        managed_root(&paths).unwrap();
+        let operation = lock(&paths, "operations.lock", true).unwrap();
+        let staging = operation_staging(&paths).unwrap().keep();
+        assert_eq!(
+            startup(&cache).unwrap_err().code,
+            "frame_interpolation_component_busy"
+        );
+        assert!(staging.exists());
+        assert_eq!(
+            cancel_pending_install(&cache).unwrap_err().code,
+            "frame_interpolation_component_busy"
+        );
+        drop(operation);
+        let (_, lease) = startup(&cache).unwrap();
+        assert!(!staging.exists());
+        drop(lease);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn unknown_staging_content_blocks_cleanup_before_any_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        let paths = Paths::new(&cache).unwrap();
+        managed_root(&paths).unwrap();
+        let ordinary = abandoned_partial_staging(&paths);
+        let unexpected = abandoned_partial_staging(&paths);
+        fs::write(unexpected.join("runtime/user-note.txt"), b"preserve").unwrap();
+        assert!(startup(&cache).is_err());
+        assert!(ordinary.exists());
+        assert_eq!(
+            fs::read(unexpected.join("runtime/user-note.txt")).unwrap(),
+            b"preserve"
+        );
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn blocked_staging_cleanup_retains_ownership_until_retry() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        let paths = Paths::new(&cache).unwrap();
+        managed_root(&paths).unwrap();
+        let staging = abandoned_partial_staging(&paths);
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(staging.join("runtime/rife_runtime.dll"))
+            .unwrap();
+        assert!(startup(&cache).is_err());
+        assert_eq!(
+            fs::read(staging.join(STAGING_OWNER)).unwrap(),
+            STAGING_IDENTITY
+        );
+        drop(blocker);
+        let (_, lease) = startup(&cache).unwrap();
+        assert!(!staging.exists());
         drop(lease);
         temp.close().unwrap();
     }
