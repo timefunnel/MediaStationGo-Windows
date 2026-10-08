@@ -41,6 +41,18 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 Source: "{#PackageSource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+Type: files; Name: "{app}\tensorrt_rtx.exe"
+Type: files; Name: "{app}\rife_engine_builder.exe"
+Type: files; Name: "{app}\rife_runtime.dll"
+Type: files; Name: "{app}\tensorrt_rtx_1_4.dll"
+Type: files; Name: "{app}\tensorrt_onnxparser_rtx_1_4.dll"
+Type: files; Name: "{app}\cudart64_12.dll"
+Type: files; Name: "{app}\frame-interpolation\runtime-manifest.json"
+Type: files; Name: "{app}\frame-interpolation\models\rife_v4.26_fp16_io.onnx"
+Type: files; Name: "{app}\frame-interpolation\models\rife_v4.26_scale0.5.onnx"
+Type: files; Name: "{app}\frame-interpolation\models\rife_v4.25_lite_fp16_io.onnx"
+
 [Icons]
 Name: "{group}\MediaStationGo"; Filename: "{app}\jellium-desktop.exe"
 Name: "{autodesktop}\MediaStationGo"; Filename: "{app}\jellium-desktop.exe"; Tasks: desktopicon

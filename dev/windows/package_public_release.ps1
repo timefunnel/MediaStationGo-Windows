@@ -31,6 +31,18 @@ Assert-ManagedPath -Path $BuildDir -Root (Join-Path $RepoRoot "build") -Descript
 Assert-ManagedPath -Path $InstallDir -Root (Join-Path $RepoRoot "build") -Description "release install"
 Assert-ManagedPath -Path $DistDir -Root (Join-Path $RepoRoot "dist") -Description "release distribution"
 
+# The GPL source archive uses git ls-files. New app/component sources must be
+# tracked before generating a distributable source archive.
+& git -C $RepoRoot ls-files --error-unmatch -- `
+    dev/windows/rife_engine_builder.cpp `
+    src/frame_interpolation/src/component.rs `
+    src/jfn_cef/src/business_interpolation.rs `
+    dev/windows/package_frame_interpolation_component.ps1 `
+    resources/win/licenses/RIFE-ENGINE-BUILDER-MIT.txt | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Track the component/Engine builder sources and license before packaging a public release"
+}
+
 if (-not (Test-Path -LiteralPath (Join-Path $MpvDir "lib\libmpv-2.dll") -PathType Leaf)) {
     throw "Pinned libmpv release runtime is missing: $MpvDir"
 }
@@ -79,7 +91,10 @@ if ($LASTEXITCODE -ne 0) {
 
 $ForbiddenRuntimeNames = @(
     'VSScript.dll', 'libvapoursynth.dll', 'libvapoursynth-script-0.dll',
-    'libpython3.14.dll', 'libplacebo-360.dll', 'libx264-165.dll', 'libx265-216.dll'
+    'libpython3.14.dll', 'libplacebo-360.dll', 'libx264-165.dll', 'libx265-216.dll',
+    'tensorrt_rtx.exe', 'rife_runtime.dll', 'tensorrt_rtx_1_4.dll', 'cudart64_12.dll',
+    'rife_engine_builder.exe', 'tensorrt_onnxparser_rtx_1_4.dll',
+    'rife_v4.26_fp16_io.onnx', 'rife_v4.26_scale0.5.onnx', 'rife_v4.25_lite_fp16_io.onnx'
 )
 $Forbidden = Get-ChildItem -LiteralPath $InstallDir -Recurse -File |
     Where-Object { $_.Name -in $ForbiddenRuntimeNames }
@@ -88,19 +103,10 @@ if ($Forbidden) {
 }
 foreach ($RequiredRuntime in @(
     'jellium-desktop.exe', 'mediastation-portable-updater.exe',
-    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll',
-    'rife_runtime.dll', 'tensorrt_rtx_1_4.dll', 'cudart64_12.dll'
+    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $RequiredRuntime) -PathType Leaf)) {
         throw "Required public runtime file is missing: $RequiredRuntime"
-    }
-}
-foreach ($Model in @(
-    'rife_v4.26_fp16_io.onnx', 'rife_v4.26_scale0.5.onnx',
-    'rife_v4.25_lite_fp16_io.onnx'
-)) {
-    if (-not (Test-Path -LiteralPath (Join-Path $InstallDir "frame-interpolation\models\$Model") -PathType Leaf)) {
-        throw "Required RIFE model is missing: $Model"
     }
 }
 

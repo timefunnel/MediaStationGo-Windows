@@ -11,7 +11,19 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-08-21，分支 `main`。同一媒体播放中开启或更换 RIFE 时，
+最近更新：2026-10-08，分支 `codex/mediastation-windows-spike`。自有 Engine
+构建助手已实现并对齐旧 CLI 参数，两部 HDR10 原片三档共 282 个中间帧与旧 CLI
+构建输出逐像素一致，本机交替探针性能差异小于 0.7%；客户端 Release、安装
+staging 和许可证 staging 通过。本轮按用户要求仅纳入本地提交，未推送、未发布新下载包；不是长片或跨设备
+完整验收。详情见下方台账。
+
+本轮已获授权将插帧抽离为按用户安装的独立组件，接受安装、卸载重启生效。
+主包去捆绑、设置页下载/卸载、组件完整性校验和本地实包验证已完成；120 项常规
+Rust 单测、用户目录原生 ABI/三档 P010、主程序 Release 与安装/许可证 staging
+通过。尚未发布组件 Release，不能把本地 ZIP 写成已经可在线下载。
+模型、原生 ABI、profile 不变；本轮仅本地提交，具体记录以 Git 历史为准，不推送或发布。
+
+此前 2026-08-21，分支 `main`。同一媒体播放中开启或更换 RIFE 时，
 插帧规划现在使用与活动媒体 ID 绑定的 mpv `container-fps`，不再因
 `PlaybackInfo` 的帧率为 `0` 而拒绝已经完成运行时探测的片源；首次播放和跨媒体
 切换仍使用目标媒体自身的预加载元数据，不复用上一媒体帧率。实现与自动化验证已
@@ -66,6 +78,181 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
   不得用隐藏回退或伪成功推进台账。
 - 后续任务在上下文压缩或干净续接后，应先读取本文和当前工作区真实状态，
   不重新推断已经有证据的结论。
+
+### 2026-10-08 按需插帧组件（本地验证通过，未发布）
+
+- 授权范围：主程序不再捆绑插帧包；设置页按需安装、卸载；重启生效。
+- 目录：应用用户 cache 下 `components/rife/active`；待变更目录
+  `components/rife/pending`；专属 Engine 与下载缓存仍在 `frame-interpolation`。
+- 安装：固定 tag `rife-component-x64-v1` 和
+  `MediaStationGo-frame-interpolation-x64-v1.zip`。必须为 prerelease，避免被
+  主程序 `/releases/latest` 当成播放器更新；GitHub API 的 asset digest 校验整个
+  ZIP，再校验组件 tuple、精确文件集合、大小与逐文件 SHA-256。下载复用配置源和
+  断点续传，但 hash 不从镜像获取。
+- 安全边界：拒绝路径穿越、额外文件、链接和超限解压；操作原子排队；全进程
+  持有读租约，其他实例退出前不能执行变更。重启前不热加载、不假装安装已生效。
+- 卸载仅删除组件及其 Engine/下载缓存，不动账号、媒体和其他缓存。
+- 当前验证：23 项插帧单测、96 项 CEF 单测和 1 项 xtask 单测通过，包含
+  排队/重启生效、多实例读/下载锁、卸载范围、损坏包、路径穿越与激活后的中断
+  恢复。设置页实际 JS 函数的缺包、下载、待重启、错误、就绪和两个 IPC 操作
+  状态测试通过；非 Windows x64 显式不支持。
+- 实包：`dist/components/MediaStationGo-frame-interpolation-x64-v1.zip`，
+  116,073,754 字节，精确 16 个文件，SHA-256
+  `88d8bf6fc7b6ad9972119edfeb1ca3a4b8d7a676b743d6acf556e4853f79e727`。
+  包内不含 NVIDIA SDK CLI、Python、VapourSynth、Engine 或用户缓存。
+- 原生验证：在临时用户根目录排队安装 → 启动激活 → 完整性/模型清单校验 →
+  NVIDIA RTX 5070 Ti / 610.74 上从 `components/rife/active` 加载 ABI 8 →
+  排队卸载 → 启动清理，全部通过；三档 ONNX hash、alignment 和 profile 数量
+  分别与原冻结合同一致。迁移后的三档 Engine 构建和 3840x2160 D3D11 P010
+  探针通过（warmup=3、iterations=10）。这只是功能探针，不替代上轮原片 A/B，
+  也不宣称新的跨设备性能或长片验收。
+- 二进制未改变：组件 `rife_runtime.dll` SHA-256 为
+  `9a68baa77fc825941eb7b53692eeee0b652f62c8cabcdfd2b779aad1216401e1`，
+  自有助手为 `da72685647d13f363a0e9dd63c2a7f079ed24ea1adfe0f24391336a3320f070c`，
+  与上轮原片 A/B 的实际输入一致。只有包装与加载目录改变。
+- 主程序：标准 `build/jellium-desktop.exe` Release 重建通过，旧捆绑的五个
+  组件二进制、SDK CLI 和三档 ONNX 已从主程序输出移除；开发输入和独立 ZIP
+  保留，可恢复。临时安装 prefix 验证必需 mpv/CEF 存在、组件 payload 不存在，
+  主包许可证 staging（26 个 MSYS 包）和 `--version` 退出码 0 通过。
+- 工具检查：JS 与 PowerShell 解析、`git diff --check` 通过。严格 Clippy 仍有
+  HEAD 原有的两处 `usable_metadata_string` redundant closure；未改动这些无关
+  行。仅对该既有 lint 类别显式豁免后，本轮三个 crate 的全 target Clippy 通过。
+- 复现：`test_frame_interpolation_component.ps1`、
+  `test_frame_interpolation_base.ps1` 和 `node dev/windows/test_frame_interpolation_ui.cjs`。
+  新生成的 GPU/安装测试目录均已由各测试 finally 清理。
+- 在线边界：固定 tag 的只读请求实测 404，返回
+  `frame_interpolation_component_not_published`，不使用旧 SDK 包冒充新组件。
+  完整在线安装仍需发布该 prerelease 和匹配 GPL 源码包；公开打包脚本先检查新增
+  组件/构建助手源码已纳入 Git，避免 `git ls-files` 生成不完整的对应源码。
+- 本轮按用户要求仅本地提交，未推送、未上传；固定新组件 Release 尚未发布时必须明确报错。
+
+### 2026-10-08 自有 RIFE Engine 构建助手
+
+- 范围：先解决 NVIDIA SDK 命令行开发工具的运行时再分发依据不明确问题；
+  尚未实施可安装/卸载组件。TensorRT-RTX 固定为 `1.4.0.76`，schema 4 /
+  runtime ABI 8 / metadata schema 3、三档 ONNX hash、精度图和 profile 全部保留。
+- 依据：SDK README 指向 NVIDIA TensorRT-RTX SLA，其 1.1 分发要求对开发
+  工具作单独限制；未找到 `tensorrt_rtx.exe` 被明确列为可分发工具的依据。
+  本轮选择排除该 CLI，不声称提供整套产品的法律合规认证。协议地址：
+  <https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html>。
+- 已实现：新增项目自有 `rife_engine_builder.exe`，直接调用 Builder 和 ONNX
+  Parser API。强类型网络按 ONNX 图保留 FP16/FP32 边界，compute capability
+  固定 `kCURRENT`，对应旧 CLI 的 `--useGpu`；不执行额外推理、不启用其他精度。
+  profile 数据仍由既有 runtime manifest/宿主传入，助手不复制三档 profile 表。
+  新助手源码单独采用 MIT，NVIDIA 库仍受原协议约束，不改应用现有许可证。
+- 发布接线：staging manifest、宿主参数和 xtask 安装都使用自有助手；公开
+  打包要求新助手及 Parser DLL，并明确拒绝 `tensorrt_rtx.exe`；安装器升级定点
+  移除旧 CLI 文件。旧工具仅保留在
+  开发 SDK 供内部验证，运行时 staging 的旧副本移除；无旧 CLI 静默回退。
+  builder SHA 已在既有 Engine key 内，因此替换助手会明确触发本机重建。
+  公开源码归档前还要求新助手源码及 MIT 许可证已被 Git 跟踪，避免 `git ls-files`
+  打包漏掉新文件；当前未跟踪状态已验证会在构建/删除输出前明确拒绝发布打包。
+- 已验证：MSVC C++20 `/utf-8 /W4 /WX` 编译通过；插帧单测 `17 passed`，
+  xtask 旧工具定点移除回归 `1 passed`，两包 Clippy `-D warnings` 通过。
+  `dev/windows/test_rife_engine_builder.ps1` 在 RTX 5070 Ti / 驱动 `610.74`
+  上从当前三个 ONNX 构建新 Engine，profile 数 `4/3/4`，顺序和 shape 合同均通过
+  原生 runtime 校验。每档执行 3840x2160 P010、warmup 30、iterations 100，
+  profile 分别命中 `3/2/3`，均 `inferred=100 / cuts=0`、`p010-packed=yes`、
+  调用者 D3D11 context 保留，runtime cache 重开命中。本轮未启动其他推理/媒体负载；
+  桌面与本轮 Rust 编译可能影响时延，故不将本次探针当作跨版本性能比较。
+- 负向验证：10 类失败输入（缺参、未知选项、重复路径、不完整 profile、
+  重复 shape、非连续 profile、数值溢出、min/opt/max 顺序错误、ONNX 缺失和
+  ONNX 损坏）全部返回非零且不生成 Engine；三档已有输出覆盖也全部拒绝，
+  文件 hash 未变。测试生成的 Engine/runtime cache 全部在隔离测试目录内清理，
+  未改用户实际 Engine 缓存。
+- 客户端构建发现既有环境问题：RC 读取 UTF-8 资源中的中文路径失败，显式
+  `/c65001` 编译成功；资源模板补充一行 `#pragma code_page(65001)`，此后
+  RC 已通过。旧 CEF CMakeCache 指向已不存在的 `c:/codex-jellium`，未删除
+  旧缓存；本轮使用 `CARGO_TARGET_DIR=C:\codex-target\jellium-rife-builder`
+  新编译缓存，成品目录仍为仓库标准 `build`，没有另起播放器配置或运行实例。
+- 客户端与发布 staging 已验证：上述编译缓存下 `cargo xtask build` 完成
+  标准 `build/jellium-desktop.exe`，大小 `5156352` 字节，SHA-256 为
+  `6F853FB69D93C430CB8DE4E331987F39361088E8D05CF4C3DB86F4C66FA520B6`；
+  隐藏窗口启动 `--version` 返回 `0`。新助手 `266240` 字节，SHA-256 为
+  `446C1FA92D3B07E284CF078419FED4644AFAEF8AF1D6F2707A3E1A5E46817DED`，
+  标准 build 内已无旧 CLI。实际 `cargo xtask install --skip-build` 的测试目录
+  先预置旧 CLI，再安装后确认其已移除、新助手及四个原生依赖均存在、三档
+  manifest 正确。公开许可证 staging 完成（26 个 MSYS2 包），包含新增 MIT。
+- 测试清理边界：三档 Engine/native runtime cache 测试目录已由测试脚本清理；
+  最后安装验证目录 `build/rife-install-validation` 和 RC 编码诊断文件
+  `build/rife-runtime/resource-check.res` 的显式清理被执行环境策略拦截，当前
+  仍保留，未通过其他入口绕过限制。用户实际 Engine 缓存与旧编译缓存未删除。
+- 当前状态：已诊断、已实现、原生/单测/静态/Release/安装及许可证 staging
+  验证通过；未提交、未推送、未上传 Release。本机未找到 Inno Setup 编译器，
+  最终安装器未重制、未执行实际安装升级；三档真实影片视觉验收未重做，既有
+  质量档 HDR10 花屏问题仍为独立未关闭问题。GitHub 历史开发 SDK 构建资产
+  本轮未改，不将其当作新的可安装组件发行包。
+
+### 2026-10-08 构建助手等效性验收（本机原片短样本通过）
+
+- 上轮只证明新 Engine 可用，没有证明新旧构建输出或性能等效。只读核查发现
+  旧 CLI 的 `avgTiming` 默认为 8，而 API 头文件文档默认为 1；不能依据头文件
+  直接断言此前实际实现取值，也不能承诺画面逐像素一致。
+- 本轮明确设置 `avgTiming=8`、优化等级 3、layer-names-only，并读回配置；
+  不改变强类型网络、ONNX、精度图、三档 profile、播放算法、runtime ABI 或用户缓存。
+- 原生 sequence probe 新增显式 `MSGO_RIFE_COLOR_MATRIX` 校验，HDR10 使用
+  `bt2020nc`，SDR 使用 `bt709`；这只影响验收工具，不改变生产颜色链路。
+- 用户确认沿用《阿丽塔：战斗天使》和《阿甘正传》原片；实时核验两者当前均为
+  HDR10，用户明确仅做原片对比，不另行转换 SDR。在本机
+  使用开发 SDK 的旧 CLI 与新助手分别构建同 manifest 三档 Engine，执行同源
+  P010 数值/切镜/时序对比及交替性能复测。未通过前不发布新下载包；本轮不提交、
+  不推送、不实施组件安装卸载。
+- 已验证：MSVC `/W4 /WX` 编译通过，三档构建的配置读回均为
+  `avgTiming=8 / optimizationLevel=3 / profiling=layer_names_only`。
+  旧 CLI 日志为 `avgTiming: 8`；其优化等级打印 `-1`（使用默认值），SDK 头文件
+  文档与帮助对应默认 3。两端强类型网络、`kCURRENT` 和 manifest profile 不变。
+- 原片与输入：当前播放 API `IsPlayback=false`，不发送播放进度/偏好更新；
+  同 User-Agent、Range 206、一次 CDN 跳转，ffprobe 核实 limited-range
+  BT.2020/PQ/10-bit、`24000/1001`。阿丽塔从 `187.270 s` 提取 48 帧、
+  `3840x2160`，P010 SHA-256
+  `03087f4e5161cadda6d240810a5f37a3de1e33f4c63b68d619d15c3f51ad6f92`；
+  阿甘从 `300.000 s` 提取 48 帧、`3840x1606`，SHA-256
+  `3ca6fa966f2d2a67de1d237db5940d6ec880b67b866ce6e8c35726fafc1f4e09`。
+  不缩放原片，不用桌面录屏或其他素材代替。
+- 数值结果：每档每片 47 个中间帧，共 282 个输出；全部 P010 Y/UV 字节 hash
+  相同，10-bit MAE/max/changed-ratio 均为 0，低 6 位 packing 正确，PTS、场景
+  分类、场景指标与输出策略相同、推理失败为 0。阿丽塔两端 profile 分别为
+  `3/2/3`，阿甘均为 `2`。这两段没有命中 hard-cut，不能写成硬切分支已实片覆盖。
+- 性能条件：RTX 5070 Ti / 驱动 `610.74` / TensorRT-RTX `1.4.0.76`；
+  UHD P010 原生探针、stage profiler 开启、warmup 30 / iterations 100，三组交替
+  `old-new / new-old / old-new`，runtime cache 重开均命中、调用方 D3D11 context
+  均保留；A/B 期间没有并行构建。以下为三轮端到端均值的中位数，不是实际播放
+  丢帧、跨设备性能或无 profiler 的最高吞吐：
+
+| 档位 | 旧 CLI | 自有助手 | 耗时变化 |
+| --- | ---: | ---: | ---: |
+| 质量 | 32.55 ms | 32.63 ms | +0.246% |
+| 均衡 | 27.55 ms | 27.44 ms | -0.399% |
+| Lite | 24.18 ms | 24.02 ms | -0.662% |
+
+- 未观察到有意义的性能退化，所有中间帧完全相同。均衡档序列化 Engine 本身
+  SHA 也相同；质量/Lite 的 Engine SHA 不同，因此不声称三档 Engine 文件均相同。
+  完整本机结果保存在生成文件 `build/rife-builder-equivalence.json`，SHA-256
+  `F548549C7C35A8DBA72352540104DBEE07C9DC8E78556D3CF73D8517A137D5E6`；
+  可复现入口为 `dev/windows/test_rife_engine_builder_equivalence.py`。
+- 验收工具回归：首轮 `Path.with_suffix` 截断模型 ID 小数点，导致 A/B 路径冲突，
+  首轮结果已废弃；修复后独立路径重跑才得到上述结果。新增 36 个路径唯一性、
+  同路径拒绝、精确输出、1 个 10-bit code 差异检测与 PTS 差异拒绝自检，全部通过。
+  非法 probe 矩阵在加载 runtime 前返回 2；PS 语法与 `git diff --check` 通过。
+- 本地成品同步：插帧 Rust 单测仍为 `17 passed`，常规 `cargo xtask build`
+  增量 Release 完成，隐藏 `--version` 启动返回 0。新助手 SHA-256
+  `DA72685647D13F363A0E9DD63C2A7F079ED24EA1ADFE0F24391336A3320F070C`
+  在 `build/rife-runtime`、`third_party/mpv-install/lib` 和标准 `build` 中一致；
+  客户端 EXE 保持上一台账 `6F853F...`，标准 build 与 runtime staging 均无 NVIDIA
+  CLI。生产 runtime DLL 未替换，A/B 两端统一使用 SHA
+  `9A68BAA77FC825941EB7B53692EEEE0B652F62C8CABCDFD2B779AAD1216401E1`。
+  最后另跑基础助手测试（warmup 1 / iterations 1，只作功能回归，不作性能证据），
+  10 类失败输入、三档已有 Engine 覆盖拒绝/原 hash 不变、三档 P010/cache/context
+  均通过。
+- 清理：有效 A/B 与最后基础回归生成的 Engine、cache 和媒体文件已由各自测试
+  生命周期清理。被中断首轮目录 `build/rife-builder-ab-aga0e4kx` 的显式清理
+  被执行环境策略拒绝，仍有 `1779523792` 字节（约 1.66 GiB）；另外首次导入
+  验收模块产生的 `dev/windows/__pycache__/test_rife_engine_builder_equivalence.cpython-312.pyc`
+  定点文件清理也被策略拒绝，未清理。没有通过其他入口绕过删除限制，未改用户实际
+  Engine 缓存。
+- 边界：本机两段 HDR10 原片的短样本输出一致；未做原生 SDR、hard-cut 实片、
+  长片/真实播放器丢帧或其他 GPU 验收，不能据此关闭既有质量档花屏问题。
+  最终安装器、公开包和历史 SDK 下载资产本轮仍未发布/修改；组件安装卸载仍未实施。
 
 ### 2026-08-21 同媒体重载使用运行时源帧率
 

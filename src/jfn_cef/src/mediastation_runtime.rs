@@ -607,12 +607,22 @@ impl Drop for ImageRequestGuard {
 #[derive(Debug)]
 struct LoadFailure {
     code: &'static str,
-    message: &'static str,
+    message: std::borrow::Cow<'static, str>,
 }
 
 impl LoadFailure {
     const fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message: std::borrow::Cow::Borrowed(message),
+        }
+    }
+
+    fn dynamic(code: &'static str, message: String) -> Self {
+        Self {
+            code,
+            message: std::borrow::Cow::Owned(message),
+        }
     }
 
     fn payload(&self) -> Value {
@@ -4908,6 +4918,12 @@ pub(crate) fn handle_frame_interpolation_message(
     let operation = list_string(args, 1);
     let result = match operation.as_str() {
         "frame_interpolation_status" => Ok(frame_interpolation_status_payload()),
+        "frame_interpolation_component_install" => crate::business_interpolation::install()
+            .map(|()| frame_interpolation_status_payload())
+            .map_err(|(code, detail)| LoadFailure::dynamic(code, detail)),
+        "frame_interpolation_component_uninstall" => crate::business_interpolation::uninstall()
+            .map(|()| frame_interpolation_status_payload())
+            .map_err(|(code, detail)| LoadFailure::dynamic(code, detail)),
         "frame_interpolation_set_model" => set_frame_interpolation_model(args),
         "frame_interpolation_diagnostics" => {
             let media_id = (args.size() >= 3
@@ -4948,6 +4964,7 @@ fn frame_interpolation_status_payload() -> Value {
         .collect::<Vec<_>>();
     json!({
         "componentStatus": if report.ready { "ready" } else { "unavailable" },
+        "component": crate::business_interpolation::status(),
         "gpuName": report.gpu_name,
         "gpuUuid": report.gpu_uuid,
         "driverVersion": report.driver_version,

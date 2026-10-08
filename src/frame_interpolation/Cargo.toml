@@ -11,6 +11,8 @@ crate-type = ["rlib"]
 [dependencies]
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

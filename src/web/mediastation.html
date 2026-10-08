@@ -267,7 +267,20 @@
             <label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
             <label class="setting-range-row" for="settings-subtitle-bottom-offset"><span>距底部</span><input id="settings-subtitle-bottom-offset" type="range" min="0" max="30" step="1"><output id="settings-subtitle-bottom-offset-value" for="settings-subtitle-bottom-offset"></output></label>
             <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>
-            <div class="setting-block frame-interpolation-settings"><h3>RTX 插帧组件</h3><p id="settings-frame-interpolation-status" class="component-status">正在检测组件...</p></div>
+            <div class="setting-block frame-interpolation-settings">
+              <h3>RTX 插帧组件</h3>
+              <p>仅 NVIDIA RTX 使用。组件按需下载到当前用户目录，安装、卸载后请退出所有播放器实例并重新启动。</p>
+              <p id="settings-frame-interpolation-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+              <div class="update-action-row">
+                <button id="settings-install-frame-interpolation" class="secondary-command" type="button" disabled>下载并安装</button>
+                <button id="settings-uninstall-frame-interpolation" class="secondary-command" type="button" disabled>卸载组件</button>
+              </div>
+              <div id="settings-confirm-frame-interpolation-uninstall" class="hidden">
+                <p>下次启动时删除插帧组件、专属 Engine 缓存和组件下载缓存。不影响媒体、账号及其他缓存。</p>
+                <button id="settings-confirm-uninstall-frame-interpolation" class="secondary-command" type="button">确认卸载</button>
+                <button id="settings-cancel-uninstall-frame-interpolation" class="secondary-command" type="button">取消</button>
+              </div>
+            </div>
           </section>
           <section class="settings-section setting-block settings-authenticated" data-settings-section="storage"><p class="eyebrow">存储空间</p><p id="settings-image-cache-status">磁盘 0 B</p><button id="settings-clear-image-cache" class="secondary-command" type="button">清除缓存</button></section>
           <section class="settings-section setting-block update-settings settings-authenticated" data-settings-section="update">

@@ -57,6 +57,12 @@ struct ReleaseInfo {
     package_kind: PackageKind,
 }
 
+struct DownloadArtifact {
+    asset_url: String,
+    asset_size: u64,
+    sha256: String,
+}
+
 #[derive(Clone, Debug)]
 struct DownloadSource {
     label: String,
@@ -873,8 +879,51 @@ fn download_update_package_to(
     source: &DownloadSource,
     inner: &Arc<Inner>,
 ) -> Result<(), UpdateError> {
+    let artifact = DownloadArtifact {
+        asset_url: release.asset_url.clone(),
+        asset_size: release.asset_size,
+        sha256: release.sha256.clone(),
+    };
+    download_release_package_to(
+        destination,
+        &artifact,
+        source,
+        |downloaded, total, label| {
+            post_status(
+                Arc::clone(inner),
+                "downloading",
+                json!({
+                    "downloadedBytes": downloaded, "totalBytes": total,
+                    "percent": downloaded.saturating_mul(100) / total, "source": label,
+                }),
+            );
+        },
+    )
+}
+
+fn download_release_package_to(
+    destination: &Path,
+    release: &DownloadArtifact,
+    source: &DownloadSource,
+    progress: impl Fn(u64, u64, &str),
+) -> Result<(), UpdateError> {
     let agent = github_agent(Duration::from_secs(20 * 60));
-    let downloaded = retained_download_bytes(release);
+    let downloaded = match fs::metadata(destination) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            return Err(UpdateError::new(
+                "update_temp_invalid",
+                "下载目标不是普通文件",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(UpdateError::new(
+                "update_temp_metadata_failed",
+                error.to_string(),
+            ));
+        }
+    };
     let asset_url = source.url(&release.asset_url);
     let response = download_response(&agent, &asset_url, downloaded, release.asset_size)?;
     let mut reader = response.into_body().into_reader();
@@ -929,16 +978,7 @@ fn download_update_package_to(
         let percent = downloaded.saturating_mul(100) / release.asset_size;
         if percent > last_percent {
             last_percent = percent;
-            post_status(
-                Arc::clone(inner),
-                "downloading",
-                json!({
-                    "downloadedBytes": downloaded,
-                    "totalBytes": release.asset_size,
-                    "percent": percent,
-                    "source": source.label.clone(),
-                }),
-            );
+            progress(downloaded, release.asset_size, &source.label);
         }
     }
 
@@ -965,6 +1005,189 @@ fn download_update_package_to(
         ));
     }
     Ok(())
+}
+
+/// The optional component shares the app's trusted GitHub transport, configured
+/// download sources, bounded transfer, resume validation and checksum checks.
+pub(crate) fn download_rife_component(
+    directory: &Path,
+    progress: impl Fn(u64, u64, &str),
+) -> Result<(PathBuf, String), (&'static str, String)> {
+    let component = || -> Result<(PathBuf, String), UpdateError> {
+        use jfn_frame_interpolation::component::{ASSET_NAME, MAX_PACKAGE_BYTES, RELEASE_TAG};
+        let url = format!(
+            "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/tags/{RELEASE_TAG}"
+        );
+        let agent = github_agent(Duration::from_secs(45));
+        let response = agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|error| UpdateError::new("component_request_failed", error.to_string()))?;
+        if response.status().as_u16() == 404 {
+            return Err(UpdateError::new(
+                "frame_interpolation_component_not_published",
+                "插帧组件包尚未发布，暂时不能在线安装",
+            ));
+        }
+        if response.status().as_u16() != 200 {
+            return Err(UpdateError::new(
+                "component_request_failed",
+                format!("组件版本接口返回 HTTP {}", response.status()),
+            ));
+        }
+        let mut body = response.into_body();
+        let text = body
+            .with_config()
+            .limit(MAX_METADATA_BYTES)
+            .read_to_string()
+            .map_err(|error| UpdateError::new("component_metadata_invalid", error.to_string()))?;
+        let release = parse_rife_component_metadata(&text)?;
+        fs::create_dir_all(directory)
+            .map_err(|error| UpdateError::new("component_directory_failed", error.to_string()))?;
+        let destination = directory.join(ASSET_NAME);
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(UpdateError::new(
+                    "component_download_invalid",
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Some(metadata) = metadata {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(UpdateError::new(
+                        "component_download_invalid",
+                        "组件下载目标不能是重解析点",
+                    ));
+                }
+            }
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(UpdateError::new(
+                    "component_download_invalid",
+                    "组件下载目标不是普通文件",
+                ));
+            }
+            if metadata.len() == release.asset_size {
+                match verify_file_sha256(&destination, &release.sha256) {
+                    Ok(()) => return Ok((destination, release.sha256)),
+                    Err(error) if error.code == "update_checksum_mismatch" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if metadata.len() >= release.asset_size || metadata.len() > MAX_PACKAGE_BYTES {
+                fs::remove_file(&destination).map_err(|error| {
+                    UpdateError::new("component_download_cleanup_failed", error.to_string())
+                })?;
+            }
+        }
+        let mut failures = Vec::new();
+        for source in download_sources() {
+            let retained = match fs::metadata(&destination) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => {
+                    return Err(UpdateError::new(
+                        "component_download_invalid",
+                        error.to_string(),
+                    ));
+                }
+            };
+            progress(retained, release.asset_size, &source.label);
+            match download_release_package_to(&destination, &release, &source, &progress) {
+                Ok(()) => return Ok((destination, release.sha256)),
+                Err(error) => {
+                    let message = format!("{}：{}", source.label, error.message);
+                    if !is_retryable_download_error(error.code) {
+                        return Err(UpdateError::new(error.code, message));
+                    }
+                    if matches!(
+                        error.code,
+                        "update_checksum_mismatch" | "update_size_invalid"
+                    ) {
+                        fs::remove_file(&destination).map_err(|error| {
+                            UpdateError::new("component_download_cleanup_failed", error.to_string())
+                        })?;
+                    }
+                    failures.push(message);
+                }
+            }
+        }
+        Err(UpdateError::new(
+            "frame_interpolation_component_download_failed",
+            format!("组件下载失败：{}", failures.join("；")),
+        ))
+    };
+    component().map_err(|error| (error.code, error.message))
+}
+
+fn parse_rife_component_metadata(text: &str) -> Result<DownloadArtifact, UpdateError> {
+    use jfn_frame_interpolation::component::{ASSET_NAME, MAX_PACKAGE_BYTES, RELEASE_TAG};
+    let payload: Value = serde_json::from_str(text)
+        .map_err(|error| UpdateError::new("component_metadata_invalid", error.to_string()))?;
+    if payload["tag_name"] != RELEASE_TAG
+        || payload["draft"] != false
+        || payload["prerelease"] != true
+    {
+        return Err(UpdateError::new(
+            "component_metadata_invalid",
+            "组件 Release 身份无效",
+        ));
+    }
+    let assets = payload["assets"]
+        .as_array()
+        .ok_or_else(|| UpdateError::new("component_metadata_invalid", "组件文件列表缺失"))?;
+    let matches = assets
+        .iter()
+        .filter(|asset| asset["name"] == ASSET_NAME)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(UpdateError::new(
+            "component_metadata_invalid",
+            "组件包缺失或重复",
+        ));
+    }
+    let asset = matches[0];
+    let url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| UpdateError::new("component_metadata_invalid", "组件下载地址缺失"))?;
+    validate_asset_url(url, RELEASE_TAG, ASSET_NAME)?;
+    let size = asset["size"]
+        .as_u64()
+        .filter(|size| *size > 0 && *size <= MAX_PACKAGE_BYTES)
+        .ok_or_else(|| UpdateError::new("component_metadata_invalid", "组件包大小超出限制"))?;
+    let sha = asset["digest"]
+        .as_str()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            UpdateError::new(
+                "component_metadata_invalid",
+                "GitHub 组件包 SHA-256 缺失或无效",
+            )
+        })?;
+    if asset["state"] != "uploaded" {
+        return Err(UpdateError::new(
+            "component_metadata_invalid",
+            "组件包尚未上传完成",
+        ));
+    }
+    Ok(DownloadArtifact {
+        asset_url: url.to_string(),
+        asset_size: size,
+        sha256: sha.to_string(),
+    })
 }
 
 fn is_retryable_download_error(code: &'static str) -> bool {
@@ -1329,6 +1552,107 @@ fn post_download_error(inner: Arc<Inner>, error: UpdateError, release: &ReleaseI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn component_metadata() -> Value {
+        use jfn_frame_interpolation::component::{ASSET_NAME, RELEASE_TAG};
+        json!({"draft": false, "prerelease": true, "tag_name": RELEASE_TAG, "assets": [{
+            "name": ASSET_NAME, "browser_download_url": format!("https://github.com/timefunnel/MediaStationGo-Windows/releases/download/{RELEASE_TAG}/{ASSET_NAME}"),
+            "state": "uploaded", "size": 1024, "digest": format!("sha256:{}", "a".repeat(64))
+        }]})
+    }
+
+    #[test]
+    fn component_metadata_requires_the_exact_prerelease_asset_and_github_digest() {
+        let metadata = component_metadata();
+        let parsed = parse_rife_component_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(parsed.asset_size, 1024);
+        assert_eq!(parsed.sha256, "a".repeat(64));
+        for (field, value) in [
+            ("digest", json!(null)),
+            ("digest", json!("sha256:invalid")),
+            ("state", json!("new")),
+            ("size", json!(0)),
+            ("size", json!(536870913)),
+            (
+                "browser_download_url",
+                json!("https://example.com/untrusted.zip"),
+            ),
+        ] {
+            let mut bad = metadata.clone();
+            bad["assets"][0][field] = value;
+            assert!(parse_rife_component_metadata(&bad.to_string()).is_err());
+        }
+        for (field, value) in [
+            ("prerelease", json!(false)),
+            ("draft", json!(true)),
+            ("tag_name", json!("v1.0.6")),
+        ] {
+            let mut bad = metadata.clone();
+            bad[field] = value;
+            assert!(parse_rife_component_metadata(&bad.to_string()).is_err());
+        }
+        let mut duplicate = metadata;
+        let asset = duplicate["assets"][0].clone();
+        duplicate["assets"].as_array_mut().unwrap().push(asset);
+        assert!(parse_rife_component_metadata(&duplicate.to_string()).is_err());
+    }
+
+    #[test]
+    fn shared_transfer_validates_resumed_component_bytes_and_checksum() {
+        use std::net::TcpListener;
+        for valid_hash in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("component.zip");
+            fs::write(&destination, b"part-").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..count])
+                        .to_ascii_lowercase()
+                        .contains("range: bytes=5-")
+                );
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 5-8/9\r\nConnection: close\r\n\r\nrest").unwrap();
+            });
+            let artifact = DownloadArtifact {
+                asset_url: url,
+                asset_size: 9,
+                sha256: if valid_hash {
+                    hex_digest(&Sha256::digest(b"part-rest"))
+                } else {
+                    "0".repeat(64)
+                },
+            };
+            let result = download_release_package_to(
+                &destination,
+                &artifact,
+                &DownloadSource::direct(),
+                |_, _, _| {},
+            );
+            if valid_hash {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code, "update_checksum_mismatch");
+            }
+            server.join().unwrap();
+            temp.close().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "read-only request to the fixed public GitHub component tag"]
+    fn unpublished_component_is_reported_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let failure = download_rife_component(temp.path(), |_, _, _| {}).unwrap_err();
+        assert_eq!(
+            failure.0, "frame_interpolation_component_not_published",
+            "{failure:?}"
+        );
+        temp.close().unwrap();
+    }
 
     #[test]
     fn stable_release_beats_matching_development_build() {
