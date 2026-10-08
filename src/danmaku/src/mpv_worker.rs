@@ -1,45 +1,48 @@
 //! mpv backed danmaku session (feature `mpv`).
 //!
-//! mpv's `osd-overlay` frames carry no timeline, so a worker thread ticks the
-//! layout engine against `time-pos` and pushes a fresh frame each tick. Keeping
-//! this behind a feature lets the layout crate stay dependency free while the
-//! mpv glue is still compiled and linted on its own.
-//!
-//! Placement in mpv's Z order is what makes this safe next to subtitles: custom
-//! OSD is always drawn above the builtin OSD, subtitles included, so danmaku can
-//! never displace a subtitle track.
+//! A normal ASS subtitle track owns the animation timeline, so libass advances
+//! scrolling comments together with video presentation. The worker only reacts
+//! to UI changes; it never submits a full overlay for every display frame.
 
-use crate::{DanmakuComment, DanmakuDriver, DanmakuStyle, OverlaySink};
-use jfn_mpv::api::{jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove};
-use std::ffi::{CStr, CString};
-use std::io;
-use std::sync::Arc;
+use crate::{DanmakuComment, DanmakuEngine, DanmakuStyle};
+use jfn_mpv::api::{
+    jfn_mpv_danmaku_subtitle_add_checked, jfn_mpv_danmaku_subtitle_enable_ass_tags_checked,
+    jfn_mpv_danmaku_subtitle_reload_checked, jfn_mpv_danmaku_subtitle_remove_checked,
+    jfn_mpv_danmaku_subtitle_restore_ass_tags_checked,
+    jfn_mpv_danmaku_subtitle_set_enabled_checked,
+};
+use std::ffi::CString;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tempfile::TempPath;
 
-/// ~30 Hz: smooth enough for scrolling comments, cheap enough for a laptop on
-/// battery. Identical frames are not re-pushed, so idle stretches cost nothing.
-const TICK_MILLIS: u64 = 33;
-/// While no file has a timeline there is nothing to draw; poll slowly.
-const IDLE_TICK_MILLIS: u64 = 250;
-const DEFAULT_PLAY_RES_X: u32 = 1920;
-const DEFAULT_PLAY_RES_Y: u32 = 1080;
+const ASS_PLAY_RES_X: f32 = 1920.0;
+const ASS_PLAY_RES_Y: f32 = 1080.0;
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The player UI's danmaku switch, shared with the worker thread.
+/// The player UI's danmaku visibility and style, shared with the worker thread.
 ///
-/// Cheap to clone: the flag lives behind an `Arc`, so the UI can flip it while
-/// the worker is mid-tick without any locking.
+/// Cheap to clone: the atomic switch and the style snapshot live behind `Arc`s,
+/// so the UI can update them without restarting the worker.
 #[derive(Clone, Debug)]
 pub struct DanmakuControls {
     enabled: Arc<AtomicBool>,
+    style: Arc<Mutex<DanmakuStyle>>,
 }
 
 impl DanmakuControls {
     pub fn new(enabled: bool) -> Self {
+        Self::new_with_style(enabled, DanmakuStyle::default())
+    }
+
+    pub fn new_with_style(enabled: bool, style: DanmakuStyle) -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
+            style: Arc::new(Mutex::new(style)),
         }
     }
 
@@ -47,10 +50,22 @@ impl DanmakuControls {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Switching off takes effect on the next tick, which clears whatever is on
-    /// screen; switching back on redraws from the current position.
+    /// Switching off hides the secondary ASS track; switching back on restores
+    /// it without rebuilding the track.
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn style(&self) -> DanmakuStyle {
+        self.style
+            .lock()
+            .expect("danmaku style lock poisoned")
+            .clone()
+    }
+
+    /// Apply a new style to the running worker. It reloads the ASS track once.
+    pub fn set_style(&self, style: DanmakuStyle) {
+        *self.style.lock().expect("danmaku style lock poisoned") = style;
     }
 }
 
@@ -68,15 +83,14 @@ pub struct DanmakuSession {
 }
 
 impl DanmakuSession {
-    /// Spawn the worker. `on_error` receives human readable problems (a frame
-    /// containing a NUL byte, a rejected overlay command) so the caller can log
-    /// them in its own logging category instead of the failure being swallowed.
+    /// Spawn the worker. `on_error` receives human readable ASS generation,
+    /// subtitle-track, and cleanup failures so the caller can log them in its
+    /// own category instead of the failure being swallowed.
     ///
     /// `controls` is shared with the caller, so the player UI can switch danmaku
     /// off (and on again) while this session runs.
     pub fn start(
         comments: Vec<DanmakuComment>,
-        style: DanmakuStyle,
         controls: DanmakuControls,
         on_error: impl Fn(&str) + Send + 'static,
     ) -> io::Result<Self> {
@@ -85,7 +99,7 @@ impl DanmakuSession {
         let worker_controls = controls.clone();
         let worker = thread::Builder::new()
             .name("danmaku-overlay".to_string())
-            .spawn(move || worker_loop(worker_stop, worker_controls, comments, style, on_error))?;
+            .spawn(move || worker_loop(worker_stop, worker_controls, comments, on_error))?;
         Ok(Self {
             stop,
             controls,
@@ -104,15 +118,15 @@ impl DanmakuSession {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Stop without waiting: the thread finishes its current tick, clears the
-    /// overlays and exits.
+    /// Stop without waiting: the thread finishes its control pass, removes the
+    /// auxiliary subtitle track, and exits.
     pub fn detach(&mut self) {
         self.signal_stop();
         self.worker.take();
     }
 
-    /// Stop and wait, so this session's final overlay clear cannot land after a
-    /// newer session pushed its first frame.
+    /// Stop and wait, so this session's auxiliary track is removed before a
+    /// newer playback session starts.
     pub fn stop(&mut self) {
         self.signal_stop();
         if let Some(worker) = self.worker.take() {
@@ -127,119 +141,123 @@ impl Drop for DanmakuSession {
     }
 }
 
-struct MpvOverlaySink<'a> {
-    on_error: &'a dyn Fn(&str),
+struct AssDanmakuTrack {
+    path: TempPath,
+    id: i64,
+    previous_secondary_ass_override: CString,
 }
 
-impl OverlaySink for MpvOverlaySink<'_> {
-    fn push(&mut self, id: i64, data: &str, res_x: u32, res_y: u32, z: i32) {
-        let Ok(payload) = CString::new(data) else {
-            (self.on_error)("danmaku frame contains a NUL byte; frame dropped");
-            return;
+impl AssDanmakuTrack {
+    fn create(comments: &[DanmakuComment], style: &DanmakuStyle) -> io::Result<Self> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(render_ass_track(comments, style).as_bytes())?;
+        file.flush()?;
+        let path = file.into_temp_path();
+        let previous_secondary_ass_override =
+            jfn_mpv_danmaku_subtitle_enable_ass_tags_checked().map_err(mpv_error_to_io)?;
+        let id = match jfn_mpv_danmaku_subtitle_add_checked(&path_as_cstring(&path)?) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = jfn_mpv_danmaku_subtitle_restore_ass_tags_checked(
+                    &previous_secondary_ass_override,
+                );
+                return Err(mpv_error_to_io(error));
+            }
         };
-        // SAFETY: the CString outlives the call; mpv copies the string.
-        unsafe { jfn_mpv_danmaku_overlay(id, payload.as_ptr(), res_x as i32, res_y as i32, z) };
+        Ok(Self {
+            path,
+            id,
+            previous_secondary_ass_override,
+        })
     }
 
-    fn clear(&mut self, id: i64) {
-        jfn_mpv_danmaku_overlay_remove(id);
+    fn reload(&mut self, comments: &[DanmakuComment], style: &DanmakuStyle) -> io::Result<()> {
+        std::fs::write(&self.path, render_ass_track(comments, style))?;
+        self.id = jfn_mpv_danmaku_subtitle_reload_checked(self.id, &path_as_cstring(&self.path)?)
+            .map_err(mpv_error_to_io)?;
+        Ok(())
+    }
+
+    fn set_enabled(&self, enabled: bool) -> io::Result<()> {
+        jfn_mpv_danmaku_subtitle_set_enabled_checked(self.id, enabled).map_err(mpv_error_to_io)
+    }
+
+    fn remove(self) -> io::Result<()> {
+        let remove = jfn_mpv_danmaku_subtitle_remove_checked(self.id);
+        let restore = jfn_mpv_danmaku_subtitle_restore_ass_tags_checked(
+            &self.previous_secondary_ass_override,
+        );
+        remove.map_err(mpv_error_to_io)?;
+        restore.map_err(mpv_error_to_io)
     }
 }
 
-/// What the worker should do on one tick.
-///
-/// Kept separate from the loop so the three cases (draw / no timeline / switched
-/// off) can be tested without an mpv handle.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TickAction {
-    /// Draw the frame for this position on the media timeline.
-    Draw(f64),
-    /// No timeline yet (loading, stopping, between files): clear what is shown.
-    Clear,
-    /// Danmaku is switched off by the player UI: clear once, then stay quiet.
-    Off,
+fn render_ass_track(comments: &[DanmakuComment], style: &DanmakuStyle) -> String {
+    DanmakuEngine::new(comments.to_vec(), style.clone()).ass_track(ASS_PLAY_RES_X, ASS_PLAY_RES_Y)
 }
 
-fn tick_action(enabled: bool, position: Option<f64>) -> TickAction {
-    if !enabled {
-        return TickAction::Off;
-    }
-    match position {
-        Some(position) => TickAction::Draw(position),
-        None => TickAction::Clear,
-    }
+fn path_as_cstring(path: &TempPath) -> io::Result<CString> {
+    CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "danmaku ASS path contains NUL"))
+}
+
+fn mpv_error_to_io(error: jfn_mpv::Error) -> io::Error {
+    io::Error::other(error)
 }
 
 fn worker_loop<F>(
     stop: Arc<AtomicBool>,
     controls: DanmakuControls,
     comments: Vec<DanmakuComment>,
-    style: DanmakuStyle,
     on_error: F,
 ) where
     F: Fn(&str),
 {
-    let mut driver = DanmakuDriver::new(comments, style);
-    let mut sink = MpvOverlaySink {
-        on_error: &on_error,
+    let mut applied_style = controls.style();
+    let mut track = match AssDanmakuTrack::create(&comments, &applied_style) {
+        Ok(track) => track,
+        Err(error) => {
+            on_error(&format!("danmaku ASS track could not be loaded: {error}"));
+            return;
+        }
     };
-    // Whether anything of ours may still be on screen. mpv keeps an overlay
-    // until it is removed, so both "no timeline" and "switched off" have to clear
-    // it exactly once instead of every tick.
-    let mut overlays_live = false;
-    while !stop.load(Ordering::Relaxed) {
-        match tick_action(controls.enabled(), mpv_property_double(c"time-pos")) {
-            TickAction::Draw(position) => {
-                let paused = mpv_property_int(c"pause").unwrap_or(0) != 0;
-                let (res_x, res_y) = render_resolution();
-                driver.tick(position, paused, res_x, res_y, &mut sink);
-                overlays_live = true;
-                thread::sleep(Duration::from_millis(TICK_MILLIS));
-            }
-            TickAction::Clear | TickAction::Off => {
-                if overlays_live {
-                    // Never leave comments from the previous position (or from
-                    // before the switch was flipped) on screen.
-                    driver.stop(&mut sink);
-                    overlays_live = false;
-                }
-                thread::sleep(Duration::from_millis(IDLE_TICK_MILLIS));
-            }
+    let mut applied_enabled = true;
+    if !controls.enabled() {
+        if let Err(error) = track.set_enabled(false) {
+            on_error(&format!("danmaku ASS track could not be hidden: {error}"));
+        } else {
+            applied_enabled = false;
         }
     }
-    driver.stop(&mut sink);
-}
-
-/// PlayRes for the overlay. `osd-*` is what libass renders into; fall back to
-/// the video size and then to 1080p.
-fn render_resolution() -> (u32, u32) {
-    if let (Some(width), Some(height)) = (
-        mpv_property_int(c"osd-width"),
-        mpv_property_int(c"osd-height"),
-    ) && width > 0
-        && height > 0
-    {
-        return (width as u32, height as u32);
+    while !stop.load(Ordering::Relaxed) {
+        let next_style = controls.style();
+        if next_style != applied_style {
+            match track.reload(&comments, &next_style) {
+                Ok(()) => {
+                    applied_style = next_style;
+                    if !applied_enabled {
+                        if let Err(error) = track.set_enabled(false) {
+                            on_error(&format!(
+                                "danmaku ASS track could not be re-hidden: {error}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => on_error(&format!("danmaku ASS style reload failed: {error}")),
+            }
+        }
+        let enabled = controls.enabled();
+        if enabled != applied_enabled {
+            match track.set_enabled(enabled) {
+                Ok(()) => applied_enabled = enabled,
+                Err(error) => on_error(&format!("danmaku ASS visibility change failed: {error}")),
+            }
+        }
+        thread::sleep(CONTROL_POLL_INTERVAL);
     }
-    if let (Some(width), Some(height)) = (mpv_property_int(c"width"), mpv_property_int(c"height"))
-        && width > 0
-        && height > 0
-    {
-        return (width as u32, height as u32);
+    if let Err(error) = track.remove() {
+        on_error(&format!("danmaku ASS track could not be removed: {error}"));
     }
-    (DEFAULT_PLAY_RES_X, DEFAULT_PLAY_RES_Y)
-}
-
-fn mpv_property_double(name: &CStr) -> Option<f64> {
-    let mut value = 0.0;
-    (unsafe { jfn_mpv::api::jfn_mpv_get_property_double(name.as_ptr(), &mut value) } >= 0)
-        .then_some(value)
-}
-
-fn mpv_property_int(name: &CStr) -> Option<i64> {
-    let mut value = 0;
-    (unsafe { jfn_mpv::api::jfn_mpv_get_property_int(name.as_ptr(), &mut value) } >= 0)
-        .then_some(value)
 }
 
 #[cfg(test)]
@@ -258,12 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn tick_action_draws_clears_or_stays_off() {
-        assert_eq!(tick_action(true, Some(12.5)), TickAction::Draw(12.5));
-        assert_eq!(tick_action(true, None), TickAction::Clear);
-        // Switched off wins over a live timeline: this is what removes the
-        // overlay from the screen when the user turns danmaku off.
-        assert_eq!(tick_action(false, Some(12.5)), TickAction::Off);
-        assert_eq!(tick_action(false, None), TickAction::Off);
+    fn controls_style_is_shared_with_the_worker() {
+        let controls = DanmakuControls::default();
+        assert_eq!(controls.style(), DanmakuStyle::default());
+        let style = DanmakuStyle {
+            font_size: 72.0,
+            display_area: 0.6,
+            ..DanmakuStyle::default()
+        };
+        controls.set_style(style.clone());
+        assert_eq!(controls.style(), style);
     }
 }

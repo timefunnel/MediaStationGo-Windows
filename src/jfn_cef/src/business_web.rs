@@ -35,9 +35,11 @@ use jfn_playback::{EndReason, Input as PbInput, MediaType as PbMediaType, post a
 
 use jfn_mpv::api::JfnMpvLoadOptions;
 
-use crate::mediastation_runtime::mediastation_subtitle_style_supported;
 pub use crate::mediastation_runtime::{
     jfn_web_clear_mediastation_session, jfn_web_configure_mediastation_session,
+};
+use crate::mediastation_runtime::{
+    mediastation_danmaku_style_supported, mediastation_subtitle_style_supported,
 };
 
 // MediaType matching jfn-playback's enum: Unknown=0, Audio=1, Video=2.
@@ -526,6 +528,43 @@ fn handle_message(message: BrowserMessage) -> bool {
                 &format!("playerSetDanmaku: {enabled}"),
             );
             crate::mediastation_runtime::set_danmaku_enabled(enabled);
+        }),
+        "playerSetDanmakuStyle" => with_args(args, |a| {
+            if a.size() < 5 {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "playerSetDanmakuStyle rejected a missing value",
+                );
+                return;
+            }
+            let font_size = f64::from(list_int(a, 0));
+            let opacity_percent = f64::from(list_int(a, 1));
+            let scroll_seconds = f64::from(list_int(a, 2));
+            let fixed_seconds = f64::from(list_int(a, 3));
+            let display_area_percent = f64::from(list_int(a, 4));
+            if !mediastation_danmaku_style_supported(
+                font_size,
+                opacity_percent,
+                scroll_seconds,
+                fixed_seconds,
+                display_area_percent,
+            ) {
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_ERROR,
+                    "playerSetDanmakuStyle rejected values outside the supported range",
+                );
+                return;
+            }
+            crate::mediastation_runtime::set_danmaku_style(jfn_danmaku::DanmakuStyle {
+                font_size: font_size as f32,
+                opacity: (opacity_percent / 100.0) as f32,
+                scroll_seconds: scroll_seconds as f32,
+                fixed_seconds: fixed_seconds as f32,
+                display_area: (display_area_percent / 100.0) as f32,
+                ..jfn_danmaku::DanmakuStyle::default()
+            });
         }),
         "playerOsdActive" => with_args(args, |a| {
             let active = a.bool(0) != 0;

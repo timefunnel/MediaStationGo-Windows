@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use cef::{ImplListValue, ListValue, sys};
-use jfn_danmaku::{DanmakuSession, DanmakuStyle};
+use jfn_danmaku::DanmakuStyle;
 use jfn_frame_interpolation::{
     InterpolationMode, InterpolationModel, InterpolationPlan, PlanRequest, prepare_plan,
 };
@@ -63,6 +63,7 @@ const OPERATION_SET_PROXY_MODE: &str = "set_proxy_mode";
 const OPERATION_IMAGE: &str = "image";
 const OPERATION_TRACKS: &str = "tracks";
 const OPERATION_TRACK_SELECTION: &str = "track_selection";
+const OPERATION_DANMAKU_EVENT: &str = "danmaku_event";
 const MAX_REQUEST_ID_LEN: usize = 128;
 const ACCOUNT_ID_LEN: usize = 64;
 const MAX_MEDIA_ID_LEN: usize = 256;
@@ -80,6 +81,16 @@ const MIN_SUBTITLE_FONT_SIZE: f64 = 24.0;
 const MAX_SUBTITLE_FONT_SIZE: f64 = 64.0;
 const MIN_SUBTITLE_POSITION: f64 = 70.0;
 const MAX_SUBTITLE_POSITION: f64 = 100.0;
+const MIN_DANMAKU_FONT_SIZE: f64 = 20.0;
+const MAX_DANMAKU_FONT_SIZE: f64 = 40.0;
+const MIN_DANMAKU_OPACITY: f64 = 35.0;
+const MAX_DANMAKU_OPACITY: f64 = 100.0;
+const MIN_DANMAKU_SCROLL_SECONDS: f64 = 6.0;
+const MAX_DANMAKU_SCROLL_SECONDS: f64 = 20.0;
+const MIN_DANMAKU_FIXED_SECONDS: f64 = 3.0;
+const MAX_DANMAKU_FIXED_SECONDS: f64 = 8.0;
+const MIN_DANMAKU_DISPLAY_AREA: f64 = 30.0;
+const MAX_DANMAKU_DISPLAY_AREA: f64 = 100.0;
 const SUBTITLE_CACHE_DIRECTORY: &str = "mediastation-subtitles";
 const HOME_CACHE_DIRECTORY: &str = "mediastation-home-v1";
 const SERIES_DETAIL_CACHE_DIRECTORY: &str = "mediastation-series-details-v1";
@@ -416,7 +427,6 @@ struct RuntimeState {
     active_image_request_ids: HashSet<String>,
     active_subtitle: Option<PreparedExternalSubtitle>,
     active_interpolation: Option<ActiveInterpolation>,
-    active_danmaku: Option<DanmakuSession>,
     active_report: Option<ActivePlaybackReport>,
 }
 
@@ -444,10 +454,6 @@ struct MediaStationRuntime {
     home_cache: HomeSnapshotCache,
     series_detail_cache: Mutex<SeriesDetailSnapshotCache>,
     image_cache: Mutex<ImageDiskCache>,
-    /// The player UI's danmaku switch. It lives outside the per-item session so
-    /// the choice survives episode changes, and so a switch flipped before a
-    /// load still applies to the session that load starts.
-    danmaku_controls: jfn_danmaku::DanmakuControls,
     state: Mutex<RuntimeState>,
 }
 
@@ -636,9 +642,6 @@ impl MediaStationRuntime {
                 cache_root.join(IMAGE_CACHE_DIRECTORY),
                 MAX_IMAGE_CACHE_BYTES,
             )),
-            danmaku_controls: jfn_danmaku::DanmakuControls::new(
-                DANMAKU_ENABLED.load(Ordering::Relaxed),
-            ),
             state: Mutex::new(RuntimeState {
                 session: None,
                 session_profile: None,
@@ -649,7 +652,6 @@ impl MediaStationRuntime {
                 active_image_request_ids: HashSet::new(),
                 active_subtitle: None,
                 active_interpolation: None,
-                active_danmaku: None,
                 active_report: None,
             }),
         })
@@ -817,6 +819,16 @@ impl MediaStationRuntime {
             jfn_mpv_stop();
         } else {
             dispatch_playback_event(event);
+        }
+        if dispatched_event.is_some()
+            || matches!(
+                event.kind,
+                PlaybackEventKind::Finished
+                    | PlaybackEventKind::Canceled
+                    | PlaybackEventKind::Error
+            )
+        {
+            dispatch_danmaku_event(json!({ "kind": "clear" }));
         }
     }
 
@@ -1573,16 +1585,11 @@ impl MediaStationRuntime {
         Ok(())
     }
 
-    /// Fetch danmaku for the item that just started and run it for as long as
-    /// playback lasts. Failure is logged and leaves danmaku off: a missing
-    /// danmaku source must never break playback.
+    /// Fetch danmaku for the item that just started and hand it to the CEF
+    /// compositor. The web layer owns the animation timeline, so low source
+    /// frame rates cannot quantize scrolling into video-frame-sized steps.
     fn start_active_danmaku(&self, snapshot: &SessionSnapshot, media_id: &str) {
-        // Join the previous worker first so its final overlay clear cannot land
-        // after the new session pushed a frame.
-        let previous = self.state.lock().active_danmaku.take();
-        if let Some(mut previous) = previous {
-            previous.stop();
-        }
+        dispatch_danmaku_event(json!({ "kind": "clear" }));
 
         let payload = match self
             .api
@@ -1612,43 +1619,31 @@ impl MediaStationRuntime {
             return;
         }
 
-        let comments = payload
+        let comments: Vec<Value> = payload
             .comments
             .into_iter()
             .map(|comment| {
-                jfn_danmaku::DanmakuComment::new(
-                    comment.cid,
-                    comment.time,
-                    comment.mode,
-                    comment.color,
-                    comment.text,
-                )
+                json!({
+                    "cid": comment.cid,
+                    "time": comment.time,
+                    "mode": comment.mode,
+                    "color": comment.color,
+                    "text": comment.text,
+                })
             })
             .collect();
-        let session = match DanmakuSession::start(
-            comments,
-            DanmakuStyle::default(),
-            self.danmaku_controls.clone(),
-            |message| {
-                log_error(&format!("MediaStation danmaku: {message}"));
-            },
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                log_error(&format!(
-                    "MediaStation danmaku worker could not start for {media_id}: {error}"
-                ));
-                return;
-            }
-        };
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         if state.generation != snapshot.generation || state.session.is_none() {
-            drop(state);
-            let mut session = session;
-            session.stop();
             return;
         }
-        state.active_danmaku = Some(session);
+        drop(state);
+        dispatch_danmaku_event(json!({
+            "kind": "load",
+            "mediaId": media_id,
+            "enabled": DANMAKU_ENABLED.load(Ordering::Relaxed),
+            "style": danmaku_style_payload(&stored_danmaku_style()),
+            "comments": comments,
+        }));
     }
 
     fn active_playback_source(
@@ -2105,13 +2100,6 @@ fn plan_playback_reports(
 }
 
 fn take_stopped_report(state: &mut RuntimeState) -> Option<ReportJob> {
-    // Every path that ends or replaces playback funnels through here, so the
-    // danmaku worker is torn down here too. It is only signalled (not joined)
-    // because callers hold the state lock; the worker clears its overlays as it
-    // exits, and a session that starts later joins the old one explicitly.
-    if let Some(mut danmaku) = state.active_danmaku.take() {
-        danmaku.detach();
-    }
     let active = state.active_report.take()?;
     active
         .started
@@ -2133,6 +2121,14 @@ static RUNTIME: OnceLock<Result<Arc<MediaStationRuntime>, ()>> = OnceLock::new()
 /// The player UI's danmaku switch before/without a runtime. See
 /// [`set_danmaku_enabled`].
 static DANMAKU_ENABLED: AtomicBool = AtomicBool::new(true);
+static DANMAKU_STYLE: OnceLock<Mutex<DanmakuStyle>> = OnceLock::new();
+
+fn stored_danmaku_style() -> DanmakuStyle {
+    DANMAKU_STYLE
+        .get_or_init(|| Mutex::new(DanmakuStyle::default()))
+        .lock()
+        .clone()
+}
 
 fn runtime() -> Result<Arc<MediaStationRuntime>, LoadFailure> {
     match RUNTIME.get_or_init(|| {
@@ -2164,11 +2160,10 @@ pub(crate) fn release_playback_resources() {
     }
 }
 
-/// Turn danmaku on or off from the player UI.
+/// Apply the danmaku visibility resolved by the player UI.
 ///
-/// The switch is remembered by this runtime, so it applies to the session that is
-/// playing right now *and* to every session started later (next episode, next
-/// load). The UI owns persisting the user's choice across app restarts.
+/// The shared switch updates the session playing right now and seeds later
+/// sessions. The UI is the only persistence owner and saves one global state.
 ///
 /// It is kept in a static as well, because the UI pushes its saved preference as
 /// soon as the settings page loads — before any MediaStation session (and
@@ -2176,9 +2171,19 @@ pub(crate) fn release_playback_resources() {
 /// runtime just to store a boolean.
 pub(crate) fn set_danmaku_enabled(enabled: bool) {
     DANMAKU_ENABLED.store(enabled, Ordering::Relaxed);
-    if let Some(Ok(runtime)) = RUNTIME.get() {
-        runtime.danmaku_controls.set_enabled(enabled);
-    }
+    dispatch_danmaku_event(json!({ "kind": "enabled", "enabled": enabled }));
+}
+
+/// Apply the global danmaku style resolved by the player UI. The CEF compositor
+/// immediately restarts the currently visible comments with the new settings.
+pub(crate) fn set_danmaku_style(style: DanmakuStyle) {
+    *DANMAKU_STYLE
+        .get_or_init(|| Mutex::new(DanmakuStyle::default()))
+        .lock() = style.clone();
+    dispatch_danmaku_event(json!({
+        "kind": "style",
+        "style": danmaku_style_payload(&style),
+    }));
 }
 
 pub(crate) fn shutdown_playback_resources() {
@@ -5885,6 +5890,36 @@ pub(crate) fn mediastation_subtitle_style_supported(
         && (MIN_SUBTITLE_POSITION..=MAX_SUBTITLE_POSITION).contains(&subtitle_position)
 }
 
+pub(crate) fn mediastation_danmaku_style_supported(
+    font_size: f64,
+    opacity_percent: f64,
+    scroll_seconds: f64,
+    fixed_seconds: f64,
+    display_area_percent: f64,
+) -> bool {
+    [
+        (font_size, MIN_DANMAKU_FONT_SIZE, MAX_DANMAKU_FONT_SIZE),
+        (opacity_percent, MIN_DANMAKU_OPACITY, MAX_DANMAKU_OPACITY),
+        (
+            scroll_seconds,
+            MIN_DANMAKU_SCROLL_SECONDS,
+            MAX_DANMAKU_SCROLL_SECONDS,
+        ),
+        (
+            fixed_seconds,
+            MIN_DANMAKU_FIXED_SECONDS,
+            MAX_DANMAKU_FIXED_SECONDS,
+        ),
+        (
+            display_area_percent,
+            MIN_DANMAKU_DISPLAY_AREA,
+            MAX_DANMAKU_DISPLAY_AREA,
+        ),
+    ]
+    .into_iter()
+    .all(|(value, minimum, maximum)| value.is_finite() && (minimum..=maximum).contains(&value))
+}
+
 fn parse_bounded_number(
     args: &ListValue,
     index: usize,
@@ -7198,6 +7233,23 @@ fn dispatch_response(
     }
 }
 
+fn danmaku_style_payload(style: &DanmakuStyle) -> Value {
+    json!({
+        "fontSize": style.font_size,
+        "opacity": style.opacity * 100.0,
+        "scrollSeconds": style.scroll_seconds,
+        "fixedSeconds": style.fixed_seconds,
+        "displayArea": style.display_area * 100.0,
+    })
+}
+
+fn dispatch_danmaku_event(payload: Value) {
+    let Some(layer) = crate::business_web::active_web_layer() else {
+        return;
+    };
+    dispatch_response(&layer, "", OPERATION_DANMAKU_EVENT, true, payload);
+}
+
 pub(crate) fn log_error(message: &str) {
     jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_ERROR, message);
 }
@@ -7534,6 +7586,63 @@ mod tests {
         assert!(!mediastation_subtitle_style_supported(36.0, 69.0));
         assert!(!mediastation_subtitle_style_supported(36.0, 101.0));
         assert!(!mediastation_subtitle_style_supported(f64::NAN, 92.0));
+    }
+
+    #[test]
+    fn danmaku_style_accepts_only_supported_ranges() {
+        assert!(mediastation_danmaku_style_supported(
+            25.0, 80.0, 12.0, 4.0, 80.0
+        ));
+        assert!(mediastation_danmaku_style_supported(
+            20.0, 35.0, 6.0, 3.0, 30.0
+        ));
+        assert!(mediastation_danmaku_style_supported(
+            40.0, 100.0, 20.0, 8.0, 100.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            19.0, 80.0, 12.0, 4.0, 80.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            25.0, 34.0, 12.0, 4.0, 80.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            25.0, 80.0, 5.0, 4.0, 80.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            25.0, 80.0, 12.0, 9.0, 80.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            25.0, 80.0, 12.0, 4.0, 29.0
+        ));
+        assert!(!mediastation_danmaku_style_supported(
+            f64::NAN,
+            80.0,
+            12.0,
+            4.0,
+            80.0
+        ));
+    }
+
+    #[test]
+    fn danmaku_style_payload_uses_the_web_compositor_contract() {
+        let style = DanmakuStyle {
+            font_size: 25.0,
+            opacity: 0.8,
+            scroll_seconds: 12.0,
+            fixed_seconds: 4.0,
+            display_area: 0.8,
+            ..DanmakuStyle::default()
+        };
+        assert_eq!(
+            danmaku_style_payload(&style),
+            json!({
+                "fontSize": 25.0,
+                "opacity": 80.0,
+                "scrollSeconds": 12.0,
+                "fixedSeconds": 4.0,
+                "displayArea": 80.0,
+            })
+        );
     }
 
     #[test]
@@ -8776,7 +8885,6 @@ mod tests {
             active_image_request_ids: HashSet::new(),
             active_subtitle: None,
             active_interpolation: None,
-            active_danmaku: None,
             active_report: None,
         };
         let preference = PlaybackTrackPreference {

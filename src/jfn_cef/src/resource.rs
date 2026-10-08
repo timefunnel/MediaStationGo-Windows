@@ -261,9 +261,8 @@ mod tests {
         }
     }
 
-    /// The danmaku switch is a contract between two embedded files: the settings
-    /// markup and the script that wires it to `jmpNative`. An id that only exists
-    /// in one of them fails at runtime, in a window nobody can inspect.
+    /// The player danmaku controls are a contract between embedded markup and
+    /// the script that resolves them before calling native.
     #[test]
     fn mediastation_shell_ships_the_danmaku_switch() {
         let html = String::from_utf8(
@@ -274,8 +273,37 @@ mod tests {
         )
         .expect("shell html is utf-8");
         assert!(
-            html.contains(r#"id="settings-danmaku-enabled""#),
-            "the playback settings need a danmaku toggle"
+            html.contains(r#"id="player-danmaku""#),
+            "the active player needs a danmaku control"
+        );
+        assert!(
+            html.contains(r#"id="player-danmaku-panel""#),
+            "the active player needs a hover danmaku style panel"
+        );
+        assert!(
+            html.contains(r#"id="player-danmaku-layer""#),
+            "the active player needs a compositor-owned danmaku layer"
+        );
+        assert!(
+            html.contains(r#"id="player-danmaku-font-size" type="range" min="20" max="40""#),
+            "the danmaku size range must keep the smallest readable desktop size"
+        );
+        for id in [
+            "player-danmaku-font-size",
+            "player-danmaku-opacity",
+            "player-danmaku-display-area",
+            "player-danmaku-scroll-seconds",
+            "player-danmaku-fixed-seconds",
+            "player-danmaku-reset",
+        ] {
+            assert!(
+                html.contains(&format!(r#"id="{id}""#)),
+                "the danmaku style panel is missing {id}"
+            );
+        }
+        assert!(
+            !html.contains(r#"id="settings-danmaku-enabled""#),
+            "danmaku configuration must not be duplicated in the settings drawer"
         );
 
         let js = String::from_utf8(
@@ -286,12 +314,42 @@ mod tests {
         )
         .expect("shell script is utf-8");
         assert!(
-            js.contains("byId('settings-danmaku-enabled')"),
-            "the toggle must be wired to its markup id"
+            js.contains("canvas.getContext('2d'")
+                && js.contains("BILI_COMMON_DURATION_MS")
+                && js.contains("chooseScrollLane"),
+            "the danmaku renderer must retain the canvas and track-allocation contract"
         );
         assert!(
             js.contains("playerSetDanmaku"),
             "the toggle must reach the native player"
+        );
+        assert!(
+            js.contains("playerSetDanmakuStyle"),
+            "the danmaku style controls must reach the native player"
+        );
+        assert!(
+            js.contains("function applyDanmakuStyle"),
+            "the danmaku style controls must persist and apply their values"
+        );
+        assert!(
+            js.contains("function togglePlayerDanmaku"),
+            "the player control must toggle the global playback state"
+        );
+        assert!(
+            js.contains("function createDanmakuRenderer"),
+            "the shell must animate danmaku in the display-synchronous compositor"
+        );
+        assert!(
+            js.contains("function migrateDanmakuStyle"),
+            "saved compact danmaku settings must be migrated into the new range"
+        );
+        assert!(
+            js.contains("showPlayerFeedback(`弹幕${enabled ? '已开启' : '已关闭'}`, 2000)"),
+            "the danmaku switch feedback must disappear after two seconds"
+        );
+        assert!(
+            !js.contains("danmakuEnabledOverride"),
+            "danmaku state must not be persisted per media"
         );
     }
 }

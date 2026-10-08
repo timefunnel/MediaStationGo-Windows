@@ -166,26 +166,46 @@ impl DanmakuDriver {
             return TickOutcome::Idle;
         }
         let previous = self.last.replace(next.clone());
-        let had_overlays = previous.is_some();
-        if next.scroll.is_empty() {
-            if had_overlays {
-                sink.clear(self.ids.scroll);
+        let resolution_changed = previous
+            .as_ref()
+            .is_none_or(|frame| frame.res_x != res_x || frame.res_y != res_y);
+        let scroll_changed = resolution_changed
+            || previous
+                .as_ref()
+                .is_none_or(|frame| frame.scroll != next.scroll);
+        let fixed_changed = resolution_changed
+            || previous
+                .as_ref()
+                .is_none_or(|frame| frame.fixed != next.fixed);
+        if scroll_changed {
+            if next.scroll.is_empty() {
+                if previous
+                    .as_ref()
+                    .is_some_and(|frame| !frame.scroll.is_empty())
+                {
+                    sink.clear(self.ids.scroll);
+                }
+            } else {
+                sink.push(
+                    self.ids.scroll,
+                    &next.scroll,
+                    res_x,
+                    res_y,
+                    self.ids.scroll_z,
+                );
             }
-        } else {
-            sink.push(
-                self.ids.scroll,
-                &next.scroll,
-                res_x,
-                res_y,
-                self.ids.scroll_z,
-            );
         }
-        if next.fixed.is_empty() {
-            if had_overlays {
-                sink.clear(self.ids.fixed);
+        if fixed_changed {
+            if next.fixed.is_empty() {
+                if previous
+                    .as_ref()
+                    .is_some_and(|frame| !frame.fixed.is_empty())
+                {
+                    sink.clear(self.ids.fixed);
+                }
+            } else {
+                sink.push(self.ids.fixed, &next.fixed, res_x, res_y, self.ids.fixed_z);
             }
-        } else {
-            sink.push(self.ids.fixed, &next.fixed, res_x, res_y, self.ids.fixed_z);
         }
         TickOutcome::Updated
     }
@@ -310,6 +330,23 @@ mod tests {
             TickOutcome::Updated
         );
         assert!(sink.pushes().len() > first);
+    }
+
+    #[test]
+    fn moving_scroll_does_not_repush_an_unchanged_fixed_layer() {
+        let mut driver = driver(vec![
+            comment(0.0, MODE_SCROLL, "scroll"),
+            comment(0.0, 5, "top"),
+        ]);
+        let mut sink = Recorder::default();
+        driver.tick(0.5, false, 1920, 1080, &mut sink);
+        sink.ops.clear();
+
+        assert_eq!(
+            driver.tick(0.6, false, 1920, 1080, &mut sink),
+            TickOutcome::Updated
+        );
+        assert!(matches!(sink.ops.as_slice(), [Op::Push { id: 100, .. }]));
     }
 
     #[test]

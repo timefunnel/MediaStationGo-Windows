@@ -95,6 +95,7 @@
 
   <section id="player-view" class="player-view hidden" aria-label="播放器">
     <div id="player-poster" class="player-poster" aria-hidden="true"><img alt=""></div>
+    <div id="player-danmaku-layer" class="player-danmaku-layer" aria-hidden="true"></div>
     <div id="player-loading" class="player-loading">
       <div class="player-loading-emblem" aria-hidden="true">
         <span class="player-loading-glow"></span>
@@ -133,6 +134,18 @@
           <button id="player-playback" class="icon-button control-button player-playback" type="button" title="播放" aria-label="播放"><svg class="player-tool-icon player-state-icon player-icon-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 17.175V6.825q0-.425.3-.713t.7-.287q.125 0 .263.037t.262.113l8.15 5.175q.225.15.338.375t.112.475t-.112.475t-.338.375l-8.15 5.175q-.125.075-.262.113T9 18.175q-.4 0-.7-.288t-.3-.712"/></svg><svg class="player-tool-icon player-state-icon player-icon-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 19q-.825 0-1.412-.587T14 17V7q0-.825.588-1.412T16 5t1.413.588T18 7v10q0 .825-.587 1.413T16 19m-8 0q-.825 0-1.412-.587T6 17V7q0-.825.588-1.412T8 5t1.413.588T10 7v10q0 .825-.587 1.413T8 19"/></svg></button>
           <div class="player-tools-secondary">
             <button id="player-speed" class="icon-button control-button player-speed" type="button" title="播放速度：1×" aria-label="播放速度：1×" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10.45 15.5q.625.625 1.575.588T13.4 15.4l4.225-6.325q.225-.35-.062-.638t-.638-.062L10.6 12.6q-.65.45-.712 1.363t.562 1.537M5.1 20q-.55 0-1.012-.238t-.738-.712q-.65-1.175-1-2.437T2 14q0-2.075.788-3.9t2.137-3.175T8.1 4.788T12 4q2.05 0 3.85.775T19 6.888t2.15 3.125t.825 3.837q.025 1.375-.312 2.688t-1.038 2.512q-.275.475-.737.713T18.874 20z"/></svg></button>
+            <div id="player-danmaku-control" class="player-danmaku-control">
+              <button id="player-danmaku" class="icon-button control-button player-danmaku" type="button" title="弹幕：显示（悬停配置）" aria-label="弹幕：显示（悬停配置）" aria-pressed="true"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16q2 0 2 2v10q0 2-2 2H9.2l-4.4 3v-3H4q-2 0-2-2V6q0-2 2-2m2 4v2h9V8zm0 4v2h12v-2zm11-4v2h1V8z"/></svg></button>
+              <div id="player-danmaku-panel" class="player-danmaku-panel" role="dialog" aria-label="弹幕配置">
+                <div class="player-danmaku-panel-heading"><strong>弹幕配置</strong><button id="player-danmaku-reset" class="player-danmaku-reset" type="button">恢复推荐</button></div>
+                <label class="player-danmaku-style-row" for="player-danmaku-font-size"><span>字号</span><input id="player-danmaku-font-size" type="range" min="20" max="40" step="1"><output id="player-danmaku-font-size-value" for="player-danmaku-font-size"></output></label>
+                <label class="player-danmaku-style-row" for="player-danmaku-opacity"><span>透明度</span><input id="player-danmaku-opacity" type="range" min="35" max="100" step="1"><output id="player-danmaku-opacity-value" for="player-danmaku-opacity"></output></label>
+                <label class="player-danmaku-style-row" for="player-danmaku-display-area"><span>显示区域</span><input id="player-danmaku-display-area" type="range" min="30" max="100" step="1"><output id="player-danmaku-display-area-value" for="player-danmaku-display-area"></output></label>
+                <label class="player-danmaku-style-row" for="player-danmaku-scroll-seconds"><span>滚动速度</span><input id="player-danmaku-scroll-seconds" type="range" min="6" max="20" step="1"><output id="player-danmaku-scroll-seconds-value" for="player-danmaku-scroll-seconds"></output></label>
+                <label class="player-danmaku-style-row" for="player-danmaku-fixed-seconds"><span>停留时间</span><input id="player-danmaku-fixed-seconds" type="range" min="3" max="8" step="1"><output id="player-danmaku-fixed-seconds-value" for="player-danmaku-fixed-seconds"></output></label>
+                <p class="player-danmaku-note">全局保存，当前播放立即生效。</p>
+              </div>
+            </div>
             <button id="player-subtitles" class="icon-button control-button" type="button" title="字幕" aria-label="字幕"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 20q-.825 0-1.412-.587T2 18V6q0-.825.588-1.412T4 4h16q.825 0 1.413.588T22 6v12q0 .825-.587 1.413T20 20zm3-4h6q.425 0 .713-.288T14 15t-.288-.712T13 14H7q-.425 0-.712.288T6 15t.288.713T7 16m4-4h6q.425 0 .713-.288T18 11t-.288-.712T17 10h-6q-.425 0-.712.288T10 11t.288.713T11 12m-3.287-.288Q8 11.426 8 11t-.288-.712T7 10t-.712.288T6 11t.288.713T7 12t.713-.288m10 4Q18 15.426 18 15t-.288-.712T17 14t-.712.288T16 15t.288.713T17 16t.713-.288"/></svg></button>
             <button id="player-audio" class="icon-button control-button" type="button" title="音轨" aria-label="音轨"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7.175 19.825Q6 18.65 6 17t1.175-2.825T10 13q.575 0 1.063.138t.937.412V4q0-.425.288-.712T13 3h4q.425 0 .713.288T18 4v2q0 .425-.288.713T17 7h-3v10q0 1.65-1.175 2.825T10 21t-2.825-1.175"/></svg></button>
             <button id="player-info" class="icon-button control-button" type="button" title="播放信息" aria-label="播放信息"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.713 16.713Q13 16.425 13 16v-4q0-.425-.288-.712T12 11t-.712.288T11 12v4q0 .425.288.713T12 17t.713-.288m0-8Q13 8.425 13 8t-.288-.712T12 7t-.712.288T11 8t.288.713T12 9t.713-.288M12 22q-2.075 0-3.9-.788t-3.175-2.137T2.788 15.9T2 12t.788-3.9t2.137-3.175T8.1 2.788T12 2t3.9.788t3.175 2.137T21.213 8.1T22 12t-.788 3.9t-2.137 3.175t-3.175 2.138T12 22"/></svg></button>
@@ -250,12 +263,7 @@
             </div>
           </section>
           <section class="settings-section setting-block default-subtitle-settings settings-authenticated" data-settings-section="playback">
-            <p class="eyebrow">播放与字幕</p><h3>弹幕</h3><p>弹幕由服务端匹配后下发，绘制在字幕之上，不会挤掉字幕轨。关闭后立即从画面移除，后续剧集也不再显示。</p>
-            <div class="setting-toggle-row">
-              <label for="settings-danmaku-enabled">显示弹幕</label>
-              <input id="settings-danmaku-enabled" type="checkbox" role="switch">
-            </div>
-            <h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
+            <p class="eyebrow">播放与字幕</p><h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
             <label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
             <label class="setting-range-row" for="settings-subtitle-bottom-offset"><span>距底部</span><input id="settings-subtitle-bottom-offset" type="range" min="0" max="30" step="1"><output id="settings-subtitle-bottom-offset-value" for="settings-subtitle-bottom-offset"></output></label>
             <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>

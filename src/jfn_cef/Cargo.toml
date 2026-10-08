@@ -14,7 +14,7 @@ parking_lot.workspace = true
 cef = { workspace = true }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
-jfn-danmaku = { path = "../danmaku", features = ["mpv"] }
+jfn-danmaku = { path = "../danmaku" }
 jfn-frame-interpolation = { path = "../frame_interpolation" }
 jfn-input = { path = "../input" }
 jfn-jellyfin = { path = "../jellyfin" }

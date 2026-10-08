@@ -10,6 +10,7 @@
     const topbar = document.querySelector('.topbar');
     const content = byId('content');
     const playerView = byId('player-view');
+    const playerDanmakuLayer = byId('player-danmaku-layer');
     const playerControls = byId('player-controls');
     const playerPanel = byId('player-panel');
     const playerPanelContent = byId('player-panel-content');
@@ -36,9 +37,24 @@
     const defaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v2';
     const legacyDefaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v1';
     const danmakuEnabledSettingKey = 'MediaStationGo.Windows.danmakuEnabled.v1';
+    const danmakuStyleSettingKey = 'MediaStationGo.Windows.danmakuStyle.v1';
     const seriesPlaybackSettingsKey = 'MediaStationGo.Windows.seriesPlaybackSettings.v1';
     const uiThemeSettingKey = 'MediaStationGo.Windows.uiTheme.v1';
     const playerSubtitleStyleDefaults = Object.freeze({ fontSize: 36, bottomOffset: 8 });
+    const danmakuStyleDefaults = Object.freeze({
+        fontSize: 25,
+        opacity: 80,
+        displayArea: 80,
+        scrollSeconds: 12,
+        fixedSeconds: 4,
+    });
+    const danmakuStyleControlDefinitions = Object.freeze([
+        { property: 'fontSize', id: 'player-danmaku-font-size', outputId: 'player-danmaku-font-size-value', min: 20, max: 40, suffix: ' px' },
+        { property: 'opacity', id: 'player-danmaku-opacity', outputId: 'player-danmaku-opacity-value', min: 35, max: 100, suffix: '%' },
+        { property: 'displayArea', id: 'player-danmaku-display-area', outputId: 'player-danmaku-display-area-value', min: 30, max: 100, suffix: '%' },
+        { property: 'scrollSeconds', id: 'player-danmaku-scroll-seconds', outputId: 'player-danmaku-scroll-seconds-value', min: 6, max: 20, suffix: ' 秒' },
+        { property: 'fixedSeconds', id: 'player-danmaku-fixed-seconds', outputId: 'player-danmaku-fixed-seconds-value', min: 3, max: 8, suffix: ' 秒' },
+    ]);
     const seriesPlaybackSettingDefaults = Object.freeze({
         autoNext: true,
         introSkipSeconds: 0,
@@ -137,6 +153,7 @@
     let playerPlaybackSettings = loadPlayerPlaybackSettings();
     let defaultPlayerSubtitleStyle = loadDefaultPlayerSubtitleStyle();
     let danmakuEnabled = loadDanmakuEnabled();
+    let danmakuStyle = loadDanmakuStyle();
     let seriesPlaybackSettings = loadSeriesPlaybackSettings();
     let playerVolume = 100;
     let lastAudiblePlayerVolume = 100;
@@ -155,6 +172,7 @@
     let appUpdateState = { status: 'idle', payload: {} };
     let automaticUpdateTimer = 0;
     let updateNotificationVersion = '';
+    const danmakuRenderer = createDanmakuRenderer(playerDanmakuLayer);
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -172,6 +190,324 @@
         if (!entries.some((entry) => entry.isIntersecting)) return;
         if (currentView?.kind === 'person') loadMorePerson(currentView.data);
     }, { root: content, rootMargin: '900px 0px' });
+
+    function createDanmakuRenderer(layer) {
+        const canvas = document.createElement('canvas');
+        canvas.className = 'player-danmaku-canvas';
+        canvas.setAttribute('aria-hidden', 'true');
+        layer.replaceChildren(canvas);
+        const context = canvas.getContext('2d', { alpha: true, desynchronized: true });
+        if (!context) throw new Error('Canvas 2D is required for danmaku rendering');
+
+        const state = {
+            comments: [],
+            active: [],
+            nextIndex: 0,
+            positionMs: 0,
+            clockAt: performance.now(),
+            playing: false,
+            rate: 1,
+            enabled: true,
+            frame: 0,
+            style: { ...danmakuStyleDefaults },
+            width: 0,
+            height: 0,
+            pixelRatio: 0,
+        };
+        const BILI_PLAYER_WIDTH = 682;
+        const BILI_COMMON_DURATION_MS = 3_800;
+        const BILI_MIN_DURATION_MS = 4_000;
+        const LANE_MARGIN = 8;
+
+        const safeNumber = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+        const styleFor = (style) => ({
+            fontSize: Math.max(20, Math.min(40, Math.round(safeNumber(style?.fontSize, state.style.fontSize)))),
+            opacity: Math.max(35, Math.min(100, safeNumber(style?.opacity, state.style.opacity))),
+            displayArea: Math.max(30, Math.min(100, safeNumber(style?.displayArea, state.style.displayArea))),
+            scrollSeconds: Math.max(6, Math.min(20, safeNumber(style?.scrollSeconds, state.style.scrollSeconds))),
+            fixedSeconds: Math.max(3, Math.min(8, safeNumber(style?.fixedSeconds, state.style.fixedSeconds))),
+        });
+
+        function currentPositionMs() {
+            if (!state.playing) return state.positionMs;
+            return state.positionMs + (performance.now() - state.clockAt) * state.rate;
+        }
+
+        function syncCanvasSize() {
+            const width = Math.max(0, Math.round(layer.clientWidth));
+            const height = Math.max(0, Math.round(layer.clientHeight));
+            const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+            if (width === state.width && height === state.height && pixelRatio === state.pixelRatio) return width > 0 && height > 0;
+            state.width = width;
+            state.height = height;
+            state.pixelRatio = pixelRatio;
+            canvas.width = Math.round(width * pixelRatio);
+            canvas.height = Math.round(height * pixelRatio);
+            canvas.style.width = `${width}px`;
+            canvas.style.height = `${height}px`;
+            context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+            context.textBaseline = 'top';
+            return width > 0 && height > 0;
+        }
+
+        function commentIndexAt(seconds) {
+            let low = 0;
+            let high = state.comments.length;
+            while (low < high) {
+                const middle = low + Math.floor((high - low) / 2);
+                if (state.comments[middle].time < seconds) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        }
+
+        function restartAt(positionMs) {
+            state.active = [];
+            const visibleWindowSeconds = Math.max(22, state.style.scrollSeconds * 2, state.style.fixedSeconds);
+            state.nextIndex = commentIndexAt(Math.max(0, positionMs / 1000 - visibleWindowSeconds));
+        }
+
+        function fontSize() {
+            return state.style.fontSize;
+        }
+
+        function lineHeight() {
+            return Math.ceil(fontSize() * 1.25 + LANE_MARGIN);
+        }
+
+        function laneCount() {
+            return Math.max(1, Math.floor(state.height * state.style.displayArea / 100 / lineHeight()));
+        }
+
+        function scrollDurationMs() {
+            const biliDuration = Math.max(
+                BILI_MIN_DURATION_MS,
+                BILI_COMMON_DURATION_MS * state.width / BILI_PLAYER_WIDTH,
+            );
+            return Math.round(biliDuration * state.style.scrollSeconds / danmakuStyleDefaults.scrollSeconds);
+        }
+
+        function colorFor(value) {
+            const color = Math.max(0, Math.min(0xFFFFFF, Math.trunc(safeNumber(value, 0xFFFFFF))));
+            return `rgb(${(color >>> 16) & 0xFF}, ${(color >>> 8) & 0xFF}, ${color & 0xFF})`;
+        }
+
+        function textWidth(text) {
+            context.font = `650 ${fontSize()}px "Microsoft YaHei", sans-serif`;
+            return Math.ceil(context.measureText(text).width);
+        }
+
+        function trackEntries(mode, lane) {
+            return state.active.filter((entry) => entry.mode === mode && entry.lane === lane);
+        }
+
+        function chooseFixedLane(mode, positionMs, lanes) {
+            for (let lane = 0; lane < lanes; lane += 1) {
+                if (!trackEntries(mode, lane).some((entry) => entry.endMs > positionMs)) return lane;
+            }
+            return -1;
+        }
+
+        function chooseScrollLane(mode, positionMs, durationMs, width, lanes) {
+            const velocity = (state.width + width) / durationMs;
+            for (let lane = 0; lane < lanes; lane += 1) {
+                const previous = trackEntries(mode, lane)
+                    .filter((entry) => entry.endMs > positionMs)
+                    .sort((left, right) => right.startMs - left.startMs)[0];
+                if (!previous) return lane;
+                const elapsed = Math.max(0, positionMs - previous.startMs);
+                const previousVelocity = (state.width + previous.width) / previous.durationMs;
+                const previousRight = state.width - previousVelocity * elapsed + previous.width;
+                const previousHasEntered = previousRight <= state.width - LANE_MARGIN;
+                if (previousHasEntered && velocity <= previousVelocity) return lane;
+            }
+            return -1;
+        }
+
+        function addComment(comment, positionMs) {
+            if (!syncCanvasSize()) return;
+            const mode = Number(comment.mode) || 1;
+            const fixed = mode === 4 || mode === 5;
+            const durationMs = fixed ? state.style.fixedSeconds * 1000 : scrollDurationMs();
+            const elapsedMs = Math.max(0, positionMs - comment.time * 1000);
+            if (elapsedMs >= durationMs) return;
+            const lanes = laneCount();
+            const width = textWidth(comment.text);
+            const lane = fixed
+                ? chooseFixedLane(mode, positionMs, lanes)
+                : chooseScrollLane(mode, positionMs, durationMs, width, lanes);
+            if (lane < 0) return;
+            const height = lineHeight();
+            let top;
+            if (fixed) {
+                const top = mode === 5
+                    ? lane * height
+                    : Math.max(0, state.height - (lane + 1) * height);
+                state.active.push({
+                    mode,
+                    lane,
+                    text: comment.text,
+                    color: colorFor(comment.color),
+                    width,
+                    top,
+                    startMs: comment.time * 1000,
+                    endMs: comment.time * 1000 + durationMs,
+                    durationMs,
+                });
+            } else {
+                top = lane * height;
+                state.active.push({
+                    mode,
+                    lane,
+                    text: comment.text,
+                    color: colorFor(comment.color),
+                    width,
+                    top,
+                    startMs: comment.time * 1000,
+                    endMs: comment.time * 1000 + durationMs,
+                    durationMs,
+                });
+            }
+        }
+
+        function draw(positionMs) {
+            if (!syncCanvasSize()) return;
+            context.clearRect(0, 0, state.width, state.height);
+            context.font = `650 ${fontSize()}px "Microsoft YaHei", sans-serif`;
+            context.lineJoin = 'round';
+            context.miterLimit = 2;
+            context.lineWidth = Math.max(1, fontSize() * 0.08);
+            const alpha = state.style.opacity / 100;
+            for (const entry of state.active) {
+                const elapsed = positionMs - entry.startMs;
+                if (elapsed < 0 || elapsed >= entry.durationMs) continue;
+                let left;
+                if (entry.mode === 4 || entry.mode === 5) {
+                    left = Math.max(0, (state.width - entry.width) / 2);
+                } else {
+                    const progress = elapsed / entry.durationMs;
+                    const distance = state.width + entry.width;
+                    left = entry.mode === 6
+                        ? -entry.width + distance * progress
+                        : state.width - distance * progress;
+                }
+                context.globalAlpha = alpha;
+                context.strokeStyle = '#000';
+                context.fillStyle = entry.color;
+                context.strokeText(entry.text, left, entry.top);
+                context.fillText(entry.text, left, entry.top);
+            }
+            context.globalAlpha = 1;
+        }
+
+        function render(positionMs) {
+            if (!state.enabled || !state.comments.length || !layer.isConnected) return;
+            while (state.nextIndex < state.comments.length
+                && state.comments[state.nextIndex].time * 1000 <= positionMs) {
+                addComment(state.comments[state.nextIndex], positionMs);
+                state.nextIndex += 1;
+            }
+            state.active = state.active.filter((entry) => entry.endMs > positionMs);
+            draw(positionMs);
+        }
+
+        function tick() {
+            state.frame = 0;
+            const positionMs = currentPositionMs();
+            render(positionMs);
+            if (state.playing && state.enabled && (state.nextIndex < state.comments.length || state.active.length)) schedule();
+        }
+
+        function schedule() {
+            if (!state.frame) state.frame = requestAnimationFrame(tick);
+        }
+
+        function setClock(positionMs, playing, rate, restart) {
+            const now = performance.now();
+            const current = currentPositionMs();
+            const nextPosition = Math.max(0, safeNumber(positionMs, current));
+            const nextRate = Math.max(0.1, safeNumber(rate, state.rate));
+            state.positionMs = nextPosition;
+            state.clockAt = now;
+            state.rate = nextRate;
+            state.playing = playing === true;
+            if (restart || Math.abs(nextPosition - current) > 1500) restartAt(nextPosition);
+            render(nextPosition);
+            if (state.playing) schedule();
+        }
+
+        new ResizeObserver(() => {
+            const positionMs = currentPositionMs();
+            syncCanvasSize();
+            if (state.comments.length) restartAt(positionMs);
+            render(positionMs);
+            if (state.playing) schedule();
+        }).observe(layer);
+
+        return {
+            load(payload, positionMs, playing, rate) {
+                state.style = styleFor(payload.style);
+                state.enabled = payload.enabled !== false;
+                state.comments = Array.isArray(payload.comments)
+                    ? payload.comments
+                        .filter((comment) => Number.isFinite(Number(comment?.time)) && typeof comment?.text === 'string')
+                        .map((comment) => ({ ...comment, time: Math.max(0, Number(comment.time)) }))
+                        .sort((left, right) => left.time - right.time)
+                    : [];
+                setClock(positionMs, playing, rate, true);
+                if (!state.enabled) clearActive();
+            },
+            clear() {
+                if (state.frame) cancelAnimationFrame(state.frame);
+                state.frame = 0;
+                state.comments = [];
+                state.nextIndex = 0;
+                state.active = [];
+                if (syncCanvasSize()) context.clearRect(0, 0, state.width, state.height);
+            },
+            setEnabled(enabled) {
+                state.enabled = enabled === true;
+                if (!state.enabled) {
+                    state.active = [];
+                    if (syncCanvasSize()) context.clearRect(0, 0, state.width, state.height);
+                } else {
+                    const positionMs = currentPositionMs();
+                    restartAt(positionMs);
+                    render(positionMs);
+                }
+                if (state.enabled && state.playing) schedule();
+            },
+            setStyle(style) {
+                state.style = styleFor(style);
+                if (state.comments.length) {
+                    const positionMs = currentPositionMs();
+                    restartAt(positionMs);
+                    render(positionMs);
+                }
+                if (state.enabled && state.playing) schedule();
+            },
+            updatePlayback(event, playing) {
+                const restart = event.kind === 'seeked';
+                setClock(event.positionMs, playing, event.rate, restart);
+            },
+            setRate(rate) {
+                setClock(currentPositionMs(), state.playing, rate, false);
+            },
+        };
+    }
+
+    function handleDanmakuEvent(event) {
+        if (!event || typeof event !== 'object') return;
+        if (event.kind === 'clear') {
+            danmakuRenderer.clear();
+        } else if (event.kind === 'enabled') {
+            danmakuRenderer.setEnabled(event.enabled === true);
+        } else if (event.kind === 'style') {
+            danmakuRenderer.setStyle(event.style);
+        } else if (event.kind === 'load' && player?.card?.id === event.mediaId) {
+            danmakuRenderer.load(event, player.positionMs, player.playing, playerPlaybackRate);
+        }
+    }
 
     function nextRequestId(prefix) {
         requestSequence += 1;
@@ -211,6 +547,10 @@
         }
         if (operation === 'playback_event') {
             handlePlaybackEvent(payload);
+            return;
+        }
+        if (operation === 'danmaku_event') {
+            handleDanmakuEvent(payload);
             return;
         }
         const task = pending.get(requestId);
@@ -470,8 +810,47 @@
         return { ...playerSubtitleStyleDefaults };
     }
 
-    // 弹幕开关：由这个 UI 负责持久化，native 只记住当前值并作用到正在播放以及
-    // 之后新起的弹幕会话上（换集、重新加载都沿用）。
+    function isValidDanmakuStyle(style) {
+        return Number.isInteger(style?.fontSize) && style.fontSize >= 20 && style.fontSize <= 40
+            && Number.isInteger(style?.opacity) && style.opacity >= 35 && style.opacity <= 100
+            && Number.isInteger(style?.displayArea) && style.displayArea >= 30 && style.displayArea <= 100
+            && Number.isInteger(style?.scrollSeconds) && style.scrollSeconds >= 6 && style.scrollSeconds <= 20
+            && Number.isInteger(style?.fixedSeconds) && style.fixedSeconds >= 3 && style.fixedSeconds <= 8;
+    }
+
+    function migrateDanmakuStyle(style) {
+        const fields = [
+            ['fontSize', 20, 40],
+            ['opacity', 35, 100],
+            ['displayArea', 30, 100],
+            ['scrollSeconds', 6, 20],
+            ['fixedSeconds', 3, 8],
+        ];
+        if (!fields.every(([property]) => Number.isFinite(Number(style?.[property])))) return null;
+        return Object.fromEntries(fields.map(([property, minimum, maximum]) => [
+            property,
+            Math.max(minimum, Math.min(maximum, Math.round(Number(style[property])))),
+        ]));
+    }
+
+    function loadDanmakuStyle() {
+        try {
+            const value = window.localStorage.getItem(danmakuStyleSettingKey);
+            if (value === null) return { ...danmakuStyleDefaults };
+            const parsed = JSON.parse(value);
+            if (isValidDanmakuStyle(parsed)) return { ...parsed };
+            const migrated = migrateDanmakuStyle(parsed);
+            if (migrated) {
+                window.localStorage.setItem(danmakuStyleSettingKey, JSON.stringify(migrated));
+                return migrated;
+            }
+            console.error('MediaStation danmaku style is invalid');
+        } catch (error) {
+            console.error(`MediaStation danmaku style could not be read: ${error}`);
+        }
+        return { ...danmakuStyleDefaults };
+    }
+
     function loadDanmakuEnabled() {
         try {
             const value = window.localStorage.getItem(danmakuEnabledSettingKey);
@@ -486,16 +865,62 @@
     }
 
     function pushDanmakuEnabled() {
-        if (window.jmpNative?.playerSetDanmaku) window.jmpNative.playerSetDanmaku(danmakuEnabled);
+        if (window.jmpNative?.playerSetDanmaku) {
+            window.jmpNative.playerSetDanmaku(danmakuEnabled);
+        }
     }
 
-    function refreshDanmakuControls() {
-        const toggle = byId('settings-danmaku-enabled');
-        if (toggle) toggle.checked = danmakuEnabled;
+    function pushDanmakuStyle() {
+        if (window.jmpNative?.playerSetDanmakuStyle) {
+            window.jmpNative.playerSetDanmakuStyle(
+                danmakuStyle.fontSize,
+                danmakuStyle.opacity,
+                danmakuStyle.scrollSeconds,
+                danmakuStyle.fixedSeconds,
+                danmakuStyle.displayArea,
+            );
+        }
+    }
+
+    function refreshDanmakuStyleControls() {
+        for (const definition of danmakuStyleControlDefinitions) {
+            const input = byId(definition.id);
+            const output = byId(definition.outputId);
+            const value = danmakuStyle[definition.property];
+            input.value = String(value);
+            input.style.setProperty('--player-danmaku-progress', `${(value - definition.min) / (definition.max - definition.min) * 100}%`);
+            output.value = `${value}${definition.suffix}`;
+        }
+    }
+
+    function applyDanmakuStyle(style, persist = false) {
+        const normalized = {
+            fontSize: Math.round(Number(style?.fontSize)),
+            opacity: Math.round(Number(style?.opacity)),
+            displayArea: Math.round(Number(style?.displayArea)),
+            scrollSeconds: Math.round(Number(style?.scrollSeconds)),
+            fixedSeconds: Math.round(Number(style?.fixedSeconds)),
+        };
+        if (!isValidDanmakuStyle(normalized)) {
+            throw new RangeError('Unsupported danmaku style');
+        }
+        danmakuStyle = normalized;
+        danmakuRenderer.setStyle(normalized);
+        if (persist) {
+            try {
+                window.localStorage.setItem(danmakuStyleSettingKey, JSON.stringify(normalized));
+            } catch (error) {
+                console.error(`MediaStation danmaku style could not be saved: ${error}`);
+                showToast('弹幕样式保存失败');
+            }
+        }
+        pushDanmakuStyle();
+        refreshDanmakuStyleControls();
     }
 
     function applyDanmakuEnabled(enabled, persist = false) {
         danmakuEnabled = enabled === true;
+        danmakuRenderer.setEnabled(danmakuEnabled);
         if (persist) {
             try {
                 window.localStorage.setItem(danmakuEnabledSettingKey, String(danmakuEnabled));
@@ -505,7 +930,7 @@
             }
         }
         pushDanmakuEnabled();
-        refreshDanmakuControls();
+        refreshPlayerTools();
     }
 
     function refreshDefaultSubtitleStyleControls() {
@@ -4493,6 +4918,9 @@
             ? { ...playbackSettings.subtitleStyle }
             : { ...defaultPlayerSubtitleStyle };
         player = activePlayer;
+        danmakuRenderer.clear();
+        pushDanmakuEnabled();
+        pushDanmakuStyle();
         byId('player-title').textContent = cardTitle(card, true);
         byId('player-subtitle').textContent = card.type === 'Episode' ? episodePosition(card) : cardSubtitle(card);
         byId('player-loading-title').textContent = cardTitle(card, true);
@@ -4741,6 +5169,7 @@
         }
         if (Number.isFinite(event.durationMs) && event.durationMs > 0) player.durationMs = event.durationMs;
         updatePlayerProgress();
+        danmakuRenderer.updatePlayback(event, event.kind === 'paused' ? false : player.playing);
         if (event.kind === 'position') maybeHandleEpisodeAutomation(player, event);
         if (player.exiting && !player.stopSent && event.kind === 'started') {
             sendPlayerStop(player);
@@ -5048,7 +5477,7 @@
     }
 
     function isPlayerInteractiveTarget(target) {
-        return target instanceof Element && Boolean(target.closest('button, input, .player-panel'));
+        return target instanceof Element && Boolean(target.closest('button, input, .player-panel, .player-danmaku-panel'));
     }
 
     function seekBy(deltaMs) {
@@ -5138,6 +5567,7 @@
             throw new RangeError(`Unsupported playback rate: ${rate}`);
         }
         playerPlaybackRate = normalized;
+        danmakuRenderer.setRate(normalized);
         if (window.jmpNative) window.jmpNative.playerSetSpeed(Math.round(normalized * 1000));
         refreshPlayerPlaybackRate();
     }
@@ -5156,10 +5586,19 @@
         showPlayerControls();
     }
 
+    function togglePlayerDanmaku() {
+        if (!player || player.exiting || !player.loadInfo) return;
+        const enabled = !danmakuEnabled;
+        applyDanmakuEnabled(enabled, true);
+        showPlayerControls();
+        showPlayerFeedback(`弹幕${enabled ? '已开启' : '已关闭'}`, 2000);
+    }
+
     function refreshPlayerTools() {
         const info = player?.loadInfo;
         const playback = byId('player-playback');
         const episodes = byId('player-episodes');
+        const danmaku = byId('player-danmaku');
         const subtitles = byId('player-subtitles');
         const audio = byId('player-audio');
         const speed = byId('player-speed');
@@ -5185,6 +5624,9 @@
         episodes.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !episodic || player?.episodesLoading;
         episodes.title = player?.episodesLoading ? '正在读取选集' : '选集';
         episodes.setAttribute('aria-label', episodes.title);
+        danmaku.disabled = !player || exiting || episodeChanging || autoAdvancePending || !info;
+        danmaku.title = `弹幕：${danmakuEnabled ? '显示' : '关闭'}（悬停配置）`;
+        danmaku.setAttribute('aria-label', danmaku.title);
         subtitles.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !Array.isArray(info.subtitleTracks);
         audio.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
         speed.disabled = !player || exiting || episodeChanging || autoAdvancePending || trackChanging || !player.started;
@@ -5210,6 +5652,7 @@
         fullscreen.setAttribute('aria-pressed', String(fullscreenActive));
         const activeKind = player?.panelKind || '';
         episodes.setAttribute('aria-pressed', String(activeKind === 'episodes'));
+        danmaku.setAttribute('aria-pressed', String(danmakuEnabled));
         subtitles.setAttribute('aria-pressed', String(activeKind === 'subtitles'));
         audio.setAttribute('aria-pressed', String(activeKind === 'audio'));
         speed.setAttribute('aria-pressed', String(activeKind === 'speed'));
@@ -6071,6 +6514,7 @@
         // the app. Invalidate any older home request so it cannot overwrite
         // this newer local state while the stopped report is still pending.
         const activeCardId = player?.card?.id || '';
+        danmakuRenderer.clear();
         const resumeCardRects = player?.resumeCardRects || new Map();
         if (player && player.positionMs > 0 && homeData && Array.isArray(homeData.resume)) {
             const id = player.card?.id;
@@ -6132,8 +6576,13 @@
         scheduleControlsHide();
     }
 
+    function isDanmakuConfigurationActive() {
+        const control = byId('player-danmaku-control');
+        return control.matches(':hover') || Boolean(control.querySelector(':focus-visible'));
+    }
+
     function hidePlayerControls() {
-        if (player?.panelKind) return;
+        if (player?.panelKind || isDanmakuConfigurationActive()) return;
         playerControls.classList.remove('visible');
         if (player) player.exitArmed = false;
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
@@ -6167,7 +6616,7 @@
 
     function scheduleControlsHide() {
         window.clearTimeout(controlsTimer);
-        if (!player?.playing || !player.started || player.panelKind || player.exiting) return;
+        if (!player?.playing || !player.started || player.panelKind || player.exiting || isDanmakuConfigurationActive()) return;
         controlsTimer = window.setTimeout(hidePlayerControls, 3000);
     }
 
@@ -6249,13 +6698,10 @@
         applyDefaultPlayerSubtitleStyle(playerSubtitleStyleDefaults, true);
     });
     refreshDefaultSubtitleStyleControls();
-    const danmakuToggle = byId('settings-danmaku-enabled');
-    danmakuToggle.addEventListener('change', () => {
-        applyDanmakuEnabled(danmakuToggle.checked, true);
-    });
-    refreshDanmakuControls();
-    // 让 native 一开始就知道当前选择，否则它会按默认（开）启动这一集的弹幕。
+    refreshDanmakuStyleControls();
+    // 未开始播放时先下发全局默认和样式；开始播放后继续由全局状态驱动。
     pushDanmakuEnabled();
+    pushDanmakuStyle();
     const autoUpdateToggle = byId('settings-auto-update-check');
     autoUpdateToggle.checked = autoUpdateCheckEnabled;
     autoUpdateToggle.addEventListener('change', () => {
@@ -6335,6 +6781,34 @@
     byId('player-episodes').addEventListener('click', (event) => openPlayerPanel('episodes', event.currentTarget));
     byId('player-volume-toggle').addEventListener('click', togglePlayerMuted);
     byId('player-speed').addEventListener('click', (event) => openPlayerPanel('speed', event.currentTarget));
+    byId('player-danmaku').addEventListener('click', togglePlayerDanmaku);
+    const danmakuControl = byId('player-danmaku-control');
+    const keepDanmakuControlsVisible = () => {
+        window.clearTimeout(controlsTimer);
+        playerControls.classList.add('visible');
+        refreshPlayerCursor();
+        refreshDanmakuStyleControls();
+    };
+    danmakuControl.addEventListener('pointerenter', keepDanmakuControlsVisible);
+    danmakuControl.addEventListener('focusin', keepDanmakuControlsVisible);
+    danmakuControl.addEventListener('pointerleave', scheduleControlsHide);
+    danmakuControl.addEventListener('focusout', (event) => {
+        if (!danmakuControl.contains(event.relatedTarget)) scheduleControlsHide();
+    });
+    for (const definition of danmakuStyleControlDefinitions) {
+        const input = byId(definition.id);
+        const update = (persist) => {
+            applyDanmakuStyle({ ...danmakuStyle, [definition.property]: Number(input.value) }, persist);
+            showPlayerControls();
+        };
+        input.addEventListener('input', () => update(false));
+        input.addEventListener('change', () => update(true));
+    }
+    byId('player-danmaku-reset').addEventListener('click', () => {
+        applyDanmakuStyle(danmakuStyleDefaults, true);
+        showPlayerFeedback('弹幕样式已恢复');
+        showPlayerControls();
+    });
     const playerVolumeControl = byId('player-volume');
     playerVolumeControl.addEventListener('input', (event) => {
         applyPlayerVolume(event.currentTarget.value, false);
@@ -6399,8 +6873,13 @@
                 }
                 return;
             }
+            if (!inputActive && event.key.toLowerCase() === 'd') {
+                event.preventDefault();
+                togglePlayerDanmaku();
+                return;
+            }
             const active = document.activeElement;
-            const toolButtons = [byId('player-playback'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
+            const toolButtons = [byId('player-playback'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
                 .filter((button) => !button.disabled);
             if (!playerPanel.classList.contains('hidden')) {
                 if (event.key === 'Escape' || event.key === 'Backspace') {

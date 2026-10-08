@@ -922,7 +922,9 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .player-poster img.image-ready { opacity: 1; }
 .player-view.cursor-hidden, .player-view.cursor-hidden * { cursor: none !important; }
-.player-controls { position: absolute; inset: 0; opacity: 0; transition: opacity 160ms ease; pointer-events: none; }
+.player-danmaku-layer { position: absolute; z-index: 2; inset: 0; overflow: hidden; pointer-events: none; contain: layout paint; }
+.player-danmaku-canvas { display: block; width: 100%; height: 100%; pointer-events: none; }
+.player-controls { position: absolute; z-index: 4; inset: 0; opacity: 0; transition: opacity 160ms ease; pointer-events: none; }
 .player-controls.visible { opacity: 1; pointer-events: auto; }
 .player-topline { display: flex; align-items: center; padding: 26px 30px 76px; background: linear-gradient(180deg, rgba(0,0,0,0.76), transparent); }
 .control-button {
@@ -1074,6 +1076,49 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .player-volume-control input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(255,255,255,0.2); }
 .player-volume-control output { width: 24px; color: rgba(255,255,255,0.68); font-size: 11px; text-align: right; }
 .player-tools .player-speed { flex: 0 0 auto; }
+.player-danmaku-control { position: relative; display: flex; align-items: center; }
+.player-danmaku-panel {
+  position: absolute;
+  z-index: 5;
+  right: 0;
+  bottom: calc(100% + 10px);
+  display: grid;
+  width: min(300px, calc(100vw - 36px));
+  gap: 7px;
+  padding: 12px 13px 11px;
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 8px;
+  background: rgba(14,18,20,0.98);
+  box-shadow: 0 18px 42px rgba(0,0,0,0.44);
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(5px);
+  transition: opacity 140ms ease, transform 140ms ease, visibility 140ms ease;
+  visibility: hidden;
+}
+.player-danmaku-control:hover .player-danmaku-panel,
+.player-danmaku-control:has(:focus-visible) .player-danmaku-panel {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+  visibility: visible;
+}
+.player-danmaku-control:has(#player-danmaku:disabled) .player-danmaku-panel { display: none; }
+.player-danmaku-panel::after { position: absolute; right: 0; bottom: -11px; width: 100%; height: 11px; content: ""; }
+.player-danmaku-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 4px; }
+.player-danmaku-panel-heading strong { font-size: 13px; }
+.player-danmaku-reset { height: 26px; padding: 0 7px; color: rgba(255,255,255,0.66); border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; background: transparent; cursor: pointer; font-size: 11px; }
+.player-danmaku-reset:hover, .player-danmaku-reset:focus-visible { color: #fff; border-color: rgba(255,255,255,0.24); background: rgba(255,255,255,0.06); outline: 0; }
+.player-danmaku-style-row { display: grid; grid-template-columns: 52px minmax(0, 1fr) 48px; align-items: center; gap: 9px; min-height: 27px; color: rgba(255,255,255,0.68); font-size: 11px; }
+.player-danmaku-style-row input { --player-danmaku-progress: 50%; width: 100%; height: 20px; margin: 0; appearance: none; background: transparent; cursor: pointer; }
+.player-danmaku-style-row input::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: linear-gradient(90deg, var(--accent) 0 var(--player-danmaku-progress), rgba(255,255,255,0.2) var(--player-danmaku-progress) 100%); }
+.player-danmaku-style-row input::-webkit-slider-thumb { width: 11px; height: 11px; margin-top: -4px; appearance: none; border: 0; border-radius: 50%; background: var(--accent); }
+.player-danmaku-style-row input:focus-visible { outline: 0; }
+.player-danmaku-style-row input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(255,255,255,0.2); }
+.player-danmaku-style-row output { color: var(--text); text-align: right; }
+.player-danmaku-note { margin: 2px 0 0; color: rgba(255,255,255,0.46); font-size: 10px; line-height: 1.45; }
 .player-tools .icon-button[aria-pressed="true"] { color: var(--accent-strong); border-color: rgba(50,205,183,0.34); background: rgba(7,10,11,0.5); opacity: 1; }
 .player-tools .player-fullscreen[aria-pressed="true"] { color: var(--text); }
 .player-tools .player-fullscreen[aria-pressed="true"]:hover { background: rgba(255,255,255,0.08); }

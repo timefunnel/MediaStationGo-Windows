@@ -2,11 +2,10 @@
 //!
 //! mpv's `osd-overlay` with `format=ass-events` has **no timeline**: every line
 //! of the `data` string becomes one ASS `Dialogue` Text, and timing dependent
-//! tags such as `\move`, `\t` and `\fad` do not animate. So the caller has to
-//! recompute positions itself and push a fresh frame every tick, which is what
-//! this crate does: given the comments of one episode, the current playback
-//! position and the render resolution, produce the ASS event lines for two
-//! overlays (z=0 scrolling, z=1 top/bottom).
+//! tags such as `\move`, `\t` and `\fad` do not animate. The live player instead
+//! uses this layout engine to compile one ordinary ASS subtitle track per item.
+//! libass then advances `\move` itself on every video frame, without a stream of
+//! per-frame overlay commands.
 //!
 //! Everything here is pure computation: no mpv, no I/O, so the layout rules can
 //! be unit tested without a player.
@@ -83,14 +82,14 @@ pub struct DanmakuStyle {
 
 impl Default for DanmakuStyle {
     fn default() -> Self {
-        // Values chosen to match the web player and the uosc_danmaku defaults
-        // that the research settled on (0.85 leaves room for subtitles).
+        // Match the readable desktop-player baseline exposed by the web
+        // 25 px is the Bilibili-style 100% desktop baseline; 20 px is the compact floor.
         Self {
-            font_size: 50.0,
-            opacity: 0.7,
-            scroll_seconds: 15.0,
-            fixed_seconds: 5.0,
-            display_area: 0.85,
+            font_size: 25.0,
+            opacity: 0.8,
+            scroll_seconds: 12.0,
+            fixed_seconds: 4.0,
+            display_area: 0.8,
             outline: 1.0,
             shadow: 0.0,
         }
@@ -258,6 +257,40 @@ impl DanmakuEngine {
         frame
     }
 
+    /// Build a complete ASS track using the same lane allocation as live frame
+    /// rendering. The regular subtitle decoder owns timing, so `\move` advances
+    /// at the video output cadence instead of being quantized by an overlay
+    /// worker loop.
+    pub fn ass_track(&mut self, res_x: f32, res_y: f32) -> String {
+        self.reset();
+        self.ensure_geometry(res_x, res_y);
+        while self.next_index < self.comments.len() {
+            let next_time = self.comments[self.next_index].time;
+            self.place_due_comments(next_time, res_x);
+        }
+
+        let mut track = String::from(
+            "[Script Info]\nScriptType: v4.00+\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n",
+        );
+        track.push_str(&format!(
+            "PlayResX: {}\nPlayResY: {}\n\n",
+            res_x.max(1.0).round() as u32,
+            res_y.max(1.0).round() as u32,
+        ));
+        track.push_str(
+            "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Danmaku,Arial,50,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n",
+        );
+        for index in 0..self.comments.len() {
+            let Some(placement) = self.placements[index] else {
+                continue;
+            };
+            let comment = &self.comments[index];
+            track.push_str(&self.render_timed_comment(comment, &placement, res_x));
+            track.push('\n');
+        }
+        track
+    }
+
     fn place_due_comments(&mut self, now: f64, res_x: f32) {
         while self.next_index < self.comments.len() {
             let comment_time = self.comments[self.next_index].time;
@@ -380,7 +413,7 @@ impl DanmakuEngine {
             MODE_TOP | MODE_BOTTOM => {
                 let anchor = if mode == MODE_TOP { "\\an8" } else { "\\an2" };
                 format!(
-                    "{prefix}{anchor}\\pos({:.0},{:.0})}}{text}",
+                    "{prefix}{anchor}\\pos({:.2},{:.2})}}{text}",
                     res_x / 2.0,
                     placement.top
                 )
@@ -388,14 +421,77 @@ impl DanmakuEngine {
             MODE_REVERSE => {
                 // Enters from the left edge and travels right.
                 let x = -placement.width + placement.speed * elapsed as f32;
-                format!("{prefix}\\an7\\pos({:.0},{:.0})}}{text}", x, placement.top)
+                format!("{prefix}\\an7\\pos({:.2},{:.2})}}{text}", x, placement.top)
             }
             _ => {
                 let x = res_x - placement.speed * elapsed as f32;
-                format!("{prefix}\\an7\\pos({:.0},{:.0})}}{text}", x, placement.top)
+                format!("{prefix}\\an7\\pos({:.2},{:.2})}}{text}", x, placement.top)
             }
         }
     }
+
+    fn render_timed_comment(
+        &self,
+        comment: &DanmakuComment,
+        placement: &Placement,
+        res_x: f32,
+    ) -> String {
+        let mode = comment.effective_mode();
+        let start = comment.time.max(0.0);
+        let end = start + self.duration(mode);
+        let style = &self.style;
+        let color = format!("{:06X}", comment.color & 0x00FF_FFFF);
+        let bgr = format!("{}{}{}", &color[4..6], &color[2..4], &color[0..2]);
+        let prefix = format!(
+            "{{\\c&H{bgr}&\\alpha&H{:02X}&\\fs{}\\bord{}\\shad{}\\q2",
+            style.alpha_tag(),
+            style.font_size.round() as i32,
+            style.outline,
+            style.shadow
+        );
+        let text = escape_ass_text(&comment.text);
+        let (layer, position) = match mode {
+            MODE_TOP | MODE_BOTTOM => {
+                let anchor = if mode == MODE_TOP { "\\an8" } else { "\\an2" };
+                (
+                    1,
+                    format!("{anchor}\\pos({:.2},{:.2})", res_x / 2.0, placement.top),
+                )
+            }
+            MODE_REVERSE => (
+                0,
+                format!(
+                    "\\an7\\move({:.2},{:.2},{:.2},{:.2})",
+                    -placement.width, placement.top, res_x, placement.top
+                ),
+            ),
+            _ => (
+                0,
+                format!(
+                    "\\an7\\move({:.2},{:.2},{:.2},{:.2})",
+                    res_x, placement.top, -placement.width, placement.top
+                ),
+            ),
+        };
+        format!(
+            "Dialogue: {layer},{},{},Danmaku,,0,0,0,,{prefix}{position}}}{text}",
+            ass_timestamp(start),
+            ass_timestamp(end),
+        )
+    }
+}
+
+fn ass_timestamp(seconds: f64) -> String {
+    let centiseconds = if seconds.is_finite() {
+        (seconds.max(0.0) * 100.0).round() as u64
+    } else {
+        0
+    };
+    let hours = centiseconds / 360_000;
+    let minutes = (centiseconds / 6_000) % 60;
+    let secs = (centiseconds / 100) % 60;
+    let hundredths = centiseconds % 100;
+    format!("{hours}:{minutes:02}:{secs:02}.{hundredths:02}")
 }
 
 /// Rough width in pixels: CJK glyphs are about one em, ASCII about half an em.
@@ -452,7 +548,17 @@ mod tests {
     }
 
     fn engine_with(comments: Vec<DanmakuComment>) -> DanmakuEngine {
-        DanmakuEngine::new(comments, DanmakuStyle::default())
+        // Rendering mechanics must not depend on the player-facing recommendation.
+        DanmakuEngine::new(
+            comments,
+            DanmakuStyle {
+                font_size: 42.0,
+                opacity: 0.7,
+                scroll_seconds: 15.0,
+                fixed_seconds: 5.0,
+                ..DanmakuStyle::default()
+            },
+        )
     }
 
     fn positions(frame: &str) -> Vec<(f32, f32)> {
@@ -489,6 +595,32 @@ mod tests {
         let late = engine.frame(14.9, 1920.0, 1080.0);
         let x_late = positions(&late.scroll)[0].0;
         assert!(x_late < x_mid, "comment must keep travelling, got {x_late}");
+    }
+
+    #[test]
+    fn scrolling_positions_keep_subpixel_precision() {
+        let mut engine = engine_with(vec![comment(0.0, MODE_SCROLL, "hello")]);
+        let x = positions(&engine.frame(0.001, 1920.0, 1080.0).scroll)[0].0;
+        assert!(
+            (x - x.round()).abs() > 0.01,
+            "scroll position was snapped to an integer pixel: {x}"
+        );
+    }
+
+    #[test]
+    fn ass_track_uses_timed_move_events_for_scrolling_comments() {
+        let mut engine = engine_with(vec![
+            comment(2.5, MODE_SCROLL, "scroll"),
+            comment(2.5, MODE_TOP, "top"),
+            comment(2.5, MODE_REVERSE, "reverse"),
+        ]);
+        let track = engine.ass_track(1920.0, 1080.0);
+        assert!(track.contains("[Events]"));
+        assert!(track.contains("Dialogue: 0,0:00:02.50,0:00:17.50,Danmaku,,0,0,0,,{\\c&"));
+        assert!(track.contains("\\move(1920.00,"));
+        assert!(track.contains("\\move(-"));
+        assert!(track.contains("Dialogue: 1,0:00:02.50,0:00:07.50,Danmaku"));
+        assert!(track.contains("\\pos(960.00,"));
     }
 
     #[test]

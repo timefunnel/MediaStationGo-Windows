@@ -23,8 +23,8 @@
 //! * clearing the overlay restores the frame byte for byte.
 //!
 //! Ignored by default: it needs libmpv and a desktop session (mpv opens its own
-//! window for a few seconds). The clip is generated on the spot — a still PPM,
-//! which mpv reads through its image demuxer — so no fixture is shipped; set
+//! window for a few seconds). The clip is generated on the spot — a solid-color
+//! Y4M frame sequence with a real presentation clock — so no fixture is shipped; set
 //! `DANMAKU_LIVE_VIDEO` to run against a real clip instead.
 //!
 //! ```text
@@ -32,12 +32,13 @@
 //! ```
 
 use jfn_danmaku::{
-    DanmakuComment, DanmakuControls, DanmakuDriver, DanmakuSession, DanmakuStyle, OverlaySink,
-    TickOutcome,
+    DanmakuComment, DanmakuControls, DanmakuDriver, DanmakuSession, DanmakuStyle, MODE_SCROLL,
+    OverlaySink, TickOutcome,
 };
 use jfn_mpv::api::{
-    WaitEvent, jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove, jfn_mpv_get_property_int,
-    jfn_mpv_get_property_string, jfn_mpv_wait_event, wait_event_owned,
+    WaitEvent, jfn_mpv_danmaku_overlay, jfn_mpv_danmaku_overlay_remove,
+    jfn_mpv_get_property_double, jfn_mpv_get_property_int, jfn_mpv_get_property_string,
+    jfn_mpv_wait_event, wait_event_owned,
 };
 use jfn_mpv::boot::{
     DisplayBackend, JfnMpvBoot, jfn_mpv_handle_get, jfn_mpv_handle_init, jfn_mpv_handle_terminate,
@@ -55,9 +56,10 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CLIP_WIDTH: usize = 320;
 const CLIP_HEIGHT: usize = 240;
-/// mpv holds a still image this long; the test is done long before it ends, so
-/// the screenshot never runs against an end-of-file frame queue.
-const CLIP_SECONDS: &str = "30";
+const CLIP_FPS: usize = 30;
+/// Long enough for the serial live tests; short enough to keep the generated
+/// fixture small.
+const CLIP_SECONDS: usize = 10;
 /// Overlay id used for the `compute_bounds` probe. The driver owns its own ids.
 const PROBE_ID: i64 = 999;
 /// `reply_userdata` of the bounds probe, so its reply is unambiguous: every
@@ -82,18 +84,25 @@ fn lock_mpv() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Write a solid navy PPM. mpv reads PPM through its image demuxer, so this
-/// gives us a deterministic frame source without shipping a video fixture or
-/// depending on a runnable ffmpeg.
+/// Write a solid navy Y4M clip. The pixels are deterministic, while the frame
+/// sequence gives libass a real media clock for testing `\move`.
 #[allow(
     clippy::expect_used,
     reason = "a live test must fail loudly when it cannot write its fixture"
 )]
 fn write_clip(path: &Path) {
-    let mut bytes = format!("P6\n{CLIP_WIDTH} {CLIP_HEIGHT}\n255\n").into_bytes();
-    bytes.reserve(CLIP_WIDTH * CLIP_HEIGHT * 3);
-    for _ in 0..CLIP_WIDTH * CLIP_HEIGHT {
-        bytes.extend_from_slice(&[0, 0, 128]);
+    let pixels_per_frame = CLIP_WIDTH * CLIP_HEIGHT;
+    let frames = CLIP_FPS * CLIP_SECONDS;
+    let mut bytes =
+        format!("YUV4MPEG2 W{CLIP_WIDTH} H{CLIP_HEIGHT} F{CLIP_FPS}:1 Ip A0:0 C420jpeg\n")
+            .into_bytes();
+    bytes.reserve(frames * (6 + pixels_per_frame * 3 / 2));
+    for _ in 0..frames {
+        bytes.extend_from_slice(b"FRAME\n");
+        // BT.601-ish YUV for a dark navy solid; only repeatability matters.
+        bytes.extend(std::iter::repeat_n(16, pixels_per_frame));
+        bytes.extend(std::iter::repeat_n(184, pixels_per_frame / 4));
+        bytes.extend(std::iter::repeat_n(105, pixels_per_frame / 4));
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("clip directory");
@@ -259,6 +268,15 @@ fn read_string(name: &str) -> String {
     value
 }
 
+#[allow(clippy::expect_used, reason = "a live test must fail loudly")]
+fn read_double(name: &str) -> f64 {
+    let name = CString::new(name).expect("property name");
+    let mut value = 0.0;
+    let status = unsafe { jfn_mpv_get_property_double(name.as_ptr(), &mut value) };
+    assert_eq!(status, 0, "mpv should expose {name:?} (error {status})");
+    value
+}
+
 /// mpv reports the video size only once the video output has video parameters,
 /// i.e. once a screenshot can actually produce a frame.
 #[allow(
@@ -305,9 +323,6 @@ fn boot(_screenshot_dir: &Path) -> *mut jfn_mpv::sys::mpv_handle {
     };
     let raw = unsafe { jfn_mpv_handle_init(&boot) };
     assert!(!raw.is_null(), "libmpv should initialize");
-    // The clip is a still PPM, so mpv's one-second default would end playback
-    // before the frames are read.
-    set_property("image-display-duration", CLIP_SECONDS);
     raw
 }
 
@@ -331,6 +346,54 @@ impl Frame {
         (0..self.height.min(other.height))
             .filter(|row| self.row(*row) != other.row(*row))
             .collect()
+    }
+
+    /// Bounds of the pixels that changed relative to another composited frame.
+    fn changed_bounds(&self, other: &Self) -> Option<PixelBounds> {
+        let width = self.width.min(other.width);
+        let height = self.height.min(other.height);
+        let mut bounds: Option<PixelBounds> = None;
+        for y in 0..height {
+            for x in 0..width {
+                let start = y * self.stride + x * 4;
+                let other_start = y * other.stride + x * 4;
+                if self.data[start..start + 4] != other.data[other_start..other_start + 4] {
+                    bounds = Some(match bounds {
+                        Some(bounds) => bounds.extend(x, y),
+                        None => PixelBounds::new(x, y),
+                    });
+                }
+            }
+        }
+        bounds
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PixelBounds {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl PixelBounds {
+    fn new(x: usize, y: usize) -> Self {
+        Self {
+            x0: x,
+            y0: y,
+            x1: x,
+            y1: y,
+        }
+    }
+
+    fn extend(self, x: usize, y: usize) -> Self {
+        Self {
+            x0: self.x0.min(x),
+            y0: self.y0.min(y),
+            x1: self.x1.max(x),
+            y1: self.y1.max(y),
+        }
     }
 }
 
@@ -675,7 +738,7 @@ fn danmaku_overlay_is_rendered_into_the_video_output() {
     let video = match env::var("DANMAKU_LIVE_VIDEO") {
         Ok(path) => PathBuf::from(path),
         Err(_) => {
-            let generated = env::temp_dir().join("danmaku-overlay-live-clip.ppm");
+            let generated = env::temp_dir().join("danmaku-overlay-live-clip.y4m");
             write_clip(&generated);
             generated
         }
@@ -863,11 +926,10 @@ fn the_danmaku_switch_clears_and_restores_the_overlay() {
     set_property("vid", "1");
     let (_res_x, _res_y) = wait_for_video_size();
 
-    // Nothing of ours is on screen yet, and the clip is a still image, so this
-    // frame is the reference the switch has to restore.
+    // Nothing of ours is on screen yet, and the clip has solid-color pixels, so
+    // this frame is the reference the switch has to restore.
     let baseline = screenshot_raw();
 
-    let controls = DanmakuControls::new(true);
     let comments = vec![DanmakuComment::new("live-1", 0.0, 5, 0x00_FF_00, LIVE_TEXT)];
     let style = DanmakuStyle {
         font_size: 32.0,
@@ -876,9 +938,10 @@ fn the_danmaku_switch_clears_and_restores_the_overlay() {
         fixed_seconds: 600.0,
         ..DanmakuStyle::default()
     };
+    let controls = DanmakuControls::new_with_style(true, style);
     let failures = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink_failures = Arc::clone(&failures);
-    let mut session = DanmakuSession::start(comments, style, controls.clone(), move |message| {
+    let mut session = DanmakuSession::start(comments, controls.clone(), move |message| {
         if let Ok(mut collected) = sink_failures.lock() {
             collected.push(message.to_string());
         }
@@ -887,9 +950,23 @@ fn the_danmaku_switch_clears_and_restores_the_overlay() {
 
     let with_danmaku = wait_for_frame(&baseline, false, Duration::from_secs(10));
     let shown = with_danmaku.differing_rows(&baseline);
+    let worker_failures = failures.lock().expect("failure list").clone();
     assert!(
         !shown.is_empty(),
-        "the worker did not draw anything: the frame never changed (is time-pos available?)"
+        "the worker did not draw anything: sid={} secondary-sid={} secondary-sub-visibility={} failures={worker_failures:?}",
+        read_string("sid"),
+        read_string("secondary-sid"),
+        read_string("secondary-sub-visibility"),
+    );
+    assert_eq!(
+        read_string("sid"),
+        "no",
+        "danmaku must not take the primary subtitle slot when no subtitle was selected"
+    );
+    assert_ne!(
+        read_string("secondary-sid"),
+        "no",
+        "danmaku should be selected only as the secondary subtitle"
     );
 
     controls.set_enabled(false);
@@ -920,5 +997,127 @@ fn the_danmaku_switch_clears_and_restores_the_overlay() {
         "the switch changed rows {}..={} while on and restored the frame byte for byte when off",
         shown.first().copied().unwrap_or(0),
         shown.last().copied().unwrap_or(0),
+    );
+}
+
+/// A regular ASS subtitle track, rather than an `ass-events` OSD snapshot,
+/// must advance the comment between video frames. This is the real player path:
+/// the ordinary subtitle stays primary while danmaku occupies `secondary-sid`.
+#[test]
+#[ignore = "needs libmpv and a desktop session"]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a live test must fail loudly when its input is missing"
+)]
+fn timed_ass_danmaku_moves_between_composited_frames() {
+    let _guard = lock_mpv();
+    let video = match env::var("DANMAKU_LIVE_VIDEO") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let generated = env::temp_dir().join("danmaku-timed-ass-live-clip.y4m");
+            write_clip(&generated);
+            generated
+        }
+    };
+    assert!(video.is_file(), "clip not found: {}", video.display());
+
+    let dir = run_dir("timed-ass");
+    fs::create_dir_all(&dir).expect("capture directory");
+    let _handle = boot(&dir);
+    loadfile(&video);
+    let (loaded, reconfigured) = wait_for_load();
+    assert!(loaded, "the clip should load: {}", video.display());
+    assert!(reconfigured, "mpv should configure a video output");
+    set_property("vid", "1");
+    let (_res_x, _res_y) = wait_for_video_size();
+    set_property("pause", "no");
+
+    let subtitle = write_subtitle(&dir.join("primary.srt"));
+    add_subtitle(&subtitle);
+    drain(Duration::from_millis(300));
+    let primary_sid = read_string("sid");
+    assert_ne!(
+        primary_sid, "no",
+        "the ordinary subtitle should be selected"
+    );
+    let baseline = screenshot_raw();
+    let previous_secondary_ass_override = read_string("secondary-sub-ass-override");
+
+    let comment_time = read_double("time-pos");
+    let comments = vec![DanmakuComment::new(
+        "moving-live-1",
+        comment_time,
+        MODE_SCROLL,
+        0x00_FF_00,
+        LIVE_TEXT,
+    )];
+    let controls = DanmakuControls::new_with_style(
+        true,
+        DanmakuStyle {
+            font_size: 32.0,
+            display_area: 0.5,
+            scroll_seconds: 6.0,
+            ..DanmakuStyle::default()
+        },
+    );
+    let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink_failures = Arc::clone(&failures);
+    let mut session = DanmakuSession::start(comments, controls, move |message| {
+        if let Ok(mut collected) = sink_failures.lock() {
+            collected.push(message.to_string());
+        }
+    })
+    .expect("the danmaku worker should start");
+
+    let first = wait_for_frame(&baseline, false, Duration::from_secs(10));
+    let first_bounds = first.changed_bounds(&baseline).unwrap_or_else(|| {
+        panic!(
+            "the first danmaku frame should contain visible glyphs: time-pos={} sid={} secondary-sid={} secondary-sub-visibility={} secondary-sub-ass-override={} failures={:?}",
+            read_double("time-pos"),
+            read_string("sid"),
+            read_string("secondary-sid"),
+            read_string("secondary-sub-visibility"),
+            read_string("secondary-sub-ass-override"),
+            failures.lock().expect("failure list"),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let second = screenshot_raw();
+    let second_bounds = second
+        .changed_bounds(&baseline)
+        .expect("the second danmaku frame should contain visible glyphs");
+    assert!(
+        second_bounds.x0 + 8 < first_bounds.x0,
+        "the ASS event should move left while visible: first={first_bounds:?}, second={second_bounds:?}"
+    );
+    assert_eq!(
+        read_string("sid"),
+        primary_sid,
+        "adding danmaku as secondary must preserve the primary subtitle"
+    );
+    assert_ne!(
+        read_string("secondary-sid"),
+        "no",
+        "the running danmaku track should be selected as secondary"
+    );
+    session.stop();
+    let after_stop = wait_for_frame(&baseline, true, Duration::from_secs(10));
+    assert_eq!(
+        after_stop.data, baseline.data,
+        "removing the danmaku track should leave the primary subtitle untouched"
+    );
+    assert_eq!(
+        read_string("secondary-sub-ass-override"),
+        previous_secondary_ass_override,
+        "stopping danmaku should restore the user's secondary subtitle ASS setting"
+    );
+    jfn_mpv_handle_terminate();
+
+    let failures = failures.lock().expect("failure list").clone();
+    assert!(failures.is_empty(), "the worker reported: {failures:?}");
+    println!(
+        "timed ASS at {comment_time:.3}s moved from x={}..={} to x={}..={} while primary sid {} stayed selected",
+        first_bounds.x0, first_bounds.x1, second_bounds.x0, second_bounds.x1, primary_sid,
     );
 }

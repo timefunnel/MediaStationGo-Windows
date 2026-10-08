@@ -37,6 +37,7 @@ pub(crate) enum NativeFunction {
     PlayerSetAspectMode,
     PlayerOsdActive,
     PlayerSetDanmaku,
+    PlayerSetDanmakuStyle,
     OpenConfigDir,
     SaveServerUrl,
     NotifyMetadata,
@@ -106,6 +107,7 @@ impl NativeFunction {
             "playerSetAspectMode" => Self::PlayerSetAspectMode,
             "playerOsdActive" => Self::PlayerOsdActive,
             "playerSetDanmaku" => Self::PlayerSetDanmaku,
+            "playerSetDanmakuStyle" => Self::PlayerSetDanmakuStyle,
             "openConfigDir" => Self::OpenConfigDir,
             "saveServerUrl" => Self::SaveServerUrl,
             "notifyMetadata" => Self::NotifyMetadata,
@@ -176,6 +178,7 @@ impl NativeFunction {
             Self::PlayerSetAspectMode => "playerSetAspectMode",
             Self::PlayerOsdActive => "playerOsdActive",
             Self::PlayerSetDanmaku => "playerSetDanmaku",
+            Self::PlayerSetDanmakuStyle => "playerSetDanmakuStyle",
             Self::OpenConfigDir => "openConfigDir",
             Self::SaveServerUrl => "saveServerUrl",
             Self::NotifyMetadata => "notifyMetadata",
@@ -301,6 +304,7 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayerSetAspectMode,
     NativeFunction::PlayerOsdActive,
     NativeFunction::PlayerSetDanmaku,
+    NativeFunction::PlayerSetDanmakuStyle,
     NativeFunction::OpenConfigDir,
     NativeFunction::SaveServerUrl,
     NativeFunction::NotifyMetadata,
@@ -662,6 +666,13 @@ mod tests {
         assert!(
             WEB_FUNCTIONS.contains(&function),
             "the player UI must be allowed to call the danmaku switch"
+        );
+        let style_function = NativeFunction::from_name("playerSetDanmakuStyle")
+            .expect("playerSetDanmakuStyle must exist");
+        assert_eq!(style_function.name(), "playerSetDanmakuStyle");
+        assert!(
+            WEB_FUNCTIONS.contains(&style_function),
+            "the player UI must be allowed to change danmaku style"
         );
     }
 }

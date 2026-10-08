@@ -345,6 +345,19 @@ fn set_str_checked(name: &CStr, value: &CStr) -> crate::Result<()> {
     })
 }
 
+fn property_string_checked(name: &CStr) -> crate::Result<CString> {
+    let handle = checked_raw()?;
+    let value = unsafe { sys::mpv_get_property_string(handle, name.as_ptr()) };
+    if value.is_null() {
+        return Err(crate::Error::new(
+            sys::mpv_error::MPV_ERROR_PROPERTY_UNAVAILABLE.0,
+        ));
+    }
+    let copied = unsafe { CStr::from_ptr(value) }.to_owned();
+    unsafe { sys::mpv_free(value.cast()) };
+    Ok(copied)
+}
+
 fn cmd_checked(args: &[&CStr]) -> crate::Result<()> {
     let handle = checked_raw()?;
     let mut pointers: Vec<*const c_char> = args.iter().map(|value| value.as_ptr()).collect();
@@ -448,6 +461,78 @@ pub fn jfn_mpv_sub_remove_current() {
 
 pub fn jfn_mpv_sub_remove_current_checked() -> crate::Result<()> {
     cmd_checked(&[c"sub-remove"])
+}
+
+/// Add an ASS danmaku track as the secondary subtitle, preserving the current
+/// primary subtitle selection. The caller owns the returned external track ID.
+pub fn jfn_mpv_danmaku_subtitle_add_checked(url: &CStr) -> crate::Result<i64> {
+    cmd_checked(&[c"sub-add", url, c"auto", c"MediaStation Danmaku", c"und"])?;
+    let id = danmaku_subtitle_track_id(None)?;
+    set_str_checked(c"secondary-sid", &track_to_mpv_str(id))?;
+    Ok(id)
+}
+
+/// Permit ASS positioning and animation tags on the secondary subtitle used by
+/// danmaku. Returns the user's previous choice so the playback session can put
+/// it back after its auxiliary track is removed.
+pub fn jfn_mpv_danmaku_subtitle_enable_ass_tags_checked() -> crate::Result<CString> {
+    let previous = property_string_checked(c"secondary-sub-ass-override")?;
+    set_str_checked(c"secondary-sub-ass-override", c"no")?;
+    Ok(previous)
+}
+
+/// Restore the user's secondary subtitle ASS override after danmaku stops.
+pub fn jfn_mpv_danmaku_subtitle_restore_ass_tags_checked(previous: &CStr) -> crate::Result<()> {
+    set_str_checked(c"secondary-sub-ass-override", previous)
+}
+
+/// Replace a danmaku ASS track after its file was rewritten. `sub-reload`
+/// selects its replacement as primary, so load the replacement with `auto`,
+/// switch only `secondary-sid`, then remove the old owned track.
+pub fn jfn_mpv_danmaku_subtitle_reload_checked(id: i64, url: &CStr) -> crate::Result<i64> {
+    cmd_checked(&[c"sub-add", url, c"auto", c"MediaStation Danmaku", c"und"])?;
+    let replacement = danmaku_subtitle_track_id(Some(id))?;
+    set_str_checked(c"secondary-sid", &track_to_mpv_str(replacement))?;
+    let id = CString::new(id.to_string())
+        .map_err(|_| crate::Error::new(sys::mpv_error::MPV_ERROR_INVALID_PARAMETER.0))?;
+    cmd_checked(&[c"sub-remove", &id])?;
+    Ok(replacement)
+}
+
+fn danmaku_subtitle_track_id(excluding: Option<i64>) -> crate::Result<i64> {
+    jfn_mpv_get_property_node(c"track-list")?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|track| {
+            let id = track.get("id")?.as_int()?;
+            (track.get("type")?.as_str() == Some("sub")
+                && track.get("external")?.as_flag() == Some(true)
+                && track.get("title")?.as_str() == Some("MediaStation Danmaku")
+                && Some(id) != excluding)
+                .then_some(id)
+        })
+        .max()
+        .ok_or_else(|| crate::Error::new(sys::mpv_error::MPV_ERROR_INVALID_PARAMETER.0))
+}
+
+/// Show or hide the owned danmaku secondary subtitle without touching the
+/// primary subtitle selected by the user.
+pub fn jfn_mpv_danmaku_subtitle_set_enabled_checked(id: i64, enabled: bool) -> crate::Result<()> {
+    if enabled {
+        let track = track_to_mpv_str(id);
+        set_str_checked(c"secondary-sid", &track)
+    } else {
+        set_str_checked(c"secondary-sid", c"no")
+    }
+}
+
+/// Remove the owned danmaku subtitle track at the end of a playback session.
+pub fn jfn_mpv_danmaku_subtitle_remove_checked(id: i64) -> crate::Result<()> {
+    set_str_checked(c"secondary-sid", c"no")?;
+    let id = CString::new(id.to_string())
+        .map_err(|_| crate::Error::new(sys::mpv_error::MPV_ERROR_INVALID_PARAMETER.0))?;
+    cmd_checked(&[c"sub-remove", &id])
 }
 
 pub unsafe fn jfn_mpv_audio_add(url: *const c_char) {
