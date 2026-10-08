@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$OutputLibDir
+    [string]$OutputLibDir,
+    [string]$EngineBuilderPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,16 +67,26 @@ foreach ($RuntimeFile in @("rife_runtime.dll", "cudart64_12.dll", "tensorrt_rtx_
         throw "Required frame interpolation runtime file is missing: $RuntimePath"
     }
 }
-$BuilderComponents = @(
-    "tensorrt_rtx.exe",
-    "tensorrt_onnxparser_rtx_1_4.dll"
-)
+$BuilderComponents = @("tensorrt_onnxparser_rtx_1_4.dll")
 foreach ($Component in $BuilderComponents) {
     $Source = Join-Path $RuntimeBin $Component
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
         throw "Required TensorRT-RTX builder component is missing: $Source"
     }
     Copy-Item -LiteralPath $Source -Destination (Join-Path $OutputLibDir $Component) -Force
+}
+
+if (-not $EngineBuilderPath) {
+    $EngineBuilderPath = Join-Path $RepoRoot "build\rife-runtime\rife_engine_builder.exe"
+}
+if (-not (Test-Path -LiteralPath $EngineBuilderPath -PathType Leaf)) {
+    throw "Project-owned RIFE engine builder is missing: $EngineBuilderPath"
+}
+Copy-Item -LiteralPath $EngineBuilderPath `
+    -Destination (Join-Path $OutputLibDir "rife_engine_builder.exe") -Force
+$LegacyBuilder = Join-Path $OutputLibDir "tensorrt_rtx.exe"
+if (Test-Path -LiteralPath $LegacyBuilder -PathType Leaf) {
+    Remove-Item -LiteralPath $LegacyBuilder -Force
 }
 
 $StageDir = Join-Path $OutputLibDir "frame-interpolation"
@@ -137,7 +148,7 @@ $Manifest = [ordered]@{
     cudaRuntimeDll = "cudart64_12.dll"
     tensorRtDll = "tensorrt_rtx_1_4.dll"
     onnxParserDll = "tensorrt_onnxparser_rtx_1_4.dll"
-    engineBuilder = "tensorrt_rtx.exe"
+    engineBuilder = "rife_engine_builder.exe"
     models = $ModelEntries
 }
 $ManifestPath = Join-Path $StageDir "runtime-manifest.json"

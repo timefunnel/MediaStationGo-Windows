@@ -1,7 +1,7 @@
 MediaStationGo includes the following NVIDIA runtime components for RTX frame
 interpolation:
 
-- TensorRT-RTX 1.4.0.76 runtime, ONNX parser, and engine builder
+- TensorRT-RTX 1.4.0.76 runtime and ONNX parser libraries
 - CUDA Runtime cudart64_12.dll
 
 These components are proprietary NVIDIA software and remain subject to the
@@ -15,3 +15,8 @@ https://docs.nvidia.com/cuda/eula/index.html
 
 TensorRT-RTX third-party acknowledgements are distributed next to this file.
 This notice does not replace or modify the NVIDIA license agreements.
+
+rife_engine_builder.exe is a project-owned, MIT-licensed application helper
+that calls the TensorRT-RTX API only for this application's RIFE models.
+The NVIDIA SDK command-line developer tool tensorrt_rtx.exe is not included
+in the application's runtime distribution. See RIFE-ENGINE-BUILDER-MIT.txt.

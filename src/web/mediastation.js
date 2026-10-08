@@ -84,6 +84,7 @@
     let imageActive = 0;
     let imageDiskStats = { imageBytes: 0, imageCount: 0 };
     let imageStatsTimer = 0;
+    let interpolationComponentTimer = 0;
     let requestSequence = 0;
     let toastTimer = 0;
     let drawerTrigger = null;
@@ -664,6 +665,10 @@
             playback_proxy_unavailable: '标准 Emby 播放需要可用的 Windows 系统代理',
             settings_write_failed: '无法保存当前服务器设置',
             frame_interpolation_runtime_unavailable: 'RIFE 插帧组件不可用',
+            frame_interpolation_component_not_installed: '未安装插帧组件',
+            frame_interpolation_component_not_published: '插帧组件包尚未发布，暂时不能在线安装',
+            frame_interpolation_component_busy: '组件变更暂不可执行，请等待任务完成或退出其他播放器实例',
+            frame_interpolation_component_invalid: '插帧组件校验或变更失败',
             frame_interpolation_nvidia_smi_unavailable: '无法读取 NVIDIA GPU 状态',
             frame_interpolation_nvidia_driver_unavailable: 'NVIDIA 驱动不可用',
             frame_interpolation_nvidia_output_invalid: 'NVIDIA GPU 信息无效',
@@ -879,6 +884,8 @@
         stopHeroCarousel();
         window.clearTimeout(imageStatsTimer);
         imageStatsTimer = 0;
+        window.clearTimeout(interpolationComponentTimer);
+        interpolationComponentTimer = 0;
         homeData = null;
         currentView = null;
         history.length = 0;
@@ -1498,10 +1505,42 @@
     function updateFrameInterpolationStatus(status) {
         if (!status) return;
         const label = byId('settings-frame-interpolation-status');
+        const component = status.component || {};
+        const blocked = component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
+        byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
+        byId('settings-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
+        byId('settings-confirm-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
+        window.clearTimeout(interpolationComponentTimer);
+        interpolationComponentTimer = 0;
         if (interpolationModels[status.selectedModel]) {
             preferredInterpolationModel = status.selectedModel;
         }
-        if (status.componentStatus === 'ready') {
+        if (component.supported === false) {
+            label.textContent = '插帧组件只支持 Windows x64。';
+            label.dataset.state = 'error';
+        } else if (component.busy) {
+            const progress = component.progress || {};
+            label.textContent = progress.phase === 'downloading'
+                ? `正在下载：${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${progress.source}`
+                : progress.phase === 'verifying' ? '正在校验并准备安装组件...' : '正在查询组件发行包...';
+            label.dataset.state = 'pending';
+            interpolationComponentTimer = window.setTimeout(refreshFrameInterpolationStatus, 1500);
+        } else if (component.restartRequired) {
+            label.textContent = component.pendingOperation === 'uninstall'
+                ? '已排队卸载：退出所有播放器实例并重新启动后生效。'
+                : '已校验安装包：退出所有播放器实例并重新启动后生效。';
+            if (['frame_interpolation_component_busy', 'frame_interpolation_component_invalid'].includes(status.failureCode)) {
+                label.textContent = `启动时未能执行组件变更：${status.failureDetail}。待重启操作已保留。`;
+            }
+            label.dataset.state = 'pending';
+            byId('settings-confirm-frame-interpolation-uninstall').classList.add('hidden');
+        } else if (component.error) {
+            label.textContent = component.error.message;
+            label.dataset.state = 'error';
+        } else if (component.installed === false) {
+            label.textContent = '未安装插帧组件。普通播放不受影响，可按需下载安装。';
+            label.dataset.state = 'pending';
+        } else if (status.componentStatus === 'ready') {
             const engines = Number.isFinite(status.engineCount) ? `${status.engineCount} 个 Engine` : null;
             const modelCount = Array.isArray(status.models) ? `${status.models.length} 个模型` : null;
             const components = [status.gpuName, modelCount, status.runtimeVersion, engines].filter(Boolean);
@@ -1511,6 +1550,22 @@
             const error = new Error(status.failureDetail || 'RIFE 插帧组件不可用');
             error.code = status.failureCode || 'frame_interpolation_runtime_unavailable';
             label.textContent = friendlyError(error);
+            label.dataset.state = 'error';
+        }
+    }
+
+    async function changeFrameInterpolationComponent(install) {
+        byId('settings-install-frame-interpolation').disabled = true;
+        byId('settings-uninstall-frame-interpolation').disabled = true;
+        byId('settings-confirm-uninstall-frame-interpolation').disabled = true;
+        const operation = install ? 'frame_interpolation_component_install' : 'frame_interpolation_component_uninstall';
+        try {
+            const status = await nativeRequest('mediaStationFrameInterpolation', operation, [operation], 15000);
+            updateFrameInterpolationStatus(status);
+        } catch (error) {
+            await refreshFrameInterpolationStatus();
+            const label = byId('settings-frame-interpolation-status');
+            label.textContent = `组件操作失败：${friendlyError(error)}`;
             label.dataset.state = 'error';
         }
     }
@@ -6307,6 +6362,16 @@
         refreshUpdateControls();
         window.jmpNative.updateInstall();
     });
+    byId('settings-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent(true));
+    byId('settings-uninstall-frame-interpolation').addEventListener('click', () => {
+        byId('settings-confirm-frame-interpolation-uninstall').classList.remove('hidden');
+        byId('settings-confirm-uninstall-frame-interpolation').focus();
+    });
+    byId('settings-cancel-uninstall-frame-interpolation').addEventListener('click', () => {
+        byId('settings-confirm-frame-interpolation-uninstall').classList.add('hidden');
+        byId('settings-uninstall-frame-interpolation').focus();
+    });
+    byId('settings-confirm-uninstall-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent(false));
     byId('settings-clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;

@@ -622,6 +622,25 @@ int wmain(int argc, wchar_t **argv)
         return 2;
     const uint32_t shape_alignment = alignment_length == 0
         ? 128u : static_cast<uint32_t>(_wtoi(alignment_value));
+    // Only the validation probe selects a matrix here. Production continues
+    // to use the decoded frame's color metadata, without changing the runtime.
+    wchar_t matrix_value[16]{};
+    const DWORD matrix_length = GetEnvironmentVariableW(
+        L"MSGO_RIFE_COLOR_MATRIX", matrix_value,
+        static_cast<DWORD>(std::size(matrix_value)));
+    if (matrix_length >= std::size(matrix_value))
+        return 2;
+    uint32_t color_matrix = RIFE_COLOR_MATRIX_BT709;
+    if (matrix_length != 0) {
+        if (std::wcscmp(matrix_value, L"bt2020nc") == 0)
+            color_matrix = RIFE_COLOR_MATRIX_BT2020_NCL;
+        else if (std::wcscmp(matrix_value, L"bt601") == 0)
+            color_matrix = RIFE_COLOR_MATRIX_BT601;
+        else if (std::wcscmp(matrix_value, L"bt709") != 0) {
+            std::fprintf(stderr, "RIFE_RUNTIME_PROBE_INVALID_COLOR_MATRIX\n");
+            return 2;
+        }
+    }
     if (!width || !height
         || (shape_alignment != 64 && shape_alignment != 128)
         || (sequence_mode
@@ -727,7 +746,7 @@ int wmain(int argc, wchar_t **argv)
         width,
         height,
         shape_alignment,
-        RIFE_COLOR_MATRIX_BT709,
+        color_matrix,
         1,
         8,
         32,

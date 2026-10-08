@@ -15,7 +15,6 @@ $OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
 $LicenseDir = Join-Path $OutputDir "licenses"
 $FfmpegCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
 $LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
-$TensorRtRoot = Join-Path $RepoRoot "third_party\frame-interpolation-runtime\.tensorrt\TensorRT-RTX-1.4.0.76"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Copy-RequiredFile {
@@ -46,14 +45,6 @@ Copy-RequiredFile (Join-Path $RepoRoot "third_party\libplacebo-$LibplaceboCommit
     (Join-Path $LicenseDir "libplacebo-LGPL-2.1-or-later.txt")
 Copy-RequiredFile (Join-Path $RepoRoot "resources\win\licenses\CEF-LICENSE.txt") `
     (Join-Path $LicenseDir "CEF-LICENSE.txt")
-Copy-RequiredFile (Join-Path $RepoRoot "resources\win\licenses\RIFE-LICENSE.txt") `
-    (Join-Path $LicenseDir "RIFE-LICENSE.txt")
-Copy-RequiredFile (Join-Path $RepoRoot "resources\win\licenses\NVIDIA-RUNTIME-NOTICE.txt") `
-    (Join-Path $LicenseDir "NVIDIA-RUNTIME-NOTICE.txt")
-Copy-RequiredFile (Join-Path $TensorRtRoot "doc\Acknowledgements.txt") `
-    (Join-Path $LicenseDir "TensorRT-RTX-Acknowledgements.txt")
-Copy-RequiredFile (Join-Path $TensorRtRoot "doc\README.txt") `
-    (Join-Path $LicenseDir "TensorRT-RTX-README.txt")
 
 $CefCredits = @(Get-ChildItem (Join-Path $RepoRoot ".cache\cef") -Recurse `
     -Filter "CREDITS.html" -File -ErrorAction SilentlyContinue)

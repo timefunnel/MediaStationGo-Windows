@@ -22,6 +22,8 @@ const RIFE_PROFILE_MAX: u32 = 16_384;
 const RIFE_PROFILE_OPT_WIDTH: u32 = 3_840;
 const RIFE_PROFILE_OPT_HEIGHT: u32 = 2_176;
 
+pub mod component;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InterpolationMode {
     #[default]
@@ -225,11 +227,26 @@ struct RuntimeComponents {
 }
 
 static REPORT: OnceLock<CapabilityReport> = OnceLock::new();
+static COMPONENT_ROOT: OnceLock<Result<PathBuf, InterpolationError>> = OnceLock::new();
+static COMPONENT_LEASE: OnceLock<File> = OnceLock::new();
 static ENGINE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn initialize(cache_root: &Path) -> &'static CapabilityReport {
     let cache_root = cache_root.to_path_buf();
-    REPORT.get_or_init(|| build_capability_report(&cache_root))
+    let root = COMPONENT_ROOT.get_or_init(|| {
+        component::startup(&cache_root).map(|(root, lease)| {
+            // Native runtime objects remain pinned until this process exits.
+            COMPONENT_LEASE.get_or_init(|| lease);
+            root
+        })
+    });
+    REPORT.get_or_init(|| match root {
+        Ok(_) => build_capability_report(&cache_root),
+        Err(failure) => CapabilityReport {
+            failure: Some(failure.clone()),
+            ..CapabilityReport::default()
+        },
+    })
 }
 
 pub fn capability_report() -> CapabilityReport {
@@ -373,22 +390,32 @@ fn probe_runtime(
     gpu: &GpuInfo,
     cache_root: &Path,
 ) -> Result<RuntimeComponents, InterpolationError> {
-    let executable = std::env::current_exe().map_err(|error| {
-        InterpolationError::new(
-            "frame_interpolation_runtime_location_unavailable",
-            format!("The application path is unavailable: {error}"),
-        )
-    })?;
-    let executable_dir = executable.parent().ok_or_else(|| {
-        InterpolationError::new(
-            "frame_interpolation_runtime_location_unavailable",
-            format!(
-                "The application path has no parent: {}",
-                executable.display()
-            ),
-        )
-    })?;
-    let runtime_dir = executable_dir.join("frame-interpolation");
+    let component_root = COMPONENT_ROOT
+        .get()
+        .ok_or_else(|| {
+            InterpolationError::new(
+                "frame_interpolation_not_initialized",
+                "Component startup has not run",
+            )
+        })?
+        .as_ref()
+        .map_err(Clone::clone)?;
+    probe_runtime_directory(gpu, cache_root, component_root)
+}
+
+fn probe_runtime_directory(
+    gpu: &GpuInfo,
+    cache_root: &Path,
+    component_root: &Path,
+) -> Result<RuntimeComponents, InterpolationError> {
+    if !component_root.is_dir() {
+        return Err(InterpolationError::new(
+            "frame_interpolation_component_not_installed",
+            "Install the RTX interpolation component in Settings, then restart",
+        ));
+    }
+    component::validate_directory(component_root)?;
+    let runtime_dir = component_root.join("frame-interpolation");
     let manifest_path = runtime_dir.join("runtime-manifest.json");
     let bytes = std::fs::read(&manifest_path).map_err(|error| {
         InterpolationError::new(
@@ -428,11 +455,17 @@ fn probe_runtime(
             ),
         ));
     }
-    let runtime_dll = component_path(executable_dir, &manifest, "runtimeDll")?;
-    let cuda_runtime_dll = component_path(executable_dir, &manifest, "cudaRuntimeDll")?;
-    let tensor_rt_dll = component_path(executable_dir, &manifest, "tensorRtDll")?;
-    let onnx_parser_dll = component_path(executable_dir, &manifest, "onnxParserDll")?;
-    let engine_builder = component_path(executable_dir, &manifest, "engineBuilder")?;
+    let runtime_dll = component_path(component_root, &manifest, "runtimeDll")?;
+    let cuda_runtime_dll = component_path(component_root, &manifest, "cudaRuntimeDll")?;
+    let tensor_rt_dll = component_path(component_root, &manifest, "tensorRtDll")?;
+    let onnx_parser_dll = component_path(component_root, &manifest, "onnxParserDll")?;
+    let engine_builder = component_path(component_root, &manifest, "engineBuilder")?;
+    if engine_builder.file_name() != Some(std::ffi::OsStr::new("rife_engine_builder.exe")) {
+        return Err(InterpolationError::new(
+            "frame_interpolation_manifest_invalid",
+            "The runtime requires the project-owned RIFE engine builder",
+        ));
+    }
     for path in [
         &runtime_dll,
         &cuda_runtime_dll,
@@ -1017,7 +1050,6 @@ fn build_model_engine(
     append_engine_profile_arguments(&mut command, &model.profiles);
     let output = command
         .arg(path_argument("--saveEngine=", &temporary_engine))
-        .args(["--skipInference", "--useGpu"])
         .output()
         .map_err(|error| {
             InterpolationError::new(
@@ -1147,7 +1179,9 @@ fn bounded_command_output(stdout: &[u8], stderr: &[u8]) -> String {
 fn probe_runtime_abi(path: &Path) -> Result<(), InterpolationError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::FreeLibrary;
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+    };
 
     type AbiVersion = unsafe extern "C" fn() -> u32;
     let wide = path
@@ -1155,7 +1189,13 @@ fn probe_runtime_abi(path: &Path) -> Result<(), InterpolationError> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+    let module = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_WITH_ALTERED_SEARCH_PATH,
+        )
+    };
     if module.is_null() {
         return Err(InterpolationError::new(
             "frame_interpolation_runtime_load_failed",
@@ -1546,6 +1586,52 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
+    #[ignore = "requires the built component ZIP and a configured NVIDIA RTX GPU"]
+    fn real_component_installs_loads_native_abi_and_uninstalls() {
+        let archive = PathBuf::from(
+            std::env::var_os("MSGO_RIFE_COMPONENT_TEST_ARCHIVE")
+                .expect("set MSGO_RIFE_COMPONENT_TEST_ARCHIVE"),
+        );
+        let hash = hash_file(&archive, "archive_missing", "archive_corrupt").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("frame-interpolation");
+        component::queue_install(&cache, &archive, &hash).unwrap();
+        assert_eq!(component::status(&cache).unwrap()["installed"], false);
+        let (active, lease) = component::startup(&cache).unwrap();
+        let gpu = probe_gpu().unwrap();
+        let runtime = probe_runtime_directory(&gpu, &cache, &active).unwrap();
+        assert!(runtime.runtime_dll.starts_with(&active));
+        assert!(runtime.engine_builder.starts_with(&active));
+        assert_eq!(runtime.tensor_rt_version, "1.4.0.76");
+        assert_eq!(runtime.models.len(), 3);
+        for model in &runtime.models {
+            assert!(model.onnx_path.starts_with(&active));
+            println!(
+                "COMPONENT_NATIVE_MODEL_OK model={} sha={} profiles={} alignment={}",
+                model.model.as_str(),
+                model.model_sha256,
+                model.profiles.len(),
+                model.model.shape_alignment()
+            );
+        }
+        println!(
+            "COMPONENT_NATIVE_ABI_OK gpu={} driver={} abi=8 builder={}",
+            gpu.name,
+            gpu.driver,
+            runtime.engine_builder.display()
+        );
+        component::queue_uninstall(&cache).unwrap();
+        assert!(active.exists());
+        drop(lease);
+        let (_, lease) = component::startup(&cache).unwrap();
+        assert!(!active.exists());
+        assert!(!runtime.cache_dir.exists());
+        drop(lease);
+        temp.close().unwrap();
+    }
+
+    #[test]
     fn missing_nvidia_smi_is_reported_explicitly() {
         let error = run_nvidia_smi(OsStr::new("jfn-missing-nvidia-smi-4f98c34d.exe"))
             .expect_err("the test executable must not exist");
@@ -1584,7 +1670,7 @@ mod tests {
             runtime: Some(RuntimeComponents {
                 runtime_dll: PathBuf::from("/runtime/rife_runtime.dll"),
                 cuda_runtime_dll: PathBuf::from("/runtime/cudart64_12.dll"),
-                engine_builder: PathBuf::from("/runtime/tensorrt_rtx.exe"),
+                engine_builder: PathBuf::from("/runtime/rife_engine_builder.exe"),
                 tensor_rt_version: RIFE_TENSORRT_VERSION.to_string(),
                 cache_dir: PathBuf::from("/cache/frame-interpolation/engine-cache"),
                 models: InterpolationModel::ALL
@@ -1692,6 +1778,9 @@ mod tests {
             .next()
             .expect("model");
         let original = engine_cache_key(&gpu, RIFE_TENSORRT_VERSION, "builder-sha", &runtime);
+        let replaced_builder =
+            engine_cache_key(&gpu, RIFE_TENSORRT_VERSION, "owned-builder-sha", &runtime);
+        assert_ne!(original, replaced_builder);
         runtime.profiles[1].max_width -= runtime.model.shape_alignment();
         let changed = engine_cache_key(&gpu, RIFE_TENSORRT_VERSION, "builder-sha", &runtime);
         assert_ne!(original, changed);

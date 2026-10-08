@@ -15,6 +15,7 @@ $RuntimeDir = (Resolve-Path -LiteralPath $RuntimeDir).Path
 $Source = Join-Path $PSScriptRoot "mpv\rife_runtime.cpp"
 $Header = Join-Path $PSScriptRoot "mpv\rife_runtime.h"
 $ProbeSource = Join-Path $PSScriptRoot "rife_runtime_probe.cpp"
+$BuilderSource = Join-Path $PSScriptRoot "rife_engine_builder.cpp"
 $CudaHeaderDir = $PSScriptRoot
 $TensorRtRoot = Join-Path $RuntimeDir ".tensorrt\TensorRT-RTX-1.4.0.76"
 $TensorRtInclude = Join-Path $TensorRtRoot "include"
@@ -24,9 +25,12 @@ foreach ($Required in @(
     $Source,
     $Header,
     $ProbeSource,
+    $BuilderSource,
     (Join-Path $CudaHeaderDir "cuda_runtime_api.h"),
     (Join-Path $TensorRtInclude "NvInferRuntime.h"),
-    (Join-Path $TensorRtLib "tensorrt_rtx_1_4.lib")
+    (Join-Path $TensorRtLib "tensorrt_rtx_1_4.lib"),
+    (Join-Path $TensorRtInclude "NvOnnxParser.h"),
+    (Join-Path $TensorRtLib "tensorrt_onnxparser_rtx_1_4.lib")
 )) {
     if (-not (Test-Path -LiteralPath $Required)) {
         throw "RIFE runtime build input is missing: $Required"
@@ -57,6 +61,7 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 $OutputDll = Join-Path $OutputDir "rife_runtime.dll"
 $OutputProbe = Join-Path $OutputDir "rife_runtime_probe.exe"
+$OutputBuilder = Join-Path $OutputDir "rife_engine_builder.exe"
 & cl.exe /nologo /std:c++20 /EHsc /O2 /W4 /WX /wd4100 /LD `
     "/I$CudaHeaderDir" "/I$TensorRtInclude" $Source "/Fo:$OutputDir\" `
     "/Fe:$OutputDll" /link "/LIBPATH:$TensorRtLib" `
@@ -72,5 +77,14 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutputProbe)) {
     throw "RIFE runtime probe compilation failed"
 }
 
+& cl.exe /nologo /std:c++20 /utf-8 /EHsc /O2 /W4 /WX /wd4100 `
+    "/I$CudaHeaderDir" "/I$TensorRtInclude" $BuilderSource `
+    "/Fo:$OutputDir\rife_engine_builder.obj" "/Fe:$OutputBuilder" /link `
+    "/LIBPATH:$TensorRtLib" tensorrt_rtx_1_4.lib tensorrt_onnxparser_rtx_1_4.lib
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutputBuilder)) {
+    throw "Project-owned RIFE engine builder compilation failed"
+}
+
+Write-Host "RIFE_ENGINE_BUILDER_BUILD_OK path=$OutputBuilder" -ForegroundColor Green
 Write-Host "RIFE_RUNTIME_BUILD_OK path=$OutputDll" -ForegroundColor Green
 Write-Host "RIFE_RUNTIME_PROBE_BUILD_OK path=$OutputProbe" -ForegroundColor Green

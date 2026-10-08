@@ -139,12 +139,11 @@ try {
 
     $TensorRtBin = Join-Path $StagedRuntime ".tensorrt\TensorRT-RTX-1.4.0.76\bin"
     $RuntimeBin = Join-Path $StagedRuntime "bin"
-    foreach ($Name in @("tensorrt_rtx.exe", "tensorrt_onnxparser_rtx_1_4.dll")) {
+    # The SDK CLI stays inside the development SDK, never in runtime/bin.
+    foreach ($Name in @("tensorrt_onnxparser_rtx_1_4.dll")) {
         Copy-Item -LiteralPath (Join-Path $TensorRtBin $Name) `
             -Destination (Join-Path $RuntimeBin $Name) -Force
     }
-    Assert-FileHash -Path (Join-Path $RuntimeBin "tensorrt_rtx.exe") `
-        -Expected $PinnedHashes[".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_rtx.exe"]
     Assert-FileHash -Path (Join-Path $RuntimeBin "tensorrt_onnxparser_rtx_1_4.dll") `
         -Expected $PinnedHashes[".tensorrt\TensorRT-RTX-1.4.0.76\bin\tensorrt_onnxparser_rtx_1_4.dll"]
 
