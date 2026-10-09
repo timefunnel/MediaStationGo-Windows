@@ -11,6 +11,11 @@ on:
         description: Stable release tag, for example v0.1.1
         required: true
         type: string
+      publish_rife_component:
+        description: Publish the candidate's optional RIFE component as a separate prerelease
+        required: false
+        default: false
+        type: boolean
       replace_existing:
         description: Replace an existing release and move its tag to the verified candidate
         required: false
@@ -145,6 +150,83 @@ jobs:
             fi
           done
           (cd dist/public && sha256sum --check --strict "$normalized_sums")
+
+      - name: Download optional RIFE component
+        if: inputs.publish_rife_component
+        uses: actions/download-artifact@v7
+        with:
+          name: rife-component-x64-v1
+          path: dist/components
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Validate and publish optional RIFE component
+        if: inputs.publish_rife_component
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, zipfile
+          root = pathlib.Path('dist/components')
+          asset = 'MediaStationGo-frame-interpolation-x64-v1.zip'
+          if sorted(p.name for p in root.iterdir()) != [asset, 'SHA256SUMS.txt']:
+              raise SystemExit('Unexpected component artifact file set')
+          package = root / asset
+          digest = hashlib.sha256(package.read_bytes()).hexdigest()
+          if (root / 'SHA256SUMS.txt').read_text() != f'{digest}  {asset}\n':
+              raise SystemExit('Component package SHA-256 mismatch')
+          with zipfile.ZipFile(package) as archive:
+              manifest = json.loads(archive.read('component-manifest.json'))
+              expected = dict(schema=1, component='rife', version='1', platform='windows-x64', runtimeAbi=8, tensorRtVersion='1.4.0.76')
+              if any(manifest.get(k) != v for k, v in expected.items()):
+                  raise SystemExit('Unsupported component tuple')
+              files = manifest['files']
+              names = [f['path'] for f in files] + ['component-manifest.json']
+              if len(names) != 16 or len(set(names)) != 16 or sorted(archive.namelist()) != sorted(names):
+                  raise SystemExit('Unexpected component ZIP file set')
+              for entry in files:
+                  data = archive.read(entry['path'])
+                  if len(data) != entry['bytes'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
+                      raise SystemExit(f"Component file integrity failed: {entry['path']}")
+          print(f'Validated optional component: {digest}')
+          PY
+          component_tag=rife-component-x64-v1
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          if jq -e --arg tag "$component_tag" '.[] | select(.tag_name == $tag)' <<<"$existing" >/dev/null; then
+            echo "Component release already exists; fixed component assets must not be overwritten" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$component_tag" "$CANDIDATE_SHA" -m "MediaStationGo optional RIFE component v1"
+          git push origin "refs/tags/$component_tag"
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          cat > "$notes_file" <<EOF
+          Windows x64 RTX 插帧独立组件 v1，供 MediaStationGo v1.0.7 及兼容客户端按需安装。
+
+          - 在设置的“播放与字幕”页面下载、安装或卸载，退出所有实例后重启生效。
+          - 包含三档 RIFE 模型、运行时、自有 Engine 构建助手和许可证；不包含 NVIDIA SDK CLI、Python、VapourSynth、预生成 Engine 或用户缓存。
+          - 原生 ABI 8、TensorRT-RTX 1.4.0.76；需要兼容的 NVIDIA RTX 显卡与驱动。
+          - 附带同一候选提交的完整源码包和组件 SHA-256 校验；客户端从 GitHub asset digest 校验下载，再逐文件校验。
+          - 本 Release 标为 prerelease，仅用于组件分发，不参与主程序最新版本检测。
+
+          Source commit: $CANDIDATE_SHA
+          EOF
+          gh release create "$component_tag" dist/components/* \
+            "dist/public/MediaStationGo-${RELEASE_TAG#v}-windows-x64-source.zip" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false \
+            --title "RTX 插帧独立组件 v1" --notes-file "$notes_file"
+          published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$component_tag")"
+          expected_digest="sha256:$(sha256sum dist/components/MediaStationGo-frame-interpolation-x64-v1.zip | cut -d' ' -f1)"
+          jq -e --arg digest "$expected_digest" \
+            '.prerelease == true and .draft == false and ([.assets[] | select(.name == "MediaStationGo-frame-interpolation-x64-v1.zip" and .digest == $digest)] | length == 1) and (.assets | length == 3)' \
+            <<<"$published" >/dev/null
 
       - name: Prepare release tag
         id: release
