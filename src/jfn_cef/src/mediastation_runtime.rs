@@ -4929,6 +4929,9 @@ pub(crate) fn handle_frame_interpolation_message(
                 .map(|()| frame_interpolation_status_payload())
                 .map_err(|(code, detail)| LoadFailure::dynamic(code, detail))
         }
+        "frame_interpolation_component_restart" => crate::business_interpolation::restart()
+            .map(|()| json!({"restarting": true}))
+            .map_err(|(code, detail)| LoadFailure::dynamic(code, detail)),
         "frame_interpolation_set_model" => set_frame_interpolation_model(args),
         "frame_interpolation_diagnostics" => {
             let media_id = (args.size() >= 3
@@ -4942,7 +4945,12 @@ pub(crate) fn handle_frame_interpolation_message(
         )),
     };
     match result {
-        Ok(payload) => dispatch_response(&layer, &request_id, &operation, true, payload),
+        Ok(payload) => {
+            dispatch_response(&layer, &request_id, &operation, true, payload);
+            if operation == "frame_interpolation_component_restart" {
+                jfn_playback::shutdown::jfn_shutdown_initiate();
+            }
+        }
         Err(failure) => {
             log_error(&format!(
                 "RTX frame interpolation request failed: operation={operation} code={}",

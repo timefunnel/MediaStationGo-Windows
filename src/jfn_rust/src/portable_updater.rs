@@ -39,6 +39,21 @@ mod windows_updater {
         log_file: PathBuf,
     }
 
+    #[derive(Debug)]
+    struct RestartArgs {
+        parent_pid: u32,
+        working_dir: PathBuf,
+        app_args: Vec<OsString>,
+    }
+
+    struct ParentProcess(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for ParentProcess {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
     struct Logger {
         path: PathBuf,
     }
@@ -65,12 +80,85 @@ mod windows_updater {
     }
 
     pub fn main() {
-        if let Err(error) = run() {
-            show_error(&format!(
-                "MediaStationGo portable update failed.\n\n{error}"
-            ));
+        let restart_only =
+            std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--restart-only"));
+        let result = if restart_only {
+            parse_restart_args(std::env::args_os().skip(2)).and_then(run_restart)
+        } else {
+            run()
+        };
+        if let Err(error) = result {
+            let title = if restart_only {
+                "MediaStationGo 自动重启失败，待安装操作仍保留"
+            } else {
+                "MediaStationGo portable update failed"
+            };
+            show_error(&format!("{title}.\n\n{error}"));
             std::process::exit(1);
         }
+    }
+
+    fn parse_restart_args<I>(args: I) -> Result<RestartArgs, String>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut values = args.into_iter();
+        if values.next().as_deref() != Some(std::ffi::OsStr::new("--parent-pid")) {
+            return Err("restart parent PID is missing".into());
+        }
+        let parent_pid = values
+            .next()
+            .and_then(|value| value.to_str()?.parse::<u32>().ok())
+            .filter(|pid| *pid != 0 && *pid != std::process::id())
+            .ok_or("restart parent PID is invalid")?;
+        if values.next().as_deref() != Some(std::ffi::OsStr::new("--working-dir")) {
+            return Err("restart working directory is missing".into());
+        }
+        let working_dir = PathBuf::from(
+            values
+                .next()
+                .ok_or("restart working directory is missing")?,
+        );
+        if !working_dir.is_absolute() || !working_dir.is_dir() {
+            return Err("restart working directory must be an existing absolute directory".into());
+        }
+        if values.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+            return Err("restart application arguments separator is missing".into());
+        }
+        Ok(RestartArgs {
+            parent_pid,
+            working_dir,
+            app_args: values.collect(),
+        })
+    }
+
+    fn run_restart(args: RestartArgs) -> Result<(), String> {
+        let helper = std::env::current_exe()
+            .map_err(|error| format!("cannot locate restart helper: {error}"))?;
+        let executable = helper
+            .parent()
+            .ok_or("restart helper has no directory")?
+            .join(APP_EXECUTABLE);
+        if !executable.is_file() {
+            return Err("restart application executable is missing".into());
+        }
+        let parent = open_parent(args.parent_pid)?
+            .ok_or("restart parent already exited before handshake")?;
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "MEDIASTATION_RESTART_READY")
+            .and_then(|()| output.flush())
+            .map_err(|error| format!("cannot acknowledge restart readiness: {error}"))?;
+        drop(output);
+        wait_for_process(&parent, PARENT_EXIT_TIMEOUT_MS)?;
+        Command::new(executable)
+            .args(args.app_args)
+            .current_dir(args.working_dir)
+            // The readiness pipe has no reader after acknowledgement. Do not
+            // let the restarted app inherit a broken stdout pipe.
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("cannot restart application: {error}"))?;
+        Ok(())
     }
 
     fn run() -> Result<(), String> {
@@ -412,25 +500,33 @@ mod windows_updater {
         Ok(path)
     }
 
-    fn wait_for_parent(parent_pid: u32) -> Result<(), String> {
+    fn open_parent(parent_pid: u32) -> Result<Option<ParentProcess>, String> {
         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
         if handle.is_null() {
             let error = unsafe { GetLastError() };
             if error == ERROR_INVALID_PARAMETER {
-                return Ok(());
+                return Ok(None);
             }
             return Err(format!(
                 "cannot open parent process for waiting: Windows error {error}"
             ));
         }
-        let result = unsafe { WaitForSingleObject(handle, PARENT_EXIT_TIMEOUT_MS) };
-        unsafe {
-            CloseHandle(handle);
-        }
+        Ok(Some(ParentProcess(handle)))
+    }
+
+    fn wait_for_process(parent: &ParentProcess, timeout_ms: u32) -> Result<(), String> {
+        let result = unsafe { WaitForSingleObject(parent.0, timeout_ms) };
         if result != WAIT_OBJECT_0 {
             return Err(format!(
                 "parent process did not exit in time: wait result {result}"
             ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_parent(parent_pid: u32) -> Result<(), String> {
+        if let Some(parent) = open_parent(parent_pid)? {
+            wait_for_process(&parent, PARENT_EXIT_TIMEOUT_MS)?;
         }
         Ok(())
     }
@@ -621,6 +717,93 @@ mod windows_updater {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn restart_args(pid: &str, directory: &Path, extra: &[&str]) -> Vec<OsString> {
+            let mut args = vec![
+                "--parent-pid".into(),
+                pid.into(),
+                "--working-dir".into(),
+                directory.as_os_str().to_owned(),
+                "--".into(),
+            ];
+            args.extend(extra.iter().map(OsString::from));
+            args
+        }
+
+        #[test]
+        fn restart_preserves_original_arguments_and_working_directory() {
+            let temp = tempfile::tempdir().unwrap();
+            let args = parse_restart_args(restart_args(
+                "1",
+                temp.path(),
+                &[
+                    "--config-dir",
+                    "D:\\用户 配置",
+                    "--log-file",
+                    "",
+                    "--hwdec=d3d11va",
+                ],
+            ))
+            .unwrap();
+            assert_eq!(args.parent_pid, 1);
+            assert_eq!(args.working_dir, temp.path());
+            assert_eq!(
+                args.app_args,
+                [
+                    "--config-dir",
+                    "D:\\用户 配置",
+                    "--log-file",
+                    "",
+                    "--hwdec=d3d11va"
+                ]
+                .map(OsString::from)
+            );
+        }
+
+        #[test]
+        fn restart_rejects_invalid_pid_directory_and_argument_separator() {
+            let temp = tempfile::tempdir().unwrap();
+            for pid in ["0", "invalid", &std::process::id().to_string()] {
+                assert!(parse_restart_args(restart_args(pid, temp.path(), &[])).is_err());
+            }
+            for directory in [Path::new("relative"), &temp.path().join("absent")] {
+                assert!(parse_restart_args(restart_args("1", directory, &[])).is_err());
+            }
+            let mut args = restart_args("1", temp.path(), &[]);
+            args.pop();
+            assert!(parse_restart_args(args).is_err());
+            assert!(parse_restart_args(Vec::<OsString>::new()).is_err());
+        }
+
+        #[test]
+        fn restart_wait_does_not_allow_launch_while_parent_is_alive() {
+            let parent = open_parent(std::process::id()).unwrap().unwrap();
+            assert!(wait_for_process(&parent, 1).is_err());
+        }
+
+        #[test]
+        fn restart_wait_completes_only_after_process_exit() {
+            use std::os::windows::process::CommandExt;
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_updater::tests::restart_parent_fixture",
+                    "--ignored",
+                ])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let parent = open_parent(child.id()).unwrap().unwrap();
+            wait_for_process(&parent, 5_000).unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+
+        #[test]
+        #[ignore = "short-lived subprocess fixture, invoked by the restart wait test"]
+        fn restart_parent_fixture() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         fn write_file(path: &Path, value: &str) {
             if let Some(parent) = path.parent() {

@@ -12,9 +12,10 @@ const element = (id) => {
         const classes = new Set();
         elements.set(id, { textContent: '', disabled: false, dataset: {}, classList: {
             add(name) { classes.add(name); },
+            remove(name) { classes.delete(name); },
             toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
             contains(name) { return classes.has(name); },
-        } });
+        }, focus() { this.focused = true; } });
     }
     return elements.get(id);
 };
@@ -25,6 +26,7 @@ let requestFailure;
 let requests = [];
 const context = vm.createContext({
     byId: element, interpolationModels: {}, interpolationComponentTimer: 0, interpolationComponentTracking: false,
+    interpolationRestartPrompted: false, interpolationComponentRestarting: false,
     window: {
         clearTimeout(id) { timers.delete(id); },
         setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
@@ -41,6 +43,10 @@ const install = element('settings-install-frame-interpolation');
 const uninstall = element('settings-uninstall-frame-interpolation');
 const cancelInstall = element('settings-cancel-install-frame-interpolation');
 const pendingInstall = element('settings-pending-frame-interpolation-install');
+const restart = element('settings-restart-frame-interpolation');
+const confirmRestart = element('settings-confirm-restart-frame-interpolation');
+const restartConfirmation = element('settings-confirm-frame-interpolation-restart');
+assert.match(html, /id="settings-install-frame-interpolation" class="primary-command"/);
 function render(component, fields = {}) {
     context.updateFrameInterpolationStatus({ componentStatus: 'unavailable', component, ...fields });
 }
@@ -61,15 +67,26 @@ assert.match(label.textContent, /重新启动后生效/);
 assert.equal(timers.size, 0);
 assert.equal(cancelInstall.disabled, false);
 assert.equal(pendingInstall.classList.contains('hidden'), false);
+assert.equal(restartConfirmation.classList.contains('hidden'), false);
+assert.equal(confirmRestart.focused, true);
+assert.equal(requests.length, 0, 'installation completion never restarts without confirmation');
+context.deferFrameInterpolationRestart();
+render({ installed: false, restartRequired: true, pendingOperation: 'install' });
+assert.equal(restartConfirmation.classList.contains('hidden'), true, 'later remains respected on repeated status queries');
+context.showFrameInterpolationRestartConfirmation();
+assert.equal(restartConfirmation.classList.contains('hidden'), false);
 render({ installed: false, restartRequired: true, pendingOperation: 'install' }, { failureCode: 'frame_interpolation_component_invalid', failureDetail: 'pending runtime file is damaged' });
 assert.match(label.textContent, /pending runtime file is damaged/);
 assert.equal(cancelInstall.disabled, false);
 assert.equal(install.disabled, true);
+assert.equal(restart.disabled, true);
+assert.equal(restartConfirmation.classList.contains('hidden'), true);
 render({ installed: true, restartRequired: true, pendingOperation: 'uninstall' }, { failureCode: 'frame_interpolation_component_busy', failureDetail: 'other player running' });
 assert.match(label.textContent, /未能执行组件变更/);
 assert.match(label.textContent, /other player running/);
 assert.equal(cancelInstall.disabled, true);
 assert.equal(pendingInstall.classList.contains('hidden'), true);
+assert.equal(restartConfirmation.classList.contains('hidden'), true, 'uninstall does not use the install restart flow');
 render({ installed: false, error: { code: 'frame_interpolation_component_not_published', message: '组件包尚未发布' } });
 assert.equal(label.dataset.state, 'error');
 assert.equal(install.disabled, false);
@@ -102,6 +119,7 @@ async function fireTimer() {
     assert.equal(requests[2][1], 'frame_interpolation_component_cancel_install');
     assert.deepEqual(Array.from(requests[2][2]), ['frame_interpolation_component_cancel_install']);
     assert.equal(install.disabled, false);
+    assert.equal(restartConfirmation.classList.contains('hidden'), true);
     assert.equal(cancelInstall.disabled, true);
     assert.equal(pendingInstall.classList.contains('hidden'), true);
 
@@ -121,6 +139,7 @@ async function fireTimer() {
     assert.equal(timers.size, 0);
     assert.match(label.textContent, /重新启动后生效/);
     assert.equal(cancelInstall.disabled, false);
+    assert.equal(restartConfirmation.classList.contains('hidden'), false, 'completed download opens the restart confirmation');
 
     render({ installed: false, busy: true });
     response = { component: { installed: false, busy: false, error: { message: 'download failed' } } };
@@ -128,6 +147,7 @@ async function fireTimer() {
     assert.equal(timers.size, 0);
     assert.equal(install.disabled, false);
     assert.equal(label.textContent, 'download failed');
+    assert.equal(restartConfirmation.classList.contains('hidden'), true);
 
     requestFailure = new Error('operation acknowledgment timeout');
     await context.changeFrameInterpolationComponent('frame_interpolation_component_install');
@@ -138,5 +158,35 @@ async function fireTimer() {
     assert.equal(requests.at(-1)[1], 'frame_interpolation_status', 'retry queries status; never silently resubmits installation');
     assert.equal(timers.size, 0);
     assert.equal(install.disabled, false);
-    console.log('RIFE_COMPONENT_UI_TEST_OK states/install/uninstall/cancel-install/transient-status-retry/terminal-stop');
+    const queuedInstall = { component: { installed: false, restartRequired: true, pendingOperation: 'install' } };
+    response = queuedInstall;
+    await context.refreshFrameInterpolationStatus();
+    requestFailure = new Error('restart helper missing');
+    const beforeFailure = requests.length;
+    await context.restartForFrameInterpolationInstall();
+    assert.equal(requests[beforeFailure][1], 'frame_interpolation_component_restart');
+    assert.equal(requests.length, beforeFailure + 2, 'failure queries status once and never repeats restart');
+    assert.equal(label.dataset.state, 'error');
+    assert.match(label.textContent, /restart helper missing/);
+    assert.equal(context.interpolationComponentRestarting, false);
+    requestFailure = null;
+    response = queuedInstall;
+    await context.refreshFrameInterpolationStatus();
+    await context.restartForFrameInterpolationInstall();
+    assert.match(label.textContent, /重启助手未确认/);
+    assert.equal(context.interpolationComponentRestarting, false);
+
+    response = { restarting: true };
+    const beforeRestart = requests.length;
+    await context.restartForFrameInterpolationInstall();
+    await context.restartForFrameInterpolationInstall();
+    assert.equal(requests.length, beforeRestart + 1, 'double confirmation sends a single restart request');
+    assert.deepEqual(Array.from(requests.at(-1)[2]), ['frame_interpolation_component_restart']);
+    assert.equal(context.interpolationComponentRestarting, true);
+    assert.equal(confirmRestart.disabled, true);
+    assert.equal(cancelInstall.disabled, true);
+    render(queuedInstall.component);
+    assert.equal(confirmRestart.disabled, true, 'late status responses cannot re-enable restart');
+    assert.match(label.textContent, /正在退出并重新启动/);
+    console.log('RIFE_COMPONENT_UI_TEST_OK theme/install/uninstall/cancel-install/transient-status-retry/terminal-stop/restart-confirmation/later/restart-failure/single-restart');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

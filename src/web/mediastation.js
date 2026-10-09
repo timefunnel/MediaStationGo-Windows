@@ -102,6 +102,8 @@
     let imageStatsTimer = 0;
     let interpolationComponentTimer = 0;
     let interpolationComponentTracking = false;
+    let interpolationRestartPrompted = false;
+    let interpolationComponentRestarting = false;
     let requestSequence = 0;
     let toastTimer = 0;
     let drawerTrigger = null;
@@ -1933,20 +1935,34 @@
         if (!status) return;
         const label = byId('settings-frame-interpolation-status');
         const component = status.component || {};
-        const blocked = component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
+        if (component.restarting) interpolationComponentRestarting = true;
+        const blocked = interpolationComponentRestarting || component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
         byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
         byId('settings-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
         byId('settings-confirm-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
         const pendingInstall = component.pendingOperation === 'install';
         byId('settings-pending-frame-interpolation-install').classList.toggle('hidden', !pendingInstall);
-        byId('settings-cancel-install-frame-interpolation').disabled = Boolean(component.supported === false || component.busy || !pendingInstall);
+        byId('settings-cancel-install-frame-interpolation').disabled = Boolean(interpolationComponentRestarting || component.supported === false || component.busy || !pendingInstall);
+        const startupFailure = ['frame_interpolation_component_busy', 'frame_interpolation_component_invalid'].includes(status.failureCode);
+        const canRestart = pendingInstall && component.restartRequired && !component.busy && !component.error && component.supported !== false && status.failureCode !== 'frame_interpolation_component_invalid';
+        byId('settings-restart-frame-interpolation').disabled = !canRestart || interpolationComponentRestarting;
+        byId('settings-confirm-restart-frame-interpolation').disabled = !canRestart || interpolationComponentRestarting;
+        byId('settings-later-restart-frame-interpolation').disabled = interpolationComponentRestarting;
+        if (!pendingInstall) interpolationRestartPrompted = false;
+        if (!canRestart) byId('settings-confirm-frame-interpolation-restart').classList.add('hidden');
+        if (canRestart && !startupFailure && !interpolationRestartPrompted && !interpolationComponentRestarting) {
+            showFrameInterpolationRestartConfirmation();
+        }
         window.clearTimeout(interpolationComponentTimer);
         interpolationComponentTimer = 0;
         interpolationComponentTracking = Boolean(component.busy);
         if (interpolationModels[status.selectedModel]) {
             preferredInterpolationModel = status.selectedModel;
         }
-        if (component.supported === false) {
+        if (interpolationComponentRestarting) {
+            label.textContent = '正在退出并重新启动播放器...';
+            label.dataset.state = 'pending';
+        } else if (component.supported === false) {
             label.textContent = '插帧组件只支持 Windows x64。';
             label.dataset.state = 'error';
         } else if (component.busy) {
@@ -1991,6 +2007,40 @@
             interpolationComponentTimer = 0;
             return refreshFrameInterpolationStatus();
         }, delayMs);
+    }
+
+    function showFrameInterpolationRestartConfirmation() {
+        if (byId('settings-restart-frame-interpolation').disabled) return;
+        interpolationRestartPrompted = true;
+        byId('settings-confirm-frame-interpolation-restart').classList.remove('hidden');
+        byId('settings-confirm-restart-frame-interpolation').focus();
+    }
+
+    function deferFrameInterpolationRestart() {
+        if (interpolationComponentRestarting) return;
+        byId('settings-confirm-frame-interpolation-restart').classList.add('hidden');
+        byId('settings-restart-frame-interpolation').focus();
+    }
+
+    async function restartForFrameInterpolationInstall() {
+        if (interpolationComponentRestarting || byId('settings-confirm-restart-frame-interpolation').disabled) return;
+        interpolationComponentRestarting = true;
+        for (const id of ['settings-restart-frame-interpolation', 'settings-confirm-restart-frame-interpolation', 'settings-later-restart-frame-interpolation', 'settings-cancel-install-frame-interpolation']) {
+            byId(id).disabled = true;
+        }
+        const label = byId('settings-frame-interpolation-status');
+        label.textContent = '正在准备退出并重新启动播放器...';
+        label.dataset.state = 'pending';
+        try {
+            const result = await nativeRequest('mediaStationFrameInterpolation', 'frame_interpolation_component_restart', ['frame_interpolation_component_restart'], 15000);
+            if (result?.restarting !== true) throw new Error('重启助手未确认退出与重新启动请求');
+            label.textContent = '正在退出并重新启动播放器...';
+        } catch (error) {
+            interpolationComponentRestarting = false;
+            await refreshFrameInterpolationStatus();
+            label.textContent = `自动重启请求失败：${friendlyError(error)}。待安装操作仍保留；不会自动重复重启。`;
+            label.dataset.state = 'error';
+        }
     }
 
     async function changeFrameInterpolationComponent(operation) {
@@ -6829,6 +6879,9 @@
     });
     byId('settings-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_install'));
     byId('settings-cancel-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_cancel_install'));
+    byId('settings-restart-frame-interpolation').addEventListener('click', showFrameInterpolationRestartConfirmation);
+    byId('settings-confirm-restart-frame-interpolation').addEventListener('click', restartForFrameInterpolationInstall);
+    byId('settings-later-restart-frame-interpolation').addEventListener('click', deferFrameInterpolationRestart);
     byId('settings-uninstall-frame-interpolation').addEventListener('click', () => {
         byId('settings-confirm-frame-interpolation-uninstall').classList.remove('hidden');
         byId('settings-confirm-uninstall-frame-interpolation').focus();

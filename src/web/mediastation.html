@@ -269,15 +269,23 @@
             <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>
             <div class="setting-block frame-interpolation-settings">
               <h3>RTX 插帧组件</h3>
-              <p>仅 NVIDIA RTX 使用。组件按需下载到当前用户目录，安装、卸载后请退出所有播放器实例并重新启动。</p>
+              <p>仅 NVIDIA RTX 使用。组件按需下载到当前用户目录，安装完成后确认即可自动重启。请先关闭其他播放器实例；卸载仍在重新启动后生效。</p>
               <p id="settings-frame-interpolation-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
               <div class="update-action-row">
-                <button id="settings-install-frame-interpolation" class="secondary-command" type="button" disabled>下载并安装</button>
+                <button id="settings-install-frame-interpolation" class="primary-command" type="button" disabled>下载并安装</button>
                 <button id="settings-uninstall-frame-interpolation" class="secondary-command" type="button" disabled>卸载组件</button>
               </div>
               <div id="settings-pending-frame-interpolation-install" class="hidden">
                 <p>若待安装文件校验失败，可取消后重新下载安装。取消只清理待安装文件，不动现有组件和缓存。</p>
+                <button id="settings-restart-frame-interpolation" class="primary-command" type="button" disabled>重启并安装</button>
                 <button id="settings-cancel-install-frame-interpolation" class="secondary-command" type="button" disabled>取消待安装</button>
+              </div>
+              <div id="settings-confirm-frame-interpolation-restart" class="update-confirm hidden" role="group" aria-label="确认重启安装插帧组件">
+                <p>安装包已下载并校验。确认后将停止当前播放，自动退出并重新启动播放器以完成安装。请先关闭其他播放器实例；重启不会自动开启插帧。</p>
+                <div class="update-confirm-actions">
+                  <button id="settings-confirm-restart-frame-interpolation" class="primary-command" type="button">确认并重启</button>
+                  <button id="settings-later-restart-frame-interpolation" class="secondary-command" type="button">稍后</button>
+                </div>
               </div>
               <div id="settings-confirm-frame-interpolation-uninstall" class="hidden">
                 <p>下次启动时删除插帧组件、专属 Engine 缓存和组件下载缓存。不影响媒体、账号及其他缓存。</p>
