@@ -40,7 +40,8 @@ jobs:
           submodules: recursive
 
       - name: Cache Cargo dependencies and target
-        uses: actions/cache@v6
+        id: cargo-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -101,17 +102,41 @@ jobs:
           "mpv_commit=$MpvCommit" >> $env:GITHUB_OUTPUT
 
       - name: Cache native media dependencies
-        uses: actions/cache@v6
+        id: native-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             third_party/mpv-install
-            third_party/ffmpeg-38b88335f99e76ed89ff3c93f877fdefce736c13
-            third_party/ffmpeg-install-38b88335f99e76ed89ff3c93f877fdefce736c13
             third_party/libplacebo-1733c8601edec161b714e4a799c72a9f5e5aa2f0.tar.gz
             third_party/libplacebo-install-1733c8601edec161b714e4a799c72a9f5e5aa2f0
           key: windows-native-deps-${{ matrix.arch }}-${{ steps.native-cache-contract.outputs.mpv_commit }}-${{ hashFiles('dev/windows/build_mpv_source.ps1', 'dev/windows/build_ffmpeg_lgpl_source.ps1', 'dev/windows/build_libplacebo_source.ps1', 'dev/windows/build_rife_runtime.ps1', 'dev/windows/stage_frame_interpolation_runtime.ps1', 'dev/windows/mpv/**', 'dev/windows/libplacebo/**', 'third_party/nvofapi/**') }}
           restore-keys: |
             windows-native-deps-${{ matrix.arch }}-${{ steps.native-cache-contract.outputs.mpv_commit }}-
+
+      - name: Cache pinned FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            third_party/ffmpeg-38b88335f99e76ed89ff3c93f877fdefce736c13
+            third_party/ffmpeg-install-38b88335f99e76ed89ff3c93f877fdefce736c13
+          key: windows-ffmpeg-${{ matrix.arch }}-38b88335f99e76ed89ff3c93f877fdefce736c13-${{ hashFiles('dev/windows/build_ffmpeg_lgpl_source.ps1') }}
+
+      - name: Build pinned FFmpeg
+        shell: pwsh
+        run: >-
+          dev\windows\build_ffmpeg_lgpl_source.ps1
+          -Arch ${{ matrix.arch }}
+          -MsysPath '${{ steps.msys2.outputs.msys2-location }}'
+
+      - name: Save verified FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party/ffmpeg-38b88335f99e76ed89ff3c93f877fdefce736c13
+            third_party/ffmpeg-install-38b88335f99e76ed89ff3c93f877fdefce736c13
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
 
       - name: Build mpv from source
         shell: pwsh
@@ -119,6 +144,16 @@ jobs:
           dev\windows\build_mpv_source.ps1
           -Arch ${{ matrix.arch }}
           -MsysPath '${{ steps.msys2.outputs.msys2-location }}'
+
+      - name: Save verified native media dependencies
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party/mpv-install
+            third_party/libplacebo-1733c8601edec161b714e4a799c72a9f5e5aa2f0.tar.gz
+            third_party/libplacebo-install-1733c8601edec161b714e4a799c72a9f5e5aa2f0
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
       - name: Build
         shell: cmd
@@ -140,6 +175,16 @@ jobs:
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" %MATRIX_ARCH% || exit /b 1
           set "PATH=%PATH%;%MSYS_BIN%"
           cargo xtask build --external-mpv "%CD%\third_party\mpv-install" --out build\mediastation-public-release
+
+      - name: Save built Cargo dependencies and target
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build\mediastation-cargo
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Install public packaging tools
         if: matrix.arch == 'x64'
