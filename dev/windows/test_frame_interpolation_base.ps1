@@ -1,4 +1,7 @@
-param([string]$BuildDir = 'build')
+param(
+    [string]$BuildDir = 'build',
+    [string]$MsysPath = 'C:\msys64'
+)
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
@@ -24,7 +27,7 @@ try {
     foreach ($Name in @('jellium-desktop.exe', 'mediastation-portable-updater.exe', 'libmpv-2.dll', 'libcef.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $TestRoot $Name) -PathType Leaf)) { throw "Base payload missing: $Name" }
     }
-    & (Join-Path $PSScriptRoot 'stage_public_release_licenses.ps1') -OutputDir $TestRoot -SourceArchiveName 'MediaStationGo-local-validation-source.zip'
+    & (Join-Path $PSScriptRoot 'stage_public_release_licenses.ps1') -OutputDir $TestRoot -MsysPath $MsysPath -SourceArchiveName 'MediaStationGo-local-validation-source.zip'
     $Process = Start-Process -FilePath (Join-Path $TestRoot 'jellium-desktop.exe') -ArgumentList '--version' -WindowStyle Hidden -Wait -PassThru
     if ($Process.ExitCode -ne 0) { throw "Staged app smoke failed: $($Process.ExitCode)" }
     Write-Host "RIFE_BASE_INSTALL_TEST_OK component-payload=absent required-runtime=present licenses=staged smoke=0"
