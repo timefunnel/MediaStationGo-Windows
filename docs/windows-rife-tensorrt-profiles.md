@@ -11,7 +11,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 ### 进度台账
 
-最近更新：2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
+最近更新：2026-10-09，分支 `codex/mediastation-windows-spike`。播放器 `v1.0.7` 和
+独立组件 `rife-component-x64-v1` 已发布，两个标签均指向
+`92951d80518b0ab91f9069c955f17ad36702b519`。主包、组件、对应源码与校验文件已核对；
+GitHub 最新稳定版本为 `v1.0.7`，组件保持 prerelease，不参与主程序更新检测。
+发布验证与边界见下方本次发布记录，以下“未发布”说明均为此前阶段的历史状态。
+
+发布前 2026-10-09：基础组件拆分已本地
 提交为 `5d15687`；本轮处理提交审查发现的三个异常恢复问题：取消待安装、状态查询
 失败后继续跟踪任务、回收可确认归属的孤立暂存目录。126 项常规 Rust 单测、JS
 状态/故障注入、实包安装卸载/原生 ABI 和标准 Release 构建/启动检查通过。
@@ -85,7 +91,28 @@ Engine/profile 或场景阈值，但在同片长测和视觉验收通过前不�
 - 后续任务在上下文压缩或干净续接后，应先读取本文和当前工作区真实状态，
   不重新推断已经有证据的结论。
 
-### 2026-10-09 提交审查修复（本地验证通过，未发布）
+### 2026-10-09 v1.0.7 与独立组件发布
+
+- 来源：已推送的开发分支提交 `92951d80518b0ab91f9069c955f17ad36702b519`；
+  [候选构建 37878898066](https://github.com/timefunnel/MediaStationGo-Windows/actions/runs/37878898066)
+  与 [发布流程 37880064341](https://github.com/timefunnel/MediaStationGo-Windows/actions/runs/37880064341)
+  均成功。发布直接复用候选产物，两个发布标签均核对到该提交。
+- 验证：相关 Rust 常规回归、实际弹幕/字幕像素共存及开关清除、组件界面状态测试、
+  本地实包安装/ABI 8 加载/卸载通过；标准本地 Release 版本为 `1.0.7`。
+  CI 主包安装 staging 确认可选 payload 缺席、必需运行库与许可证齐全，启动检查
+  返回 0；独立 ZIP 的 tuple、精确 16 文件、大小与逐文件 SHA-256 校验通过。
+- 在线组件：116,077,403 字节，SHA-256
+  `8fe800b19424fda91faca75c6f530277f4e7d79e132949dda953be574dbc0ff2`。
+  [组件 Release](https://github.com/timefunnel/MediaStationGo-Windows/releases/tag/rife-component-x64-v1)
+  附带与主程序完全相同的源码包；GitHub asset digest 与校验文件一致。
+- 构建修复：libplacebo 原下载入口返回反机器人网页，改用官方 GitHub 镜像，同一
+  提交的 archive SHA-256 完全不变。CEF、FFmpeg、原生依赖与 Cargo 分阶段保存缓存；
+  后续候选已复用缓存。基础包检查显式接收 runner 的 MSYS2/libclang 路径。
+- 边界：本轮未改模型、profile、原生算法或此前质量档 HDR10 问题的结论。
+  GPU 回归使用本机源和此前已验证的本地 ZIP；GitHub 生成的 ZIP 完成包完整性
+  校验，未在 GitHub runner 执行 RTX 探针，不扩大为长片或跨设备验收。
+
+### 2026-10-09 提交审查修复（发布前本地验证记录）
 
 - 待安装恢复：设置页新增“取消待安装”；后台只允许取消 install，不取消卸载。
   先在操作锁下原子移出 pending，再清理待安装文件；已激活组件、Engine 和下载
