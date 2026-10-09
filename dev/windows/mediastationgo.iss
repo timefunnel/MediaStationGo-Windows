@@ -62,3 +62,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Run]
 Filename: "{app}\jellium-desktop.exe"; Description: "{cm:LaunchProgram,MediaStationGo}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\jellium-desktop.exe"; Flags: nowait skipifnotsilent runasoriginaluser; Check: IsAppUpdate
+
+[Code]
+function IsAppUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:UPDATE|0}') = '1';
+end;

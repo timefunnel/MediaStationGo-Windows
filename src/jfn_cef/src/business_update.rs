@@ -1406,7 +1406,16 @@ fn launch_update_package(path: &Path, release: &ReleaseInfo) -> Result<(), Updat
 
 #[cfg(windows)]
 fn launch_installer(path: &Path) -> Result<(), UpdateError> {
-    std::process::Command::new(path)
+    let executable = std::env::current_exe().map_err(|error| {
+        UpdateError::new(
+            "executable_path_failed",
+            format!("无法确认当前应用目录：{error}"),
+        )
+    })?;
+    let install_dir = executable.parent().ok_or_else(|| {
+        UpdateError::new("executable_path_failed", "当前应用程序没有有效的安装目录")
+    })?;
+    installer_update_command(path, install_dir)
         .spawn()
         .map(|_| ())
         .map_err(|error| {
@@ -1415,6 +1424,18 @@ fn launch_installer(path: &Path) -> Result<(), UpdateError> {
                 format!("无法启动更新安装器：{error}"),
             )
         })
+}
+
+#[cfg(windows)]
+fn installer_update_command(path: &Path, install_dir: &Path) -> std::process::Command {
+    let mut directory = std::ffi::OsString::from("/DIR=");
+    directory.push(install_dir);
+    let mut command = std::process::Command::new(path);
+    // Hide the setup wizard while preserving installation error dialogs.
+    command
+        .args(["/VERYSILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"])
+        .arg(directory);
+    command
 }
 
 #[cfg(windows)]
@@ -1552,6 +1573,22 @@ fn post_download_error(inner: Arc<Inner>, error: UpdateError, release: &ReleaseI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_update_preserves_custom_directory_and_reports_errors() {
+        let installer = Path::new(r"C:\更新缓存\MediaStationGo-setup.exe");
+        let install_dir = Path::new(r"D:\应用程序\Media Station Go");
+        let command = installer_update_command(installer, install_dir);
+        assert_eq!(command.get_program(), installer.as_os_str());
+        let arguments: Vec<_> = command.get_args().collect();
+        for required in ["/VERYSILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"] {
+            assert!(arguments.contains(&std::ffi::OsStr::new(required)));
+        }
+        assert!(arguments.contains(&std::ffi::OsStr::new(r"/DIR=D:\应用程序\Media Station Go")));
+        assert!(!arguments.contains(&std::ffi::OsStr::new("/SUPPRESSMSGBOXES")));
+        assert!(!arguments.contains(&std::ffi::OsStr::new("/FORCECLOSEAPPLICATIONS")));
+    }
 
     fn component_metadata() -> Value {
         use jfn_frame_interpolation::component::{ASSET_NAME, RELEASE_TAG};
