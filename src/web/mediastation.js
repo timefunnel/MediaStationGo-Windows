@@ -4365,6 +4365,8 @@
     function applyUiTheme(theme, persist = false) {
         const selected = validUiTheme(theme) ? theme : 'violet';
         document.documentElement.dataset.uiTheme = selected;
+        const titlebarColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+        if (titlebarColor && window.jmpNative?.themeColor) window.jmpNative.themeColor(titlebarColor);
         document.querySelectorAll('[data-ui-theme]').forEach((button) => {
             button.setAttribute('aria-pressed', String(button.dataset.uiTheme === selected));
         });

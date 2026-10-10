@@ -123,32 +123,66 @@ fn post_execution_state(flags: u32) {
     unsafe { cef_post_task(TID_UI, raw as *mut cef_task_t) };
 }
 
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_CAPTION_COLOR: u32 = 35;
+const DWMWA_TEXT_COLOR: u32 = 36;
 
 // SetThreadExecutionState flags (winbase.h).
 const ES_CONTINUOUS: u32 = 0x8000_0000;
 const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
 const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 
-/// Tint the DWM titlebar so it matches the current theme color.
-/// rgb is 0x00RRGGBB; DWMWA_CAPTION_COLOR wants 0x00BBGGRR (COLORREF).
+fn rgb_to_colorref(rgb: u32) -> u32 {
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
+    r | (g << 8) | (b << 16)
+}
+
+fn is_dark_color(rgb: u32) -> bool {
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
+    299 * r + 587 * g + 114 * b < 128_000
+}
+
+fn set_dwm_attribute<T>(hwnd: *mut c_void, attribute: u32, value: &T, name: &str) {
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            value as *const T as *const c_void,
+            std::mem::size_of::<T>() as u32,
+        )
+    };
+    if result < 0 {
+        tracing::warn!(target: "platform", hresult = result, "DwmSetWindowAttribute({name}) failed");
+    }
+}
+
+/// Tint the DWM titlebar and select contrasting native caption controls.
+/// rgb is 0x00RRGGBB; DWM color attributes want 0x00BBGGRR (COLORREF).
 pub fn win_set_theme_color(rgb: u32) {
     let hwnd = jfn_win_get_hwnd();
     if hwnd.is_null() {
         return;
     }
-    let r = (rgb >> 16) & 0xFF;
-    let g = (rgb >> 8) & 0xFF;
-    let b = rgb & 0xFF;
-    let colorref: u32 = r | (g << 8) | (b << 16);
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CAPTION_COLOR,
-            &colorref as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-    }
+    let dark_mode: i32 = is_dark_color(rgb).into();
+    let caption_color = rgb_to_colorref(rgb);
+    let text_color = if dark_mode != 0 { 0x00FF_FFFF } else { 0 };
+    set_dwm_attribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark_mode,
+        "DWMWA_USE_IMMERSIVE_DARK_MODE",
+    );
+    set_dwm_attribute(
+        hwnd,
+        DWMWA_CAPTION_COLOR,
+        &caption_color,
+        "DWMWA_CAPTION_COLOR",
+    );
+    set_dwm_attribute(hwnd, DWMWA_TEXT_COLOR, &text_color, "DWMWA_TEXT_COLOR");
 }
 
 /// Map IdleInhibitLevel (None=0, System=1, Display=2) to execution-state

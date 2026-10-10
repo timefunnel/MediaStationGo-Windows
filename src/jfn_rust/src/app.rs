@@ -523,6 +523,9 @@ fn init_main_browser(
     let web_kind = cs("web");
     let main_layer = unsafe { jfn_cef::browsers::jfn_browsers_create(web_kind.as_ptr()) };
     jfn_cef::business_web::jfn_web_init(main_layer);
+    // The MediaStation shell owns login now, so no legacy server-selection
+    // overlay will dismiss and unlock the buffered initial theme color.
+    jfn_color::theme::jfn_theme_color_on_overlay_dismissed();
 
     let main_url = "app://resources/mediastation.html";
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) local MediaStation shell");
