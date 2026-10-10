@@ -40,6 +40,10 @@ static RESOURCES: &[(&str, Embedded)] = &[
     embedded!("input-plugin.js", "application/javascript"),
     embedded!("logo.png", "image/png"),
     embedded!("mediastationgo-icon.png", "image/png"),
+    embedded!("cinema-login-interstellar.jpg", "image/jpeg"),
+    embedded!("cinema-login-dune.jpg", "image/jpeg"),
+    embedded!("cinema-login-blade.jpg", "image/jpeg"),
+    embedded!("cinema-login-wide.jpg", "image/jpeg"),
     embedded!("mediastation.css", "text/css"),
     embedded!("mediastation.html", "text/html"),
     embedded!("mediastation.js", "application/javascript"),
@@ -255,6 +259,10 @@ mod tests {
             "resources/mediastation.css",
             "resources/mediastation.js",
             "resources/mediastationgo-icon.png",
+            "resources/cinema-login-interstellar.jpg",
+            "resources/cinema-login-dune.jpg",
+            "resources/cinema-login-blade.jpg",
+            "resources/cinema-login-wide.jpg",
         ] {
             let resource = lookup(path).expect("MediaStation shell resource should be embedded");
             assert!(!resource.bytes.is_empty());

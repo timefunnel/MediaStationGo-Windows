@@ -2914,6 +2914,8 @@ enum CatalogOperation {
     SeriesEpisodes,
     PersonItems,
     Search,
+    Favorites,
+    SetFavorite,
     CacheStats,
     ClearImageCache,
 }
@@ -2928,6 +2930,8 @@ impl CatalogOperation {
             Self::SeriesEpisodes => "series_episodes",
             Self::PersonItems => "person_items",
             Self::Search => "search",
+            Self::Favorites => "favorites",
+            Self::SetFavorite => "set_favorite",
             Self::CacheStats => "cache_stats",
             Self::ClearImageCache => "clear_image_cache",
         }
@@ -2977,6 +2981,8 @@ fn parse_catalog_request(
         "series_episodes" => CatalogOperation::SeriesEpisodes,
         "person_items" => CatalogOperation::PersonItems,
         "search" => CatalogOperation::Search,
+        "favorites" => CatalogOperation::Favorites,
+        "set_favorite" => CatalogOperation::SetFavorite,
         "cache_stats" => CatalogOperation::CacheStats,
         "clear_image_cache" => CatalogOperation::ClearImageCache,
         _ => {
@@ -3181,16 +3187,18 @@ fn execute_catalog_request(
             let limit = usize_param(&request.params, "limit", 60)?;
             let item_type = optional_param(&request.params, "itemType")?;
             let genre = optional_param(&request.params, "genre")?;
+            let sort = optional_param(&request.params, "sort")?;
             page_payload(
                 &runtime
                     .api
-                    .load_library_page_filtered(
+                    .load_library_page_sorted(
                         &snapshot.session,
                         &parent_id,
                         start_index,
                         limit,
                         item_type.as_deref(),
                         genre.as_deref(),
+                        sort.as_deref().unwrap_or("DateCreated"),
                     )
                     .map_err(|error| catalog_failure(request.operation, &error))?,
             )
@@ -3363,6 +3371,46 @@ fn execute_catalog_request(
                     .load_person_page(&snapshot.session, &person_id, start_index, limit)
                     .map_err(|error| catalog_failure(request.operation, &error))?,
             )
+        }
+        CatalogOperation::Favorites => {
+            let start_index = usize_param(&request.params, "startIndex", 0)?;
+            let limit = usize_param(&request.params, "limit", 48)?;
+            page_payload(
+                &runtime
+                    .api
+                    .load_favorites_page(&snapshot.session, start_index, limit)
+                    .map_err(|error| catalog_failure(request.operation, &error))?,
+            )
+        }
+        CatalogOperation::SetFavorite => {
+            let media_id = required_param(&request.params, "mediaId")?;
+            let favorite = request
+                .params
+                .get("favorite")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| LoadFailure::new("invalid_request", "favorite must be a boolean"))?;
+            let actual = runtime
+                .api
+                .set_favorite(&snapshot.session, &media_id, favorite)
+                .map_err(|error| catalog_failure(request.operation, &error))?;
+            let mut cache_warning = false;
+            if let Err(error) = runtime
+                .series_detail_cache
+                .lock()
+                .remove(&snapshot.session, &media_id)
+            {
+                log_error(&format!(
+                    "MediaStation favorite detail cache invalidation failed: {error}"
+                ));
+                cache_warning = true;
+            }
+            if let Err(error) = runtime.home_cache.remove(&snapshot.session) {
+                log_error(&format!(
+                    "MediaStation favorite home cache invalidation failed: {error}"
+                ));
+                cache_warning = true;
+            }
+            json!({ "mediaId": media_id, "isFavorite": actual, "cacheWarning": cache_warning })
         }
         CatalogOperation::Search => {
             let query = required_param(&request.params, "query")?;
@@ -3661,9 +3709,12 @@ fn media_card_payload(card: &MediaCard) -> Value {
         "durationMs": card.duration_ms,
         "resumePositionMs": card.resume_position_ms,
         "played": card.played,
+        "isFavorite": card.is_favorite,
         "lastPlayedAt": card.last_played_at,
         "indexNumber": card.index_number,
         "parentIndexNumber": card.parent_index_number,
+        "childCount": card.child_count,
+        "recursiveItemCount": card.recursive_item_count,
         "parentId": card.parent_id,
         "seasonId": card.season_id,
         "seriesId": card.series_id,
@@ -7963,6 +8014,7 @@ mod tests {
             duration_ms: 90_000,
             resume_position_ms: 10_000,
             played: false,
+            is_favorite: false,
             last_played_at: None,
             index_number: None,
             parent_index_number: None,
@@ -8046,6 +8098,7 @@ mod tests {
             duration_ms: 9_000_000,
             resume_position_ms: 0,
             played: false,
+            is_favorite: false,
             last_played_at: None,
             index_number: None,
             parent_index_number: None,

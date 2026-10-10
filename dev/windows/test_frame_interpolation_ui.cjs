@@ -46,11 +46,14 @@ const pendingInstall = element('settings-pending-frame-interpolation-install');
 const restart = element('settings-restart-frame-interpolation');
 const confirmRestart = element('settings-confirm-restart-frame-interpolation');
 const restartConfirmation = element('settings-confirm-frame-interpolation-restart');
+const playerInterpolation = element('player-interpolation');
 assert.match(html, /id="settings-install-frame-interpolation" class="primary-command"/);
 function render(component, fields = {}) {
     context.updateFrameInterpolationStatus({ componentStatus: 'unavailable', component, ...fields });
 }
 render({ installed: false });
+assert.equal(playerInterpolation.classList.contains('hidden'), true);
+assert.equal(playerInterpolation.dataset.componentInstalled, 'false');
 assert.equal(install.disabled, false);
 assert.equal(uninstall.disabled, true);
 assert.equal(cancelInstall.disabled, true);
@@ -96,6 +99,8 @@ assert.equal(install.disabled, true);
 assert.equal(uninstall.disabled, false);
 assert.equal(label.dataset.state, 'error');
 render({ installed: true }, { componentStatus: 'ready', gpuName: 'RTX', runtimeVersion: '1.4.0.76', models: [{}, {}, {}], engineCount: 0 });
+assert.equal(playerInterpolation.classList.contains('hidden'), false);
+assert.equal(playerInterpolation.dataset.componentReady, 'true');
 assert.equal(label.dataset.state, 'ready');
 assert.match(label.textContent, /3 个模型/);
 async function fireTimer() {

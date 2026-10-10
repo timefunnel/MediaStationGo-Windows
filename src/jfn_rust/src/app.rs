@@ -643,15 +643,10 @@ pub fn jfn_app_main() -> c_int {
         return 1;
     }
 
-    // force-window=yes (not "immediate") defers VO creation so the user's
-    // mpv.conf color never flashes before this override is applied.
-    let user_bg = jfn_mpv::api::jfn_mpv_get_background_color();
-    video_bg_set(user_bg);
-    {
-        let hex = format!("#{:06x}", user_bg);
-        tracing::info!(target: "Main", "video bg captured: {hex}");
-    }
-    let startup_bg = cs("#101010");
+    // Keep the playback canvas and resize/letterbox gaps pure black. The app
+    // theme still controls the shell and title bar outside video mode.
+    video_bg_set(0x000000);
+    let startup_bg = cs("#000000");
     unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(startup_bg.as_ptr()) };
 
     log_mpv_versions();

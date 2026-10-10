@@ -20,13 +20,15 @@
     const imagePending = new Map();
     const imageQueue = [];
     const libraryCache = new Map();
+    const libraryBrowsePreferences = new Map();
     const seriesDetailCache = new Map();
     const detailRefreshRequests = new Set();
     const scrollMotions = new WeakMap();
     const history = [];
     const homeRefreshDelayMs = 1200;
     const heroRotationIntervalMs = 9000;
-    const heroCarouselMaxCards = 20;
+    const heroCarouselMaxCards = 4;
+    const heroArtworkCache = new Map();
     const maximumContinueWatchingItems = 20;
     const libraryPageSize = 48;
     const maximumLibraryCacheEntries = 12;
@@ -98,6 +100,7 @@
         vi: '越南语', vie: '越南语',
     });
     let imageActive = 0;
+    let imageBackgroundActive = 0;
     let imageDiskStats = { imageBytes: 0, imageCount: 0 };
     let imageStatsTimer = 0;
     let interpolationComponentTimer = 0;
@@ -121,8 +124,6 @@
     let appBackdropRevision = 0;
     let appBackdropSrc = '';
     let heroSlideTimer = 0;
-    let heroCopyTimer = 0;
-    let lastHeroBackdropSrc = '';
     let controlsTimer = 0;
     let feedbackTimer = 0;
     let playerClickTimer = 0;
@@ -131,6 +132,7 @@
     let playerClickY = 0;
     let seekRepeatCount = 0;
     let player = null;
+    let playbackFailure = null;
     let playerPanelTrigger = null;
     let overviewTrigger = null;
     let sourcePickerTrigger = null;
@@ -171,7 +173,7 @@
     let globalProxyMode = window.jmpInfo?.settings?.advanced?.mediaStationProxyMode === 'system'
         ? 'system'
         : 'direct';
-    let activeSettingsSection = 'network';
+    let activeSettingsSection = 'appearance';
     let proxySettingsStatus = { state: '', text: '' };
     let appUpdateState = { status: 'idle', payload: {} };
     let automaticUpdateTimer = 0;
@@ -649,7 +651,7 @@
         const animateX = requested.left !== undefined && Math.abs(targetX - node.scrollLeft) > 0.01;
         const animateY = requested.top !== undefined && Math.abs(targetY - node.scrollTop) > 0.01;
         stopSmoothScroll(node);
-        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        if (prefersReducedMotion()) {
             if (requested.left !== undefined) node.scrollLeft = targetX;
             if (requested.top !== undefined) node.scrollTop = targetY;
             return Promise.resolve(true);
@@ -946,6 +948,9 @@
         bottomOffset.style.setProperty('--setting-range-progress', `${defaultPlayerSubtitleStyle.bottomOffset / 30 * 100}%`);
         byId('settings-subtitle-font-size-value').value = String(defaultPlayerSubtitleStyle.fontSize);
         byId('settings-subtitle-bottom-offset-value').value = `${defaultPlayerSubtitleStyle.bottomOffset}%`;
+        const preview = byId('settings-subtitle-preview-text');
+        preview.style.fontSize = `${defaultPlayerSubtitleStyle.fontSize * .65}px`;
+        preview.style.bottom = `${defaultPlayerSubtitleStyle.bottomOffset}%`;
     }
 
     function applyDefaultPlayerSubtitleStyle(style, persist = false) {
@@ -1158,11 +1163,16 @@
     function updateSessionUi() {
         const name = session?.userName || session?.userId || 'Media';
         const initial = initials(name);
+        const baseUrl = session?.baseUrl || '';
+        const serverName = serverLabel(baseUrl);
         byId('account-name').textContent = name;
+        byId('account-server-name').textContent = serverName;
+        byId('account-server-name').title = baseUrl;
+        byId('account-open').title = [name, baseUrl].filter(Boolean).join(' · ');
         byId('account-avatar').textContent = initial;
         byId('drawer-avatar').textContent = initial;
         byId('drawer-user').textContent = name;
-        byId('drawer-server').textContent = session?.baseUrl || '';
+        byId('drawer-server').textContent = baseUrl;
     }
 
     function validConnectionProfile(value) {
@@ -1228,6 +1238,9 @@
     function setPlayerMode(enabled) {
         document.documentElement.classList.toggle('player-mode', enabled);
         document.body.classList.toggle('player-mode', enabled);
+        const shellColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+        const windowColor = enabled ? '#000000' : shellColor;
+        if (windowColor && window.jmpNative?.themeColor) window.jmpNative.themeColor(windowColor);
     }
 
     function showLogin(
@@ -1322,14 +1335,15 @@
         appBackdropRevision += 1;
         window.clearTimeout(heroSlideTimer);
         heroSlideTimer = 0;
-        window.clearTimeout(heroCopyTimer);
-        heroCopyTimer = 0;
         stopSmoothScroll(content);
-        lastHeroBackdropSrc = '';
         clearAppBackdrop(appBackdropRevision);
         imageCache.clear();
+        heroArtworkCache.clear();
         imagePending.clear();
         libraryCache.clear();
+        libraryBrowsePreferences.clear();
+        byId('sidebar-libraries').replaceChildren();
+        delete byId('sidebar-libraries').dataset.identity;
         seriesDetailCache.clear();
         libraryPageObserver.disconnect();
         personPageObserver.disconnect();
@@ -1448,6 +1462,10 @@
         const focusKey = active instanceof Element
             ? active.closest('[data-focus-key]')?.dataset.focusKey || ''
             : '';
+        if (currentView.kind === 'library') libraryBrowsePreferences.set(currentView.data.library.id, {
+            filter: { ...currentView.data.filter }, viewMode: currentView.data.viewMode || 'grid', scrollTop: content.scrollTop,
+            filterExpanded: { ...currentView.data.filterExpanded },
+        });
         return { ...currentView, scrollTop: content.scrollTop, rows, focusKey };
     }
 
@@ -1459,6 +1477,7 @@
         content.scrollTop = 0;
         renderCurrentView(captured ? 'forward' : '');
         refreshHomeAfterEntry(previousView);
+        refreshFavoritesAfterEntry(previousView);
     }
 
     function beginLoadingView(kind, captured, render) {
@@ -1488,6 +1507,7 @@
             restoreViewState(captured);
         }
         refreshHomeAfterEntry(previousView);
+        refreshFavoritesAfterEntry(previousView);
         return true;
     }
 
@@ -1665,9 +1685,11 @@
         renderCurrentView('back');
         restoreViewState(previous);
         refreshHomeAfterEntry(previousView);
+        refreshFavoritesAfterEntry(previousView);
     }
 
     function renderCurrentView(transition = '') {
+        parkSettings();
         stopSmoothScroll(content);
         if (currentView?.kind !== 'home') stopHeroCarousel();
         appBackdropRevision += 1;
@@ -1675,6 +1697,9 @@
         updateNavState();
         switch (currentView?.kind) {
             case 'home': renderHome(currentView.data); break;
+            case 'resume': renderResume(currentView.data); break;
+            case 'favorites': renderFavorites(currentView.data); break;
+            case 'settings': renderSettings(); break;
             case 'libraries': renderLibraries(currentView.data); break;
             case 'library': renderLibrary(currentView.data); break;
             case 'detail': renderDetail(currentView.data); break;
@@ -1685,10 +1710,55 @@
         playContentTransition(transition);
     }
 
+    function parkSettings() {
+        const settings = byId('settings-drawer');
+        if (content.contains(settings)) {
+            settings.classList.remove('settings-page', 'open');
+            settings.setAttribute('aria-hidden', 'true');
+            settings.setAttribute('role', 'dialog');
+            settings.setAttribute('aria-modal', 'true');
+            document.body.append(settings);
+        }
+    }
+
+    function replaceContent(...nodes) {
+        parkSettings();
+        content.replaceChildren(...nodes);
+    }
+
+    function updateSidebarLibraries() {
+        const host = byId('sidebar-libraries'); const libraries = homeData?.libraries || [];
+        const identity = JSON.stringify(libraries.map((library) => [library.id, library.title, library.childCount]));
+        if (host.dataset.identity !== identity) {
+            host.dataset.identity = identity; host.replaceChildren();
+            libraries.forEach((library) => {
+                const button = element('button', 'nav-command sidebar-library'); button.type = 'button';
+                button.dataset.libraryId = library.id; button.dataset.focusKey = 'library:' + library.id; button.title = library.title;
+                const icon = strokeIcon(library.collectionType === 'movies' ? 'film' : 'tv');
+                button.append(icon, element('span', '', library.title));
+                if (Number.isInteger(library.childCount) && library.childCount > 0) button.append(element('small', '', library.childCount));
+                button.addEventListener('click', () => openLibrary(library)); host.append(button);
+            });
+        }
+        [...host.children].forEach((button) => {
+            const selected = currentView?.kind === 'library' && currentView.data.library.id === button.dataset.libraryId;
+            button.classList.toggle('active', selected);
+            if (selected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
+        });
+    }
+
     function updateNavState() {
+        updateSidebarLibraries(); const kind = currentView?.kind;
+        byId('view-title').textContent = kind === 'library' ? currentView.data.library.title
+            : kind === 'detail' ? cardTitle(currentView.data.item, true)
+            : ({ home: '首页', libraries: '媒体库', resume: '继续观看', favorites: '收藏', settings: '设置', search: '搜索', person: '演职人员',
+                'library-loading': '媒体库', 'detail-loading': '作品详情' })[kind] || '你的媒体空间';
         byId('nav-home').classList.toggle('active', currentView?.kind === 'home');
         byId('nav-library').classList.toggle('active', ['libraries', 'library'].includes(currentView?.kind));
-        byId('topbar-home-shortcut').classList.toggle('hidden', currentView?.kind === 'home');
+        byId('nav-resume').classList.toggle('active', kind === 'resume');
+        byId('nav-favorites').classList.toggle('active', kind === 'favorites');
+        byId('nav-resume-count').textContent = homeData?.resume?.length || '';
+        byId('settings-open').classList.toggle('active', kind === 'settings');
     }
 
     function updateTopbarState() {
@@ -1700,7 +1770,7 @@
     }
 
     function renderLoading() {
-        content.replaceChildren();
+        replaceContent();
         const wrap = element('div', 'loading-grid');
         for (let index = 0; index < 12; index += 1) {
             const card = element('div', 'placeholder-card');
@@ -1714,7 +1784,7 @@
     }
 
     function renderEmpty(message) {
-        content.replaceChildren(element('div', 'empty-state', message));
+        replaceContent(element('div', 'empty-state', message));
     }
 
     function invalidateHomeRefresh() {
@@ -1726,6 +1796,11 @@
     function refreshHomeAfterEntry(previousView) {
         if (!previousView || previousView.kind === 'home' || currentView?.kind !== 'home') return;
         scheduleHomeRefresh(0);
+    }
+
+    function refreshFavoritesAfterEntry(previousView) {
+        if (currentView?.kind !== 'favorites' || previousView?.data === currentView.data) return;
+        void loadFavorites(currentView.data, { refresh: true });
     }
 
     async function loadHome(replaceHistory = false) {
@@ -1782,7 +1857,7 @@
     }
 
     function imageWidthFor(ref, landscape, hero = false) {
-        if (hero) return 1600;
+        if (hero) return Math.min(2000, Math.max(1280, Math.ceil(content.clientWidth * Math.min(window.devicePixelRatio || 1, 2))));
         if (ref?.type === 'backdrop' || landscape) return 640;
         return 360;
     }
@@ -1842,7 +1917,7 @@
             clearAppBackdrop(revision);
             return;
         }
-        requestImage(ref, imageWidthFor(ref, true, true)).then((src) => {
+        requestImage(ref, imageWidthFor(ref, true, true), { background: true }).then((src) => {
             if (revision !== appBackdropRevision || currentView !== expectedView) return;
             setAppBackdrop(src, revision);
         }).catch((error) => {
@@ -1865,14 +1940,20 @@
             });
     }
 
-    function requestImage(ref, width) {
+    function requestImage(ref, width, { background = false } = {}) {
         const memoryKey = imageMemoryKey(ref, width);
         const cached = imageCache.get(memoryKey);
         if (cached) return Promise.resolve(cached);
         const active = imagePending.get(memoryKey);
-        if (active) return active;
+        if (active) {
+            if (!background) {
+                const queued = imageQueue.find((task) => task.memoryKey === memoryKey);
+                if (queued) { queued.background = false; pumpImages(); }
+            }
+            return active;
+        }
         const request = new Promise((resolve, reject) => {
-            imageQueue.push({ ref, width, memoryKey, resolve, reject });
+            imageQueue.push({ ref, width, memoryKey, background, resolve, reject });
             pumpImages();
         });
         imagePending.set(memoryKey, request);
@@ -1889,8 +1970,15 @@
 
     function pumpImages() {
         while (imageActive < 2 && imageQueue.length > 0) {
-            const task = imageQueue.shift();
+            // Keep one native request slot available for visible covers while large artwork loads.
+            let index = imageQueue.findIndex((task) => !task.background);
+            if (index < 0) {
+                if (imageBackgroundActive >= 1) break;
+                index = 0;
+            }
+            const [task] = imageQueue.splice(index, 1);
             imageActive += 1;
+            if (task.background) imageBackgroundActive += 1;
             nativeRequest('mediaStationImage', 'image', [JSON.stringify(task.ref), Math.round(task.width)], 40000)
                 .then((payload) => {
                     if (payload.key !== task.ref.key || typeof payload.dataUrl !== 'string' || !payload.dataUrl.startsWith('data:image/')) {
@@ -1906,6 +1994,7 @@
                 .catch(task.reject)
                 .finally(() => {
                     imageActive -= 1;
+                    if (task.background) imageBackgroundActive -= 1;
                     pumpImages();
                     if (imageActive === 0 && imageQueue.length === 0) scheduleImageCacheStatsRefresh();
                 });
@@ -1935,6 +2024,12 @@
         if (!status) return;
         const label = byId('settings-frame-interpolation-status');
         const component = status.component || {};
+        const interpolationEntry = byId('player-interpolation');
+        const componentInstalled = component.installed === true;
+        const componentReady = componentInstalled && status.componentStatus === 'ready';
+        interpolationEntry.dataset.componentInstalled = String(componentInstalled);
+        interpolationEntry.dataset.componentReady = String(componentReady);
+        interpolationEntry.classList.toggle('hidden', !componentInstalled);
         if (component.restarting) interpolationComponentRestarting = true;
         const blocked = interpolationComponentRestarting || component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
         byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
@@ -2102,6 +2197,66 @@
         return [season, episode].filter(Boolean).join(' · ');
     }
 
+    function strokeIcon(name) {
+        const paths = {
+            film: 'M4 3h16v18H4ZM8 3v18M16 3v18M4 8h4M4 16h4M16 8h4M16 16h4',
+            tv: 'M8 3l4 4 4-4M7 21h10M3 8h18v11H3Z',
+            grid: 'M4 4h6v6H4ZM14 4h6v6h-6ZM4 14h6v6H4ZM14 14h6v6h-6Z',
+            list: 'M9 6h12M9 12h12M9 18h12M3 6h1M3 12h1M3 18h1',
+            play: 'm8 5 11 7-11 7Z',
+            pause: 'M8 5v14M16 5v14',
+            back: 'M8 4 4 8l4 4M4 8h9a8 8 0 1 1-8 10',
+            forward: 'm16 4 4 4-4 4M20 8h-9a8 8 0 1 0 8 10',
+            subtitles: 'M3 5h18v14H3ZM6 10h4M14 10h4M6 14h12',
+            audio: 'M9 17V5l10-2v12M9 5l10-2M9 17a3 3 0 1 1-3-3h3M19 15a3 3 0 1 1-3-3h3',
+            speed: 'M4 18a9 9 0 1 1 16 0ZM12 14l5-5',
+            more: 'M5 12h.01M12 12h.01M19 12h.01',
+            eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12ZM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6',
+            close: 'm6 6 12 12M6 18 18 6',
+            appearance: 'M12 3a9 9 0 1 0 0 18ZM12 3a9 9 0 0 1 0 18V3',
+            settings: 'm9 3-1 3-3 1-2 3 2 2v3l3 2 1 4h6l1-4 3-2v-3l2-2-2-3-3-1-1-3ZM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6',
+            network: 'M12 3v6M5 16v5M19 16v5M5 16H2V9h20v7h-3ZM5 12h.01M9 12h.01M12 12h7',
+            update: 'M20 8V3l-4 4M20 8a9 9 0 1 0 1 8',
+            volume: 'M11 5 6 9H3v6h3l5 4ZM15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14',
+            muted: 'M11 5 6 9H3v6h3l5 4ZM16 9l6 6M16 15l6-6',
+            fullscreen: 'M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5',
+            restore: 'M3 8h5V3M16 3v5h5M21 16h-5v5M8 21v-5H3',
+            interpolation: 'M8 4h8v16H8ZM4 7H2v10h2M20 7h2v10h-2',
+            danmaku: 'M3 4h18v13H9l-5 4v-4H3ZM6 8h12M6 12h8',
+            info: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM12 11v6M12 7h.01',
+        };
+        const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        icon.setAttribute('viewBox', '0 0 24 24'); icon.setAttribute('aria-hidden', 'true');
+        icon.classList.add('shell-icon');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', paths[name]); icon.append(path);
+        return icon;
+    }
+
+    function playerIcon(name) {
+        const filledPaths = {
+            play: 'M8 17.175V6.825q0-.425.3-.713t.7-.287q.125 0 .263.037t.262.113l8.15 5.175q.225.15.338.375t.112.475t-.112.475t-.338.375l-8.15 5.175q-.125.075-.262.113T9 18.175q-.4 0-.7-.288t-.3-.712',
+            pause: 'M16 19q-.825 0-1.412-.587T14 17V7q0-.825.588-1.412T16 5t1.413.588T18 7v10q0 .825-.587 1.413T16 19m-8 0q-.825 0-1.412-.587T6 17V7q0-.825.588-1.412T8 5t1.413.588T10 7v10q0 .825-.587 1.413T8 19',
+            back: 'M11 16.7V7.3q0-.675-.6-.975t-1.15.1L3.1 11q-.45.325-.45 1t.45 1l6.15 4.575q.55.4 1.15.1t.6-.975m10 0V7.3q0-.675-.6-.975t-1.15.1L13.1 11q-.45.325-.45 1t.45 1l6.15 4.575q.55.4 1.15.1t.6-.975',
+            forward: 'M13 16.7V7.3q0-.675.6-.975t1.15.1L20.9 11q.45.325.45 1t-.45 1l-6.15 4.575q-.55.4-1.15.1t-.6-.975m-10 0V7.3q0-.675.6-.975t1.15.1L10.9 11q.45.325.45 1t-.45 1l-6.15 4.575q-.55.4-1.15.1t-.6-.975',
+        };
+        if (filledPaths[name]) {
+            const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            icon.setAttribute('viewBox', '0 0 24 24');
+            icon.setAttribute('aria-hidden', 'true');
+            icon.setAttribute('focusable', 'false');
+            icon.classList.add('player-tool-icon', 'player-solid-icon');
+            if (name === 'back' || name === 'forward') icon.classList.add('player-seek-icon');
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', filledPaths[name]);
+            icon.append(path);
+            return icon;
+        }
+        const icon = strokeIcon(name);
+        icon.classList.add('player-tool-icon');
+        return icon;
+    }
+
     function cardSubtitle(card, omitSeriesName = false, includeEpisodeTitle = false) {
         if (card.type === 'Episode') {
             return [
@@ -2110,7 +2265,7 @@
                 includeEpisodeTitle ? card.title : '',
             ].filter(Boolean).join(' · ');
         }
-        return card.year ? String(card.year) : '';
+        return [card.year, ...(card.genres || []).slice(0, 2)].filter(Boolean).join(' · ');
     }
 
     function cardTitle(card, preferSeriesName = false) {
@@ -2170,9 +2325,6 @@
                 ? (card.landscapeImage || card.primaryImage)
                 : (card.primaryImage || card.landscapeImage);
         observeImage(img, ref, imageWidthFor(ref, options.landscape));
-        if (options.episodePicker && card.indexNumber) {
-            art.append(element('span', 'episode-badge', `第 ${card.indexNumber} 集`));
-        }
         const progress = progressPercent(card);
         if (progress > 0) {
             const track = element('span', 'card-progress');
@@ -2181,20 +2333,30 @@
             track.append(value);
             art.append(track);
         }
+        if (rowKey === 'resume' && card.durationMs > card.resumePositionMs) {
+            art.append(element('span', 'card-remaining', `还剩 ${Math.floor((card.durationMs - card.resumePositionMs) / 60000)}分钟`));
+        }
         if (isLibrary) {
-            const overlay = element('span', 'library-card-overlay');
-            overlay.append(element('strong', '', title), element('span', '', '打开媒体库'));
-            art.append(overlay);
-            button.append(art);
+            button.setAttribute('aria-label', '打开媒体库：' + title);
+            button.title = title; fallback.textContent = title; button.append(art);
         } else {
-            const subtitle = options.episodePicker
+            const resumeEpisodeTitle = options.resumePage && card.type === 'Episode'
+                && card.title !== title && !episodePosition(card).includes(card.title) ? card.title : '';
+            const subtitle = rowKey === 'resume'
+                ? [card.type === 'Episode' ? episodePosition(card) : card.year, resumeEpisodeTitle, `已看到 ${formatTime(card.resumePositionMs || 0)}`].filter(Boolean).join(' · ')
+                : options.episodePicker
                 ? formatDuration(card.durationMs)
                 : cardSubtitle(
                     card,
                     options.omitSeriesName ?? options.episodeAsSeries,
                     rowKey === 'resume',
                 );
-            button.append(art, element('span', 'card-title', title), element('span', 'card-subtitle', subtitle));
+            const caption = options.episodePicker && card.indexNumber
+                ? `第 ${card.indexNumber} 集 · ${title}`
+                : rowKey === 'resume' && card.type === 'Episode' && !options.resumePage
+                    ? [title, card.title].filter(Boolean).join(' · ') : title;
+            button.title = [caption, subtitle].filter(Boolean).join('\n');
+            button.append(art, element('span', 'card-title', caption), element('span', 'card-subtitle', subtitle));
         }
         button.addEventListener('focus', () => options.onFocus?.(card));
         button.addEventListener('click', () => options.onClick?.(card));
@@ -2204,6 +2366,7 @@
     function createRowCarousel(row, title, controlsHost = null, options = {}) {
         row.classList.add('carousel-row');
         const rowShell = element('div', 'media-row-carousel');
+        if (row.classList.contains('home-media-row')) rowShell.classList.add('home-row-carousel');
         if (row.classList.contains('episode-row')) rowShell.classList.add('episode-row-carousel');
         const previous = element('button', 'icon-button hero-carousel-button hero-carousel-previous media-row-carousel-button media-row-carousel-previous');
         previous.type = 'button';
@@ -2423,6 +2586,7 @@
         const section = element('section', 'media-section');
         const heading = element('div', 'section-heading');
         heading.append(element('h2', '', title));
+        if (options.description) heading.firstElementChild.append(element('small', 'section-description', options.description));
         const headingActions = element('div', 'section-heading-actions');
         if (options.more) {
             const more = element('button', '', '查看全部');
@@ -2440,6 +2604,10 @@
         return section;
     }
 
+    function resumePlayback(card) {
+        return startPlayback(card, card.resumePositionMs || 0);
+    }
+
     function captureMediaRowRects(rowKey) {
         const row = content.querySelector(`.media-row[data-row-key="${rowKey}"]`);
         if (!row) return new Map();
@@ -2448,7 +2616,7 @@
     }
 
     function animateMediaRowReorder(rowKey, previousRects, emphasizedId) {
-        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        if (prefersReducedMotion()) return;
         requestAnimationFrame(() => requestAnimationFrame(() => {
             const row = content.querySelector(`.media-row[data-row-key="${rowKey}"]`);
             if (!row) return;
@@ -2488,324 +2656,306 @@
         }));
     }
 
-    function updateHero(hero, card) {
-        if (!card) return;
-        const revision = ++heroRevision;
-        const copy = hero.querySelector('.hero-copy');
-        const nextCopy = document.createDocumentFragment();
-        nextCopy.append(element('h1', '', cardTitle(card, true)));
-        const meta = element('p', 'hero-meta');
-        [card.year, card.dynamicRange, formatDuration(card.durationMs), card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '']
-            .filter(Boolean).forEach((value) => meta.append(element('span', '', value)));
-        nextCopy.append(meta);
-        if (card.overview) nextCopy.append(element('p', 'hero-overview', card.overview));
-        const actions = element('div', 'hero-actions');
-        const primary = element('button', 'primary-command hero-primary');
-        primary.type = 'button';
-        primary.dataset.focusKey = `hero:primary:${card.id}`;
-        if (card.type === 'CollectionFolder') {
-            primary.append(element('span', '', '→'), element('span', '', '打开媒体库'));
-            primary.addEventListener('click', () => openLibrary(card));
-        } else if (card.playable) {
-            const label = card.resumePositionMs ? `继续播放 ${formatTime(card.resumePositionMs)}` : '开始播放';
-            primary.append(element('span', '', '▶'), element('span', '', label));
-            primary.addEventListener('click', () => startPlayback(card, card.resumePositionMs));
-        } else {
-            primary.append(element('span', '', '→'), element('span', '', '查看详情'));
-            primary.addEventListener('click', () => openDetail(card));
-        }
-        actions.append(primary);
-        if (card.playable && card.type !== 'CollectionFolder' && card.type !== 'Episode') {
-            const detail = element('button', 'secondary-command hero-secondary', '查看详情');
-            detail.type = 'button';
-            detail.dataset.focusKey = `hero:detail:${card.id}`;
-            detail.addEventListener('click', () => openDetail(card));
-            actions.append(detail);
-        }
-        nextCopy.append(actions);
-        let copyApplied = false;
-        const applyCopy = (animate) => {
-            if (copyApplied) return;
-            copyApplied = true;
-            window.clearTimeout(heroCopyTimer);
-            copy.classList.remove('hero-copy-enter');
-            copy.replaceChildren(nextCopy);
-            if (!animate) return;
-            void copy.offsetWidth;
-            copy.classList.add('hero-copy-enter');
-            heroCopyTimer = window.setTimeout(() => {
-                copy.classList.remove('hero-copy-enter');
-                heroCopyTimer = 0;
-            }, 340);
-        };
+    function heroArtworkFits(hero, art) {
+        const width = hero.clientWidth;
+        const stacked = content.clientWidth <= 740;
+        const height = stacked ? Math.min(width * 9 / 16, 300) : hero.clientHeight;
+        const availableWidth = stacked ? width : width * .7;
+        const scale = (stacked ? Math.max : Math.min)(availableWidth / art.width, height / art.height);
+        const density = window.devicePixelRatio || 1;
+        return art.width >= 960 && art.width / art.height >= 1.45
+            && art.width >= Math.ceil(art.width * scale * density)
+            && art.height >= Math.ceil(art.height * scale * density);
+    }
+
+    async function loadHeroArtwork(hero, card) {
+        const expectedSession = session;
         const ref = card.backdropImage || card.landscapeImage;
-        applyCopy(copy.childElementCount > 0);
-        if (!ref) return;
-        requestImage(ref, imageWidthFor(ref, true, true)).then((src) => {
-            if (revision !== heroRevision || !hero.isConnected) return;
-            const layers = [...hero.querySelectorAll('.hero-backdrop-layer')];
-            if (layers.length !== 2) return;
-            const activeIndex = Number(hero.dataset.backdropLayer ?? -1);
-            const nextIndex = activeIndex === 0 ? 1 : 0;
-            applyCopy(activeIndex >= 0);
-            window.clearTimeout(heroSlideTimer);
-            heroSlideTimer = 0;
-            layers.forEach((layer) => {
-                layer.classList.remove('sliding');
-                layer.style.transition = 'none';
+        const requestWidth = imageWidthFor(ref, true, true);
+        const key = JSON.stringify([session?.baseUrl, session?.userId, ref, requestWidth]);
+        let art = heroArtworkCache.get(key);
+        if (!art) {
+            const src = await requestImage(ref, requestWidth, { background: true });
+            const image = new Image(); image.src = src; await image.decode();
+            if (session !== expectedSession) throw new Error('账号已切换，取消旧账号精选图片');
+            art = { src, width: image.naturalWidth, height: image.naturalHeight, requestWidth };
+            heroArtworkCache.set(key, art);
+        }
+        return art;
+    }
+
+    function refreshHeroArtworkQualification() {
+        if (currentView?.kind !== 'home') return;
+        const hero = content.querySelector('.home-hero');
+        if (!hero?._artworkPool) return;
+        const cards = hero._artworkPool.filter((entry) => heroArtworkFits(hero, entry.art)).slice(0, heroCarouselMaxCards);
+        const requestWidth = imageWidthFor(null, true, true);
+        if (!hero._refreshingArtwork && hero._artworkPool.some((entry) => entry.art.requestWidth < requestWidth && !heroArtworkFits(hero, entry.art))) {
+            hero._refreshingArtwork = true;
+            const revision = heroRevision;
+            Promise.allSettled(hero._artworkPool.map(async (entry) => ({ card: entry.card, art: await loadHeroArtwork(hero, entry.card) }))).then((results) => {
+                hero._refreshingArtwork = false;
+                if (revision !== heroRevision || !hero.isConnected) return;
+                results.filter((result) => result.status === 'rejected').forEach((result) => console.error('精选高清图片重新加载失败：' + friendlyError(result.reason)));
+                hero._artworkPool = results.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+                refreshHeroArtworkQualification();
             });
-            layers[nextIndex].style.backgroundImage = `url("${src}")`;
-            lastHeroBackdropSrc = src;
-            setAppBackdrop(src);
-            if (activeIndex < 0) {
-                layers[nextIndex].style.transform = 'translateX(0)';
-                layers[nextIndex].classList.add('active');
-                hero.dataset.backdropLayer = String(nextIndex);
-                return;
-            }
-            layers[activeIndex].style.transform = 'translateX(0)';
-            layers[nextIndex].style.transform = 'translateX(100%)';
-            void hero.offsetWidth;
-            layers[activeIndex].style.transition = '';
-            layers[nextIndex].style.transition = '';
-            layers[activeIndex].classList.add('sliding');
-            layers[nextIndex].classList.add('active', 'sliding');
-            layers[activeIndex].style.transform = 'translateX(-100%)';
-            layers[nextIndex].style.transform = 'translateX(0)';
-            hero.dataset.backdropLayer = String(nextIndex);
-            heroSlideTimer = window.setTimeout(() => {
-                if (!hero.isConnected || Number(hero.dataset.backdropLayer) !== nextIndex) return;
-                layers[activeIndex].classList.remove('active', 'sliding');
-                layers[activeIndex].style.transition = 'none';
-                layers[activeIndex].style.transform = 'translateX(100%)';
-                layers[activeIndex].style.backgroundImage = '';
-                layers[nextIndex].classList.remove('sliding');
-                heroSlideTimer = 0;
-            }, 700);
-        }).catch((error) => console.error(`Hero image failed: ${friendlyError(error)}`));
+        }
+        const signature = cards.map((entry) => entry.card.id).join(',');
+        if (signature === hero.dataset.qualifiedIds) return;
+        const selectedId = hero.dataset.mediaId;
+        heroCarouselController?.destroy(); heroCarouselController = null;
+        hero.dataset.qualifiedIds = signature; hero.dataset.mediaId = '';
+        hero.replaceChildren(element('div', 'hero-slide'), element('div', 'hero-slide'));
+        hero.classList.toggle('hero-pending', !cards.length);
+        if (cards.length) startHeroCarousel(hero, cards, selectedId);
+    }
+
+    async function updateHero(hero, card, art, direction = 1) {
+        if (!hero.isConnected || hero.dataset.mediaId === card.id) return;
+        const copy = element('div', 'hero-copy');
+        copy.append(element('p', 'hero-kicker', '最近添加'));
+        copy.append(element('h1', '', cardTitle(card, true)));
+        const meta = element('p', 'hero-meta');
+        [card.year, ...(card.genres || []).slice(0, 2), card.dynamicRange]
+            .filter(Boolean).forEach((value) => meta.append(element('span', '', value)));
+        copy.append(meta);
+        if (card.overview) copy.append(element('p', 'hero-overview', card.overview.length > 80 ? card.overview.slice(0, 80).trimEnd() + '…' : card.overview));
+        const actions = element('div', 'hero-actions');
+        const primary = element('button', 'primary-command hero-primary'); primary.type = 'button';
+        primary.dataset.focusKey = `hero:primary:${card.id}`;
+        primary.append(strokeIcon('play'), element('span', '', '打开作品'));
+        primary.addEventListener('click', () => openDetail(card)); actions.append(primary, createFavoriteButton(card)); copy.append(actions);
+        const image = document.createElement('img');
+        image.className = 'hero-image'; image.alt = ''; image.src = art.src;
+        const slides = [...hero.querySelectorAll('.hero-slide')];
+        const active = slides.find((slide) => slide.classList.contains('active'));
+        const next = slides.find((slide) => slide !== active);
+        const focusInside = active?.contains(document.activeElement);
+        slides.forEach((slide) => { slide.classList.remove('sliding'); slide.inert = true; slide.setAttribute('aria-hidden', 'true'); });
+        next.replaceChildren(image, copy);
+        next.style.transform = `translateX(${direction * 100}%)`;
+        const animate = Boolean(active) && !prefersReducedMotion();
+        void next.offsetWidth;
+        if (animate) { next.classList.add('sliding'); active.classList.add('sliding'); }
+        next.classList.add('active'); next.inert = false; next.setAttribute('aria-hidden', 'false');
+        next.style.transform = 'translateX(0)';
+        if (active) { active.classList.remove('active'); active.style.transform = `translateX(${-direction * 100}%)`; }
+        hero.dataset.mediaId = card.id;
+        if (focusInside) primary.focus({ preventScroll: true });
+        if (animate) await new Promise((resolve) => window.setTimeout(resolve, 320));
+        slides.forEach((slide) => { slide.classList.remove('sliding'); if (slide !== next) { slide.replaceChildren(); slide.style.transform = 'translateX(100%)'; } });
     }
 
     function stopHeroCarousel() {
-        window.clearTimeout(heroRotationTimer);
-        heroRotationTimer = 0;
-        if (heroCarouselController) {
-            const controller = heroCarouselController;
-            heroCarouselController = null;
-            controller.destroy();
-        }
+        window.clearTimeout(heroRotationTimer); heroRotationTimer = 0;
+        heroRevision += 1;
+        heroCarouselController?.destroy(); heroCarouselController = null;
     }
 
-    function shuffledHeroCards(data, latestSections) {
+    function heroCandidates(data, latestSections) {
         const seen = new Set();
-        const cards = [];
-        const sources = [
-            ...(Array.isArray(data.resume) ? data.resume : []),
-            ...latestSections.flatMap((section) => section.items || []),
-            ...(Array.isArray(data.latest) ? data.latest : []),
-        ];
-        for (const card of sources) {
-            if (!card?.id || seen.has(card.id) || card.type === 'CollectionFolder') continue;
-            if (!card.backdropImage && !card.landscapeImage) continue;
-            seen.add(card.id);
-            cards.push(card);
-        }
-        for (let index = cards.length - 1; index > 0; index -= 1) {
-            const target = Math.floor(Math.random() * (index + 1));
-            [cards[index], cards[target]] = [cards[target], cards[index]];
-        }
-        return cards.slice(0, heroCarouselMaxCards);
+        return [...latestSections.flatMap((section) => section.items || []), ...(data.latest || []), ...(data.resume || [])]
+            .filter((card) => {
+                const key = JSON.stringify(card?.backdropImage || card?.landscapeImage);
+                if (!card?.id || card.type === 'Episode' || card.type === 'CollectionFolder' || key === undefined || key === 'null' || seen.has(key)) return false;
+                seen.add(key); return true;
+            }).slice(0, 20);
     }
 
-    function startHeroCarousel(hero, cards) {
-        stopHeroCarousel();
-        if (!cards.length) {
-            return { select: () => {}, previous: () => {}, next: () => {} };
-        }
-        let index = 0;
-        let remainingMs = heroRotationIntervalMs;
-        let startedAt = 0;
-        let destroyed = false;
+    function startHeroCarousel(hero, cards, selectedId = '') {
+        let index = -1; let destroyed = false; let busy = false;
         const pauseReasons = new Set();
-        const indicator = element('div', 'hero-carousel-progress');
-        const indicatorText = element('span', 'hero-carousel-progress-label');
-        const progressTrack = element('span', 'hero-carousel-progress-track');
-        const progressFill = element('span', 'hero-carousel-progress-fill');
-        progressTrack.append(progressFill);
-        indicator.append(indicatorText, progressTrack);
-        hero.append(indicator);
-
-        const updateIndicator = (restart = false) => {
-            indicatorText.textContent = `${index + 1} / ${cards.length}`;
-            if (!restart) return;
-            progressFill.style.animation = 'none';
-            void progressFill.offsetWidth;
-            progressFill.style.animation = `hero-carousel-progress ${remainingMs}ms linear forwards`;
-            progressFill.style.animationPlayState = pauseReasons.size ? 'paused' : 'running';
-        };
-        const schedule = (reset = true) => {
+        const controls = element('div', 'hero-carousel-controls');
+        const dots = element('div', 'hero-carousel-dots'); dots.setAttribute('role', 'group'); dots.setAttribute('aria-label', '精选作品');
+        const schedule = () => {
             window.clearTimeout(heroRotationTimer);
-            heroRotationTimer = 0;
-            if (destroyed || cards.length < 2) return;
-            if (reset) remainingMs = heroRotationIntervalMs;
-            updateIndicator(reset);
-            if (pauseReasons.size) {
-                progressFill.style.animationPlayState = 'paused';
-                return;
-            }
-            progressFill.style.animationPlayState = 'running';
-            startedAt = performance.now();
-            heroRotationTimer = window.setTimeout(() => {
-                heroRotationTimer = 0;
-                if (destroyed || !hero.isConnected || currentView?.kind !== 'home') return;
-                index = (index + 1) % cards.length;
-                updateHero(hero, cards[index]);
-                schedule(true);
-            }, remainingMs);
+            if (destroyed || busy || pauseReasons.size || cards.length < 2) return;
+            heroRotationTimer = window.setTimeout(() => void select((index + 1) % cards.length, 1), heroRotationIntervalMs);
         };
-        const pause = (reason) => {
-            if (destroyed || pauseReasons.has(reason)) return;
-            pauseReasons.add(reason);
-            if (heroRotationTimer) {
-                remainingMs = Math.max(80, remainingMs - (performance.now() - startedAt));
-                window.clearTimeout(heroRotationTimer);
-                heroRotationTimer = 0;
-            }
-            progressFill.style.animationPlayState = 'paused';
+        const select = async (nextIndex, direction) => {
+            if (destroyed || busy || nextIndex === index) return;
+            const focusedControl = controls.contains(document.activeElement) ? document.activeElement : null;
+            busy = true; window.clearTimeout(heroRotationTimer);
+            controls.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+            index = nextIndex;
+            [...dots.children].forEach((dot, n) => dot.setAttribute('aria-pressed', String(n === index)));
+            await updateHero(hero, cards[index].card, cards[index].art, direction);
+            busy = false;
+            if (destroyed) return;
+            controls.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+            if (focusedControl?.isConnected) focusedControl.focus({ preventScroll: true });
+            schedule();
         };
-        const resume = (reason) => {
-            if (destroyed || !pauseReasons.delete(reason) || pauseReasons.size) return;
-            schedule(false);
-        };
-        const select = (card) => {
-            const selectedIndex = cards.findIndex((candidate) => candidate.id === card?.id);
-            if (selectedIndex >= 0) index = selectedIndex;
-            updateHero(hero, card);
-            schedule(true);
-        };
-        const step = (offset) => {
-            index = (index + offset + cards.length) % cards.length;
-            updateHero(hero, cards[index]);
-            schedule(true);
-        };
-        const onPointerEnter = () => pause('pointer');
-        const onPointerLeave = () => resume('pointer');
-        const onFocusIn = () => pause('focus');
-        const onFocusOut = (event) => {
-            if (!hero.contains(event.relatedTarget)) resume('focus');
-        };
-        const onVisibilityChange = () => document.hidden ? pause('hidden') : resume('hidden');
-        hero.addEventListener('pointerenter', onPointerEnter);
-        hero.addEventListener('pointerleave', onPointerLeave);
-        hero.addEventListener('focusin', onFocusIn);
-        hero.addEventListener('focusout', onFocusOut);
-        document.addEventListener('visibilitychange', onVisibilityChange);
-        if (document.hidden) pauseReasons.add('hidden');
-        if (!playerView.classList.contains('hidden')) pauseReasons.add('player');
-        heroCarouselController = {
-            pause,
-            resume,
-            destroy: () => {
-                destroyed = true;
-                window.clearTimeout(heroRotationTimer);
-                heroRotationTimer = 0;
-                hero.removeEventListener('pointerenter', onPointerEnter);
-                hero.removeEventListener('pointerleave', onPointerLeave);
-                hero.removeEventListener('focusin', onFocusIn);
-                hero.removeEventListener('focusout', onFocusOut);
-                document.removeEventListener('visibilitychange', onVisibilityChange);
-            },
-        };
-        select(cards[0]);
-        return {
-            select,
-            previous: () => step(-1),
-            next: () => step(1),
-        };
+        cards.forEach((entry, n) => {
+            const dot = element('button', 'hero-dot'); dot.type = 'button';
+            dot.setAttribute('aria-label', `轮播作品 ${n + 1}：${entry.card.title}`); dot.setAttribute('aria-pressed', 'false');
+            dot.addEventListener('click', () => void select(n, n < index ? -1 : 1)); dots.append(dot);
+        });
+        controls.append(dots);
+        for (const [offset, label] of [[-1, '上一部精选'], [1, '下一部精选']]) {
+            const button = element('button', 'icon-button hero-carousel-button ' + (offset < 0 ? 'hero-carousel-previous' : 'hero-carousel-next'));
+            button.type = 'button'; button.setAttribute('aria-label', label); button.title = label;
+            button.append(element('span', 'hero-carousel-chevron'));
+            button.addEventListener('click', () => void select((index + offset + cards.length) % cards.length, offset)); controls.append(button);
+        }
+        if (cards.length > 1) hero.append(controls);
+        const pause = (reason) => { pauseReasons.add(reason); window.clearTimeout(heroRotationTimer); };
+        const resume = (reason) => { pauseReasons.delete(reason); schedule(); };
+        const enter = () => pause('pointer'); const leave = () => resume('pointer');
+        const focus = () => pause('focus'); const blur = (event) => { if (!hero.contains(event.relatedTarget)) resume('focus'); };
+        const visibility = () => document.hidden ? pause('hidden') : resume('hidden');
+        hero.addEventListener('pointerenter', enter); hero.addEventListener('pointerleave', leave);
+        hero.addEventListener('focusin', focus); hero.addEventListener('focusout', blur);
+        document.addEventListener('visibilitychange', visibility);
+        if (document.hidden) pause('hidden'); if (player) pause('player');
+        heroCarouselController = { pause, resume, destroy() {
+            destroyed = true; window.clearTimeout(heroRotationTimer);
+            hero.removeEventListener('pointerenter', enter); hero.removeEventListener('pointerleave', leave);
+            hero.removeEventListener('focusin', focus); hero.removeEventListener('focusout', blur);
+            document.removeEventListener('visibilitychange', visibility);
+        } };
+        const restored = cards.findIndex((entry) => entry.card.id === selectedId || currentView?.focusKey?.endsWith(':' + entry.card.id));
+        void select(restored >= 0 ? restored : 0, 1);
+    }
+
+    async function loadHeroCandidates(hero, candidates, revision) {
+        hero._artworkPool = [];
+        for (const card of candidates) {
+            if (revision !== heroRevision || !hero.isConnected) return;
+            try {
+                const art = await loadHeroArtwork(hero, card);
+                if (revision !== heroRevision || !hero.isConnected) return;
+                hero._artworkPool.push({ card, art });
+                // Reveal the first sharp image immediately; complete the carousel in the background.
+                if (!hero.dataset.qualifiedIds && heroArtworkFits(hero, art)) refreshHeroArtworkQualification();
+                if (hero._artworkPool.filter((entry) => heroArtworkFits(hero, entry.art)).length >= heroCarouselMaxCards) break;
+            } catch (error) { console.error('精选图片加载失败：' + friendlyError(error)); }
+        }
+        if (revision === heroRevision && hero.isConnected) refreshHeroArtworkQualification();
     }
 
     function renderHome(data) {
-        stopHeroCarousel();
-        content.replaceChildren();
-        const resumeItems = Array.isArray(data.resume)
-            ? data.resume.slice(0, maximumContinueWatchingItems)
-            : [];
-        const latestSections = Array.isArray(data.latestSections)
-            ? data.latestSections.filter((section) => section?.library && section.items?.length)
-            : [];
-        const hero = element('section', 'home-hero');
-        const firstBackdrop = element('span', 'hero-backdrop-layer');
-        const secondBackdrop = element('span', 'hero-backdrop-layer');
-        if (lastHeroBackdropSrc) {
-            firstBackdrop.style.backgroundImage = `url("${lastHeroBackdropSrc}")`;
-            firstBackdrop.style.transform = 'translateX(0)';
-            firstBackdrop.classList.add('active');
-            hero.dataset.backdropLayer = '0';
-        }
-        hero.append(
-            firstBackdrop,
-            secondBackdrop,
-            element('div', 'hero-copy'),
-        );
-        const heroCards = shuffledHeroCards({ ...data, resume: resumeItems }, latestSections);
-        const fallback = resumeItems[0] || latestSections[0]?.items?.[0] || data.latest?.[0] || data.libraries?.[0];
-        const carousel = heroCards.length
-            ? startHeroCarousel(hero, heroCards)
-            : { select: (card) => updateHero(hero, card), previous: () => {}, next: () => {} };
-        if (!heroCards.length && fallback) carousel.select(fallback);
-        const restoreHeroId = currentView?.focusKey?.startsWith('hero:')
-            ? currentView.focusKey.split(':').at(-1)
-            : '';
-        const restoreHeroCard = heroCards.find((card) => card.id === restoreHeroId);
-        if (restoreHeroCard) carousel.select(restoreHeroCard);
-        if (heroCards.length > 1) {
-            const controls = element('div', 'hero-carousel-controls');
-            const previous = element('button', 'icon-button hero-carousel-button hero-carousel-previous');
-            previous.type = 'button';
-            previous.title = '上一张';
-            previous.setAttribute('aria-label', '上一张海报');
-            previous.append(element('span', 'hero-carousel-chevron'));
-            previous.addEventListener('click', carousel.previous);
-            const next = element('button', 'icon-button hero-carousel-button hero-carousel-next');
-            next.type = 'button';
-            next.title = '下一张';
-            next.setAttribute('aria-label', '下一张海报');
-            next.append(element('span', 'hero-carousel-chevron'));
-            next.addEventListener('click', carousel.next);
-            controls.append(previous, next);
-            hero.append(controls);
-        }
+        stopHeroCarousel(); replaceContent();
+        const revision = heroRevision;
+        const resumeItems = Array.isArray(data.resume) ? data.resume.slice(0, maximumContinueWatchingItems) : [];
+        const latestSections = Array.isArray(data.latestSections) ? data.latestSections.filter((section) => section?.library && section.items?.length) : [];
+        const hero = element('section', 'home-hero hero-pending');
+        hero.setAttribute('aria-label', '最近添加精选');
+        hero.append(element('div', 'hero-slide'), element('div', 'hero-slide'));
         const band = element('div', 'page-band');
-        const focusHero = (card) => carousel.select(card);
-        const libraries = createSection('媒体库', data.libraries, {
-            key: 'libraries', rowIndex: 0, landscape: true, library: true, onFocus: focusHero,
-            onClick: openLibrary, more: () => setCurrentView({ kind: 'libraries', data: data.libraries }),
-        });
         const resume = createSection('继续观看', resumeItems, {
-            key: 'resume', rowIndex: 1, landscape: true, episodeAsSeries: true, onFocus: focusHero,
-            onClick: (card) => card.playable ? startPlayback(card, card.resumePositionMs) : openDetail(card),
+            key: 'resume', rowIndex: 1, landscape: true, episodeAsSeries: true, description: '接着上次的故事',
+            more: () => setCurrentView({ kind: 'resume', data: homeData }),
+            onClick: resumePlayback,
         });
         const latestRows = latestSections.length
             ? latestSections.map((section, index) => createSection(`最近添加 · ${section.library.title}`, section.items, {
-                key: `latest:${section.library.id}`, rowIndex: index + 2,
-                onFocus: focusHero, onClick: openDetail,
+                key: `latest:${section.library.id}`, rowIndex: index + 2, onClick: openDetail,
+                more: () => openLibrary(section.library),
             }))
-            : [createSection('最近添加', data.latest, {
-                key: 'latest', rowIndex: 2, onFocus: focusHero, onClick: openDetail,
-            })];
-        [libraries, resume, ...latestRows].filter(Boolean).forEach((section) => band.append(section));
+            : [createSection('最近添加', data.latest, { key: 'latest', rowIndex: 2, onClick: openDetail })];
+        [resume, ...latestRows].filter(Boolean).forEach((section) => band.append(section));
         if (!band.childElementCount) band.append(element('div', 'empty-state', '媒体库暂无内容'));
         content.append(hero, band);
+        const candidates = heroCandidates(data, latestSections);
+        void loadHeroCandidates(hero, candidates, revision);
+    }
+
+    function renderResume(data) {
+        replaceContent();
+        const header = element('div', 'page-header'); header.append(element('h1', '', '继续观看'));
+        const grid = element('div', 'grid-view resume-grid');
+        (data.resume || []).forEach((card, index) => grid.append(createMediaCard(card, {
+            key: 'resume', index, landscape: true, episodeAsSeries: true, resumePage: true,
+            onClick: resumePlayback,
+        })));
+        content.append(header, grid.childElementCount ? grid : element('div', 'empty-state', '暂无继续观看的作品'));
+    }
+
+    function createFavoriteButton(card) {
+        const button = element('button', 'secondary-command favorite-command'); button.type = 'button';
+        button.dataset.favoriteId = card.id; button.dataset.focusKey = `favorite:${card.id}`;
+        const refresh = () => {
+            button.textContent = card.isFavorite === true ? '✓ 已收藏' : card.isFavorite === false ? '+ 收藏' : '收藏';
+            if (typeof card.isFavorite === 'boolean') button.setAttribute('aria-pressed', String(card.isFavorite));
+            else { button.removeAttribute('aria-pressed'); button.title = '先读取服务器收藏状态'; }
+        };
+        refresh();
+        button.addEventListener('click', async () => {
+            button.disabled = true; button.setAttribute('aria-busy', 'true');
+            try {
+                if (typeof card.isFavorite !== 'boolean') {
+                    const detail = await nativeRequest('mediaStationCatalog', 'detail', ['detail', JSON.stringify({ mediaId: card.id, refresh: true })]);
+                    if (detail.item?.id !== card.id || typeof detail.item.isFavorite !== 'boolean') throw new Error('服务器没有返回有效的收藏状态');
+                    card.isFavorite = detail.item.isFavorite; button.title = ''; refresh();
+                    showToast('收藏状态已读取，可再次点击更改。'); return;
+                }
+                const result = await nativeRequest('mediaStationCatalog', 'set_favorite', ['set_favorite', JSON.stringify({ mediaId: card.id, favorite: card.isFavorite !== true })]);
+                if (result.mediaId !== card.id || typeof result.isFavorite !== 'boolean') throw new Error('服务器没有返回有效的收藏状态');
+                card.isFavorite = result.isFavorite;
+                const sources = [homeData?.resume || [], homeData?.latest || [], ...(homeData?.latestSections || []).map((section) => section.items || []), ...[...libraryCache.values()].map((entry) => entry.items || [])];
+                sources.flat().filter((item) => item.id === card.id).forEach((item) => { item.isFavorite = result.isFavorite; });
+                seriesDetailCache.delete(seriesDetailCacheKey(card.id));
+                if (currentView?.kind === 'favorites') void loadFavorites(currentView.data, { refresh: true });
+                if (result.cacheWarning) showToast('收藏已保存，但本地缓存更新失败；请重新打开客户端核验。');
+                document.querySelectorAll('[data-favorite-id]').forEach((node) => {
+                    if (node.dataset.favoriteId === card.id) { node.textContent = card.isFavorite ? '✓ 已收藏' : '+ 收藏'; node.setAttribute('aria-pressed', String(card.isFavorite)); }
+                });
+            } catch (error) { showToast(`收藏操作失败：${friendlyError(error)}`); }
+            finally { button.disabled = false; button.removeAttribute('aria-busy'); }
+        });
+        return button;
+    }
+
+    function renderFavorites(data) {
+        replaceContent(); const header = element('div', 'page-header'); header.append(element('h1', '', '收藏')); content.append(header);
+        if (data.items.length) {
+            const grid = element('div', 'grid-view'); data.items.forEach((card, index) => grid.append(createMediaCard(card, { index, onClick: openDetail }))); content.append(grid);
+        }
+        if (data.loading) content.append(element('p', 'library-state', '正在读取收藏…'));
+        else if (data.error) {
+            const state = element('div', 'library-state'); state.append(element('p', '', data.error));
+            const retry = element('button', 'secondary-command', '重新尝试'); retry.type = 'button'; retry.addEventListener('click', () => void loadFavorites(data)); state.append(retry); content.append(state);
+        } else if (!data.items.length) content.append(element('p', 'empty-state', '暂无收藏作品'));
+        else if (data.items.length < data.totalRecordCount) {
+            const more = element('button', 'secondary-command favorite-more', '加载更多'); more.type = 'button'; more.addEventListener('click', () => void loadFavorites(data)); content.append(more);
+        }
+    }
+
+    async function loadFavorites(data, { refresh = false } = {}) {
+        if (data.loading && !refresh) return;
+        const revision = data.requestRevision = (data.requestRevision || 0) + 1;
+        if (refresh) { data.items = []; data.totalRecordCount = 0; }
+        data.loading = true; data.error = '';
+        if (currentView?.data === data) renderFavorites(data);
+        try {
+            const startIndex = data.items.length;
+            const response = await nativeRequest('mediaStationCatalog', 'favorites', ['favorites', JSON.stringify({ startIndex, limit: libraryPageSize })]);
+            const page = validateLibraryPage(response, startIndex);
+            if (data.requestRevision !== revision || currentView?.data !== data) return;
+            data.items.push(...page.items); data.totalRecordCount = page.totalRecordCount;
+        } catch (error) {
+            if (data.requestRevision === revision) data.error = `收藏加载失败：${friendlyError(error)}`;
+        } finally {
+            if (data.requestRevision === revision) {
+                data.loading = false;
+                if (currentView?.data === data) renderFavorites(data);
+            }
+        }
     }
 
     function renderLibraries(libraries) {
-        content.replaceChildren();
+        replaceContent();
         const backdropCard = libraries.find((library) => library.backdropImage || library.landscapeImage || library.primaryImage);
         loadViewBackdrop(backdropCard && (backdropCard.backdropImage || backdropCard.landscapeImage || backdropCard.primaryImage), appBackdropRevision, currentView);
         const header = element('div', 'page-header');
         const back = element('button', 'back-button hero-carousel-previous');
         back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
-        header.append(back, element('h1', '', '媒体库'));
+        const copy = element('div', 'page-header-copy');
+        copy.append(element('h1', '', '媒体库'), element('p', '', `${libraries.length} 个媒体库 · 选择一个开始浏览`));
+        header.append(copy);
         const grid = element('div', 'grid-view library-grid');
         libraries.forEach((library, index) => grid.append(createMediaCard(library, { landscape: true, library: true, index, onClick: openLibrary })));
         content.append(header, grid);
@@ -2813,12 +2963,15 @@
 
     async function openLibrary(library) {
         const captured = captureView();
-        const filter = { itemType: '', genre: '' };
+        const preferences = libraryBrowsePreferences.get(library.id);
+        const filter = { itemType: '', genre: '', sort: 'DateCreated', ...preferences?.filter };
         const cached = getLibraryCache(library, filter);
         if (cached) {
             const data = {
                 library,
                 filter,
+                viewMode: preferences?.viewMode || 'grid',
+                filterExpanded: { ...preferences?.filterExpanded },
                 ...cached,
                 items: cached.items.slice(),
                 syncing: true,
@@ -2827,6 +2980,7 @@
                 filterRevision: ++libraryFilterRevision,
             };
             setCurrentView({ kind: 'library', data });
+            if (preferences?.scrollTop) restoreViewState({ scrollTop: preferences.scrollTop, rows: {}, focusKey: '' }, { restoreFocus: false });
             syncLibraryFirstPage(data);
             return;
         }
@@ -2846,6 +3000,8 @@
             const data = {
                 library,
                 filter,
+                viewMode: preferences?.viewMode || 'grid',
+                filterExpanded: { ...preferences?.filterExpanded },
                 filters,
                 ...page,
                 syncing: false,
@@ -2866,11 +3022,12 @@
         const params = { parentId: data.library.id, startIndex, limit: libraryPageSize };
         if (data.filter?.itemType) params.itemType = data.filter.itemType;
         if (data.filter?.genre) params.genre = data.filter.genre;
+        params.sort = data.filter?.sort || 'DateCreated';
         return params;
     }
 
     function libraryFilterIdentity(filter) {
-        return JSON.stringify([filter?.itemType || '', filter?.genre || '']);
+        return JSON.stringify([filter?.itemType || '', filter?.genre || '', filter?.sort || 'DateCreated']);
     }
 
     function isLibraryRequestCurrent(data, revision, filterIdentity) {
@@ -2970,16 +3127,6 @@
         data.filterExpanded ||= { itemType: false, genre: false };
         const bar = element('section', 'library-filters');
         bar.setAttribute('aria-label', '媒体库筛选');
-        bar.append(createFilterGroup({
-            key: 'type',
-            label: '类型',
-            values: data.filters.itemTypes,
-            selected: data.filter.itemType,
-            expanded: data.filterExpanded.itemType,
-            onExpandedChange: (expanded) => { data.filterExpanded.itemType = expanded; },
-            onSelect: (itemType) => applyLibraryFilter(data, { itemType, genre: data.filter.genre }),
-            valueLabel: mediaTypeLabel,
-        }));
         if (data.filters.genres.length) {
             bar.append(createFilterGroup({
                 key: 'genre',
@@ -2988,7 +3135,7 @@
                 selected: data.filter.genre,
                 expanded: data.filterExpanded.genre,
                 onExpandedChange: (expanded) => { data.filterExpanded.genre = expanded; },
-                onSelect: (genre) => applyLibraryFilter(data, { itemType: data.filter.itemType, genre }),
+                onSelect: (genre) => applyLibraryFilter(data, { ...data.filter, genre }),
             }));
         }
         requestAnimationFrame(() => {
@@ -3000,14 +3147,43 @@
 
     function renderLibrary(data) {
         libraryPageObserver.disconnect();
-        content.replaceChildren();
+        replaceContent();
         loadViewBackdrop(data.library.backdropImage || data.library.landscapeImage, appBackdropRevision, currentView);
         const header = element('div', 'page-header');
+        const breadcrumb = element('nav', 'library-breadcrumb'); breadcrumb.setAttribute('aria-label', '库内导航');
+        const directory = element('button', '', '媒体库'); directory.type = 'button'; directory.dataset.focusKey = 'back';
+        directory.addEventListener('click', () => setCurrentView({ kind: 'libraries', data: homeData.libraries }));
+        breadcrumb.append(directory, element('span', '', '›'), element('span', '', data.library.title));
         const back = element('button', 'back-button hero-carousel-previous');
         back.append(element('span', 'hero-carousel-chevron'));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
-        header.append(back, element('h1', '', data.library.title));
-        content.append(header, renderLibraryFilters(data));
+        const cover = element('span', 'library-header-cover');
+        const image = document.createElement('img'); image.alt = '';
+        observeImage(image, data.library.landscapeImage || data.library.primaryImage, 360);
+        cover.append(image); header.append(cover, element('h1', '', data.library.title));
+        content.append(breadcrumb, header);
+        if (data.filters.genres.length) content.append(renderLibraryFilters(data));
+        const toolbar = element('div', 'library-toolbar');
+        toolbar.append(element('span', '', data.filterLoading ? '正在筛选…' : data.totalRecordCount + ' 部作品'));
+        const controls = element('div', 'library-toolbar-controls');
+        const sort = document.createElement('select');
+        sort.setAttribute('aria-label', '作品排序'); sort.dataset.focusKey = 'library:sort';
+        [['DateCreated', '最近添加'], ['SortName', '名称'], ['ProductionYear', '发行年份'], ['CommunityRating', '评分']]
+            .forEach(([value, label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; sort.append(option); });
+        sort.value = data.filter.sort || 'DateCreated'; sort.disabled = Boolean(data.filterLoading);
+        sort.addEventListener('change', () => applyLibraryFilter(data, { ...data.filter, sort: sort.value }));
+        controls.append(sort);
+        const views = element('div', 'library-view-switch'); views.setAttribute('role', 'group'); views.setAttribute('aria-label', '显示方式');
+        [['grid', '网格'], ['list', '列表']].forEach(([mode, label]) => {
+            const button = element('button'); button.type = 'button'; button.append(strokeIcon(mode));
+            button.setAttribute('aria-label', label); button.title = label;
+            button.setAttribute('aria-pressed', String((data.viewMode || 'grid') === mode));
+            button.addEventListener('click', () => {
+                data.viewMode = mode; content.querySelector('.library-items-grid')?.classList.toggle('list-view', mode === 'list');
+                [...views.children].forEach((child) => child.setAttribute('aria-pressed', String(child === button)));
+            }); views.append(button);
+        });
+        controls.append(views); toolbar.append(controls); content.append(toolbar);
         if (data.filterLoading) {
             content.append(element('div', 'library-state', '正在加载筛选结果…'));
             return;
@@ -3026,7 +3202,7 @@
             content.append(element('div', 'empty-state', '当前筛选没有结果'));
             return;
         }
-        const grid = element('div', 'grid-view');
+        const grid = element('div', 'grid-view library-items-grid' + (data.viewMode === 'list' ? ' list-view' : ''));
         data.items.forEach((card, index) => grid.append(createMediaCard(card, {
             index,
             onClick: openDetail,
@@ -3047,12 +3223,10 @@
 
     async function applyLibraryFilter(data, filter, force = false) {
         if (currentView?.kind !== 'library' || currentView.data !== data || data.filterLoading) return;
-        if (!force && filter.itemType === data.filter.itemType && filter.genre === data.filter.genre) return;
+        if (!force && libraryFilterIdentity(filter) === libraryFilterIdentity(data.filter)) return;
         const revision = ++libraryFilterRevision;
         const filterIdentity = libraryFilterIdentity(filter);
-        const focusKey = filter.itemType !== data.filter.itemType
-            ? `filter:类型:${filter.itemType || 'all'}`
-            : `filter:题材:${filter.genre || 'all'}`;
+        const focusKey = filter.sort !== data.filter.sort ? 'library:sort' : 'filter:题材:' + (filter.genre || 'all');
         data.filter = filter;
         data.filterRevision = revision;
         data.items = [];
@@ -3237,7 +3411,7 @@
     }
 
     function libraryCacheKey(library, filter = {}) {
-        return [session?.baseUrl || '', session?.userId || '', library.id, filter.itemType || '', filter.genre || '', 'DateCreated', 'Descending'].join('\n');
+        return [session?.baseUrl || '', session?.userId || '', library.id, filter.itemType || '', filter.genre || '', filter.sort || 'DateCreated'].join('\n');
     }
 
     function getLibraryCache(library, filter) {
@@ -3360,7 +3534,7 @@
     }
 
     function renderDetailLoading() {
-        content.replaceChildren();
+        replaceContent();
         const view = element('div', 'detail-view');
         const backdrop = element('div', 'detail-backdrop placeholder-art');
         backdrop.style.height = 'min(72vh, 720px)';
@@ -3385,7 +3559,7 @@
 
     function renderDetail(detail) {
         const card = detail.item;
-        content.replaceChildren();
+        replaceContent();
         const view = element('article', 'detail-view');
         view.dataset.seriesId = card.type === 'Series' ? card.id : '';
         const backdrop = element('div', 'detail-backdrop');
@@ -3394,6 +3568,9 @@
         const body = element('div', 'detail-content');
         const back = element('button', 'back-button hero-carousel-previous detail-back');
         back.append(element('span', 'hero-carousel-chevron'));
+        const previous = history.at(-1);
+        const backLabel = previous?.kind === 'library' ? `返回${previous.data.library.title}` : previous?.kind === 'home' ? '返回首页' : '返回';
+        back.append(element('span', '', backLabel));
         back.type = 'button'; back.title = '返回'; back.setAttribute('aria-label', '返回'); back.dataset.focusKey = 'back'; back.addEventListener('click', goBack);
         const layout = element('div', 'detail-layout');
         const poster = element('div', 'detail-poster');
@@ -3439,18 +3616,22 @@
         if (card.type === 'Series') actions.dataset.seriesId = card.id;
         const playTarget = card.playable ? card : (pickContinueEpisode(detail.episodes) || detail.episodes?.[0]);
         if (playTarget?.playable) appendDetailPlayAction(actions, playTarget, detail);
+        actions.append(createFavoriteButton(card));
         if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
         if (card.genres?.length) {
             copy.append(createDetailGenres(detail));
         }
         layout.append(poster, copy);
+        const flowing = element('div', 'detail-flow');
+        [...copy.children].filter((node) => node.matches('.detail-overview, .detail-actions, .tag-list')).forEach((node) => flowing.append(node));
+        copy.append(flowing);
         body.append(back, layout);
         view.append(backdrop, body);
         const peopleHost = element('div', 'detail-people');
         peopleHost.dataset.detailField = 'people';
         if (detail.people?.length) peopleHost.append(createPeopleSection(detail.people));
-        view.append(peopleHost);
         if (card.type === 'Series' && detail.seasons?.length) view.append(createEpisodes(detail, actions));
+        view.append(peopleHost);
         content.append(view);
         const ref = card.backdropImage || card.landscapeImage;
         const backdropRevision = appBackdropRevision;
@@ -3485,7 +3666,7 @@
         // 片源类型跟随所选版本，切换片源后这里显示的就是即将播放的版本。
         const { options, selected } = detailSourceState(detail);
         const dynamicRange = selected?.dynamicRange || card.dynamicRange;
-        [card.year, ...seriesMeta, formatDuration(card.durationMs), card.officialRating, card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', dynamicRange]
+        [card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.year, ...seriesMeta, formatDuration(card.durationMs), mediaTypeLabel(card.type), card.officialRating, dynamicRange]
             .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
         if (options.length > 1) {
             const switchButton = element('button', 'meta-switch', '切换片源');
@@ -3645,7 +3826,7 @@
 
     function renderPerson(data) {
         personPageObserver.disconnect();
-        content.replaceChildren();
+        replaceContent();
         loadViewBackdrop(data.person.primaryImage, appBackdropRevision, currentView);
         const header = element('div', 'page-header person-page-header');
         const back = element('button', 'back-button hero-carousel-previous');
@@ -3899,58 +4080,13 @@
             renderedEpisodes = episodes;
             syncSeasonPicker();
             const cards = episodes.slice().sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
-            const preferredIndex = Math.max(0, cards.findIndex((card) => card.resumePositionMs > 0));
-            const ranges = buildEpisodeRanges(cards);
-            let selectedRange = Math.floor(preferredIndex / 10);
-            const rangeTabs = element('div', 'segmented-control episode-ranges');
-            rangeTabs.setAttribute('role', 'tablist');
-            const row = element('div', 'media-row landscape episode-row');
-            row.dataset.rowKey = `season-${seasonId}`;
-            row.dataset.rowIndex = '0';
-            cards.forEach((card, index) => row.append(createMediaCard(card, {
-                landscape: true,
-                episodePicker: true,
-                omitSeriesName: true,
-                index,
+            const grid = element('div', 'grid-view episodes-grid');
+            cards.forEach((card, index) => grid.append(createMediaCard(card, {
+                landscape: true, episodePicker: true, omitSeriesName: true, index,
                 onClick: (item) => startPlayback(item, item.resumePositionMs),
             })));
             pagingControls.replaceChildren();
-            const carousel = createRowCarousel(row, '选集', pagingControls, {
-                initialScrollTarget: selectedRange > 0
-                    ? () => {
-                        const target = row.querySelector(`.media-card[data-card-index="${ranges[selectedRange]?.start || 0}"]`);
-                        return target ? revealTarget(row, target, 'x', 'start') : 0;
-                    }
-                    : null,
-            });
-
-            const selectRange = (rangeIndex, scroll = true) => {
-                selectedRange = rangeIndex;
-                rangeTabs.querySelectorAll('button').forEach((button) => {
-                    button.setAttribute('aria-selected', String(Number(button.dataset.range) === rangeIndex));
-                });
-                if (!scroll) return;
-                const target = row.querySelector(`.media-card[data-card-index="${ranges[rangeIndex]?.start || 0}"]`);
-                if (target) {
-                    row._smoothCarouselTo?.(() => revealTarget(row, target, 'x', 'start'));
-                }
-            };
-
-            if (ranges.length > 1) {
-                ranges.forEach((range, index) => {
-                    const button = element('button', 'segment-button episode-range', range.label);
-                    button.type = 'button';
-                    button.dataset.range = String(index);
-                    button.dataset.start = String(range.start);
-                    button.setAttribute('role', 'tab');
-                    button.addEventListener('click', () => selectRange(index));
-                    rangeTabs.append(button);
-                });
-            }
-            stage.replaceChildren();
-            if (ranges.length > 1) stage.append(rangeTabs);
-            stage.append(carousel);
-            selectRange(selectedRange, false);
+            stage.replaceChildren(grid.childElementCount ? grid : element('div', 'episode-stage-state', '这一季暂无剧集'));
         };
 
         const setDetailPlayAction = (episodes) => {
@@ -4216,9 +4352,9 @@
         const label = target.type === 'Episode'
             ? `播放 ${episodePosition(target).replace(' · ', '')}${position}`
             : (target.resumePositionMs ? `继续播放${position}` : '开始播放');
-        play.append(element('span', '', '▶'), element('span', '', label));
+        play.append(strokeIcon('play'), element('span', '', label));
         play.addEventListener('click', () => startPlayback(target, target.resumePositionMs, detail?.selectedSourceId || ''));
-        actions.append(play);
+        actions.prepend(play);
     }
 
     function openOverview(card, trigger) {
@@ -4238,7 +4374,7 @@
     }
 
     function renderSearch(data = { query: '', draft: '', items: null, status: 'idle', error: '' }) {
-        content.replaceChildren();
+        replaceContent();
         if (data.items?.[0]) {
             loadViewBackdrop(data.items[0].backdropImage || data.items[0].landscapeImage, appBackdropRevision, currentView);
         } else if (data.status === 'idle') {
@@ -4253,6 +4389,13 @@
         back.setAttribute('aria-label', '返回');
         back.dataset.focusKey = 'search:back';
         back.addEventListener('click', goBack);
+        const heading = element('div', 'search-heading');
+        heading.append(
+            element('h1', '', '搜索媒体库'),
+            element('p', '', '按片名、剧集名或关键词查找你的收藏'),
+        );
+        const header = element('header', 'search-header');
+        header.append(back, heading);
         const field = element('div', 'search-field');
         const leading = element('span', 'search-leading');
         leading.setAttribute('aria-hidden', 'true');
@@ -4262,7 +4405,7 @@
         input.type = 'search'; input.placeholder = '搜索电影、剧集'; input.value = data.draft ?? data.query ?? '';
         input.setAttribute('aria-label', '搜索媒体');
         input.dataset.focusKey = 'search:input';
-        const clear = element('button', 'icon-button search-clear', '×');
+        const clear = element('button', 'search-clear');
         clear.type = 'button';
         clear.title = '清除搜索';
         clear.setAttribute('aria-label', '清除搜索');
@@ -4287,31 +4430,10 @@
         submit.disabled = data.status === 'loading';
         field.append(input, clear);
         form.append(field, submit);
-        form.addEventListener('submit', async (event) => {
-            event.preventDefault();
-            if (data.status === 'loading') return;
-            const query = input.value.trim();
-            if (!query) {
-                Object.assign(data, { draft: input.value, status: 'invalid', error: '请输入搜索内容' });
-                renderSearch(data);
-                return;
-            }
-            const revision = ++searchRevision;
-            Object.assign(data, { query, draft: query, items: null, status: 'loading', error: '' });
-            renderSearch(data);
-            try {
-                const result = await nativeRequest('mediaStationCatalog', 'search', ['search', JSON.stringify({ query, limit: 60 })]);
-                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
-                if (!result || !Array.isArray(result.items)) throw new Error('搜索响应缺少结果列表');
-                Object.assign(data, { items: result.items, status: 'success', error: '' });
-                renderSearch(data);
-            } catch (error) {
-                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
-                Object.assign(data, { items: null, status: 'error', error: `搜索失败：${friendlyError(error)}` });
-                renderSearch(data);
-            }
+        form.addEventListener('submit', (event) => {
+            event.preventDefault(); void submitSearch(data, input.value);
         });
-        root.append(back, form);
+        root.append(header, form);
         if (data.status === 'loading') {
             const state = element('div', 'search-state', '正在搜索…');
             state.setAttribute('role', 'status');
@@ -4333,11 +4455,53 @@
                 })));
                 root.append(resultsHeading, grid);
             } else {
-                root.append(element('div', 'empty-state', '没有找到相关内容'));
+                const empty = element('div', 'search-empty');
+                const icon = element('span', 'search-empty-icon');
+                icon.append(element('span', 'search-glyph'));
+                empty.append(
+                    icon,
+                    element('strong', '', '没有找到相关内容'),
+                    element('p', '', '试试更短的片名、其他译名或不同的关键词。'),
+                );
+                root.append(empty);
             }
+        } else {
+            const empty = element('div', 'search-empty');
+            const icon = element('span', 'search-empty-icon');
+            icon.append(element('span', 'search-glyph'));
+            empty.append(
+                icon,
+                element('strong', '', '找到下一部想看的作品'),
+                element('p', '', '输入片名、剧集名或关键词，搜索结果会在这里展示。'),
+            );
+            root.append(empty);
         }
         content.append(root);
         requestAnimationFrame(() => input.focus());
+    }
+
+    async function submitSearch(data, query) {
+            if (data.status === 'loading') return;
+            query = query.trim();
+            if (!query) {
+                Object.assign(data, { draft: query, status: 'invalid', error: '请输入搜索内容' });
+                renderSearch(data);
+                return;
+            }
+            const revision = ++searchRevision;
+            Object.assign(data, { query, draft: query, items: null, status: 'loading', error: '' });
+            renderSearch(data);
+            try {
+                const result = await nativeRequest('mediaStationCatalog', 'search', ['search', JSON.stringify({ query, limit: 60 })]);
+                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
+                if (!result || !Array.isArray(result.items)) throw new Error('搜索响应缺少结果列表');
+                Object.assign(data, { items: result.items, status: 'success', error: '' });
+                renderSearch(data);
+            } catch (error) {
+                if (revision !== searchRevision || currentView?.kind !== 'search' || currentView.data !== data) return;
+                Object.assign(data, { items: null, status: 'error', error: `搜索失败：${friendlyError(error)}` });
+                renderSearch(data);
+            }
     }
 
     function openSearch() {
@@ -4349,24 +4513,40 @@
     }
 
     function validUiTheme(value) {
-        return ['violet', 'cobalt', 'ember'].includes(value);
+        return ['light', 'dark'].includes(value);
     }
 
     function loadUiTheme() {
         try {
             const stored = window.localStorage.getItem(uiThemeSettingKey);
-            return validUiTheme(stored) ? stored : 'violet';
+            return validUiTheme(stored) ? stored : (['violet', 'cobalt', 'ember'].includes(stored) ? 'dark' : 'light');
         } catch (error) {
             console.error(`MediaStation UI theme could not be read: ${error}`);
-            return 'violet';
+            return 'light';
+        }
+    }
+
+    function prefersReducedMotion() {
+        return document.documentElement.dataset.reduceMotion === 'true'
+            || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+
+    function applyMotionPreference(value, persist = false) {
+        document.documentElement.dataset.reduceMotion = String(value);
+        byId('settings-reduce-motion').checked = value;
+        if (persist) {
+            try { window.localStorage.setItem('MediaStationGo.Windows.reduceMotion.v1', String(value)); }
+            catch (error) { console.error(error); showToast('动态效果设置保存失败'); }
         }
     }
 
     function applyUiTheme(theme, persist = false) {
-        const selected = validUiTheme(theme) ? theme : 'violet';
-        document.documentElement.dataset.uiTheme = selected;
+        const selected = validUiTheme(theme) ? theme : 'light';
+        document.documentElement.dataset.uiTheme = selected; document.documentElement.style.colorScheme = selected;
         const titlebarColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
         if (titlebarColor && window.jmpNative?.themeColor) window.jmpNative.themeColor(titlebarColor);
+        byId('theme-toggle').title = selected === 'dark' ? '切换为浅色主题' : '切换为深色主题';
+        byId('theme-toggle').setAttribute('aria-label', byId('theme-toggle').title);
         document.querySelectorAll('[data-ui-theme]').forEach((button) => {
             button.setAttribute('aria-pressed', String(button.dataset.uiTheme === selected));
         });
@@ -4527,7 +4707,7 @@
     }
 
     function settingsMotionDuration(opening) {
-        if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return 0;
+        if (prefersReducedMotion()) return 0;
         return opening ? settingsCardOpenMotionDuration : settingsCardCloseMotionDuration;
     }
 
@@ -4636,12 +4816,36 @@
     function openSettings(trigger) {
         selectSettingsSection(activeSettingsSection);
         refreshProxySettings();
+        if (session) {
+            if (currentView?.kind !== 'settings') setCurrentView({ kind: 'settings', data: {} });
+            refreshFrameInterpolationStatus(); refreshUpdateControls();
+            return;
+        }
         openDrawer(byId('settings-drawer'), trigger);
         animateSettingsCard(trigger, true);
         if (session) {
             refreshFrameInterpolationStatus();
             refreshUpdateControls();
         }
+    }
+
+    function renderSettings() {
+        replaceContent();
+        const settings = byId('settings-drawer');
+        settings.classList.add('settings-page', 'open'); settings.classList.remove('is-closed', 'is-closing', 'is-animating');
+        settings.removeAttribute('aria-modal'); settings.setAttribute('role', 'region'); settings.setAttribute('aria-hidden', 'false');
+        content.append(settings); selectSettingsSection(activeSettingsSection); refreshProxySettings();
+    }
+
+    function positionAccountPopover(drawer = byId('account-drawer'), trigger = byId('account-open')) {
+        if (!drawer || !trigger?.getBoundingClientRect) return;
+        const rect = trigger.getBoundingClientRect();
+        const edge = 14;
+        const panelWidth = Math.min(430, Math.max(0, window.innerWidth - edge * 2));
+        const left = clamp(rect.left, edge, Math.max(edge, window.innerWidth - panelWidth - edge));
+        const bottom = Math.max(edge, window.innerHeight - rect.top + 8);
+        drawer.style.setProperty('--account-popover-left', `${Math.round(left)}px`);
+        drawer.style.setProperty('--account-popover-bottom', `${Math.round(bottom)}px`);
     }
 
     function openDrawer(drawer, trigger) {
@@ -4654,6 +4858,7 @@
         drawer.classList.remove('is-closed', 'is-closing');
         currentDrawer = drawer;
         drawerTrigger = trigger;
+        if (drawer === byId('account-drawer')) positionAccountPopover(drawer, trigger);
         window.clearTimeout(drawerScrimCloseTimer);
         const scrim = byId('drawer-scrim');
         scrim.classList.remove('hidden', 'is-closing', 'is-settings-closing');
@@ -4803,6 +5008,7 @@
             const serverHeader = element('header', 'saved-account-server-header', null);
             const serverCopy = element('div', 'saved-account-server-copy', null);
             serverCopy.append(element('strong', '', serverLabel(server.baseUrl)));
+            serverCopy.append(element('span', 'saved-account-server-connection', server.baseUrl));
             serverCopy.append(element(
                 'span',
                 'saved-account-server-client',
@@ -4984,6 +5190,7 @@
     }
 
     async function startPlayback(card, startMs = 0, mediaSourceId = '') {
+        dismissPlaybackFailure();
         if (!card?.id || !card.playable) {
             showToast('该项目不能直接播放');
             return;
@@ -4993,6 +5200,7 @@
             : { ...seriesPlaybackSettingDefaults };
         const activePlayer = {
             card,
+            mediaSourceId,
             resumeCardRects: currentView?.kind === 'home'
                 ? captureMediaRowRects('resume')
                 : new Map(),
@@ -5048,8 +5256,12 @@
         pushDanmakuEnabled();
         pushDanmakuStyle();
         byId('player-title').textContent = cardTitle(card, true);
-        byId('player-subtitle').textContent = card.type === 'Episode' ? episodePosition(card) : cardSubtitle(card);
+        byId('player-subtitle').textContent = card.type === 'Episode' ? [episodePosition(card), card.title].filter(Boolean).join(' · ') : cardSubtitle(card);
         byId('player-loading-title').textContent = cardTitle(card, true);
+        byId('player-loading-meta').textContent = [card.type === 'Episode' ? episodePosition(card) : card.year,
+            formatDuration(card.durationMs), card.dynamicRange,
+            startMs > 0 ? '从 ' + formatTime(startMs) + ' 继续' : ''].filter(Boolean).join(' · ');
+        closePlayerMore(false);
         setPlayerPoster(card);
         setPlayerLoading(true, '正在准备播放');
         updatePlayerProgress();
@@ -5094,8 +5306,8 @@
         } catch (error) {
             if (player !== activePlayer) return;
             if (activePlayer.exiting && activePlayer.stopSent) return;
-            if (!activePlayer.exiting) showToast(friendlyError(error));
-            finishPlayer();
+            if (activePlayer.exiting) finishPlayer();
+            else showPlaybackFailure(friendlyError(error));
         }
     }
 
@@ -5331,7 +5543,6 @@
                         hidePlayerFeedback();
                         hidePlayerControls();
                     } else {
-                        hidePlayerFeedback();
                         showPlayerControls();
                     }
                 }
@@ -5351,7 +5562,6 @@
                     hidePlayerFeedback();
                     break;
                 }
-                hidePlayerFeedback();
                 showPlayerControls();
                 break;
             case 'buffering':
@@ -5368,7 +5578,9 @@
                 }
                 break;
             case 'finished':
-                if (player.autoAdvancePending) {
+                if (player.exiting) {
+                    finishPlayer();
+                } else if (player.autoAdvancePending) {
                     player.playbackFinishedDuringAdvance = true;
                 } else if (player.card.type === 'Episode' && player.seriesPlaybackSetting.autoNext) {
                     void advanceToNextEpisode(player, 'finished');
@@ -5380,12 +5592,12 @@
                 finishPlayer();
                 break;
             case 'error':
-                showToast(event.errorCode
+                if (player.exiting) { finishPlayer(); break; }
+                showPlaybackFailure(event.errorCode
                     ? friendlyError({ code: event.errorCode })
                     : (player.interpolationChanging
                         ? 'RTX 插帧切换失败'
                         : (player.episodeChanging ? '剧集切换失败' : '播放失败')));
-                finishPlayer();
                 break;
         }
     }
@@ -5399,16 +5611,43 @@
             || player?.autoAdvancePending
             || player?.exiting);
         playerView.classList.toggle('preparing', covered);
+        playerView.setAttribute('aria-busy', String(visible));
+        playerControls.querySelector('.player-bottom').inert = covered;
+    }
+
+    function showPlaybackFailure(message) {
+        if (!player) return;
+        const failed = { card: player.card, positionMs: player.positionMs, mediaSourceId: player.mediaSourceId || '' };
+        finishPlayer(); playbackFailure = failed;
+        setPlayerLoading(false); playerView.classList.remove('hidden'); playerView.classList.add('preparing');
+        playerControls.classList.remove('visible'); playerControls.inert = true;
+        byId('player-failure-message').textContent = `${cardTitle(failed.card, true)} · ${message}`;
+        byId('player-failure').classList.remove('hidden'); setPlayerMode(true);
+        byId('player-retry').focus();
+    }
+
+    function dismissPlaybackFailure() {
+        if (!playbackFailure) return;
+        playbackFailure = null; byId('player-failure').classList.add('hidden');
+        playerView.classList.add('hidden'); playerView.classList.remove('preparing'); setPlayerMode(false);
     }
 
     function setPlayerPoster(card) {
         const targetPlayer = player;
         const img = byId('player-poster').firstElementChild;
         const ref = card.backdropImage || card.landscapeImage || card.primaryImage;
+        img.removeAttribute('src'); img.classList.remove('image-ready', 'image-error');
+        const cover = byId('player-loading-art'); cover.removeAttribute('src');
+        const detailCard = currentView?.kind === 'detail' ? currentView.data.item : null;
+        const knownCards = [detailCard, ...(homeData?.latest || []), ...(homeData?.latestSections || []).flatMap((section) => section.items || []), ...[...libraryCache.values()].flatMap((entry) => entry.items || [])];
+        const series = card.type === 'Episode' ? knownCards.find((item) => item?.id === card.seriesId) : null;
+        const coverRef = card.type === 'Episode' ? series?.primaryImage : card.primaryImage;
+        cover.classList.remove('image-ready', 'image-error'); cover.hidden = !coverRef;
+        if (coverRef) requestImage(coverRef, 360).then((src) => {
+            if (player === targetPlayer && player?.card?.id === card.id) setImageSource(cover, src);
+        }).catch((error) => console.error('播放封面加载失败：' + friendlyError(error)));
         if (!ref) return;
-        img.removeAttribute('src');
-        img.classList.remove('image-ready', 'image-error');
-        requestImage(ref, 640)
+        requestImage(ref, 1280)
             .then((src) => {
                 if (img.isConnected && player === targetPlayer && player?.card?.id === card.id) {
                     setImageSource(img, src);
@@ -5508,6 +5747,7 @@
             showPlayerControls();
         }
         refreshPlayerTools();
+        if (player.started) showPlayerFeedback({ icon: player.playing ? 'play' : 'pause' }, 750);
     }
 
     async function setFrameInterpolation(modelId) {
@@ -5703,6 +5943,8 @@
         const label = formatPlayerPlaybackRate(playerPlaybackRate);
         button.title = `播放速度：${label}`;
         button.setAttribute('aria-label', button.title);
+        const caption = button.querySelector('.player-tool-label');
+        if (caption) caption.textContent = label;
     }
 
     function selectPlayerPlaybackRate(rate) {
@@ -5745,6 +5987,12 @@
         playback.classList.toggle('is-playing', playing);
         playback.title = playing ? '暂停' : '播放';
         playback.setAttribute('aria-label', playback.title);
+        byId('player-seek-back').disabled = !player?.started || exiting || episodeChanging || autoAdvancePending;
+        byId('player-seek-forward').disabled = byId('player-seek-back').disabled;
+        byId('player-more').disabled = !info || exiting || episodeChanging || autoAdvancePending;
+        const next = byId('player-next'); next.classList.toggle('hidden', player?.card?.type !== 'Episode');
+        next.disabled = !info || !player?.started || exiting || episodeChanging || autoAdvancePending || player?.episodesLoading
+            || (Array.isArray(player?.episodes) && !nextPlayerEpisode(player));
         const episodic = player?.card?.type === 'Episode' && Boolean(player.card.seriesId);
         episodes.classList.toggle('hidden', !episodic);
         episodes.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !episodic || player?.episodesLoading;
@@ -5762,10 +6010,15 @@
         const interpolationModel = player?.interpolationChanging
             ? player.interpolationTargetModel
             : (player?.interpolationModel || info?.frameInterpolation?.modelId || null);
-        interpolation.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !player?.started || !info || player.interpolationChanging;
+        const interpolationInstalled = interpolation.dataset.componentInstalled === 'true';
+        const interpolationReady = interpolation.dataset.componentReady === 'true';
+        interpolation.classList.toggle('hidden', !interpolationInstalled);
+        interpolation.disabled = !interpolationReady || exiting || episodeChanging || autoAdvancePending || trackChanging || !player?.started || !info || player.interpolationChanging;
         interpolation.title = player?.interpolationChanging
             ? playerTransitionLoadingLabel(player)
-            : (interpolationEnabled
+            : (!interpolationReady
+                ? 'RTX 插帧组件未就绪'
+                : interpolationEnabled
                 ? `RTX 插帧：${interpolationModels[interpolationModel]?.label || '已开启'}`
                 : 'RTX 插帧');
         interpolation.setAttribute('aria-label', interpolation.title);
@@ -5883,14 +6136,10 @@
         art.append(fallback, image);
         const ref = episode.landscapeImage || episode.primaryImage;
         observeImage(image, ref, imageWidthFor(ref, true));
-        art.append(element('span', 'player-episode-badge', Number.isFinite(episode.indexNumber) ? `第 ${episode.indexNumber} 集` : '剧集'));
-        if (selected) {
-            const playingState = element('span', 'player-episode-playing-state');
-            playingState.setAttribute('aria-hidden', 'true');
-            playingState.append(element('strong', '', '正在播放'));
-            art.append(playingState);
-        }
-        option.append(art);
+        const copy = element('span', 'player-episode-copy');
+        copy.append(element('strong', '', optionTitle), element('small', '', selected ? '当前单集' : formatDuration(episode.durationMs) || '时长未知'));
+        option.append(art, copy);
+        if (selected) option.append(strokeIcon('audio'));
         option.addEventListener('click', onSelect);
         return option;
     }
@@ -5970,24 +6219,6 @@
 
     function episodeSeasonLabel(season) {
         return season === 0 ? '特别篇' : `第 ${season} 季`;
-    }
-
-    function buildEpisodeRanges(episodes, rangeSize = 10) {
-        const ranges = [];
-        for (let start = 0; start < episodes.length; start += rangeSize) {
-            const end = Math.min(start + rangeSize, episodes.length) - 1;
-            const firstNumber = Number.isFinite(episodes[start]?.indexNumber)
-                ? episodes[start].indexNumber
-                : start + 1;
-            const lastNumber = Number.isFinite(episodes[end]?.indexNumber)
-                ? episodes[end].indexNumber
-                : end + 1;
-            ranges.push({
-                start,
-                label: firstNumber === lastNumber ? `第 ${firstNumber} 集` : `${firstNumber}-${lastNumber}`,
-            });
-        }
-        return ranges;
     }
 
     function episodeOptionTitle(episode) {
@@ -6101,7 +6332,6 @@
                 player.episodeSeason = episodeSeasonNumber(player.card);
             }
             if (!seasons.includes(player.episodeSeason)) player.episodeSeason = seasons[0];
-            playerPanelContent.append(createSeriesPlaybackControls());
             if (seasons.length > 1) {
                 const tabs = element('div', 'player-season-tabs');
                 tabs.setAttribute('role', 'tablist');
@@ -6128,7 +6358,7 @@
             for (const episode of episodes) {
                 group.append(createPlayerEpisodeOption(episode, player.card.id === episode.id, () => switchPlayerEpisode(episode)));
             }
-            playerPanelContent.append(group);
+            playerPanelContent.append(group, createSeriesPlaybackControls());
             return;
         }
 
@@ -6268,9 +6498,7 @@
         const triggerRect = playerPanelTrigger.getBoundingClientRect();
         const panelRect = playerPanel.getBoundingClientRect();
         const safeInset = window.innerWidth <= 760 ? 18 : 30;
-        const centeredLeft = triggerRect.left + triggerRect.width / 2 - panelRect.width / 2;
-        const maximumLeft = Math.max(safeInset, playerRect.right - safeInset - panelRect.width);
-        const viewportLeft = Math.max(safeInset, Math.min(maximumLeft, centeredLeft));
+        const viewportLeft = Math.max(safeInset, playerRect.right - safeInset - panelRect.width);
         playerPanel.style.left = `${Math.round(viewportLeft - playerRect.left)}px`;
         playerPanel.style.bottom = `${Math.round(playerRect.bottom - triggerRect.top + 12)}px`;
     }
@@ -6281,6 +6509,7 @@
         playerPanelTrigger = trigger || null;
         window.clearTimeout(controlsTimer);
         playerControls.classList.add('visible');
+        playerControls.inert = false;
         activePlayer.exitArmed = false;
         renderPlayerPanel();
         playerPanel.classList.remove('hidden');
@@ -6341,6 +6570,8 @@
     }
 
     async function openPlayerPanel(kind, trigger) {
+        const panelTrigger = trigger?.closest('.player-more-menu') ? byId('player-more') : trigger;
+        closePlayerMore(false);
         const activePlayer = player;
         if (!activePlayer?.loadInfo || activePlayer.trackChanging || activePlayer.trackRefreshing || activePlayer.exiting) return;
         if (activePlayer.panelKind === kind && !playerPanel.classList.contains('hidden')) {
@@ -6349,7 +6580,7 @@
         }
 
         if (kind === 'episodes') {
-            presentPlayerPanel(activePlayer, kind, trigger);
+            presentPlayerPanel(activePlayer, kind, panelTrigger);
             await loadPlayerEpisodes(activePlayer);
             return;
         }
@@ -6388,7 +6619,7 @@
                 if (!activePlayer.exiting) showToast(friendlyError(error));
             }
         }
-        presentPlayerPanel(activePlayer, kind, trigger);
+        presentPlayerPanel(activePlayer, kind, panelTrigger);
     }
 
     function closePlayerPanel(restoreFocus = true) {
@@ -6451,8 +6682,11 @@
         const targetPlaybackRate = automatic ? previousPlaybackRate : 1;
         applyPlayerPlaybackRate(targetPlaybackRate);
         byId('player-title').textContent = cardTitle(episode, true);
-        byId('player-subtitle').textContent = episodePosition(episode);
+        byId('player-subtitle').textContent = [episodePosition(episode), episode.title].filter(Boolean).join(' · ');
         byId('player-loading-title').textContent = cardTitle(episode, true);
+        byId('player-loading-meta').textContent = [episodePosition(episode),
+            activePlayer.positionMs > 0 ? '从 ' + formatTime(activePlayer.positionMs) + ' 继续' : ''].filter(Boolean).join(' · ');
+        closePlayerMore(false);
         setPlayerPoster(episode);
         updatePlayerProgress();
         closePlayerPanel(false);
@@ -6488,7 +6722,7 @@
             Object.assign(activePlayer, previous);
             if (playerPlaybackRate !== previousPlaybackRate) applyPlayerPlaybackRate(previousPlaybackRate);
             byId('player-title').textContent = cardTitle(previous.card, true);
-            byId('player-subtitle').textContent = episodePosition(previous.card);
+            byId('player-subtitle').textContent = [episodePosition(previous.card), previous.card.title].filter(Boolean).join(' · ');
             byId('player-loading-title').textContent = cardTitle(previous.card, true);
             setPlayerPoster(previous.card);
             updatePlayerProgress();
@@ -6608,6 +6842,7 @@
         hidePlayerFeedback();
         setPlayerLoading(true, '正在退出播放');
         playerControls.classList.add('visible');
+        playerControls.inert = false;
         refreshPlayerTools();
         refreshPlayerCursor();
         if (activePlayer.started) sendPlayerStop(activePlayer);
@@ -6694,8 +6929,8 @@
     }
 
     function showPlayerControls(focusTarget = '') {
-        if (player?.playing && feedbackTimer) hidePlayerFeedback();
         playerControls.classList.add('visible');
+        playerControls.inert = false;
         if (player) player.exitArmed = focusTarget === 'exit';
         if (focusTarget === 'exit') focusElement(byId('player-exit'));
         refreshPlayerCursor();
@@ -6708,8 +6943,10 @@
     }
 
     function hidePlayerControls() {
-        if (player?.panelKind || isDanmakuConfigurationActive()) return;
+        if (player?.panelKind || player?.buffering || !byId('player-more-menu').classList.contains('hidden')
+            || isDanmakuConfigurationActive() || playerControls.querySelector(':focus-visible')) return;
         playerControls.classList.remove('visible');
+        playerControls.inert = true;
         if (player) player.exitArmed = false;
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
         refreshPlayerCursor();
@@ -6720,10 +6957,13 @@
         playerView.classList.toggle('cursor-hidden', shouldHide);
     }
 
-    function showPlayerFeedback(symbol, durationMs = 0, onElapsed = null) {
+    function showPlayerFeedback(value, durationMs = 2000, onElapsed = null) {
         window.clearTimeout(feedbackTimer);
         const feedback = byId('player-feedback');
-        feedback.querySelector('span').textContent = symbol;
+        const body = feedback.querySelector('.player-feedback-body');
+        const icon = typeof value === 'object' && value ? value.icon || '' : '';
+        body.dataset.icon = icon;
+        body.querySelector('.player-feedback-text').textContent = icon ? '' : String(value ?? '');
         feedback.classList.remove('hidden');
         if (durationMs > 0) {
             feedbackTimer = window.setTimeout(() => {
@@ -6742,7 +6982,7 @@
 
     function scheduleControlsHide() {
         window.clearTimeout(controlsTimer);
-        if (!player?.playing || !player.started || player.panelKind || player.exiting || isDanmakuConfigurationActive()) return;
+        if (!player?.playing || !player.started || player.panelKind || player.buffering || player.exiting || !byId('player-more-menu').classList.contains('hidden') || isDanmakuConfigurationActive()) return;
         controlsTimer = window.setTimeout(hidePlayerControls, 3000);
     }
 
@@ -6762,12 +7002,103 @@
             : `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
     }
 
+    const narrowSidebar = window.matchMedia('(max-width: 480px)');
+    function updateSidebarToggle() {
+        const expanded = narrowSidebar.matches ? appShell.classList.contains('sidebar-open') : !appShell.classList.contains('sidebar-collapsed');
+        byId('sidebar-toggle').setAttribute('aria-expanded', String(expanded));
+        byId('sidebar-toggle').title = expanded ? '收起侧栏' : '展开侧栏';
+        byId('sidebar-toggle').setAttribute('aria-label', byId('sidebar-toggle').title);
+    }
+    byId('sidebar-toggle').addEventListener('click', () => {
+        appShell.classList.toggle(narrowSidebar.matches ? 'sidebar-open' : 'sidebar-collapsed');
+        updateSidebarToggle();
+        requestAnimationFrame(refreshHeroArtworkQualification);
+    });
+    narrowSidebar.addEventListener('change', updateSidebarToggle);
+    updateSidebarToggle();
+    byId('theme-toggle').addEventListener('click', () => applyUiTheme(document.documentElement.dataset.uiTheme === 'dark' ? 'light' : 'dark', true));
+    function closePlayerMore(restoreFocus = false) {
+        const menu = byId('player-more-menu'); const wasOpen = !menu.classList.contains('hidden');
+        menu.classList.add('hidden'); byId('player-more').setAttribute('aria-expanded', 'false');
+        if (wasOpen && restoreFocus) byId('player-more').focus(); scheduleControlsHide();
+    }
+    byId('player-more').addEventListener('click', (event) => {
+        if (!player || player.exiting) return;
+        const menu = byId('player-more-menu'); const opening = menu.classList.contains('hidden');
+        closePlayerPanel(false); menu.classList.toggle('hidden', !opening);
+        byId('player-more').setAttribute('aria-expanded', String(opening)); showPlayerControls();
+        if (opening && event.detail === 0) menu.querySelector('button:not(:disabled):not(.hidden)')?.focus();
+    });
+    byId('player-seek-back').addEventListener('click', () => { seekBy(-10000); showPlayerFeedback('−10 秒', 750); showPlayerControls(); });
+    byId('player-seek-forward').addEventListener('click', () => { seekBy(10000); showPlayerFeedback('+10 秒', 750); showPlayerControls(); });
+    byId('player-next').addEventListener('click', async () => {
+        const activePlayer = player; if (!activePlayer?.started || activePlayer.exiting) return;
+        await loadPlayerEpisodes(activePlayer); if (player !== activePlayer || activePlayer.exiting) return;
+        const next = nextPlayerEpisode(activePlayer);
+        if (next) await switchPlayerEpisode(next); else if (!activePlayer.episodesError) showPlayerFeedback('已到最后一集');
+    });
+    playerView.addEventListener('click', (event) => { if (!event.target.closest('.player-more-control')) closePlayerMore(false); });
+    playerControls.addEventListener('focusin', () => showPlayerControls());
+    playerControls.addEventListener('focusout', () => scheduleControlsHide());
     byId('brand-home').addEventListener('click', goHome);
-    byId('topbar-home-shortcut').addEventListener('click', goHome);
     byId('content-to-top').addEventListener('click', () => smoothScrollTo(content, { top: 0 }));
     byId('nav-home').addEventListener('click', goHome);
     byId('nav-library').addEventListener('click', () => homeData && setCurrentView({ kind: 'libraries', data: homeData.libraries }));
-    byId('search-open').addEventListener('click', openSearch);
+    byId('nav-resume').addEventListener('click', () => homeData && setCurrentView({ kind: 'resume', data: homeData }));
+    byId('nav-favorites').addEventListener('click', () => {
+        const data = { items: [], totalRecordCount: 0, loading: false, error: '' };
+        setCurrentView({ kind: 'favorites', data });
+    });
+    byId('player-failure-back').addEventListener('click', () => {
+        const card = playbackFailure?.card; dismissPlaybackFailure();
+        if (card && currentView?.kind !== 'detail') void openDetail(card);
+    });
+    byId('player-retry').addEventListener('click', () => {
+        const failed = playbackFailure;
+        if (failed) void startPlayback(failed.card, failed.positionMs, failed.mediaSourceId);
+    });
+    byId('settings-reduce-motion').addEventListener('change', (event) => applyMotionPreference(event.currentTarget.checked, true));
+    try { applyMotionPreference(window.localStorage.getItem('MediaStationGo.Windows.reduceMotion.v1') === 'true'); }
+    catch (error) { console.error('读取动态效果设置失败：', error); }
+    byId('player-panel-close').replaceChildren(strokeIcon('close'));
+    byId('settings-open').querySelector('svg').replaceWith(strokeIcon('settings'));
+    for (const [section, icon] of [['appearance', 'appearance'], ['playback', 'play'], ['network', 'network'], ['update', 'update']]) {
+        const button = document.querySelector(`.settings-nav [data-settings-section="${section}"]`);
+        button.querySelector('span').remove(); button.prepend(strokeIcon(icon));
+    }
+    for (const [id, variants] of [
+        ['player-playback', [['play', 'play'], ['pause', 'pause']]],
+        ['player-volume-toggle', [['volume', 'volume'], ['muted', 'muted']]],
+        ['player-fullscreen', [['fullscreen', 'enter-fullscreen'], ['restore', 'exit-fullscreen']]],
+    ]) {
+        byId(id).replaceChildren(...variants.map(([name, state]) => {
+            const icon = playerIcon(name); icon.classList.add('player-state-icon', `player-icon-${state}`); return icon;
+        }));
+    }
+    byId('player-panel-close').addEventListener('click', () => closePlayerPanel(true));
+    byId('password-visibility').append(strokeIcon('eye'));
+    byId('password-visibility').addEventListener('click', () => {
+        const visible = byId('password').type === 'password';
+        byId('password').type = visible ? 'text' : 'password';
+        byId('password-visibility').setAttribute('aria-label', visible ? '隐藏密码' : '显示密码');
+        byId('password-visibility').setAttribute('aria-pressed', String(visible));
+    });
+    for (const [id, icon, label] of [
+        ['player-seek-back', 'back', ''], ['player-seek-forward', 'forward', ''],
+        ['player-episodes', 'list', '选集'], ['player-speed', 'speed', '倍速'],
+        ['player-subtitles', 'subtitles', '字幕'], ['player-audio', 'audio', '音轨'],
+        ['player-more', 'more', ''],
+    ]) {
+        const button = byId(id); button.replaceChildren(playerIcon(icon));
+        if (label) button.append(element('span', 'player-tool-label', label));
+    }
+    [['player-interpolation', 'interpolation', 'RTX 插帧'], ['player-danmaku', 'danmaku', '弹幕'], ['player-info', 'info', '播放信息']].forEach(([id, icon, label]) => byId(id).replaceChildren(playerIcon(icon), element('span', 'player-tool-label', label)));
+    byId('topbar-search').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const query = byId('search-open').value;
+        const data = { query: '', draft: query, items: null, status: 'idle', error: '' };
+        setCurrentView({ kind: 'search', data }); void submitSearch(data, query);
+    });
     byId('account-open').addEventListener('click', (event) => {
         openDrawer(byId('account-drawer'), event.currentTarget);
         loadSavedAccounts();
@@ -6780,7 +7111,9 @@
     byId('settings-drawer').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeDrawer();
     });
-    document.querySelectorAll('.drawer-close').forEach((button) => button.addEventListener('click', () => closeDrawer()));
+    document.querySelectorAll('.drawer-close').forEach((button) => button.addEventListener('click', () => {
+        if (button.closest('.settings-page')) goBack(); else closeDrawer();
+    }));
     proxyModeInputs().forEach((input) => input.addEventListener('change', (event) => {
         void updateGlobalProxyMode(event.currentTarget.value);
     }));
@@ -6926,6 +7259,7 @@
     const keepDanmakuControlsVisible = () => {
         window.clearTimeout(controlsTimer);
         playerControls.classList.add('visible');
+        playerControls.inert = false;
         refreshPlayerCursor();
         refreshDanmakuStyleControls();
     };
@@ -6998,6 +7332,13 @@
     });
 
     document.addEventListener('keydown', (event) => {
+        if (playbackFailure) {
+            if (event.key === 'Escape') { event.preventDefault(); byId('player-failure-back').click(); }
+            else if (event.key === 'Tab') {
+                event.preventDefault(); (document.activeElement === byId('player-retry') ? byId('player-failure-back') : byId('player-retry')).focus();
+            }
+            return;
+        }
         if (!byId('account-delete-scrim').classList.contains('hidden')) {
             if (event.key === 'Escape') {
                 event.preventDefault();
@@ -7007,6 +7348,20 @@
         }
         const inputActive = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
         if (player) {
+            if (event.key === 'Tab') {
+                showPlayerControls();
+                const scope = !playerPanel.classList.contains('hidden') ? playerPanel
+                    : !byId('player-more-menu').classList.contains('hidden') ? byId('player-more-menu') : playerControls;
+                const focusable = [...scope.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)')]
+                    .filter((node) => node.getClientRects().length && !node.closest('[inert]'));
+                if (focusable.length) {
+                    const n = focusable.indexOf(document.activeElement);
+                    if (n < 0 || (!event.shiftKey && n === focusable.length - 1) || (event.shiftKey && n === 0)) {
+                        event.preventDefault(); focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+                    }
+                }
+                return;
+            }
             if (player.exiting) {
                 if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Enter', ' ', 'Escape', 'Backspace'].includes(event.key)) {
                     event.preventDefault();
@@ -7018,9 +7373,12 @@
                 togglePlayerDanmaku();
                 return;
             }
+            if ((event.key === 'Escape' || event.key === 'Backspace') && !byId('player-more-menu').classList.contains('hidden')) {
+                event.preventDefault(); closePlayerMore(true); return;
+            }
             const active = document.activeElement;
-            const toolButtons = [byId('player-playback'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
-                .filter((button) => !button.disabled);
+            const toolButtons = [byId('player-playback'), byId('player-seek-back'), byId('player-seek-forward'), byId('player-next'), byId('player-more'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
+                .filter((button) => !button.disabled && button.getClientRects().length > 0);
             if (!playerPanel.classList.contains('hidden')) {
                 if (event.key === 'Escape' || event.key === 'Backspace') {
                     event.preventDefault(); closePlayerPanel(true);
@@ -7254,8 +7612,10 @@
     }, { capture: true, passive: true });
 
     window.addEventListener('resize', () => {
+        refreshHeroArtworkQualification();
         refreshMediaRowCarousels();
         content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
+        if (currentDrawer === byId('account-drawer')) positionAccountPopover(currentDrawer, drawerTrigger);
         positionPlayerPanel();
     }, { passive: true });
 

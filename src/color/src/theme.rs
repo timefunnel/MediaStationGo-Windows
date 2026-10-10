@@ -14,7 +14,7 @@
 use parking_lot::Mutex;
 use std::ffi::c_char;
 
-const DEFAULT_BG_RGB: u32 = 0x101010; // kBgColor
+const DEFAULT_BG_RGB: u32 = 0x000000;
 
 struct ThemeColor {
     on_set_theme_color: Option<unsafe extern "C" fn(u32)>,

@@ -20,11 +20,11 @@
     </header>
     <main class="login-layout">
       <section class="login-intro" aria-hidden="true">
-        <div class="login-poster-stack"><span></span><span></span><span></span></div>
+        <img class="login-art-background" src="cinema-login-wide.jpg" alt=""><div class="login-poster-stack"><img src="cinema-login-interstellar.jpg" alt=""><img src="cinema-login-dune.jpg" alt=""><img src="cinema-login-blade.jpg" alt=""></div>
         <div class="login-intro-copy">
           <p class="eyebrow">私人媒体空间</p>
-          <h2>回到你想看的世界。</h2>
-          <p>安全连接你的媒体服务器，继续上次没有看完的故事。</p>
+          <h2>回到你的<br>私人影院。</h2>
+          <p>连接媒体服务器，继续上次的故事。<br>喜欢的电影和剧集，在这里相遇。</p>
         </div>
       </section>
       <section id="login-account-panel" class="login-panel login-account-panel hidden" aria-labelledby="login-account-title">
@@ -47,16 +47,17 @@
           </div>
         </div>
         <label>服务器地址<input id="server-url" name="server" type="url" inputmode="url" placeholder="https://example.com" required></label>
-        <fieldset id="emby-client-profile-field" class="login-connection-fieldset login-client-profile-field">
+
+        <label>用户名<input id="username" name="username" autocomplete="username" required></label>
+        <label>密码<span class="password-field"><input id="password" name="password" type="password" autocomplete="current-password"><button id="password-visibility" type="button" aria-label="显示密码" aria-pressed="false"></button></span></label>
+        <details class="login-advanced"><summary>高级连接选项</summary><fieldset id="emby-client-profile-field" class="login-connection-fieldset login-client-profile-field">
           <legend>兼容身份（高级） <span class="inline-tip" tabindex="0" aria-label="默认使用 MediaStation Windows 身份；仅在服务器明确要求时选择 SenPlayer 或 Infuse。">i<span role="tooltip">默认使用 MediaStation Windows 身份；仅在服务器明确要求时选择 SenPlayer 或 Infuse。</span></span></legend>
           <div class="login-option-cards login-client-profile-options" role="radiogroup" aria-label="客户端身份">
             <label class="login-client-profile-default"><input type="radio" name="emby-client-profile" value="mediastation_windows" checked><span><strong>默认</strong><small>MediaStation Windows</small></span></label>
             <label><input type="radio" name="emby-client-profile" value="senplayer"><span><strong>SenPlayer</strong><small>通用兼容</small></span></label>
             <label><input type="radio" name="emby-client-profile" value="infuse"><span><strong>Infuse</strong><small>原生身份</small></span></label>
           </div>
-        </fieldset>
-        <label>用户名<input id="username" name="username" autocomplete="username" required></label>
-        <label>密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
+        </fieldset></details>
         <div class="login-actions">
           <button id="login-submit" class="primary-command" type="submit">
             <span class="login-submit-icon" aria-hidden="true">&#9654;</span>
@@ -74,17 +75,27 @@
       <span class="app-backdrop-layer"></span>
       <span class="app-backdrop-layer"></span>
     </div>
-    <header class="topbar">
+    <aside id="app-sidebar" class="app-sidebar" aria-label="媒体空间导航">
       <button id="brand-home" class="brand brand-button" type="button" title="返回首页" data-focus-key="top:brand"><img class="brand-icon" src="mediastationgo-icon.png" alt=""><span>MediaStationGo</span></button>
-      <button id="topbar-home-shortcut" class="icon-button topbar-home-shortcut hidden" type="button" title="返回首页" aria-label="返回首页" data-focus-key="top:home-shortcut"><span aria-hidden="true">⌂</span></button>
+      <p class="sidebar-caption">YOUR PRIVATE CINEMA</p>
+      <p class="sidebar-group-label">浏览</p>
       <nav class="top-nav" aria-label="主导航">
-        <button id="nav-home" class="nav-command active" type="button" data-focus-key="top:nav-home">首页</button>
-        <button id="nav-library" class="nav-command" type="button" data-focus-key="top:nav-library">媒体库</button>
+        <button id="nav-home" class="nav-command active" type="button" aria-label="首页" data-focus-key="top:nav-home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v10H15v-7H9v7H3Z"/></svg><span>首页</span></button>
+        <button id="nav-library" class="nav-command" type="button" aria-label="媒体库" data-focus-key="top:nav-library"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h5v16H3zm9 0h5v16h-5zm7 1 3 14"/></svg><span>媒体库</span></button>
+        <button id="nav-resume" class="nav-command" type="button" data-focus-key="top:nav-resume"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>继续观看</span><small id="nav-resume-count"></small></button>
+        <button id="nav-favorites" class="nav-command" type="button" data-focus-key="top:nav-favorites"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/></svg><span>收藏</span></button>
       </nav>
+      <p class="sidebar-library-label">我的媒体库</p>
+      <nav id="sidebar-libraries" class="sidebar-libraries" aria-label="我的媒体库"></nav>
+      <div class="sidebar-footer"><button id="settings-open" class="nav-command" type="button" title="设置" aria-label="设置" data-focus-key="top:settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-1 3-3 1-3 3v4l3 3 3 1 1 3h4l1-3 3-1 3-3v-4l-3-3-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/></svg><span>设置</span></button><button id="account-open" class="account-button" type="button" title="账号" data-focus-key="top:account"><span id="account-avatar" aria-hidden="true">M</span><span class="account-identity"><strong id="account-name"></strong><small id="account-server-name"></small></span><span class="account-chevron" aria-hidden="true">›</span></button></div>
+    </aside>
+    <header class="topbar">
+      <button id="sidebar-toggle" class="icon-button" type="button" title="收起侧栏" aria-label="收起侧栏" aria-controls="app-sidebar" aria-expanded="true"><svg class="shell-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button>
+      <span class="topbar-space">你的媒体空间</span><span class="breadcrumb-chevron" aria-hidden="true">›</span>
+      <span id="view-title" class="view-title">首页</span>
       <div class="top-actions">
-        <button id="search-open" class="icon-button" type="button" title="搜索" aria-label="搜索" data-focus-key="top:search"><span class="search-glyph" aria-hidden="true"></span></button>
-        <button id="account-open" class="account-button" type="button" title="账号" data-focus-key="top:account"><span id="account-avatar" aria-hidden="true">M</span><span id="account-name"></span></button>
-        <button id="settings-open" class="icon-button" type="button" title="设置" aria-label="设置" data-focus-key="top:settings"><span class="symbol-icon" aria-hidden="true">&#x2699;&#xFE0E;</span></button>
+        <form id="topbar-search" class="search-entry" role="search"><span class="search-glyph" aria-hidden="true"></span><input id="search-open" type="search" placeholder="搜索你的媒体库…" aria-label="搜索媒体库" data-focus-key="top:search"></form>
+        <button id="theme-toggle" class="icon-button" type="button" title="切换主题" aria-label="切换主题"><svg class="shell-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z"/></svg></button>
       </div>
     </header>
     <main id="content" class="content" tabindex="-1"></main>
@@ -96,26 +107,26 @@
   <section id="player-view" class="player-view hidden" aria-label="播放器">
     <div id="player-poster" class="player-poster" aria-hidden="true"><img alt=""></div>
     <div id="player-danmaku-layer" class="player-danmaku-layer" aria-hidden="true"></div>
-    <div id="player-loading" class="player-loading">
-      <div class="player-loading-emblem" aria-hidden="true">
-        <span class="player-loading-glow"></span>
-        <span class="player-loading-orbit"></span>
-        <span class="player-loading-orbit player-loading-orbit-inner"></span>
-        <span class="player-loading-core"></span>
-      </div>
+    <div id="player-loading" class="player-loading" role="status" aria-live="polite">
+      <img id="player-loading-art" class="player-loading-art" alt="">
       <div class="player-loading-copy">
+        <span class="player-loading-kicker">即将开始</span>
         <strong id="player-loading-title"></strong>
-        <p id="player-loading-label">正在准备播放</p>
+        <p id="player-loading-meta"></p>
+        <p class="player-loading-status"><span class="player-loading-spinner" aria-hidden="true"></span><span id="player-loading-label">正在准备播放</span></p>
       </div>
-      <div class="player-loading-track"><span class="player-loading-bar"></span></div>
     </div>
+    <section id="player-failure" class="player-failure hidden" aria-labelledby="player-failure-title">
+      <h2 id="player-failure-title">暂时无法播放</h2><p id="player-failure-message"></p>
+      <div class="player-failure-actions"><button id="player-retry" class="primary-command" type="button">重新尝试</button><button id="player-failure-back" class="secondary-command" type="button">返回作品</button></div>
+    </section>
     <div id="player-controls" class="player-controls visible">
       <div class="player-topline">
         <button id="player-exit" class="icon-button hero-carousel-button hero-carousel-previous" type="button" title="退出播放" aria-label="退出播放"><span class="hero-carousel-chevron" aria-hidden="true"></span></button>
-      </div>
-      <div id="player-feedback" class="player-feedback hidden" aria-hidden="true"><span></span></div>
-      <div class="player-bottom">
         <div class="player-heading"><strong id="player-title"></strong><span id="player-subtitle"></span></div>
+      </div>
+      <div id="player-feedback" class="player-feedback hidden" aria-hidden="true"><span class="player-feedback-body" data-icon=""><svg class="player-feedback-icon player-feedback-icon-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 17.175V6.825q0-.425.3-.713t.7-.287q.125 0 .263.037t.262.113l8.15 5.175q.225.15.338.375t.112.475t-.112.475t-.338.375l-8.15 5.175q-.125.075-.262.113T9 18.175q-.4 0-.7-.288t-.3-.712"/></svg><svg class="player-feedback-icon player-feedback-icon-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 19q-.825 0-1.412-.587T14 17V7q0-.825.588-1.412T16 5t1.413.588T18 7v10q0 .825-.587 1.413T16 19m-8 0q-.825 0-1.412-.587T6 17V7q0-.825.588-1.412T8 5t1.413.588T10 7v10q0 .825-.587 1.413T8 19"/></svg><span class="player-feedback-text"></span></span></div>
+      <div class="player-bottom">
         <div class="player-timeline">
           <span id="player-current">00:00</span>
           <input id="player-progress" type="range" min="0" max="1000" value="0" aria-label="播放进度">
@@ -123,17 +134,26 @@
         </div>
         <div class="player-tools" role="toolbar" aria-label="播放选项">
           <div class="player-tools-primary">
-            <button id="player-episodes" class="icon-button control-button player-episodes hidden" type="button" title="选集" aria-label="选集" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10 19q-.425 0-.712-.288T9 18t.288-.712T10 17h10q.425 0 .713.288T21 18t-.288.713T20 19zm0-6q-.425 0-.712-.288T9 12t.288-.712T10 11h10q.425 0 .713.288T21 12t-.288.713T20 13zm0-6q-.425 0-.712-.288T9 6t.288-.712T10 5h10q.425 0 .713.288T21 6t-.288.713T20 7zM5 20q-.825 0-1.412-.587T3 18t.588-1.412T5 16t1.413.588T7 18t-.587 1.413T5 20m0-6q-.825 0-1.412-.587T3 12t.588-1.412T5 10t1.413.588T7 12t-.587 1.413T5 14M3.588 7.413Q3 6.825 3 6t.588-1.412T5 4t1.413.588T7 6t-.587 1.413T5 8t-1.412-.587"/></svg></button>
-            <button id="player-interpolation" class="icon-button control-button player-interpolation" type="button" title="RTX 插帧" aria-label="RTX 插帧" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2 15V9q0-.825.588-1.412T4 7t1.413.588T6 9v6q0 .825-.587 1.413T4 17t-1.412-.587T2 15m7 4q-.825 0-1.412-.587T7 17V7q0-.825.588-1.412T9 5h6q.825 0 1.413.588T17 7v10q0 .825-.587 1.413T15 19zm9-4V9q0-.825.588-1.412T20 7t1.413.588T22 9v6q0 .825-.587 1.413T20 17t-1.412-.587T18 15"/></svg></button>
+          <button id="player-playback" class="icon-button control-button player-playback" type="button" title="播放" aria-label="播放"><svg class="player-tool-icon player-state-icon player-icon-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 17.175V6.825q0-.425.3-.713t.7-.287q.125 0 .263.037t.262.113l8.15 5.175q.225.15.338.375t.112.475t-.112.475t-.338.375l-8.15 5.175q-.125.075-.262.113T9 18.175q-.4 0-.7-.288t-.3-.712"/></svg><svg class="player-tool-icon player-state-icon player-icon-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 19q-.825 0-1.412-.587T14 17V7q0-.825.588-1.412T16 5t1.413.588T18 7v10q0 .825-.587 1.413T16 19m-8 0q-.825 0-1.412-.587T6 17V7q0-.825.588-1.412T8 5t1.413.588T10 7v10q0 .825-.587 1.413T8 19"/></svg></button>
+<button id="player-seek-back" class="icon-button control-button player-seek" type="button" title="后退 10 秒" aria-label="后退 10 秒"><svg class="player-tool-icon player-solid-icon player-seek-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 16.7V7.3q0-.675-.6-.975t-1.15.1L3.1 11q-.45.325-.45 1t.45 1l6.15 4.575q.55.4 1.15.1t.6-.975m10 0V7.3q0-.675-.6-.975t-1.15.1L13.1 11q-.45.325-.45 1t.45 1l6.15 4.575q.55.4 1.15.1t.6-.975"/></svg></button><button id="player-seek-forward" class="icon-button control-button player-seek" type="button" title="快进 10 秒" aria-label="快进 10 秒"><svg class="player-tool-icon player-solid-icon player-seek-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 16.7V7.3q0-.675.6-.975t1.15.1L20.9 11q.45.325.45 1t-.45 1l-6.15 4.575q-.55.4-1.15.1t-.6-.975m-10 0V7.3q0-.675.6-.975t1.15.1L10.9 11q.45.325.45 1t-.45 1l-6.15 4.575q-.55.4-1.15.1t-.6-.975"/></svg></button>
+            <button id="player-next" class="icon-button control-button hidden" type="button" title="下一集" aria-label="下一集"><svg class="shell-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 5 10 7-10 7Z M19 5v14"/></svg></button>
             <div class="player-volume-control">
               <button id="player-volume-toggle" class="icon-button control-button player-volume-toggle" type="button" title="静音" aria-label="静音" aria-pressed="false"><svg class="player-tool-icon player-state-icon player-icon-volume" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19 11.975q0-2.075-1.1-3.787t-2.95-2.563q-.375-.175-.55-.537t-.05-.738q.15-.4.538-.575t.787 0Q18.1 4.85 19.55 7.063T21 11.974t-1.45 4.913t-3.875 3.287q-.4.175-.788 0t-.537-.575q-.125-.375.05-.737t.55-.538q1.85-.85 2.95-2.562t1.1-3.788M7 15H4q-.425 0-.712-.288T3 14v-4q0-.425.288-.712T4 9h3l3.3-3.3q.475-.475 1.088-.213t.612.938v11.15q0 .675-.612.938T10.3 18.3zm9.5-3q0 1.05-.475 1.988t-1.25 1.537q-.25.15-.513.013T14 15.1V8.85q0-.3.263-.437t.512.012q.775.625 1.25 1.575t.475 2"/></svg><svg class="player-tool-icon player-state-icon player-icon-muted" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16.775 19.575q-.275.175-.55.325t-.575.275q-.375.175-.762 0t-.538-.575q-.15-.375.038-.737t.562-.538q.1-.05.188-.1t.187-.1L12 14.8v2.775q0 .675-.612.938T10.3 18.3L7 15H4q-.425 0-.712-.288T3 14v-4q0-.425.288-.712T4 9h2.2L2.1 4.9q-.275-.275-.275-.7t.275-.7t.7-.275t.7.275l17 17q.275.275.275.7t-.275.7t-.7.275t-.7-.275zm2.225-7.6q0-2.075-1.1-3.787t-2.95-2.563q-.375-.175-.55-.537t-.05-.738q.15-.4.538-.575t.787 0Q18.1 4.85 19.55 7.05T21 11.975q0 .825-.15 1.638t-.425 1.562q-.2.55-.612.688t-.763.012t-.562-.45t-.013-.75q.275-.65.4-1.312T19 11.975m-4.225-3.55Q15.6 8.95 16.05 10t.45 2v.25q0 .125-.025.25q-.05.325-.35.425t-.55-.15L14.3 11.5q-.15-.15-.225-.337T14 10.775V8.85q0-.3.263-.437t.512.012M9.75 6.95Q9.6 6.8 9.6 6.6t.15-.35l.55-.55q.475-.475 1.087-.213t.613.938V8q0 .35-.3.475t-.55-.125z"/></svg></button>
               <input id="player-volume" type="range" min="0" max="100" step="1" value="100" aria-label="播放器音量">
               <output id="player-volume-value" for="player-volume">100</output>
             </div>
           </div>
-          <button id="player-playback" class="icon-button control-button player-playback" type="button" title="播放" aria-label="播放"><svg class="player-tool-icon player-state-icon player-icon-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 17.175V6.825q0-.425.3-.713t.7-.287q.125 0 .263.037t.262.113l8.15 5.175q.225.15.338.375t.112.475t-.112.475t-.338.375l-8.15 5.175q-.125.075-.262.113T9 18.175q-.4 0-.7-.288t-.3-.712"/></svg><svg class="player-tool-icon player-state-icon player-icon-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 19q-.825 0-1.412-.587T14 17V7q0-.825.588-1.412T16 5t1.413.588T18 7v10q0 .825-.587 1.413T16 19m-8 0q-.825 0-1.412-.587T6 17V7q0-.825.588-1.412T8 5t1.413.588T10 7v10q0 .825-.587 1.413T8 19"/></svg></button>
           <div class="player-tools-secondary">
+            <button id="player-episodes" class="icon-button control-button player-episodes hidden" type="button" title="选集" aria-label="选集" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10 19q-.425 0-.712-.288T9 18t.288-.712T10 17h10q.425 0 .713.288T21 18t-.288.713T20 19zm0-6q-.425 0-.712-.288T9 12t.288-.712T10 11h10q.425 0 .713.288T21 12t-.288.713T20 13zm0-6q-.425 0-.712-.288T9 6t.288-.712T10 5h10q.425 0 .713.288T21 6t-.288.713T20 7zM5 20q-.825 0-1.412-.587T3 18t.588-1.412T5 16t1.413.588T7 18t-.587 1.413T5 20m0-6q-.825 0-1.412-.587T3 12t.588-1.412T5 10t1.413.588T7 12t-.587 1.413T5 14M3.588 7.413Q3 6.825 3 6t.588-1.412T5 4t1.413.588T7 6t-.587 1.413T5 8t-1.412-.587"/></svg></button>
+
             <button id="player-speed" class="icon-button control-button player-speed" type="button" title="播放速度：1×" aria-label="播放速度：1×" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10.45 15.5q.625.625 1.575.588T13.4 15.4l4.225-6.325q.225-.35-.062-.638t-.638-.062L10.6 12.6q-.65.45-.712 1.363t.562 1.537M5.1 20q-.55 0-1.012-.238t-.738-.712q-.65-1.175-1-2.437T2 14q0-2.075.788-3.9t2.137-3.175T8.1 4.788T12 4q2.05 0 3.85.775T19 6.888t2.15 3.125t.825 3.837q.025 1.375-.312 2.688t-1.038 2.512q-.275.475-.737.713T18.874 20z"/></svg></button>
+            <button id="player-subtitles" class="icon-button control-button" type="button" title="字幕" aria-label="字幕"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 20q-.825 0-1.412-.587T2 18V6q0-.825.588-1.412T4 4h16q.825 0 1.413.588T22 6v12q0 .825-.587 1.413T20 20zm3-4h6q.425 0 .713-.288T14 15t-.288-.712T13 14H7q-.425 0-.712.288T6 15t.288.713T7 16m4-4h6q.425 0 .713-.288T18 11t-.288-.712T17 10h-6q-.425 0-.712.288T10 11t.288.713T11 12m-3.287-.288Q8 11.426 8 11t-.288-.712T7 10t-.712.288T6 11t.288.713T7 12t.713-.288m10 4Q18 15.426 18 15t-.288-.712T17 14t-.712.288T16 15t.288.713T17 16t.713-.288"/></svg></button>
+            <button id="player-audio" class="icon-button control-button" type="button" title="音轨" aria-label="音轨"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7.175 19.825Q6 18.65 6 17t1.175-2.825T10 13q.575 0 1.063.138t.937.412V4q0-.425.288-.712T13 3h4q.425 0 .713.288T18 4v2q0 .425-.288.713T17 7h-3v10q0 1.65-1.175 2.825T10 21t-2.825-1.175"/></svg></button>
+            <div class="player-more-control">
+              <button id="player-more" class="icon-button control-button" type="button" aria-label="更多播放选项" title="更多播放选项" aria-expanded="false" aria-controls="player-more-menu"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg></button>
+              <div id="player-more-menu" class="player-more-menu hidden" role="group" aria-label="更多播放选项">
+            <span class="player-more-menu-title" aria-hidden="true">更多操作</span>
+            <button id="player-interpolation" class="icon-button control-button player-interpolation hidden" type="button" title="RTX 插帧" aria-label="RTX 插帧" aria-pressed="false"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2 15V9q0-.825.588-1.412T4 7t1.413.588T6 9v6q0 .825-.587 1.413T4 17t-1.412-.587T2 15m7 4q-.825 0-1.412-.587T7 17V7q0-.825.588-1.412T9 5h6q.825 0 1.413.588T17 7v10q0 .825-.587 1.413T15 19zm9-4V9q0-.825.588-1.412T20 7t1.413.588T22 9v6q0 .825-.587 1.413T20 17t-1.412-.587T18 15"/></svg></button>
             <div id="player-danmaku-control" class="player-danmaku-control">
               <button id="player-danmaku" class="icon-button control-button player-danmaku" type="button" title="弹幕：显示（悬停配置）" aria-label="弹幕：显示（悬停配置）" aria-pressed="true"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16q2 0 2 2v10q0 2-2 2H9.2l-4.4 3v-3H4q-2 0-2-2V6q0-2 2-2m2 4v2h9V8zm0 4v2h12v-2zm11-4v2h1V8z"/></svg></button>
               <div id="player-danmaku-panel" class="player-danmaku-panel" role="dialog" aria-label="弹幕配置">
@@ -146,15 +166,15 @@
                 <p class="player-danmaku-note">全局保存，当前播放立即生效。</p>
               </div>
             </div>
-            <button id="player-subtitles" class="icon-button control-button" type="button" title="字幕" aria-label="字幕"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 20q-.825 0-1.412-.587T2 18V6q0-.825.588-1.412T4 4h16q.825 0 1.413.588T22 6v12q0 .825-.587 1.413T20 20zm3-4h6q.425 0 .713-.288T14 15t-.288-.712T13 14H7q-.425 0-.712.288T6 15t.288.713T7 16m4-4h6q.425 0 .713-.288T18 11t-.288-.712T17 10h-6q-.425 0-.712.288T10 11t.288.713T11 12m-3.287-.288Q8 11.426 8 11t-.288-.712T7 10t-.712.288T6 11t.288.713T7 12t.713-.288m10 4Q18 15.426 18 15t-.288-.712T17 14t-.712.288T16 15t.288.713T17 16t.713-.288"/></svg></button>
-            <button id="player-audio" class="icon-button control-button" type="button" title="音轨" aria-label="音轨"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7.175 19.825Q6 18.65 6 17t1.175-2.825T10 13q.575 0 1.063.138t.937.412V4q0-.425.288-.712T13 3h4q.425 0 .713.288T18 4v2q0 .425-.288.713T17 7h-3v10q0 1.65-1.175 2.825T10 21t-2.825-1.175"/></svg></button>
             <button id="player-info" class="icon-button control-button" type="button" title="播放信息" aria-label="播放信息"><svg class="player-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.713 16.713Q13 16.425 13 16v-4q0-.425-.288-.712T12 11t-.712.288T11 12v4q0 .425.288.713T12 17t.713-.288m0-8Q13 8.425 13 8t-.288-.712T12 7t-.712.288T11 8t.288.713T12 9t.713-.288M12 22q-2.075 0-3.9-.788t-3.175-2.137T2.788 15.9T2 12t.788-3.9t2.137-3.175T8.1 2.788T12 2t3.9.788t3.175 2.137T21.213 8.1T22 12t-.788 3.9t-2.137 3.175t-3.175 2.138T12 22"/></svg></button>
+              </div>
+            </div>
             <button id="player-fullscreen" class="icon-button control-button player-fullscreen" type="button" title="进入全屏" aria-label="进入全屏" aria-pressed="false"><svg class="player-tool-icon player-state-icon player-icon-enter-fullscreen" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 19h2q.425 0 .713.288T8 20t-.288.713T7 21H4q-.425 0-.712-.288T3 20v-3q0-.425.288-.712T4 16t.713.288T5 17zm14 0v-2q0-.425.288-.712T20 16t.713.288T21 17v3q0 .425-.288.713T20 21h-3q-.425 0-.712-.288T16 20t.288-.712T17 19zM5 5v2q0 .425-.288.713T4 8t-.712-.288T3 7V4q0-.425.288-.712T4 3h3q.425 0 .713.288T8 4t-.288.713T7 5zm14 0h-2q-.425 0-.712-.288T16 4t.288-.712T17 3h3q.425 0 .713.288T21 4v3q0 .425-.288.713T20 8t-.712-.288T19 7z"/></svg><svg class="player-tool-icon player-state-icon player-icon-exit-fullscreen" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 18H4q-.425 0-.712-.288T3 17t.288-.712T4 16h3q.425 0 .713.288T8 17v3q0 .425-.288.713T7 21t-.712-.288T6 20zm12 0v2q0 .425-.288.713T17 21t-.712-.288T16 20v-3q0-.425.288-.712T17 16h3q.425 0 .713.288T21 17t-.288.713T20 18zM6 6V4q0-.425.288-.712T7 3t.713.288T8 4v3q0 .425-.288.713T7 8H4q-.425 0-.712-.288T3 7t.288-.712T4 6zm12 0h2q.425 0 .713.288T21 7t-.288.713T20 8h-3q-.425 0-.712-.288T16 7V4q0-.425.288-.712T17 3t.713.288T18 4z"/></svg></button>
           </div>
         </div>
       </div>
       <section id="player-panel" class="player-panel hidden" aria-label="播放选项面板">
-        <header><h2 id="player-panel-title"></h2></header>
+        <header><h2 id="player-panel-title"></h2><button id="player-panel-close" class="icon-button" type="button" aria-label="关闭播放选项"><svg class="shell-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></header>
         <div id="player-panel-content" class="player-panel-content"></div>
       </section>
     </div>
@@ -231,12 +251,12 @@
       <section><h3>图片缓存</h3><p id="image-cache-status">0 张图片</p><button id="clear-image-cache" class="secondary-command" type="button">清除图片缓存</button></section>
     </div>
     <section class="settings-preferences">
-      <header class="settings-modal-header"><div><p class="eyebrow">偏好中心</p><h2 id="settings-title">设置</h2></div><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
+      <header class="settings-modal-header"><div><h2 id="settings-title">设置</h2><p class="settings-page-description">让播放器适合你的习惯。</p></div><button class="icon-button drawer-close" type="button" title="关闭" aria-label="关闭">&#10005;</button></header>
       <div class="settings-layout">
         <nav class="settings-nav settings-authenticated" aria-label="设置分类">
-          <button type="button" data-settings-section="network" data-focus-key="settings:network"><span aria-hidden="true">⌁</span>网络与代理</button>
           <button type="button" data-settings-section="appearance" data-focus-key="settings:appearance"><span aria-hidden="true">◐</span>外观</button>
           <button type="button" data-settings-section="playback" data-focus-key="settings:playback"><span aria-hidden="true">▣</span>播放与字幕</button>
+          <button type="button" data-settings-section="network" data-focus-key="settings:network"><span aria-hidden="true">⌁</span>网络与代理</button>
           <button type="button" data-settings-section="storage" data-focus-key="settings:storage"><svg class="settings-nav-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M7 15h.01M10 15h5"></path></svg>存储空间</button>
           <button type="button" data-settings-section="update" data-focus-key="settings:update"><span aria-hidden="true">↻</span>更新</button>
         </nav>
@@ -255,16 +275,19 @@
             <p id="settings-proxy-status" class="component-status" role="status" aria-live="polite"></p>
           </section>
           <section class="settings-section setting-block settings-authenticated" data-settings-section="appearance" aria-labelledby="settings-appearance-title">
-            <p class="eyebrow">外观</p><h3 id="settings-appearance-title">选择你的夜间主题</h3><p>保持深色界面的可读性，仅替换选中项和重点操作的色彩。</p>
+            <h3 id="settings-appearance-title">外观</h3><p>让影视内容成为焦点，让界面保持舒适。</p><h4 class="settings-group-label">界面主题</h4>
             <div class="theme-grid" aria-label="主题选择">
-              <button class="theme-choice" type="button" data-ui-theme="violet" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>夜幕紫</b><small>深邃而有电影感</small></button>
-              <button class="theme-choice" type="button" data-ui-theme="cobalt" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>深海蓝</b><small>清晰、克制</small></button>
-              <button class="theme-choice" type="button" data-ui-theme="ember" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"></span><b>霞光橘</b><small>温暖、有能量</small></button>
+              <button class="theme-choice" type="button" data-ui-theme="dark" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"><i class="theme-mini-sidebar"></i><i class="theme-mini-hero"></i><i class="theme-mini-card"></i><i class="theme-mini-card"></i><i class="theme-mini-card"></i></span><b>夜间影院</b></button>
+              <button class="theme-choice" type="button" data-ui-theme="light" aria-pressed="false"><span class="theme-swatch" aria-hidden="true"><i class="theme-mini-sidebar"></i><i class="theme-mini-hero"></i><i class="theme-mini-card"></i><i class="theme-mini-card"></i><i class="theme-mini-card"></i></span><b>日间画廊</b></button>
             </div>
+            <h4 class="settings-group-label">界面体验</h4><div class="settings-experience">
+              <label for="settings-reduce-motion"><span><strong>减少动态效果</strong><small>简化页面过渡和海报悬停动效</small></span><input id="settings-reduce-motion" type="checkbox" role="switch"></label>
+              <div><span><strong>强调色</strong><small>主要操作、选中状态与播放进度使用同一颜色</small></span><i class="settings-accent" aria-label="影院蓝"></i></div>
+            </div><p class="settings-footnote">字体沿用 Windows 系统字体，中文正文保持清晰可读。</p>
           </section>
           <section class="settings-section setting-block default-subtitle-settings settings-authenticated" data-settings-section="playback">
             <p class="eyebrow">播放与字幕</p><h3>默认字幕样式</h3><p>未单独调整过的影片和剧集使用这套样式；距底部数值越大，字幕位置越高。</p>
-            <label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
+            <div class="settings-subtitle-preview" aria-hidden="true"><span id="settings-subtitle-preview-text">每一个故事，都值得被看见。</span></div><label class="setting-range-row" for="settings-subtitle-font-size"><span>文字大小</span><input id="settings-subtitle-font-size" type="range" min="24" max="64" step="1"><output id="settings-subtitle-font-size-value" for="settings-subtitle-font-size"></output></label>
             <label class="setting-range-row" for="settings-subtitle-bottom-offset"><span>距底部</span><input id="settings-subtitle-bottom-offset" type="range" min="0" max="30" step="1"><output id="settings-subtitle-bottom-offset-value" for="settings-subtitle-bottom-offset"></output></label>
             <button id="settings-reset-subtitle-style" class="secondary-command" type="button">恢复推荐值</button>
             <div class="setting-block frame-interpolation-settings">

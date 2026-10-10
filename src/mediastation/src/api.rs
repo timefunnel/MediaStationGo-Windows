@@ -325,6 +325,7 @@ pub struct MediaCard {
     pub duration_ms: u64,
     pub resume_position_ms: u64,
     pub played: bool,
+    pub is_favorite: bool,
     /// Emby UserData.LastPlayedDate（RFC3339 原文），用于“最近在看优先”选集。
     pub last_played_at: Option<String>,
     pub index_number: Option<i64>,
@@ -776,8 +777,39 @@ impl MediaStationApiClient {
         item_type: Option<&str>,
         genre: Option<&str>,
     ) -> Result<MediaPage, ApiError> {
+        self.load_library_page_sorted(
+            session,
+            parent_id,
+            start_index,
+            limit,
+            item_type,
+            genre,
+            "DateCreated",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_library_page_sorted(
+        &self,
+        session: &MediaStationSession,
+        parent_id: &str,
+        start_index: usize,
+        limit: usize,
+        item_type: Option<&str>,
+        genre: Option<&str>,
+        sort: &str,
+    ) -> Result<MediaPage, ApiError> {
         validate_identifier("parent_id", parent_id)?;
         validate_page(start_index, limit)?;
+        if !matches!(
+            sort,
+            "DateCreated" | "SortName" | "ProductionYear" | "CommunityRating"
+        ) {
+            return Err(ApiError::InvalidInput {
+                field: "sort",
+                reason: "unsupported library sort".to_string(),
+            });
+        }
         if let Some(item_type) = item_type {
             validate_catalog_item_type(item_type)?;
         }
@@ -791,8 +823,15 @@ impl MediaStationApiClient {
             .append_pair("ParentId", parent_id)
             .append_pair("StartIndex", &start_index.to_string())
             .append_pair("Limit", &limit.to_string())
-            .append_pair("SortBy", "DateCreated")
-            .append_pair("SortOrder", "Descending")
+            .append_pair("SortBy", sort)
+            .append_pair(
+                "SortOrder",
+                if sort == "SortName" {
+                    "Ascending"
+                } else {
+                    "Descending"
+                },
+            )
             .append_pair("Fields", CATALOG_FIELDS)
             .append_pair("Recursive", "true");
         if item_type.is_none() {
@@ -806,6 +845,91 @@ impl MediaStationApiClient {
         }
         drop(query);
         parse_media_page(&self.get_json(session, &url)?, start_index)
+    }
+
+    pub fn load_favorites_page(
+        &self,
+        session: &MediaStationSession,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<MediaPage, ApiError> {
+        validate_page(start_index, limit)?;
+        let mut url = endpoint(&session.base_url, &["Items"])?;
+        url.query_pairs_mut()
+            .append_pair("UserId", &session.user_id)
+            .append_pair("StartIndex", &start_index.to_string())
+            .append_pair("Limit", &limit.to_string())
+            .append_pair("Filters", "IsFavorite")
+            .append_pair("Recursive", "true")
+            .append_pair("IncludeItemTypes", "Movie,Series,Video,MusicVideo")
+            .append_pair("SortBy", "SortName")
+            .append_pair("SortOrder", "Ascending")
+            .append_pair("Fields", BROWSE_FIELDS);
+        parse_media_page(&self.get_json(session, &url)?, start_index)
+    }
+
+    pub fn set_favorite(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+        favorite: bool,
+    ) -> Result<bool, ApiError> {
+        validate_identifier("media_id", media_id)?;
+        let url = endpoint(
+            &session.base_url,
+            &["Users", &session.user_id, "FavoriteItems", media_id],
+        )?;
+        let agent = self.agent_for_session(session)?;
+        let mut response = if favorite {
+            agent
+                .post(url.as_str())
+                .header(
+                    HEADER_USER_AGENT,
+                    self.user_agent_for_profile(session.connection),
+                )
+                .header(HEADER_EMBY_TOKEN, &session.token)
+                .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
+                .send("")
+        } else {
+            agent
+                .delete(url.as_str())
+                .header(
+                    HEADER_USER_AGENT,
+                    self.user_agent_for_profile(session.connection),
+                )
+                .header(HEADER_EMBY_TOKEN, &session.token)
+                .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
+                .call()
+        }
+        .map_err(|error| transport_error(&url, error))?;
+        let status_code = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| ApiError::Transport {
+                url: redacted_url(&url),
+                message: error.to_string(),
+            })?;
+        ensure_success(&url, status_code, &body)?;
+        let item_url = endpoint(
+            &session.base_url,
+            &["Users", &session.user_id, "Items", media_id],
+        )?;
+        let item = self.get_json(session, &item_url)?;
+        let actual = item
+            .get("UserData")
+            .and_then(|value| value.get("IsFavorite"))
+            .and_then(Value::as_bool)
+            .ok_or(ApiError::MissingField {
+                field: "UserData.IsFavorite",
+            })?;
+        if actual != favorite {
+            return Err(ApiError::InvalidInput {
+                field: "favorite",
+                reason: "server favorite state did not change".to_string(),
+            });
+        }
+        Ok(actual)
     }
 
     pub fn load_library_filters(
@@ -2101,6 +2225,10 @@ fn parse_media_card(value: &Value) -> Result<MediaCard, ApiError> {
             .and_then(|data| data.get("Played"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        is_favorite: user_data
+            .and_then(|data| data.get("IsFavorite"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         last_played_at: user_data.and_then(|data| optional_string(data.get("LastPlayedDate"))),
         index_number: item.get("IndexNumber").and_then(Value::as_i64),
         parent_index_number: item.get("ParentIndexNumber").and_then(Value::as_i64),
@@ -3056,6 +3184,57 @@ mod tests {
     }
 
     #[test]
+    fn favorites_page_uses_authenticated_server_filter_and_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = json!({"Items": [{"Id":"movie-1","Name":"Movie","Type":"Movie","UserData":{"IsFavorite":true}}], "StartIndex":48,"TotalRecordCount":49}).to_string();
+        let (base_url, server) = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let client = MediaStationApiClient::new("MediaStationWindows/0.1")?;
+        let page = client.load_favorites_page(&session(base_url), 48, 48)?;
+        assert!(page.items[0].is_favorite);
+        assert_eq!(page.total_record_count, 49);
+        let request = server.join().map_err(|_| "server thread failed")?;
+        assert!(request.starts_with("GET /Items?"));
+        assert!(request.contains("Filters=IsFavorite"));
+        assert!(request.contains("StartIndex=48"));
+        assert!(request.contains("UserId=user-1"));
+        assert!(request.contains("x-emby-token: secret-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn favorite_mutation_verifies_server_state_and_does_not_fake_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (wanted, actual) in [(true, true), (false, false), (true, false)] {
+            let body = json!({"UserData":{"IsFavorite":actual}}).to_string();
+            let (base_url, server) = serve_sequence(vec![
+                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            ]);
+            let client = MediaStationApiClient::new("MediaStationWindows/0.1")?;
+            let result = client.set_favorite(&session(base_url), "movie-1", wanted);
+            if wanted == actual {
+                assert!(matches!(result, Ok(value) if value == wanted));
+            } else {
+                assert!(result.is_err());
+            }
+            let requests = server.join().map_err(|_| "server thread failed")?;
+            assert!(requests[0].starts_with(if wanted {
+                "POST /Users/user-1/FavoriteItems/movie-1 "
+            } else {
+                "DELETE /Users/user-1/FavoriteItems/movie-1 "
+            }));
+            assert!(requests[1].starts_with("GET /Users/user-1/Items/movie-1 "));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn authenticate_posts_credentials_without_exposing_the_token() {
         let body = json!({
             "AccessToken": "returned-secret-token",
@@ -3706,6 +3885,67 @@ mod tests {
             params.get("Recursive").map(|value| value.as_ref()),
             Some("true")
         );
+    }
+
+    #[test]
+    fn library_sort_applies_to_server_pagination_and_rejects_unknown_values() {
+        let client = MediaStationApiClient::new("MediaStationWindows/0.1").unwrap();
+        for (sort, order) in [
+            ("DateCreated", "Descending"),
+            ("SortName", "Ascending"),
+            ("ProductionYear", "Descending"),
+            ("CommunityRating", "Descending"),
+        ] {
+            let body = json!({"StartIndex": 48, "TotalRecordCount": 48, "Items": []}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let (base_url, server) = serve_once(response);
+            client
+                .load_library_page_sorted(
+                    &session(base_url),
+                    "library-1",
+                    48,
+                    48,
+                    None,
+                    Some("剧情"),
+                    sort,
+                )
+                .unwrap();
+            let request = server.join().unwrap();
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(params.get("SortBy").map(|v| v.as_ref()), Some(sort));
+            assert_eq!(params.get("SortOrder").map(|v| v.as_ref()), Some(order));
+            assert_eq!(params.get("StartIndex").map(|v| v.as_ref()), Some("48"));
+            assert_eq!(params.get("Genres").map(|v| v.as_ref()), Some("剧情"));
+        }
+        let error = client
+            .load_library_page_sorted(
+                &session(Url::parse("http://127.0.0.1:1").unwrap()),
+                "library-1",
+                0,
+                48,
+                None,
+                None,
+                "random",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::InvalidInput { field: "sort", .. }
+        ));
     }
 
     #[test]
