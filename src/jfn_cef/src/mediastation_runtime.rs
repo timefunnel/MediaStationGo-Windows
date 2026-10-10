@@ -4468,11 +4468,61 @@ fn valid_text(value: &str, maximum_len: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum_len && !value.chars().any(char::is_control)
 }
 
+#[derive(Debug, PartialEq)]
+struct InterpolationVideoInputs {
+    width: u32,
+    height: u32,
+    source_fps: f64,
+    source_fps_origin: &'static str,
+    dynamic_range: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_range: Option<String>,
+}
+
+fn interpolation_video_inputs(
+    server: &VideoStream,
+    runtime: Option<&VideoStream>,
+) -> InterpolationVideoInputs {
+    let width = preferred_positive_u64(server.width, runtime.and_then(|value| value.width))
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let height = preferred_positive_u64(server.height, runtime.and_then(|value| value.height))
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let (source_fps, source_fps_origin) = select_interpolation_source_fps(
+        server.frame_rate,
+        runtime.and_then(|value| value.frame_rate),
+    );
+    InterpolationVideoInputs {
+        width,
+        height,
+        source_fps,
+        source_fps_origin,
+        dynamic_range: preferred_string(
+            server.dynamic_range.as_deref(),
+            runtime.and_then(|value| value.dynamic_range.as_deref()),
+        ),
+        color_space: preferred_string(
+            server.color_space.as_deref(),
+            runtime.and_then(|value| value.color_space.as_deref()),
+        ),
+        color_transfer: preferred_string(
+            server.color_transfer.as_deref(),
+            runtime.and_then(|value| value.color_transfer.as_deref()),
+        ),
+        color_range: preferred_string(
+            server.color_range.as_deref(),
+            runtime.and_then(|value| value.color_range.as_deref()),
+        ),
+    }
+}
+
 fn frame_interpolation_plan(
     source: &PlaybackSource,
     mode: InterpolationMode,
     model: InterpolationModel,
-    runtime_source_fps: Option<f64>,
+    runtime_video: Option<&VideoStream>,
 ) -> Result<Option<InterpolationPlan>, LoadFailure> {
     if mode == InterpolationMode::Off {
         return Ok(None);
@@ -4483,40 +4533,40 @@ fn frame_interpolation_plan(
             "Frame interpolation requires a video stream",
         )
     })?;
-    let width = video
-        .width
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
-    let height = video
-        .height
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
-    let (source_fps, source_fps_origin) =
-        select_interpolation_source_fps(video.frame_rate, runtime_source_fps);
+    let inputs = interpolation_video_inputs(video, runtime_video);
     let request = PlanRequest {
         mode,
         model,
-        width,
-        height,
-        source_fps,
+        width: inputs.width,
+        height: inputs.height,
+        source_fps: inputs.source_fps,
         display_fps: jfn_playback::ingest_driver::jfn_playback_display_hz(),
-        dynamic_range: video.dynamic_range.clone(),
-        color_space: video.color_space.clone(),
-        color_transfer: video.color_transfer.clone(),
-        color_range: video.color_range.clone(),
+        dynamic_range: inputs.dynamic_range,
+        color_space: inputs.color_space,
+        color_transfer: inputs.color_transfer,
+        color_range: inputs.color_range,
     };
     match prepare_plan(request) {
         Ok(plan) => {
             log_debug(&format!(
-                "RIFE source frame rate selected: media_id={} origin={} source_fps={source_fps:.6}",
-                source.media_id, source_fps_origin
+                "RIFE source metadata selected: media_id={} dimensions={}x{} fps_origin={} source_fps={:.6}",
+                source.media_id,
+                inputs.width,
+                inputs.height,
+                inputs.source_fps_origin,
+                inputs.source_fps,
             ));
             Ok(plan)
         }
         Err(error) => {
             log_error(&format!(
-                "RTX frame interpolation plan rejected: code={} detail={} fps_origin={} source_fps={source_fps:.6}",
-                error.code, error.detail, source_fps_origin
+                "RTX frame interpolation plan rejected: code={} detail={} dimensions={}x{} fps_origin={} source_fps={:.6}",
+                error.code,
+                error.detail,
+                inputs.width,
+                inputs.height,
+                inputs.source_fps_origin,
+                inputs.source_fps,
             ));
             Err(LoadFailure::new(
                 error.code,
@@ -4536,15 +4586,15 @@ fn select_interpolation_source_fps(
     (playback_info_fps.unwrap_or(0.0), "playback_info")
 }
 
-fn runtime_container_fps_for_media(
+fn runtime_metadata_for_media<'a>(
     active_media_id: Option<&str>,
     requested_media_id: &str,
-    container_fps: Option<f64>,
-) -> Option<f64> {
+    metadata: Option<&'a RuntimeMediaMetadata>,
+) -> Option<&'a RuntimeMediaMetadata> {
     if active_media_id != Some(requested_media_id) {
         return None;
     }
-    container_fps.filter(|value| value.is_finite() && *value > 0.0)
+    metadata
 }
 
 pub(crate) fn handle_load_message(layer: Option<Arc<Inner>>, args: Option<&ListValue>) -> bool {
@@ -6100,14 +6150,12 @@ fn execute_load(
 ) -> Result<Value, LoadFailure> {
     runtime.ensure_generation(snapshot.generation)?;
     let active_media_id_before = runtime.active_playback_media_id(snapshot)?;
-    let runtime_source_fps = if request.interpolation_mode == InterpolationMode::Off {
+    let runtime_metadata = if request.interpolation_mode == InterpolationMode::Off {
         None
     } else if active_media_id_before.as_deref() == Some(request.media_id.as_str()) {
-        runtime_container_fps_for_media(
-            active_media_id_before.as_deref(),
-            &request.media_id,
-            mpv_property_double(c"container-fps"),
-        )
+        jfn_mpv_get_property_node(c"track-list")
+            .ok()
+            .map(|track_list| current_runtime_video_metadata(&track_list))
     } else {
         None
     };
@@ -6120,11 +6168,12 @@ fn execute_load(
         )
         .map_err(|error| api_failure("playback_info_failed", &error))?;
     let active_media_id_after = runtime.active_playback_media_id(snapshot)?;
-    let runtime_source_fps = runtime_container_fps_for_media(
+    let runtime_video = runtime_metadata_for_media(
         active_media_id_after.as_deref(),
         &request.media_id,
-        runtime_source_fps,
-    );
+        runtime_metadata.as_ref(),
+    )
+    .and_then(|metadata| metadata.video.as_ref());
     let audio_summary = source
         .audio_tracks
         .iter()
@@ -6151,7 +6200,7 @@ fn execute_load(
         &source,
         request.interpolation_mode,
         request.interpolation_model,
-        runtime_source_fps,
+        runtime_video,
     )?;
     log_debug(&format!(
         "MediaStation playback interpolation request: media_id={} mode={} model={}",
@@ -7623,23 +7672,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_container_fps_is_scoped_to_the_active_media() {
-        assert_eq!(
-            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(23.976)),
-            Some(23.976)
-        );
-        assert_eq!(
-            runtime_container_fps_for_media(Some("media-1"), "media-2", Some(23.976)),
-            None
-        );
-        assert_eq!(
-            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(0.0)),
-            None
-        );
-        assert_eq!(
-            runtime_container_fps_for_media(Some("media-1"), "media-1", Some(f64::NAN)),
-            None
-        );
+    fn runtime_metadata_is_scoped_to_the_active_media() {
+        let metadata = RuntimeMediaMetadata::default();
+        assert!(runtime_metadata_for_media(Some("media-1"), "media-1", Some(&metadata)).is_some());
+        assert!(runtime_metadata_for_media(Some("media-1"), "media-2", Some(&metadata)).is_none());
+        assert!(runtime_metadata_for_media(None, "media-1", Some(&metadata)).is_none());
+        assert!(runtime_metadata_for_media(Some("media-1"), "media-1", None).is_none());
     }
 
     #[test]
@@ -7656,6 +7694,61 @@ mod tests {
             select_interpolation_source_fps(Some(24.0), Some(0.0)),
             (24.0, "playback_info")
         );
+    }
+
+    #[test]
+    fn interpolation_metadata_fills_missing_server_fields_from_active_runtime() {
+        let server = VideoStream {
+            dynamic_range: None,
+            range_type: None,
+            codec: Some("hevc".to_string()),
+            profile: None,
+            level: None,
+            width: None,
+            height: None,
+            frame_rate: Some(0.0),
+            color_space: None,
+            color_transfer: None,
+            color_range: None,
+            bit_depth: None,
+            max_content_light_level: None,
+            max_frame_average_light_level: None,
+            dolby_vision_profile: None,
+            dolby_vision_level: None,
+            dolby_vision_base_layer_present: None,
+            dolby_vision_compatibility_id: None,
+        };
+        let runtime = VideoStream {
+            dynamic_range: Some("HDR10".to_string()),
+            range_type: Some("HDR".to_string()),
+            codec: Some("hevc".to_string()),
+            profile: Some("Main 10".to_string()),
+            level: None,
+            width: Some(3840),
+            height: Some(2160),
+            frame_rate: Some(25.0),
+            color_space: Some("bt.2020-ncl".to_string()),
+            color_transfer: Some("pq".to_string()),
+            color_range: Some("limited".to_string()),
+            bit_depth: Some(10),
+            max_content_light_level: None,
+            max_frame_average_light_level: None,
+            dolby_vision_profile: None,
+            dolby_vision_level: None,
+            dolby_vision_base_layer_present: None,
+            dolby_vision_compatibility_id: None,
+        };
+
+        let inputs = interpolation_video_inputs(&server, Some(&runtime));
+
+        assert_eq!(inputs.width, 3840);
+        assert_eq!(inputs.height, 2160);
+        assert_eq!(inputs.source_fps, 25.0);
+        assert_eq!(inputs.source_fps_origin, "mpv_container");
+        assert_eq!(inputs.dynamic_range.as_deref(), Some("HDR10"));
+        assert_eq!(inputs.color_space.as_deref(), Some("bt.2020-ncl"));
+        assert_eq!(inputs.color_transfer.as_deref(), Some("pq"));
+        assert_eq!(inputs.color_range.as_deref(), Some("limited"));
     }
 
     #[test]

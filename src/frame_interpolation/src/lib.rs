@@ -1551,7 +1551,8 @@ fn rational_frame_rate(value: f64) -> Result<(u32, u32), InterpolationError> {
 
 fn normalize_matrix(value: Option<&str>) -> Result<(), InterpolationError> {
     let normalized = value.unwrap_or_default().trim().to_ascii_lowercase();
-    match normalized.as_str() {
+    let canonical = normalized.replace(['.', '-', '_'], "");
+    match canonical.as_str() {
         "" | "bt709" | "709" | "bt2020nc" | "bt2020ncl" | "2020ncl" | "bt2020" | "smpte170m"
         | "bt470bg" | "bt601" | "601" => Ok(()),
         _ => Err(InterpolationError::new(
@@ -1922,6 +1923,16 @@ mod tests {
         let plan =
             build_plan(&ready_report(), input).expect("native filter validates decoded frames");
         assert_eq!(plan.hwdec, "d3d11va");
+    }
+
+    #[test]
+    fn mpv_color_matrix_aliases_are_accepted() {
+        for value in ["bt.709", "bt.2020-ncl", "smpte-170m", "bt_470bg"] {
+            assert!(
+                normalize_matrix(Some(value)).is_ok(),
+                "mpv color matrix alias must be accepted: {value}"
+            );
+        }
     }
 
     #[test]
