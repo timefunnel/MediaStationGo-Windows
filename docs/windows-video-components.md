@@ -123,6 +123,37 @@ HLG 额外输出 `hlg-reference=1000-nits-gamma-1.2`。
 
 ## 验证记录与复现
 
+### 已安装组件在首次播放时未识别修复（2026-10-11）
+
+真实用户目录中 DLSSNR、VFG 的 active 清单和逐文件 SHA-256 全部通过校验，原生
+运行时也返回 installed/playbackAvailable=true。问题来自前端：首页入口只读取 RIFE
+状态，NVIDIA 状态 Map 直到访问组件管理才填充；播放菜单直接依赖空 Map，因而把
+已安装的组件显示成“请先安装”。此前仅检查原生 IPC，没有覆盖首页到播放菜单的状态链。
+
+修复后首页自动调用现有 `video_components_status`；每次打开画面增强面板先查询最新
+状态再渲染，查询失败明确提示并停止打开，不使用未加载状态伪装未安装。请求期间
+退出或更换播放器不会由晚到结果重开旧面板。参数和所有原生 GPU 处理代码未改。
+
+`node dev/windows/test_video_components_detection.cjs` 运行原始首页/查询/面板渲染
+函数，覆盖无需进入组件管理的首次识别、NR/VFG 启用与参数应用按钮、查询错误和
+退出竞态；原组件、RIFE 与现代播放器三个 JS 回归脚本通过。标准 Release 构建通过。
+
+正式应用使用既有用户 config/cache，仅临时增加 loopback 调试端口。首次进入首页且
+组件管理保持关闭时，DLSSNR/VFG 状态文字已自动更新为“已安装”，原生 IPC 同时确认
+两项可播放；RTX Video 当前未安装。未复制或重装用户组件，也未启动媒体或修改账户。
+记录为 `build/video-enhancement/component-detection-first-entry.json`，启动和构建日志
+分别为 `component-detection-startup.log`、`component-detection-release-build.log`。
+可复现 `node dev/windows/test_video_components_first_entry_app.cjs <调试端口> dlssnr nvidia-vfg`；
+此脚本必须在正式应用刚启动后运行，不先进入组件管理。上述运行时可用状态不替代
+此前 GPU/播放验收；本项专门验证用户安装到前端状态的链路。
+
+检查结束后已关闭临时调试实例、删除启动参数记录，再以原有无参数方式打开标准
+播放器，窗口存在且响应正常；未留下调试端口。正常退出仍超时，核验精确可执行
+路径和父子进程后终止，退出生命周期未在本次修改。最新应用 SHA-256 为
+`0d95f84f937b9445b5c4c952f6d2c07de412f348f7f40e77908436959708840d`。
+构建和运行状态汇总见 `build/video-enhancement/component-detection-release-validation.json`。
+本次仅本地提交和标准构建更新，未推送或发布。
+
 ### Veyra 参考 HLG 首版（2026-10-11）
 
 参考正式版本 `v2.0.6 / e3aa842` 的 HLG 线性化和色度元数据范围，扩展三项 NVIDIA

@@ -1317,6 +1317,7 @@
         scheduleAutomaticUpdateCheck();
         refreshImageCacheStatus();
         refreshFrameInterpolationStatus();
+        refreshVideoComponents();
         await loadHome(true);
     }
 
@@ -4861,10 +4862,14 @@
         videoComponentsTimer = window.setTimeout(() => { videoComponentsTimer = 0; refreshVideoComponents(); }, delay);
     }
     async function refreshVideoComponents() {
-        try { updateVideoComponents(await nativeRequest('mediaStationFrameInterpolation', 'video_components_status', ['video_components_status'], 15000)); }
+        try {
+            updateVideoComponents(await nativeRequest('mediaStationFrameInterpolation', 'video_components_status', ['video_components_status'], 15000));
+            return true;
+        }
         catch (error) {
             for (const id of ['rtx-video', 'dlssnr', 'nvidia-vfg']) { const label = byId(`component-${id}-status`); label.textContent = `状态查询失败：${friendlyError(error)}`; label.dataset.state = 'error'; }
             if (videoComponentsTracking) scheduleVideoComponentsRefresh(3000);
+            return false;
         }
     }
     async function changeVideoComponent(id, operation) {
@@ -6536,7 +6541,7 @@
             }
             playerPanelContent.append(group);
             const draft = videoEnhancementSelection(player.videoEnhancement);
-            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR / HDR10 · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR / HDR10 · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR / HDR10 · 风格与增强强度可配置']]) {
+            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR / HDR10 / HLG · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR / HDR10 / HLG · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR / HDR10 / HLG · 风格与增强强度可配置']]) {
                 const ready = videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
                 const selected = player.videoEnhancement?.[key] === true;
                 const button = createTrackOption({ title, meta: ready ? meta : '请先在组件管理安装', selected, onSelect: () => {
@@ -6718,6 +6723,14 @@
             return;
         }
 
+        if (kind === 'interpolation') {
+            const ready = await refreshVideoComponents();
+            if (player !== activePlayer || activePlayer.exiting) return;
+            if (!ready) {
+                showToast('组件状态查询失败，请稍后重试');
+                return;
+            }
+        }
         if (kind === 'episodes') {
             presentPlayerPanel(activePlayer, kind, panelTrigger);
             await loadPlayerEpisodes(activePlayer);
