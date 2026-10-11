@@ -34,8 +34,13 @@ RGB10A2/PQ 推理，VSR/NR 使用固定参考的 SDR 代理与 FP16 HDR 原图�
 仍拒绝，未验收实体 HDR 显示、4K 长片或长期显存。原有 RIFE ABI 8、模型、
 profile、固定 2 倍插帧和刷新行为未改；组件 ZIP 不变。主包构建与提交状态以
 本地构建日志及 Git 历史为准，不推送或发布。
-Release 代码编译已通过，但正在运行的旧播放器锁住标准 `build` 的 EXE，
-复制返回 Windows 错误 32；等待用户确认退出后完成产物更新和新版本启动检查。
+用户授权关闭旧播放器后，标准 Release 构建与 `build` 产物覆盖已完成；HDR10 实现
+提交为 `ef8e56b`。正式应用在独立测试 config/cache 下经真实原生 IPC 返回 NR
+installed/runtimeVerified/playbackAvailable=true，supportedDynamicRanges=[sdr,hdr10]；
+测试进程与临时缓存已清理，更新后的标准播放器已按原来的无参数方式重新打开，
+窗口存在且响应正常。旧实例及测试实例正常关闭均超时，核验进程归属后终止；
+退出生命周期未修改，未将此项标记为正常退出验收通过。构建、IPC 与产物 SHA-256
+见视频组件记录及 `build/video-enhancement/hdr-release-validation.json`。
 
 此前 2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
 提交为 `5d15687`；本轮处理提交审查发现的三个异常恢复问题：取消待安装、状态查询

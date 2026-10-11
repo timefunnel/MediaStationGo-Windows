@@ -154,10 +154,31 @@ libmpv 的隐藏 HWND / gpu-next / d3d11va 下运行。初次生成时，本机 
 原生数值日志为 `build/video-enhancement/hdr-gpu-acceptance.log`；
 `test_video_enhancement.ps1 -HdrOnly` 可单独复现 HDR 播放，省略该开关同时跑 SDR。
 
-标准 Release 代码已编译通过（`hdr-release-build.log`），但复制到 `build` 时，
-正在运行的旧播放器锁住 EXE，返回 Windows `os error 32`。当前 `build` 的播放器
-仍为此前 SDR 版本；用户确认退出后再完成同目录产物更新和新版本启动/IPC 检查。
-这项最终更新尚未完成，不能将已编译的缓存 EXE 当成已更新的运行版本。
+用户授权关闭旧播放器后，标准 Release 构建与同目录产物覆盖已完成
+（`build/video-enhancement/hdr-release-build.log`），源码实现提交为 `ef8e56b`。
+正式 `build/jellium-desktop.exe` 使用独立 config/cache 启动，原版 NR ZIP 仅展开到
+测试 active 目录；真实 CEF 页面经原生 IPC 返回 installed/runtimeVerified/
+playbackAvailable 均为 true、nrTarget=1080、supportedDynamicRanges=[sdr,hdr10]。
+记录位于 `build/video-enhancement/app-smoke-validation.json`，测试进程及临时配置、
+组件和浏览器缓存已清理。未配置服务器的测试 profile 在启动日志中报告
+invalid_server_url；本项只验收本地组件 IPC，不涉及账户或服务器播放。
+
+旧实例与测试实例均接受 CloseMainWindow 请求，但 25 秒内未退出；核验可执行文件
+路径、PID 与子进程归属后终止。此处如实记录退出问题，未修改退出生命周期逻辑。
+随后以原来的无参数启动方式重新打开更新后的标准播放器，窗口存在且响应正常。
+产物与运行检查汇总为 `build/video-enhancement/hdr-release-validation.json`。
+
+当前 HDR10 标准构建 SHA-256：
+
+| 产物 | SHA-256 |
+| --- | --- |
+| `build/jellium-desktop.exe` | `2dfdc80eb246fc690ac72c33622110e74633c5a00d1e9c4abc2b2f58868c10a9` |
+| `build/libmpv-2.dll` | `eb730e5532f3d2c7f5ac8d4f7d6559b4785496f9500eff4634910a6db09fb8ca` |
+| `build/video_enhancement.dll` | `dc2a3228feeab5705282474e161649b47f90301dc4a58da6a7bbeb5df941e19b` |
+| `build/nvngx.dll` | `9b43f4fa02e90cb1411a4fa9b994fd2ed915d7fa2bd2cf23690ac30e7ec06268` |
+
+三个现有组件 ZIP 的 SHA-256 已重新核验，与下方原 SDR 接入记录一致，无需重新打包。
+本次仅更新本地标准构建与验证记录，未推送或发布。
 
 ### 原 SDR 接入记录
 
