@@ -1,4 +1,4 @@
-// HDR10 GPU adapters. Original implementation using BT.2020 NCL and ST.2084.
+// PQ/HLG GPU adapters. Original implementation using BT.2020 NCL and BT.2100.
 // SDR model input is a proxy; its output never replaces the retained HDR base.
 #pragma once
 #include "video_enhancement.h"
@@ -27,7 +27,7 @@ struct HdrPipeline {
         }
     }
     static constexpr const char *source = R"HLSL(
-cbuffer Params : register(b0) { uint w,h,ow,oh,fullRange,chroma; uint2 padding; }
+cbuffer Params : register(b0) { uint w,h,ow,oh,fullRange,chroma,transfer,padding; }
 Texture2D<float> inY : register(t0);
 Texture2D<float2> inUV : register(t1);
 Texture2D<float4> baseTex : register(t2);
@@ -48,6 +48,21 @@ float3 pqEncode(float3 nits) {
     float3 p=pow(saturate(nits/10000.0),2610.0/16384.0);
     return pow((3424.0/4096.0+2413.0/128.0*p)/(1+2392.0/128.0*p),2523.0/32.0);
 }
+// Match Veyra's HLG reference display: 1000 nits, gamma 1.2, ideal black.
+// The luminance-dependent OOTF is essential for colored HLG pixels.
+float3 hlgDecode(float3 signal) {
+    signal=saturate(signal);
+    float3 scene=signal<=.5 ? signal*signal/3.0 : (exp((signal-.55991073)/.17883277)+.28466892)/12.0;
+    return 1000.0*scene*pow(max(dot(scene,float3(.2627,.6780,.0593)),0),.2);
+}
+float3 hlgEncode(float3 nits) {
+    float3 display=max(nits/1000.0,0);
+    float luminance=dot(display,float3(.2627,.6780,.0593));
+    float3 scene=luminance>0 ? display*pow(luminance,-1.0/6.0) : 0;
+    return scene<=1.0/12.0 ? sqrt(3.0*scene) : .17883277*log(max(12.0*scene-.28466892,1e-6))+.55991073;
+}
+float3 sourceDecode(float3 signal) { return transfer==2 ? hlgDecode(signal) : pqDecode(signal); }
+float3 sourceEncode(float3 nits) { return transfer==2 ? hlgEncode(nits) : pqEncode(nits); }
 float3 to709(float3 c) {
     return mul(float3x3(1.660491,-.587641,-.072850,-.124550,1.132900,-.008349,-.018151,-.100579,1.118730),c);
 }
@@ -56,8 +71,9 @@ float3 to2020(float3 c) {
 }
 float3 srgbEncode(float3 v) { return v<=.0031308 ? 12.92*v : 1.055*pow(max(v,0),1.0/2.4)-.055; }
 float3 srgbDecode(float3 v) { return v<=.04045 ? v/12.92 : pow((v+.055)/1.055,2.4); }
-float3 readPq(uint2 p) {
-    float2 offset=chroma==1 ? float2(1,1) : chroma==2 ? float2(.5,.5) : float2(1,.5);
+float3 readSource(uint2 p) {
+    float2 offset=float2(chroma==2||chroma==3||chroma==5 ? .5 : 1,
+                         chroma==1||chroma==3 ? 1 : chroma==4||chroma==5 ? 0 : .5);
     float y=inY[p]*(65535.0/64.0);
     float2 uv=inUV.SampleLevel(linearClamp,(float2(p)+offset)/float2(w,h),0)*(65535.0/64.0);
     y=fullRange ? y/1023.0 : (y-64.0)/876.0;
@@ -66,7 +82,7 @@ float3 readPq(uint2 p) {
 }
 [numthreads(16,16,1)] void decode(uint3 id:SV_DispatchThreadID) {
     if(id.x>=w||id.y>=h)return;
-    float3 original=pqDecode(readPq(id.xy));
+    float3 original=sourceDecode(readSource(id.xy));
     baseOut[id.xy]=float4(original,1);
     float3 v=max(to709(original)/203.0,0);
     // A fixed white point avoids exposure pumping between source frames.
@@ -75,7 +91,10 @@ float3 readPq(uint2 p) {
 }
 [numthreads(16,16,1)] void encode10(uint3 id:SV_DispatchThreadID) {
     if(id.x>=w||id.y>=h)return;
-    uint3 rgb=(uint3)round(saturate(readPq(id.xy))*1023.0);
+    // VFG always sees PQ RGB10A2, including for an HLG source.
+    float3 signal=readSource(id.xy);
+    if(transfer==2)signal=pqEncode(hlgDecode(signal));
+    uint3 rgb=(uint3)round(saturate(signal)*1023.0);
     packedOut[id.xy]=rgb.x|(rgb.y<<10)|(rgb.z<<20)|(3u<<30);
 }
 float3 restored(int2 p) {
@@ -87,13 +106,15 @@ float3 restored(int2 p) {
     float luminance=dot(original,float3(.2627,.6780,.0593));
     float peak=max(proxy.r,max(proxy.g,proxy.b));
     float protection=saturate(luminance/4.0)*saturate((.98-peak)/.18);
+    if(transfer==2)protection*=1-smoothstep(950.0,1000.0,max(original.r,max(original.g,original.b)));
     float3 delta=clamp(neural-proxy,-.5,.5)*203.0*protection;
-    return pqEncode(original+to2020(delta));
+    return sourceEncode(original+to2020(delta));
 }
 float3 unpacked(int2 p) {
     p=clamp(p,int2(0,0),int2(ow-1,oh-1));
     uint v=packedTex[p];
-    return float3(v&1023u,(v>>10)&1023u,(v>>20)&1023u)/1023.0;
+    float3 signal=float3(v&1023u,(v>>10)&1023u,(v>>20)&1023u)/1023.0;
+    return transfer==2 ? hlgEncode(pqDecode(signal)) : signal;
 }
 float3 yuv(float3 rgb) {
     float y=dot(rgb,float3(.2627,.6780,.0593));
@@ -108,14 +129,13 @@ void writeP010(uint2 p, bool packed) {
     if((p.x&1u)||(p.y&1u))return;
     float2 uv=0;
     // Downsample about the declared chroma center, including the left-edge case.
-    if(chroma==2) {
-        for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++)uv+=yuv(picture(int2(p)+int2(dx,dy),packed)).yz*.25;
-    } else {
-        for(int dy=chroma==1?-1:0;dy<2;dy++)for(int dx=-1;dx<2;dx++) {
-            float wx=dx==0?.5:.25;
-            float wy=chroma==1?(dy==0?.5:.25):.5;
-            uv+=yuv(picture(int2(p)+int2(dx,dy),packed)).yz*wx*wy;
-        }
+    bool halfX=chroma==2||chroma==3||chroma==5;
+    bool halfY=chroma==0||chroma==2;
+    int centerY=chroma==4||chroma==5 ? 1 : 0;
+    for(int dy=halfY?0:centerY-1;dy<=(halfY?1:centerY+1);dy++)for(int dx=halfX?0:-1;dx<=1;dx++) {
+        float wx=halfX?.5:dx==0?.5:.25;
+        float wy=halfY?.5:dy==centerY?.5:.25;
+        uv+=yuv(picture(int2(p)+int2(dx,dy),packed)).yz*wx*wy;
     }
     float2 code=uv*(fullRange?1023.0:896.0)+512.0;
     outUV[p/2]=uint2(quantize(code.x),quantize(code.y));
@@ -158,11 +178,11 @@ void writeP010(uint2 p, bool packed) {
         c=config; hr(c.device->QueryInterface(IID_PPV_ARGS(&device)),"HDR D3D11 device3");
         for(auto item : {std::pair{"decode",decode_shader.GetAddressOf()},{"encode10",encode_shader.GetAddressOf()},{"restore",restore_shader.GetAddressOf()},{"pack10",pack_shader.GetAddressOf()}}) {
             Ptr<ID3DBlob> code,error;
-            HRESULT result=D3DCompile(source,strlen(source),"HDR10 GPU pipeline",nullptr,nullptr,item.first,"cs_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&code,&error);
+            HRESULT result=D3DCompile(source,strlen(source),"PQ/HLG GPU pipeline",nullptr,nullptr,item.first,"cs_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&code,&error);
             if(FAILED(result))throw std::runtime_error(error?std::string(static_cast<const char*>(error->GetBufferPointer()),error->GetBufferSize()):"HDR shader compilation failed");
             hr(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,item.second),"HDR compute shader");
         }
-        unsigned values[8]={c.width,c.height,c.out_width,c.out_height,c.full_range,c.chroma_location,0,0};
+        unsigned values[8]={c.width,c.height,c.out_width,c.out_height,c.full_range,c.chroma_location,c.transfer,0};
         D3D11_BUFFER_DESC d{};d.ByteWidth=sizeof(values);d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;d.Usage=D3D11_USAGE_IMMUTABLE;
         D3D11_SUBRESOURCE_DATA data{values,0,0};hr(device->CreateBuffer(&d,&data,&constants),"HDR constants");
         D3D11_SAMPLER_DESC s{};s.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;s.AddressU=s.AddressV=s.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;s.MaxLOD=D3D11_FLOAT32_MAX;

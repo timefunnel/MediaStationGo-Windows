@@ -115,7 +115,7 @@ struct nvvideo_session {
         hr = device1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device), &chosen, &isolated);
         check(hr, "D3D11 context isolation", SUCCEEDED(hr));
         ContextGuard guard(multithread.Get(), context1.Get(), isolated.Get());
-        if (config.hdr10) { hdr = std::make_unique<HdrPipeline>(); hdr->initialize(config); }
+        if (config.transfer != NVVIDEO_SDR) { hdr = std::make_unique<HdrPipeline>(); hdr->initialize(config); }
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = config.out_width; desc.Height = config.out_height; desc.MipLevels = desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
@@ -162,7 +162,7 @@ struct nvvideo_session {
             int device = -1; cuda(get_device(&device, adapter.Get()), "cudaD3D11GetDevice"); cuda(set_device(device), "cudaSetDevice");
             cuda(stream_create(&stream, 1), "cudaStreamCreate");
             cuda(create_effect("VideoFrameGeneration", &effect), "VFG CreateEffect");
-            for (auto &im : images) cuda(alloc(&im, config.width, config.height, config.hdr10 ? 13 : 7, config.hdr10 ? 11 : 1, 0, 1, 32), "VFG image allocation");
+            for (auto &im : images) cuda(alloc(&im, config.width, config.height, hdr ? 13 : 7, hdr ? 11 : 1, 0, 1, 32), "VFG image allocation");
             cuda(set_stream(effect, "CudaStream", stream), "VFG stream");
             cuda(set_u32(effect, "InputWidth", config.width), "VFG width"); cuda(set_u32(effect, "InputHeight", config.height), "VFG height");
             cuda(set_u32(effect, "Mode", config.vfg_quality), "VFG quality");
@@ -195,7 +195,7 @@ struct nvvideo_session {
             if (!texture) continue;
             D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
             bool dest = texture == destination;
-            check(0, "Native frame format/dimensions mismatch", desc.ArraySize == 1 && desc.MipLevels == 1 && desc.Format == (config.hdr10 ? DXGI_FORMAT_P010 : DXGI_FORMAT_B8G8R8A8_UNORM) && desc.Width == (dest ? config.out_width : config.width) && desc.Height == (dest ? config.out_height : config.height));
+            check(0, "Native frame format/dimensions mismatch", desc.ArraySize == 1 && desc.MipLevels == 1 && desc.Format == (hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_B8G8R8A8_UNORM) && desc.Width == (dest ? config.out_width : config.width) && desc.Height == (dest ? config.out_height : config.height));
         }
         if (hdr && config.mode != 2) { hdr->input(current); current = hdr->proxy.Get(); }
         if (config.mode == 1) {
@@ -223,12 +223,12 @@ struct nvvideo_session {
     }
 };
 
-uint32_t __cdecl nvvideo_abi() { return 3; }
+uint32_t __cdecl nvvideo_abi() { return 4; }
 nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *error, size_t size) {
     try {
-        if (!config || config->abi != 3 || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier < 2 || config->multiplier > 8 || config->scene_detection > 1)
+        if (!config || config->abi != 4 || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier < 2 || config->multiplier > 8 || config->scene_detection > 1)
             throw std::runtime_error("Invalid native enhancement configuration");
-        if (config->hdr10 > 1 || config->full_range > 1 || config->chroma_location > 2 || (config->hdr10 && ((config->width | config->height | config->out_width | config->out_height) & 1))) throw std::runtime_error("Invalid HDR10 format/range/chroma configuration");
+        if (config->transfer > NVVIDEO_HLG || config->full_range > 1 || config->chroma_location > 5 || (config->transfer != NVVIDEO_SDR && ((config->width | config->height | config->out_width | config->out_height) & 1))) throw std::runtime_error("Invalid PQ/HLG format/range/chroma configuration");
         if (config->nr_style < 0 || config->nr_style > 2 || config->nr_auto_mask < 0 || config->nr_auto_mask > 1 || config->nr_ui_correction < 0 || config->nr_ui_correction > 1 || !std::isfinite(config->nr_skin) || !(config->nr_skin == -1.f || (config->nr_skin >= 0.f && config->nr_skin <= 2.f))) throw std::runtime_error("Invalid DLSSNR configuration");
         if (config->nr_target != 0 && config->nr_target != 480 && config->nr_target != 720 && config->nr_target != 900 && config->nr_target != 1080 && config->nr_target != 1440) throw std::runtime_error("Invalid DLSSNR processing size");
         for (float value : {config->nr_intensity, config->nr_tone, config->nr_structure}) if (!std::isfinite(value) || value < 0.f || value > 1.f) throw std::runtime_error("Invalid DLSSNR strength");

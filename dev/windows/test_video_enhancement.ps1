@@ -25,8 +25,15 @@ try {
         $Stream = ($ProbeJson | ConvertFrom-Json).streams[0]
         if ($Stream.pix_fmt -ne 'yuv420p10le' -or $Stream.color_space -ne 'bt2020nc' -or $Stream.color_transfer -ne 'smpte2084' -or $Stream.color_primaries -ne 'bt2020' -or $Stream.color_range -ne 'tv' -or $Stream.chroma_location -ne 'left') { throw 'Generated source does not have the required HDR10 VUI' }
         Write-Output "HDR10_SOURCE_VUI_OK size=$Size format=p010 primaries=bt2020 transfer=pq matrix=bt2020nc range=limited chroma=left"
+        & $Ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=${Size}:rate=24:duration=4" -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -c:v libx265 -preset ultrafast -pix_fmt yuv420p10le -color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv -chroma_sample_location left -x265-params 'log-level=error:colorprim=9:transfer=18:colormatrix=9' -c:a aac -shortest (Join-Path $TestRoot "hlg-$Size.mp4")
+        if ($LASTEXITCODE -ne 0) { throw 'HLG synthetic video generation failed' }
+        $ProbeJson = & ffprobe.exe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_space,color_transfer,color_primaries,color_range,chroma_location -of json (Join-Path $TestRoot "hlg-$Size.mp4")
+        if ($LASTEXITCODE -ne 0) { throw 'HLG source metadata probe failed' }
+        $Stream = ($ProbeJson | ConvertFrom-Json).streams[0]
+        if ($Stream.pix_fmt -ne 'yuv420p10le' -or $Stream.color_space -ne 'bt2020nc' -or $Stream.color_transfer -ne 'arib-std-b67' -or $Stream.color_primaries -ne 'bt2020' -or $Stream.color_range -ne 'tv' -or $Stream.chroma_location -ne 'left') { throw 'Generated source does not have the required HLG VUI' }
+        Write-Output "HLG_SOURCE_VUI_OK size=$Size format=p010 primaries=bt2020 transfer=hlg matrix=bt2020nc range=limited chroma=left"
     }
-    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\experimental\nr-original" (Join-Path $TestRoot 'source-hd.mp4') (Join-Path $TestRoot 'hdr-640x360.mp4') (Join-Path $TestRoot 'hdr-1920x1080.mp4') ([int]$HdrOnly.IsPresent)
+    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\experimental\nr-original" (Join-Path $TestRoot 'source-hd.mp4') (Join-Path $TestRoot 'hdr-640x360.mp4') (Join-Path $TestRoot 'hdr-1920x1080.mp4') ([int]$HdrOnly.IsPresent) (Join-Path $TestRoot 'hlg-640x360.mp4') (Join-Path $TestRoot 'hlg-1920x1080.mp4')
     if ($LASTEXITCODE -ne 0) { throw 'Native mpv playback/seek/EOF test failed' }
 } finally {
     $Absolute = [IO.Path]::GetFullPath($TestRoot)

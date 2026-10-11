@@ -12,10 +12,11 @@ static std::string utf8(const wchar_t *value) {
 static std::string quote(const std::string &text) { return "%" + std::to_string(text.size()) + "%" + text; }
 static unsigned count(mpv_handle *mpv, const char *name) { char *value = mpv_get_property_string(mpv, name); unsigned result = value ? static_cast<unsigned>(std::strtoul(value, nullptr, 10)) : 0; mpv_free(value); return result; }
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 11) return 2; // SDR, bridge, VSR, VFG, cache, NR, SDR HD, HDR10, HDR10 HD, HDR-only
+    if (argc != 13) return 2; // SDR, bridge, VSR, VFG, cache, NR, SDR HD, HDR10, HDR10 HD, HDR-only, HLG, HLG HD
     HWND window = CreateWindowExW(0, L"STATIC", L"MediaStationGo native video test", WS_POPUP, 0, 0, 640, 360, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!window) return 3; // Never shown. The D3D11 output context still uses this native surface.
-    for (bool hdr : {false, true}) for (unsigned mode : {1u, 2u, 3u, 4u, 7u, 8u, 12u}) {
+    for (unsigned transfer : {0u, 1u, 2u}) for (unsigned mode : {1u, 2u, 3u, 4u, 7u, 8u, 12u}) {
+        const bool hdr=transfer!=0;
         if (!hdr && std::wstring(argv[10]) == L"1") continue;
         if (hdr && mode == 8) continue; // High 8x is already known to exceed real-time budget.
         mpv_handle *mpv = mpv_create(); if (!mpv) return 4;
@@ -32,7 +33,7 @@ int wmain(int argc, wchar_t **argv) {
         if (hdr && (mode & 2)) append(vfg_filter);
         if (!hdr) append("@nvoutput:d3d11vpp=format=nv12");
         if (mpv_set_option_string(mpv, "vf", filter.c_str()) < 0 || mpv_initialize(mpv) < 0) return 7;
-        mpv_request_log_messages(mpv, "warn"); auto filename = utf8(argv[hdr ? mode==12?9:8 : mode == 12 ? 7 : 1]); const char *load[] = {"loadfile", filename.c_str(), nullptr};
+        mpv_request_log_messages(mpv, "warn"); auto filename = utf8(argv[transfer==2 ? mode==12?12:11 : hdr ? mode==12?9:8 : mode == 12 ? 7 : 1]); const char *load[] = {"loadfile", filename.c_str(), nullptr};
         if (mpv_command(mpv, load) < 0) return 8;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(35);
         bool seeked = false, finished = false; unsigned vsr = 0, vfg = 0, nr = 0, resets = 0;
@@ -54,21 +55,26 @@ int wmain(int argc, wchar_t **argv) {
         char* elapsed=mpv_get_property_string(mpv,(std::string("vf-metadata/")+label+"/avg-process-ms").c_str());
         if ((mode == 4 || mode == 12) && max_av > 0.25) { std::fprintf(stderr,"DLSSNR_REALTIME_FAIL mode=%u max-avsync=%.4f\n",mode,max_av);mpv_free(elapsed);mpv_terminate_destroy(mpv);DestroyWindow(window);return 11; }
         char *gamma=mpv_get_property_string(mpv,"video-out-params/gamma"),*primaries=mpv_get_property_string(mpv,"video-out-params/primaries"),*encoding=mpv_get_property_string(mpv,(std::string("vf-metadata/")+label+"/sdk-encoding").c_str());
-        bool color_ok=!hdr||(gamma&&std::string(gamma)=="pq"&&primaries&&std::string(primaries)=="bt.2020");
+        bool color_ok=!hdr||(gamma&&std::string(gamma)==(transfer==2?"hlg":"pq")&&primaries&&std::string(primaries)=="bt.2020");
         if(hdr) {
             char *format=mpv_get_property_string(mpv,"video-out-params/hw-pixelformat");
             color_ok=color_ok&&format&&std::string(format)=="p010";mpv_free(format);
             for(const char *field:{"min-luma","max-luma","max-cll","max-fall"}) {
                 double before=0,after=0;
-                color_ok=color_ok&&mpv_get_property(mpv,(std::string("video-params/")+field).c_str(),MPV_FORMAT_DOUBLE,&before)>=0&&mpv_get_property(mpv,(std::string("video-out-params/")+field).c_str(),MPV_FORMAT_DOUBLE,&after)>=0&&std::abs(before-after)<.00001;
+                int source=mpv_get_property(mpv,(std::string("video-params/")+field).c_str(),MPV_FORMAT_DOUBLE,&before),output=mpv_get_property(mpv,(std::string("video-out-params/")+field).c_str(),MPV_FORMAT_DOUBLE,&after);
+                color_ok=color_ok&&(transfer==1 ? source>=0&&output>=0&&std::abs(before-after)<.00001 : ((source>=0)==(output>=0))&&(source<0||std::abs(before-after)<.00001));
             }
             if(mode&2) {
                 char *sdk=mpv_get_property_string(mpv,"vf-metadata/enhance_vfg/sdk-encoding");
                 color_ok=color_ok&&sdk&&std::string(sdk)=="rgb10a2-pq";mpv_free(sdk);
             }
+            if(transfer==2) {
+                char *range=mpv_get_property_string(mpv,(std::string("vf-metadata/")+label+"/dynamic-range").c_str()),*reference=mpv_get_property_string(mpv,(std::string("vf-metadata/")+label+"/hlg-reference").c_str());
+                color_ok=color_ok&&range&&std::string(range)=="hlg"&&reference&&std::string(reference)=="1000-nits-gamma-1.2";mpv_free(range);mpv_free(reference);
+            }
         }
         if (!finished || !seeked || !color_ok || ((mode & 1) && vsr <= 12) || (((mode & 2) || mode == 8) && vfg <= 12) || ((mode & 4) && nr <= 12) || resets == 0 || width != ((mode & 1) ? hdr?1280:2560 : mode==12?1920:640) || height != ((mode & 1) ? hdr?720:1440 : mode==12?1080:360)) { std::fprintf(stderr, "PLAYBACK_FAIL hdr=%d mode=%u finished=%d seek=%d vsr=%u vfg=%u nr=%u resets=%u output=%lldx%lld gamma=%s primaries=%s\n",hdr, mode, finished, seeked, vsr, vfg,nr, resets, width, height,gamma?gamma:"null",primaries?primaries:"null"); DestroyWindow(window); return 10; }
-        std::printf("NVVIDEO_MPV_PLAYBACK_OK hdr=%d mode=%u vsr-sdk-frames=%u vfg-sdk-frames=%u nr-sdk-frames=%u resets=%u output=%lldx%lld seek=1 eof=1 avg-process-ms=%s max-avsync=%.4f gamma=%s primaries=%s sdk-encoding=%s\n",hdr, mode, vsr, vfg,nr, resets, width, height,elapsed?elapsed:"unavailable",max_av,gamma?gamma:"unknown",primaries?primaries:"unknown",encoding?encoding:"unknown");
+        std::printf("NVVIDEO_MPV_PLAYBACK_OK transfer=%u mode=%u vsr-sdk-frames=%u vfg-sdk-frames=%u nr-sdk-frames=%u resets=%u output=%lldx%lld seek=1 eof=1 avg-process-ms=%s max-avsync=%.4f gamma=%s primaries=%s sdk-encoding=%s\n",transfer, mode, vsr, vfg,nr, resets, width, height,elapsed?elapsed:"unavailable",max_av,gamma?gamma:"unknown",primaries?primaries:"unknown",encoding?encoding:"unknown");
         mpv_free(gamma);mpv_free(primaries);mpv_free(encoding);
         mpv_free(elapsed);mpv_terminate_destroy(mpv);
     }

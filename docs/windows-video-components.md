@@ -10,15 +10,15 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 | 组件 | 安装管理 | 播放能力 | 当前边界 |
 | --- | --- | --- | --- |
 | RIFE | 沿用既有组件，增加本地导入入口 | 原有三档与固定 2 倍插帧 | ABI 8、模型、TensorRT profile 与 HDR 路径保持原合同 |
-| RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR / HDR10；HDR 使用代理推理和原图残差合成 |
-| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，2–8 倍帧率，可配置自动切镜检测 | 渐进 SDR / HDR10；HDR 原生 RGB10A2/PQ；与 RIFE 互斥 |
-| DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR / HDR10；HDR 使用代理推理和原图残差合成 |
+| RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
+| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，2–8 倍帧率，可配置自动切镜检测 | 渐进 SDR / HDR10 / HLG；HDR 使用 RGB10A2/PQ；与 RIFE 互斥 |
+| DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
 
 ## 使用
 
 1. 打开侧栏“组件管理”，点击所需组件的“从本地安装”，选择对应组件 ZIP。
 2. 校验并排队完成后，确认重启；也可稍后重启或取消待安装。
-3. 播放渐进 SDR 或 HDR10 视频，在播放器“画面增强”菜单开启所需组件，展开参数后应用。
+3. 播放渐进 SDR、HDR10 或 HLG 视频，在播放器“画面增强”菜单开启所需组件，展开参数后应用。
    NR、VFG 与超分可叠加；开启 RIFE 会关闭 VFG。关闭插帧保留 NR 与超分选择。
 
 本次三个新组件包仅生成于 `dist/components`，尚未发布 GitHub Release。
@@ -39,7 +39,7 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 - 用户 cache 下 `components/{rife,rtx-video,dlssnr,nvidia-vfg}/{active,pending}`
   各自存放运行库；专属缓存为 `frame-interpolation`、`rtx-video`、`dlssnr`、`nvidia-vfg`。
   卸载清理仅针对选中组件及其专属缓存。
-- 主程序携带自写 ABI 3 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
+- 主程序携带自写 ABI 4 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
   安装成功只说明文件经过校验；GPU/驱动支持在实际创建 SDK feature 时验证。
 - SDR 链路为 `D3D11 解码 → d3d11vpp BGRA8 → 可选 DLSSNR → 可选 VFG → 可选 VSR →
   d3d11vpp NV12 → 原有 VO`。BGRA→NV12 是输出格式合同的一部分。
@@ -51,10 +51,10 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
   CUDA 设备。NGX 参数在 Shutdown 前释放；释放异常输出明确诊断。
 - 加载请求附带明确的增强选择，旧前端缺省为关闭。播放中切换复用原有重载流程，
   保留进度、片源版本、播放/暂停意图；切集保留增强选择。
-- HDR10 链路为 `D3D11 P010 → 可选 DLSSNR → 可选 VSR → 可选 VFG → P010 → 原有 VO`。
+- HDR10 / HLG 链路为 `D3D11 P010 → 可选 DLSSNR → 可选 VSR → 可选 VFG → P010 → 原有 VO`。
   HDR 顺序将 VFG 放在超分与色彩恢复之后；不会经过 BGRA/NV12 的普通视频转换。
-- 预加载拒绝已知 HLG、HDR10+ 和 Dolby Vision；原生滤镜继续检查每帧的格式、
-  BT.2020 NCL/PQ、明确量化范围、色度位置、隔行与动态元数据。未知格式明确失败。
+- 预加载拒绝已知 HDR10+ 和 Dolby Vision；原生滤镜继续检查每帧的格式、
+  BT.2020 NCL/PQ 或 HLG、明确量化范围、色度位置、隔行与动态元数据。未知格式明确失败。
   SDK 失败或请求的滤镜失效会触发明确播放错误并停止，不静默退回普通处理。
 
 ## 来源与 DLSSNR 实现
@@ -83,16 +83,25 @@ D3D11 计算着色器将 SDR BGRA 帧转换为 RGBA8 推理输入，NR 在新的
 720p、900p、1440p；始终保持比例且不放大低分辨率输入。运动与深度输入使用明确的零图，
 当前未接 NR 光流、多层模型或参考项目额外的残差/防闪烁参数。
 
-## HDR10 处理
+## HDR10 / HLG 处理
 
-主包桥 ABI 升为 3，与自定义 mpv 同步构建；可选 NVIDIA 运行库及三个组件 ZIP 不变。
-HDR 输入与输出均为 P010，支持 Limited/Full 和 left/top-left/center 色度位置。
-BT.2020 NCL 转 RGB、ST.2084 EOTF/OETF 和色度重建在 GPU 执行；P010 使用整数
+主包桥 ABI 为 4，与自定义 mpv 同步构建；可选 NVIDIA 运行库及三个组件 ZIP 不变。
+HDR 输入与输出均为 P010，支持 Limited/Full 和 left/top-left/center/top/bottom-left/bottom
+六种色度位置。BT.2020 NCL 转 RGB、ST.2084 或 HLG 传递函数和色度重建在 GPU 执行；P010 使用整数
 UAV 将十位码值写入高十位，避免 UNORM 写入的舍入使低六位不再为零。
 
 VFG 使用 SDK 的 RGB10A2/P32 编码。RGB10A2 位布局放在 R32_UINT 纹理中，与
 CUDA 互操作后直接交给 VFG，不将 HDR 转为 SDR。所有中间输出再转换为 P010，
 原有色彩属性和静态 HDR 元数据通过 `mp_image_copy_attributes` 传递。
+
+HLG 参考 Veyra 正式版本 [e3aa842 的线性化路径](https://github.com/Likely7/Veyra-NRVideo/blob/e3aa842/shaders/YuvToLinearRgb.hlsl)，
+采用 1000 尼特参考显示、system gamma 1.2、理想黑位。反 OETF 后执行与 BT.2020
+亮度有关的 OOTF；恢复时执行对应逆变换，不能把 HLG 当成逐通道 gamma 曲线。
+VFG 内部先转为 PQ RGB10A2，再把输出恢复为 HLG P010；VSR/NR 保留 HLG 线性原图。
+输出继续标记 HLG，与 Veyra 在 HDR 显示出口转 PQ/scRGB 的路径有区别。
+HLG 残差在原图峰值 950–1000 尼特之间逐渐减弱，保护参考峰值；这是本项目自写的
+保护规则，不宣称与 Veyra 逐像素相同。RIFE 暂不支持 HLG；HDR10+ 和 Dolby Vision
+动态元数据处理未接入，仍明确拒绝，也未采用其尚未合并的杜比修复 PR。
 
 VSR/NR 保留线性 BT.2020 FP16 原图，另生成固定 203 尼特参考的 BT.709/sRGB 8 位
 代理图供现有模型推理。代理映射采用 `x/(1+x)`，增强前后差值在线性空间转换回
@@ -103,6 +112,7 @@ BT.2020 后叠加到原图；保护接近黑位和压缩高光，残差为零时
 
 滤镜元数据新增 `dynamic-range`、`sdk-encoding`、`hdr-processing`，区分
 `rgb10a2-pq / native-10bit` 与 `bgra8 / proxy-residual`，可审计实际执行路径。
+HLG 额外输出 `hlg-reference=1000-nits-gamma-1.2`。
 显示器是否用 HDR 输出仍由 mpv/Windows 的原有显示链路决定，本次不修改全局显示设置。
 
 播放“画面增强”内展开各组件参数，点击“应用参数并启用”。VSR 质量 1–4；目标尺寸为
@@ -112,6 +122,67 @@ BT.2020 后叠加到原图；保护接近黑位和压缩高光，残差为零时
 前后端拒绝未知字段、无效类型、非有限值、越界参数和错误的返回参数，不自动降档。
 
 ## 验证记录与复现
+
+### Veyra 参考 HLG 首版（2026-10-11）
+
+参考正式版本 `v2.0.6 / e3aa842` 的 HLG 线性化和色度元数据范围，扩展三项 NVIDIA
+组件；没有接入尚未合并的 Dolby Vision 分支。视频桥 ABI 从 3 升至 4，区分 SDR、
+PQ、HLG；NR 适配器和可选运行库 ABI 不变。必须使用同步更新的主包 mpv 与视频桥，
+三个现有组件 ZIP 无需更换。RIFE 模型、ABI 8、profile、固定 2 倍合同与刷新行为未改。
+
+RTX 5070 Ti / 596.49 上，137 项常规 Rust 测试、scoped Clippy、格式检查和三个 JS
+回归脚本通过。`hlg-playback.log` 中七条 SDR、六条 HDR10 和六条 HLG 共 19 条链路
+均完成实际 SDK 调用、精确 seek、EOF 和尺寸检查。High SDR VFG 8x 最大 A/V 偏差
+0.8163 秒，只通过功能检查，仍不属于实时流畅验收。其他本轮短片最大偏差为 0.0417 秒。
+
+HLG 使用 4 秒 / 24 fps HEVC Main10 + AAC 合成源；先由 ffprobe 检查 BT.2020 NCL、
+`arib-std-b67`、Limited/left，再在原生 gpu-next/d3d11va 播放。六条输出均保持
+HLG、BT.2020、P010，并检查 `hlg-reference=1000-nits-gamma-1.2`；VFG 内部编码为
+`rgb10a2-pq`。HLG 不要求伪造静态 HDR 元数据：输入有值则保持，输入缺失则输出也缺失。
+
+| HLG 链路 | VSR / VFG / NR 调用数 | 输出 | 最大 A/V 偏差（秒） |
+| --- | --- | --- | --- |
+| VSR | 96 / 0 / 0 | 1280×720 | 0.0417 |
+| VFG | 0 / 95 / 0 | 640×360 | 0.0169 |
+| VSR → VFG | 96 / 94 / 0 | 1280×720 | 0.0208 |
+| NR | 0 / 0 / 96 | 640×360 | 0.0417 |
+| NR → VSR → VFG | 96 / 94 / 96 | 1280×720 | 0.0208 |
+| NR（1080p 源 / 720p 推理） | 0 / 0 / 96 | 1920×1080 | 0.0417 |
+
+数值验收覆盖 PQ/HLG × Limited/Full × 六种色度位置 × 代理/10 位路径共 48 组。
+HLG 灰阶为 0、1、100、203、500、1000 尼特，并有两组 BT.2020 彩色块；独立标量
+参考检查保留的 FP16 原图，验证与亮度有关的 OOTF。每种量化范围/色度位置检查 44 个
+采样点，包含颜色边界和上下行偏移，十二组共 528 点通过。往返灰阶和彩色码值误差不超过 1，
+所有 P010 字低六位为零。真实 VFG、VSR、NR 各连续执行六次；HLG VFG/NR 分别改变
+114048/225776 个 P010 字，黑位和参考峰值误差均为零。NR 未保护中间调最大码值变化为
+15，不将模型改色称作无损恢复。VSR 实际输出 1280×720。
+
+日志位于 `build/video-enhancement/hlg-gpu-acceptance.log`、`hlg-playback.log`、
+`hlg-hdr-final-playback.log`、`hlg-rust-tests.log` 和 `hlg-clippy.log`。色度边界和严格
+PQ 静态元数据检查见最后一次 HDR 日志。`test_video_enhancement.ps1 -HdrOnly` 现在
+同时复现 PQ 和 HLG，省略开关则包含 SDR。仍未验收实体声音/HDR 显示、4K 长片、
+长期显存或跨 GPU；HDR10+ 和 Dolby Vision 仍明确拒绝，RIFE HLG 未开放。
+
+标准 `build/jellium-desktop.exe` 已更新，Release 日志为 `hlg-release-build.log`。
+独立测试 config/cache 下，真实 CEF 页面经原生 IPC 返回 NR installed、runtimeVerified、
+playbackAvailable 均为 true，supportedDynamicRanges=[sdr,hdr10,hlg]；结果保存为
+`hlg-app-smoke-validation.json`，不覆盖此前 HDR10 的 IPC 记录。未配置服务器的测试
+profile 仅用于本地组件 IPC，不代表账户或真实片源播放验收。测试进程、媒体、探针和
+临时组件/缓存已清理；标准播放器以原有无参数方式重新启动，窗口存在且响应正常。
+正常关闭仍在 25 秒后超时，核验精确路径及父子进程归属后终止；未修改退出生命周期，
+该问题继续保留在关闭检查记录中。汇总见 `hlg-release-validation.json`。
+
+本轮标准构建 SHA-256：
+
+| 产物 | SHA-256 |
+| --- | --- |
+| `build/jellium-desktop.exe` | `9d9e457703665e0fbfefb37c10e32351093d16dbd6a17215124d8a1950117177` |
+| `build/libmpv-2.dll` | `bc0c7a70c467b48bccda7e3cac6892c8f2367ea63c4586d4f772c9670e470ab6` |
+| `build/video_enhancement.dll` | `958ca591bff5fb88ce116b5987de2f3d8781e9d42ea2283425bd5f5e431462b9` |
+| `build/nvngx.dll` | `de26bff1f86322bbefd92154e65c9ea8b15692aa0e4f7348c6cfe70e59b784a2` |
+
+标准构建的 mpv/视频桥/NR 适配器与 `third_party/mpv-install/lib` 对应文件哈希相同。
+三个组件 ZIP 重新核验与开头组件包表一致，仅更新主包；本轮仅本地实现、构建与验证，未推送或发布。
 
 ### HDR10 追加验收（2026-10-11）
 
@@ -168,7 +239,7 @@ invalid_server_url；本项只验收本地组件 IPC，不涉及账户或服务�
 随后以原来的无参数启动方式重新打开更新后的标准播放器，窗口存在且响应正常。
 产物与运行检查汇总为 `build/video-enhancement/hdr-release-validation.json`。
 
-当前 HDR10 标准构建 SHA-256：
+此前 HDR10 标准构建 SHA-256：
 
 | 产物 | SHA-256 |
 | --- | --- |

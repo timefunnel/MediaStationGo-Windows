@@ -48,7 +48,7 @@ pub fn status(kind: ComponentKind) -> Value {
     match runtime(kind) {
         Ok(runtime) => {
             json!({"runtimeVerified": runtime.installed, "playbackAvailable": runtime.installed && bridge_path().is_ok(),
-            "experimental": false, "supportedDynamicRanges": ["sdr", "hdr10"], "failureDetail": null, "defaults": Selection::default().payload()})
+            "experimental": false, "supportedDynamicRanges": ["sdr", "hdr10", "hlg"], "failureDetail": null, "defaults": Selection::default().payload()})
         }
         Err(error) => {
             json!({"runtimeVerified": false, "playbackAvailable": false, "failureCode": error.code, "failureDetail": error.detail})
@@ -166,7 +166,7 @@ impl Selection {
     pub fn filter(
         self,
         rife_filter: Option<&str>,
-        hdr10: bool,
+        hdr: bool,
     ) -> Result<String, InterpolationError> {
         if self.vfg && rife_filter.is_some() {
             return Err(InterpolationError::new(
@@ -179,11 +179,11 @@ impl Selection {
             .map(str::to_string)
             .collect::<Vec<_>>();
         if self.enabled() {
-            if !hdr10 {
+            if !hdr {
                 filters.push("@nvconvert:d3d11vpp=format=bgra".into());
             }
             // HDR remains P010 throughout. Generate frames after HDR restoration.
-            let providers = if hdr10 {
+            let providers = if hdr {
                 [
                     (self.nr, ComponentKind::DlssNr, 3, "enhance_nr"),
                     (self.vsr, ComponentKind::RtxVideo, 1, "enhance_vsr"),
@@ -243,7 +243,7 @@ impl Selection {
                 ));
             }
         }
-        if self.enabled() && !hdr10 {
+        if self.enabled() && !hdr {
             filters.push("@nvoutput:d3d11vpp=format=nv12".into());
         }
         Ok(filters.join(","))

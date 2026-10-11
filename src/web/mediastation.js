@@ -1152,7 +1152,7 @@
             frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
             frame_interpolation_filter_inactive: 'RIFE 原生滤镜未生效',
             video_enhancement_filter_inactive: '画面增强原生滤镜未生效，播放已停止；请检查组件、GPU 和媒体格式',
-            video_enhancement_format_unsupported: '画面增强支持 SDR 和 HDR10，暂不支持 HLG、HDR10+ 和 Dolby Vision',
+            video_enhancement_format_unsupported: '画面增强支持 SDR、HDR10 和 HLG，暂不支持 HDR10+ 和 Dolby Vision',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -6575,7 +6575,7 @@
                 const apply = element('button', 'secondary-command', '应用参数并启用'); apply.type = 'button'; apply.disabled = !ready || player.interpolationChanging;
                 apply.addEventListener('click', () => setFrameInterpolation(key === 'vfg' ? null : selectedModel, { ...draft, [key]: true })); form.append(apply); playerPanelContent.append(form);
             }
-            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；支持 SDR 和 HDR10，暂不支持 HLG、HDR10+ 和 Dolby Vision。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
+            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；增强支持 SDR、HDR10 和 HLG，暂不支持 HDR10+ 和 Dolby Vision。HLG 按 1000 尼特参考处理；RIFE 暂不支持 HLG。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
             return;
         }
 

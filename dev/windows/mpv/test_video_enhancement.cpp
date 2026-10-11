@@ -40,7 +40,7 @@ int wmain(int argc, wchar_t **argv) {
     for (unsigned mode : {1u, 2u, 3u}) {
         const unsigned scale = mode == 1 ? 2u : 1u; desc.Width = 640 * scale; desc.Height = 360 * scale;
         ComPtr<ID3D11Texture2D> output; if (FAILED(device->CreateTexture2D(&desc, nullptr, &output))) return 7;
-        nvvideo_config config{3, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode == 3 ? 4 : mode], argv[3],4,0,2,1,0,0,0,1.f,1.f,1.f,-1.f,1080,0,0,0}; char error[512]{};
+        nvvideo_config config{4, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode == 3 ? 4 : mode], argv[3],4,0,2,1,0,0,0,1.f,1.f,1.f,-1.f,1080,0,0,0}; char error[512]{};
         auto session = nvvideo_create(&config, error, sizeof(error)); if (!session) { std::fprintf(stderr, "mode=%u create: %s\n", mode, error); return 8; }
         bool ok = true;
         for (unsigned i = 0; i < 6; ++i) if (!nvvideo_process(session, first.Get(), second.Get(), output.Get(),1, error, sizeof(error))) { ok = false; break; }

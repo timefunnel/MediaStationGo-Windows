@@ -42,6 +42,16 @@ installed/runtimeVerified/playbackAvailable=true，supportedDynamicRanges=[sdr,h
 退出生命周期未修改，未将此项标记为正常退出验收通过。构建、IPC 与产物 SHA-256
 见视频组件记录及 `build/video-enhancement/hdr-release-validation.json`。
 
+同日参考 Veyra `v2.0.6 / e3aa842` 追加 HLG 首版：仅扩展 RTX Video、NVIDIA VFG、
+DLSSNR，采用 1000 尼特 / gamma 1.2 参考，保留 P010 与 HLG 输出色彩属性。桥 ABI 4，
+六种色度位置；48 组 GPU 往返、528 个 HLG 线性亮度/色度边界采样、三项真实 SDK、
+19 条 SDR/PQ/HLG 播放链路的 seek/EOF/输出检查通过。严格 HDR 检查追加复测通过；
+137 项 Rust、JS、scoped Clippy 和标准 Release 构建通过，真实应用 IPC 已返回
+NR 可用且 supportedDynamicRanges=[sdr,hdr10,hlg]。三个组件 ZIP 无需替换。
+RIFE HLG 未开放，HDR10+/Dolby Vision 继续明确拒绝；RIFE ABI 8、模型、profile、
+固定 2 倍合同与刷新行为不变。尚未验收实体 HDR 显示、4K 长片与跨 GPU。
+证据见视频组件记录的 HLG 首版章节；本轮仅更新本地标准构建，不推送或发布。
+
 此前 2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
 提交为 `5d15687`；本轮处理提交审查发现的三个异常恢复问题：取消待安装、状态查询
 失败后继续跟踪任务、回收可确认归属的孤立暂存目录。126 项常规 Rust 单测、JS
