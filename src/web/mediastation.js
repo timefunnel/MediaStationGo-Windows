@@ -1152,7 +1152,7 @@
             frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
             frame_interpolation_filter_inactive: 'RIFE 原生滤镜未生效',
             video_enhancement_filter_inactive: '画面增强原生滤镜未生效，播放已停止；请检查组件、GPU 和媒体格式',
-            video_enhancement_format_unsupported: '新增画面增强组件暂只支持 SDR 视频',
+            video_enhancement_format_unsupported: '画面增强支持 SDR 和 HDR10，暂不支持 HLG、HDR10+ 和 Dolby Vision',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -6536,7 +6536,7 @@
             }
             playerPanelContent.append(group);
             const draft = videoEnhancementSelection(player.videoEnhancement);
-            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR · 风格与增强强度可配置']]) {
+            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR / HDR10 · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR / HDR10 · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR / HDR10 · 风格与增强强度可配置']]) {
                 const ready = videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
                 const selected = player.videoEnhancement?.[key] === true;
                 const button = createTrackOption({ title, meta: ready ? meta : '请先在组件管理安装', selected, onSelect: () => {
@@ -6575,7 +6575,7 @@
                 const apply = element('button', 'secondary-command', '应用参数并启用'); apply.type = 'button'; apply.disabled = !ready || player.interpolationChanging;
                 apply.addEventListener('click', () => setFrameInterpolation(key === 'vfg' ? null : selectedModel, { ...draft, [key]: true })); form.append(apply); playerPanelContent.append(form);
             }
-            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；这些新增组件仅支持 SDR。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
+            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；支持 SDR 和 HDR10，暂不支持 HLG、HDR10+ 和 Dolby Vision。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
             return;
         }
 

@@ -42,7 +42,8 @@ async function main() {
         assert.equal(nr.runtime.playbackAvailable, true);
         assert.equal(nr.runtime.experimental, false);
         assert.equal(nr.runtime.defaults.nrTarget, 1080);
-        const report = { appPage: page.url, component: 'dlssnr', installed: nr.installed, runtimeVerified: nr.runtime.runtimeVerified, playbackAvailable: nr.runtime.playbackAvailable, nrTarget: nr.runtime.defaults.nrTarget };
+        assert.deepEqual(nr.runtime.supportedDynamicRanges, ['sdr', 'hdr10']);
+        const report = { appPage: page.url, component: 'dlssnr', installed: nr.installed, runtimeVerified: nr.runtime.runtimeVerified, playbackAvailable: nr.runtime.playbackAvailable, nrTarget: nr.runtime.defaults.nrTarget, supportedDynamicRanges: nr.runtime.supportedDynamicRanges };
         fs.writeFileSync(path.join(root, 'build/video-enhancement/app-smoke-validation.json'), JSON.stringify(report, null, 2));
         console.log(`APP_COMPONENT_IPC_SMOKE_OK ${JSON.stringify(report)}`);
     } finally { ws.close(); }

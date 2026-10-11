@@ -48,7 +48,7 @@ pub fn status(kind: ComponentKind) -> Value {
     match runtime(kind) {
         Ok(runtime) => {
             json!({"runtimeVerified": runtime.installed, "playbackAvailable": runtime.installed && bridge_path().is_ok(),
-            "experimental": false, "failureDetail": null, "defaults": Selection::default().payload()})
+            "experimental": false, "supportedDynamicRanges": ["sdr", "hdr10"], "failureDetail": null, "defaults": Selection::default().payload()})
         }
         Err(error) => {
             json!({"runtimeVerified": false, "playbackAvailable": false, "failureCode": error.code, "failureDetail": error.detail})
@@ -163,7 +163,11 @@ impl Selection {
     pub fn enabled(self) -> bool {
         self.vsr || self.vfg || self.nr
     }
-    pub fn filter(self, rife_filter: Option<&str>) -> Result<String, InterpolationError> {
+    pub fn filter(
+        self,
+        rife_filter: Option<&str>,
+        hdr10: bool,
+    ) -> Result<String, InterpolationError> {
         if self.vfg && rife_filter.is_some() {
             return Err(InterpolationError::new(
                 "video_enhancement_conflict",
@@ -175,12 +179,24 @@ impl Selection {
             .map(str::to_string)
             .collect::<Vec<_>>();
         if self.enabled() {
-            filters.push("@nvconvert:d3d11vpp=format=bgra".into());
-            for (enabled, kind, mode, label) in [
-                (self.nr, ComponentKind::DlssNr, 3, "enhance_nr"),
-                (self.vfg, ComponentKind::NvidiaVfg, 2, "enhance_vfg"),
-                (self.vsr, ComponentKind::RtxVideo, 1, "enhance_vsr"),
-            ] {
+            if !hdr10 {
+                filters.push("@nvconvert:d3d11vpp=format=bgra".into());
+            }
+            // HDR remains P010 throughout. Generate frames after HDR restoration.
+            let providers = if hdr10 {
+                [
+                    (self.nr, ComponentKind::DlssNr, 3, "enhance_nr"),
+                    (self.vsr, ComponentKind::RtxVideo, 1, "enhance_vsr"),
+                    (self.vfg, ComponentKind::NvidiaVfg, 2, "enhance_vfg"),
+                ]
+            } else {
+                [
+                    (self.nr, ComponentKind::DlssNr, 3, "enhance_nr"),
+                    (self.vfg, ComponentKind::NvidiaVfg, 2, "enhance_vfg"),
+                    (self.vsr, ComponentKind::RtxVideo, 1, "enhance_vsr"),
+                ]
+            };
+            for (enabled, kind, mode, label) in providers {
                 if !enabled {
                     continue;
                 }
@@ -227,7 +243,7 @@ impl Selection {
                 ));
             }
         }
-        if self.enabled() {
+        if self.enabled() && !hdr10 {
             filters.push("@nvoutput:d3d11vpp=format=nv12".into());
         }
         Ok(filters.join(","))
@@ -276,12 +292,15 @@ mod tests {
                 vfg: true,
                 ..Selection::default()
             }
-            .filter(Some("rife"))
+            .filter(Some("rife"), false)
             .unwrap_err()
             .code,
             "video_enhancement_conflict"
         );
-        assert_eq!(Selection::default().filter(Some("rife")).unwrap(), "rife");
+        assert_eq!(
+            Selection::default().filter(Some("rife"), false).unwrap(),
+            "rife"
+        );
     }
     #[test]
     fn all_provider_parameters_round_trip_without_losing_values() {

@@ -22,10 +22,20 @@ NVIDIA VFG 与 DLSSNR 已接入原生 mpv；三者核心参数已配置到实际
 RTX 5070 Ti/596.49 上完成原生推理、NR RGB 输出/参数差异、七条播放链路的跳转、
 EOF 与尺寸验证，包括 1080p NR 按 720p 推理并合成回原尺寸。136 项常规 Rust、
 JS 参数/状态/重载回归、scoped Clippy 和标准 Release 构建通过。RIFE ABI 8、三档
-模型和 profile 未变。新增处理限渐进 SDR，VFG 与 RIFE 互斥。High VFG 8x 超出
+模型和 profile 未变。初次接入限渐进 SDR，VFG 与 RIFE 互斥。High VFG 8x 超出
 本机实时预算，出现音画不同步，未标记为实时流畅通过；NR 短片验证通过，长片和
 其他 GPU 尚未验收。完整证据、来源、边界见 [视频组件记录](windows-video-components.md)。
 本次仅本地实现与验证，未推送或发布；提交记录以 Git 历史为准。
+
+同日追加 HDR10 接入：自写视频桥 ABI 3，保留 P010 输入/输出，VFG 实际执行
+RGB10A2/PQ 推理，VSR/NR 使用固定参考的 SDR 代理与 FP16 HDR 原图残差合成。
+12 组 GPU 数值往返及三项真实 provider、六条 HDR10 播放/seek/EOF/静态元数据
+检查通过；137 项常规 Rust、JS、scoped Clippy 通过。HLG、HDR10+、Dolby Vision
+仍拒绝，未验收实体 HDR 显示、4K 长片或长期显存。原有 RIFE ABI 8、模型、
+profile、固定 2 倍插帧和刷新行为未改；组件 ZIP 不变。主包构建与提交状态以
+本地构建日志及 Git 历史为准，不推送或发布。
+Release 代码编译已通过，但正在运行的旧播放器锁住标准 `build` 的 EXE，
+复制返回 Windows 错误 32；等待用户确认退出后完成产物更新和新版本启动检查。
 
 此前 2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
 提交为 `5d15687`；本轮处理提交审查发现的三个异常恢复问题：取消待安装、状态查询

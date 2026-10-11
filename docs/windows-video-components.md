@@ -10,15 +10,15 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 | 组件 | 安装管理 | 播放能力 | 当前边界 |
 | --- | --- | --- | --- |
 | RIFE | 沿用既有组件，增加本地导入入口 | 原有三档与固定 2 倍插帧 | ABI 8、模型、TensorRT profile 与 HDR 路径保持原合同 |
-| RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR；本机 RTX 5070 Ti 验证通过 |
-| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，2–8 倍帧率，可配置自动切镜检测 | 渐进 SDR；与 RIFE 互斥；本机 RTX 5070 Ti 验证通过 |
-| DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR；本机 RTX 5070 Ti 的原生与 mpv 验证通过 |
+| RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR / HDR10；HDR 使用代理推理和原图残差合成 |
+| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，2–8 倍帧率，可配置自动切镜检测 | 渐进 SDR / HDR10；HDR 原生 RGB10A2/PQ；与 RIFE 互斥 |
+| DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR / HDR10；HDR 使用代理推理和原图残差合成 |
 
 ## 使用
 
 1. 打开侧栏“组件管理”，点击所需组件的“从本地安装”，选择对应组件 ZIP。
 2. 校验并排队完成后，确认重启；也可稍后重启或取消待安装。
-3. 播放渐进 SDR 视频，在播放器“画面增强”菜单开启所需组件，展开参数后应用。
+3. 播放渐进 SDR 或 HDR10 视频，在播放器“画面增强”菜单开启所需组件，展开参数后应用。
    NR、VFG 与超分可叠加；开启 RIFE 会关闭 VFG。关闭插帧保留 NR 与超分选择。
 
 本次三个新组件包仅生成于 `dist/components`，尚未发布 GitHub Release。
@@ -39,9 +39,9 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 - 用户 cache 下 `components/{rife,rtx-video,dlssnr,nvidia-vfg}/{active,pending}`
   各自存放运行库；专属缓存为 `frame-interpolation`、`rtx-video`、`dlssnr`、`nvidia-vfg`。
   卸载清理仅针对选中组件及其专属缓存。
-- 主程序携带自写 ABI 2 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
+- 主程序携带自写 ABI 3 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
   安装成功只说明文件经过校验；GPU/驱动支持在实际创建 SDK feature 时验证。
-- mpv 链路为 `D3D11 解码 → d3d11vpp BGRA8 → 可选 DLSSNR → 可选 VFG → 可选 VSR →
+- SDR 链路为 `D3D11 解码 → d3d11vpp BGRA8 → 可选 DLSSNR → 可选 VFG → 可选 VSR →
   d3d11vpp NV12 → 原有 VO`。BGRA→NV12 是输出格式合同的一部分。
   生产帧保持在 GPU，不经过 CPU 读回；GPU 探针中的读回仅用于检查结果。
 - mpv 继续拥有 PTS、音轨、字幕、播放速度和 EOF。VFG 第 i 个中间帧 PTS 为 prev + (current - prev) × i / multiplier；
@@ -51,7 +51,10 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
   CUDA 设备。NGX 参数在 Shutdown 前释放；释放异常输出明确诊断。
 - 加载请求附带明确的增强选择，旧前端缺省为关闭。播放中切换复用原有重载流程，
   保留进度、片源版本、播放/暂停意图；切集保留增强选择。
-- 已知 HDR/Dolby Vision 元数据在预加载时拒绝；原生滤镜也拒绝 PQ、HLG 和隔行输入。
+- HDR10 链路为 `D3D11 P010 → 可选 DLSSNR → 可选 VSR → 可选 VFG → P010 → 原有 VO`。
+  HDR 顺序将 VFG 放在超分与色彩恢复之后；不会经过 BGRA/NV12 的普通视频转换。
+- 预加载拒绝已知 HLG、HDR10+ 和 Dolby Vision；原生滤镜继续检查每帧的格式、
+  BT.2020 NCL/PQ、明确量化范围、色度位置、隔行与动态元数据。未知格式明确失败。
   SDK 失败或请求的滤镜失效会触发明确播放错误并停止，不静默退回普通处理。
 
 ## 来源与 DLSSNR 实现
@@ -78,7 +81,29 @@ NR 使用同一 DXGI 适配器上的 D3D12 设备、共享 NT 纹理与 D3D11/D3
 D3D11 计算着色器将 SDR BGRA 帧转换为 RGBA8 推理输入，NR 在新的 D3D12 命令列表执行，
 结果差量在 GPU 上合成回原始尺寸。默认处理上限为 1920×1080，可选原尺寸、480p、
 720p、900p、1440p；始终保持比例且不放大低分辨率输入。运动与深度输入使用明确的零图，
-当前未接 NR 光流、HDR/RenoDX 色彩恢复、多层模型或参考项目额外的残差/防闪烁参数。
+当前未接 NR 光流、多层模型或参考项目额外的残差/防闪烁参数。
+
+## HDR10 处理
+
+主包桥 ABI 升为 3，与自定义 mpv 同步构建；可选 NVIDIA 运行库及三个组件 ZIP 不变。
+HDR 输入与输出均为 P010，支持 Limited/Full 和 left/top-left/center 色度位置。
+BT.2020 NCL 转 RGB、ST.2084 EOTF/OETF 和色度重建在 GPU 执行；P010 使用整数
+UAV 将十位码值写入高十位，避免 UNORM 写入的舍入使低六位不再为零。
+
+VFG 使用 SDK 的 RGB10A2/P32 编码。RGB10A2 位布局放在 R32_UINT 纹理中，与
+CUDA 互操作后直接交给 VFG，不将 HDR 转为 SDR。所有中间输出再转换为 P010，
+原有色彩属性和静态 HDR 元数据通过 `mp_image_copy_attributes` 传递。
+
+VSR/NR 保留线性 BT.2020 FP16 原图，另生成固定 203 尼特参考的 BT.709/sRGB 8 位
+代理图供现有模型推理。代理映射采用 `x/(1+x)`，增强前后差值在线性空间转换回
+BT.2020 后叠加到原图；保护接近黑位和压缩高光，残差为零时保持原图。
+参考 [Veyra HDR 代理与恢复思路](https://github.com/Likely7/Veyra-NRVideo/blob/4ceb2df78ebcefef8c2b564afb54eed66b81d595/shaders/HdrColor.hlsli)，
+本项目自写 shader，代理曲线与残差保护并非 Veyra 逐像素同一实现，也不加载 RenoDX 插件。
+这是应用层 HDR 适配，不能称为 NR 模型原生高精度 HDR 推理。
+
+滤镜元数据新增 `dynamic-range`、`sdk-encoding`、`hdr-processing`，区分
+`rgb10a2-pq / native-10bit` 与 `bgra8 / proxy-residual`，可审计实际执行路径。
+显示器是否用 HDR 输出仍由 mpv/Windows 的原有显示链路决定，本次不修改全局显示设置。
 
 播放“画面增强”内展开各组件参数，点击“应用参数并启用”。VSR 质量 1–4；目标尺寸为
 2 倍、QHD、4K、5K、6K、7K、8K 的 16:9 外框，保持原比例且不缩小源；VFG 质量
@@ -87,6 +112,54 @@ D3D11 计算着色器将 SDR BGRA 帧转换为 RGBA8 推理输入，NR 在新的
 前后端拒绝未知字段、无效类型、非有限值、越界参数和错误的返回参数，不自动降档。
 
 ## 验证记录与复现
+
+### HDR10 追加验收（2026-10-11）
+
+RTX 5070 Ti / 596.49 上，`/W4 /WX` 编译和 137 项常规 Rust 单测通过
+（CEF 104、组件/RIFE 33）；JS 回归与 scoped Clippy 通过。浅色/深色参数截图已更新，
+仍是离线真实渲染函数的布局检查，不是用户组件安装或实体 HDR 显示的证据。
+
+`test_hdr_video_enhancement.cpp` 使用 0、1、100、203、1000、4000 尼特灰阶与
+BT.2020 彩色块：Limited/Full × 三种色度位置 × 代理/10 位路径共 12 组往返，
+灰阶码值误差均为 0，彩色误差至多 1，所有 P010 字的低六位均为零。三项真实
+provider 各连续执行 6 次，VFG/NR 分别改变 34434/234581 个 P010 字；VSR 输出
+1280×720。NR 允许改变未保护的中间调，最大灰阶码值变化为 8；黑位和 4000 尼特
+采样误差为 0，不把模型产生的色调变化称作无损恢复。
+
+播放使用 4 秒、24 fps HEVC Main10 + AAC 合成源，先用 ffprobe 核验 VUI，再在正式
+libmpv 的隐藏 HWND / gpu-next / d3d11va 下运行。初次生成时，本机 x265 未从 FFmpeg
+通用选项写出 PQ/原色标记；已显式设置编码器 `colorprim=9:transfer=16:colormatrix=9`，
+测试源不满足这些元数据时直接失败，没有解除滤镜格式保护。
+
+`build/video-enhancement/hdr-playback-only.log` 六条链路均通过精确 seek 和 EOF；
+输出检查 P010、PQ、BT.2020，并逐项断言 min/max luminance、MaxCLL、MaxFALL
+与输入相同。HDR VFG 使用 Low 2x；超分目标为 720p，NR 默认 1080p 上限，
+1920×1080 样本按 720p 推理再合成回源尺寸。结果如下：
+
+| HDR10 链路 | VSR / VFG / NR 调用数 | 输出 | 最大 A/V 偏差（秒） |
+| --- | --- | --- | --- |
+| VSR | 96 / 0 / 0 | 1280×720 | 0.0417 |
+| VFG | 0 / 95 / 0 | 640×360 | 0.0169 |
+| VSR → VFG | 96 / 94 / 0 | 1280×720 | 0.0208 |
+| NR | 0 / 0 / 96 | 640×360 | 0.0417 |
+| NR → VSR → VFG | 96 / 94 / 96 | 1280×720 | 0.0208 |
+| NR（1080p 源 / 720p 推理） | 0 / 0 / 96 | 1920×1080 | 0.0417 |
+
+本轮同时复核七条原 SDR 播放链路；High VFG 8x 仍有约 0.824 秒 A/V 偏差，
+仅通过功能性 seek/EOF 检查，未通过实时流畅验收。测试使用 `ao=null`，后台有
+普通桌面应用运行；这些短片结果不代表 4K 长片、实体声音/HDR 显示、长期显存
+或跨 GPU 验收。HDR10+、HLG、Dolby Vision 仍明确拒绝。测试临时媒体、缓存和
+浏览器 profile 清理后只保留脱敏日志和文档截图。
+
+原生数值日志为 `build/video-enhancement/hdr-gpu-acceptance.log`；
+`test_video_enhancement.ps1 -HdrOnly` 可单独复现 HDR 播放，省略该开关同时跑 SDR。
+
+标准 Release 代码已编译通过（`hdr-release-build.log`），但复制到 `build` 时，
+正在运行的旧播放器锁住 EXE，返回 Windows `os error 32`。当前 `build` 的播放器
+仍为此前 SDR 版本；用户确认退出后再完成同目录产物更新和新版本启动/IPC 检查。
+这项最终更新尚未完成，不能将已编译的缓存 EXE 当成已更新的运行版本。
+
+### 原 SDR 接入记录
 
 环境：RTX 5070 Ti，驱动 596.49（Win32 32.0.15.9649），MSVC 14.50，
 mpv 子模块 `9347cbc4d4333daf1b9d6d9ff292f2c99dd2c380`，RTX Video SDK 1.1.0。
@@ -154,7 +227,7 @@ NV12 输出转换与 SDK 全生命周期上下文隔离修复，修复后三条�
 `mediastation_runtime.rs` 的两处既有 `redundant_closure` 阻挡，本任务未修改无关代码。
 未发布组件 Release、推送或部署；提交状态以本地 Git 历史为准。
 
-当前标准构建 SHA-256：应用 `703774f670bc752bb9cf1403e2bd45db0727133fc05e939f471185fd1c9db692`，
+此前 SDR 标准构建 SHA-256：应用 `703774f670bc752bb9cf1403e2bd45db0727133fc05e939f471185fd1c9db692`，
 视频桥 `e3dbb4b5fc97fb2bc40644afad8a4488efe548e47be3460ea1463c20ef6cabd0`，
 NR 适配器 `5d075b793d9d9e11ed09641a77b20212137fe6f4153532b206ede35730e36f5d`。
 

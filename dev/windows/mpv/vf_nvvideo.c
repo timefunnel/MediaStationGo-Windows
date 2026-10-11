@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/frame.h>
 #include "common/common.h"
 #include "common/msg.h"
 #include "common/tags.h"
@@ -88,7 +89,7 @@ static ID3D11Texture2D *single_texture(struct mp_filter *f, struct mp_image *ima
 static struct mp_image *output_frame(struct mp_filter *f, struct mp_image *input) {
     struct priv *p = f->priv;
     AVHWFramesContext *frames = (void *)input->hwctx->data;
-    if (!mp_update_av_hw_frames_pool(&p->hw_pool, frames->device_ref, IMGFMT_D3D11, IMGFMT_BGRA, p->out_width, p->out_height, false)) return NULL;
+    if (!mp_update_av_hw_frames_pool(&p->hw_pool, frames->device_ref, IMGFMT_D3D11, input->params.hw_subfmt, p->out_width, p->out_height, false)) return NULL;
     AVFrame *frame = av_frame_alloc();
     if (!frame) return NULL;
     if (av_hwframe_get_buffer(p->hw_pool, frame, 0) < 0) { av_frame_free(&frame); return NULL; }
@@ -107,7 +108,9 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         p->create = (void *)GetProcAddress(p->module, "nvvideo_create");
         p->process = (void *)GetProcAddress(p->module, "nvvideo_process");
         p->destroy_session = (void *)GetProcAddress(p->module, "nvvideo_destroy");
-        if (!abi || abi() != 2 || !p->create || !p->process || !p->destroy_session) return false;
+        if (!abi || !p->create || !p->process || !p->destroy_session) { MP_ERR(f, "Native video bridge is missing required exports\n"); return false; }
+        uint32_t version = abi();
+        if (version != 3) { MP_ERR(f, "Native video bridge ABI mismatch: expected=3 actual=%u\n", version); return false; }
     }
     if (p->context) ID3D11DeviceContext_Release(p->context);
     if (p->device) ID3D11Device_Release(p->device);
@@ -123,7 +126,7 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         if (scale > 1.0) { p->out_width = ((int)(input->w * scale + 1e-6)) & ~1; p->out_height = ((int)(input->h * scale + 1e-6)) & ~1; }
     }
     struct nvvideo_config config = {
-        .abi = 2, .mode = p->opts->mode, .width = input->w, .height = input->h,
+        .abi = 3, .mode = p->opts->mode, .width = input->w, .height = input->h,
         .out_width = p->out_width, .out_height = p->out_height, .device = p->device, .context = p->context,
         .runtime_directory = runtime, .cache_directory = cache,
         .vsr_quality = p->opts->mode == 1 && p->opts->quality >= 0 ? p->opts->quality : 4,
@@ -132,12 +135,23 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         .nr_style = p->opts->nr_style, .nr_auto_mask = p->opts->nr_auto_mask, .nr_ui_correction = p->opts->nr_ui_correction,
         .nr_intensity = p->opts->nr_intensity, .nr_tone = p->opts->nr_tone, .nr_structure = p->opts->nr_structure, .nr_skin = p->opts->nr_skin,
         .nr_target = p->opts->nr_target,
+        .hdr10 = input->params.color.transfer == PL_COLOR_TRC_PQ,
+        .full_range = input->params.repr.levels == PL_COLOR_LEVELS_FULL,
+        .chroma_location = input->params.chroma_location == PL_CHROMA_TOP_LEFT ? 1 : input->params.chroma_location == PL_CHROMA_CENTER ? 2 : 0,
     };
     char detail[512] = {0}; p->session = p->create(&config, detail, sizeof(detail));
     talloc_free(runtime); talloc_free(cache);
     if (!p->session) MP_ERR(f, "%s\n", detail);
     p->params = input->params;
     return p->session != NULL;
+}
+static bool valid_input(struct mp_image *input) {
+    if (input->imgfmt != IMGFMT_D3D11 || !input->hwctx || (input->fields & MP_IMGFIELD_INTERLACED) || input->dovi || input->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || input->params.color.hdr.scene_avg > 0 || input->params.color.hdr.ootf.num_anchors > 0) return false;
+    for (int i = 0; i < input->num_ff_side_data; i++) if (input->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) return false;
+    if (input->params.color.transfer == PL_COLOR_TRC_PQ) {
+        return input->params.hw_subfmt == IMGFMT_P010 && input->params.color.primaries == PL_COLOR_PRIM_BT_2020 && input->params.repr.sys == PL_COLOR_SYSTEM_BT_2020_NC && (input->params.repr.levels == PL_COLOR_LEVELS_FULL || input->params.repr.levels == PL_COLOR_LEVELS_LIMITED) && (input->params.chroma_location == PL_CHROMA_LEFT || input->params.chroma_location == PL_CHROMA_TOP_LEFT || input->params.chroma_location == PL_CHROMA_CENTER);
+    }
+    return input->params.hw_subfmt == IMGFMT_BGRA && input->params.color.transfer != PL_COLOR_TRC_HLG;
 }
 static void process(struct mp_filter *f) {
     struct priv *p = f->priv;
@@ -150,8 +164,9 @@ static void process(struct mp_filter *f) {
     if (!frame.type) return;
     if (frame.type != MP_FRAME_VIDEO) { if (frame.type == MP_FRAME_EOF) reset(f); mp_pin_in_write(f->ppins[1], frame); return; }
     struct mp_image *input = frame.data;
-    if (input->imgfmt != IMGFMT_D3D11 || input->params.hw_subfmt != IMGFMT_BGRA || !input->hwctx || input->params.color.transfer == PL_COLOR_TRC_PQ || input->params.color.transfer == PL_COLOR_TRC_HLG || (input->fields & MP_IMGFIELD_INTERLACED)) {
-        mp_frame_unref(&frame); fail(f, "Only progressive SDR D3D11 BGRA8 input is supported"); return;
+    if (!valid_input(input)) {
+        MP_ERR(f, "Unsupported enhancement input: %s\n", mp_image_params_to_str(&input->params));
+        mp_frame_unref(&frame); fail(f, "Requires progressive SDR BGRA8 or HDR10 P010 BT.2020 NCL/PQ with explicit range and left/top-left/center chroma; HLG, HDR10+ and Dolby Vision are unsupported"); return;
     }
     if (p->session && !mp_image_params_static_equal(&p->params, &input->params)) reset(f);
     if (!p->session && !initialize(f, input)) { mp_frame_unref(&frame); fail(f, "Cannot initialize installed native provider; see preceding SDK error"); return; }
@@ -211,6 +226,9 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd) {
     struct priv *p = f->priv; struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
     mp_tags_set_str(tags, "status", p->failed ? "failed" : p->session_frames ? "active" : "initializing");
     mp_tags_set_str(tags, "backend", p->opts->mode == 1 ? "rtx-video" : p->opts->mode == 2 ? "nvidia-vfg" : "dlssnr");
+    mp_tags_set_str(tags, "dynamic-range", p->params.color.transfer == PL_COLOR_TRC_PQ ? "hdr10" : "sdr");
+    mp_tags_set_str(tags, "sdk-encoding", p->params.color.transfer == PL_COLOR_TRC_PQ && p->opts->mode == 2 ? "rgb10a2-pq" : "bgra8");
+    mp_tags_set_str(tags, "hdr-processing", p->params.color.transfer != PL_COLOR_TRC_PQ ? "none" : p->opts->mode == 2 ? "native-10bit" : "proxy-residual");
     mp_tags_set_str(tags, "multiplier", mp_tprintf(30, "%d", p->opts->mode == 2 ? p->opts->multiplier : 1));
     mp_tags_set_str(tags, "quality", mp_tprintf(30, "%d", p->opts->quality));
     mp_tags_set_str(tags, "avg-process-ms", mp_tprintf(40, "%.3f", p->sdk_frames ? p->process_ms / p->sdk_frames : 0));
