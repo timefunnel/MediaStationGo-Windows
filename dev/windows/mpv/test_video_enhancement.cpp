@@ -26,7 +26,7 @@ static std::vector<unsigned char> read(ID3D11Device *device, ID3D11DeviceContext
     context->Unmap(staging.Get(), 0); return result;
 }
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 4) { std::fprintf(stderr, "Usage: test_video_enhancement vsr-dir vfg-dir cache-dir\n"); return 2; }
+    if (argc != 5) { std::fprintf(stderr, "Usage: test_video_enhancement vsr-dir vfg-dir cache-dir nr-dir\n"); return 2; }
     ComPtr<IDXGIFactory1> factory; if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter1> adapter;
     for (unsigned i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) { DXGI_ADAPTER_DESC1 desc{}; adapter->GetDesc1(&desc); if (desc.VendorId == 0x10de) break; adapter.Reset(); }
@@ -37,17 +37,36 @@ int wmain(int argc, wchar_t **argv) {
     D3D11_TEXTURE2D_DESC desc{}; desc.Width = 640; desc.Height = 360; desc.MipLevels = desc.ArraySize = 1; desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     D3D11_SUBRESOURCE_DATA sourceA{a.data(), 640 * 4, 0}, sourceB{b.data(), 640 * 4, 0};
     ComPtr<ID3D11Texture2D> first, second; if (FAILED(device->CreateTexture2D(&desc, &sourceA, &first)) || FAILED(device->CreateTexture2D(&desc, &sourceB, &second))) return 6;
-    for (unsigned mode : {1u, 2u}) {
+    for (unsigned mode : {1u, 2u, 3u}) {
         const unsigned scale = mode == 1 ? 2u : 1u; desc.Width = 640 * scale; desc.Height = 360 * scale;
         ComPtr<ID3D11Texture2D> output; if (FAILED(device->CreateTexture2D(&desc, nullptr, &output))) return 7;
-        nvvideo_config config{1, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode], argv[3]}; char error[512]{};
+        nvvideo_config config{2, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode == 3 ? 4 : mode], argv[3],4,0,2,1,0,0,0,1.f,1.f,1.f,-1.f,1080}; char error[512]{};
         auto session = nvvideo_create(&config, error, sizeof(error)); if (!session) { std::fprintf(stderr, "mode=%u create: %s\n", mode, error); return 8; }
         bool ok = true;
-        for (unsigned i = 0; i < 6; ++i) if (!nvvideo_process(session, first.Get(), second.Get(), output.Get(), error, sizeof(error))) { ok = false; break; }
+        for (unsigned i = 0; i < 6; ++i) if (!nvvideo_process(session, first.Get(), second.Get(), output.Get(),1, error, sizeof(error))) { ok = false; break; }
         auto result = read(device.Get(), context.Get(), output.Get()); nvvideo_destroy(session);
         if (!ok) { std::fprintf(stderr, "mode=%u process: %s\n", mode, error); return 9; }
-        if (result.empty() || !std::any_of(result.begin(), result.end(), [](unsigned char value) { return value != 0; }) || (mode == 2 && (result == a || result == b))) { std::fprintf(stderr, "mode=%u output is empty, zero or equals an input\n", mode); return 10; }
+        if (result.empty() || !std::any_of(result.begin(), result.end(), [](unsigned char value) { return value != 0; }) || (mode != 1 && (result == a || result == b))) { std::fprintf(stderr, "mode=%u output is empty, zero or equals an input\n", mode); return 10; }
         std::printf("NATIVE_VIDEO_GPU_OK mode=%u output=%ux%u bytes=%zu real-sdk-runs=6\n", mode, desc.Width, desc.Height, result.size());
+        if (mode == 3) {
+            size_t changed = 0; unsigned long long difference = 0;
+            for (size_t j = 0; j < result.size(); j++) if (j % 4 != 3) { const auto delta = static_cast<unsigned>(std::abs(int(result[j]) - int(b[j]))); changed += delta != 0; difference += delta; }
+            if (changed < 100) { std::fprintf(stderr, "DLSSNR did not change RGB pixels\n"); return 11; }
+            std::printf("DLSSNR_RGB_OUTPUT_OK changed-components=%zu mean-absolute-delta=%.4f\n", changed, double(difference) / (640 * 360 * 3));
+            for (unsigned variant : {0u, 1u, 2u}) {
+                config.nr_style = static_cast<int>(variant); config.nr_intensity = variant == 0 ? 0.f : 0.7f;
+                config.nr_tone = 0.6f; config.nr_structure = 0.8f; config.nr_skin = 1.f; config.nr_auto_mask = config.nr_ui_correction = 1;
+                session = nvvideo_create(&config, error, sizeof(error)); if (!session) { std::fprintf(stderr,"DLSSNR variant create: %s\n",error);return 12; }
+                ok = true;
+                for (unsigned i = 0; i < 6; i++) if (!nvvideo_process(session, first.Get(), second.Get(), output.Get(),1,error,sizeof(error))) { ok = false; break; }
+                auto variant_output = read(device.Get(), context.Get(), output.Get());nvvideo_destroy(session);
+                if (!ok || variant_output.size() != result.size()) { std::fprintf(stderr,"DLSSNR variant process: %s\n",error);return 13; }
+                size_t parameter_changes = 0;
+                for (size_t j = 0; j < result.size(); j++) if (j % 4 != 3) parameter_changes += variant_output[j] != result[j];
+                if (parameter_changes < 100) { std::fprintf(stderr,"DLSSNR parameters had no RGB effect\n");return 14; }
+                std::printf("DLSSNR_PARAMETER_GPU_OK style=%u intensity=%.2f changed-components=%zu runs=6\n",variant,config.nr_intensity,parameter_changes);
+            }
+        }
     }
     return 0;
 }

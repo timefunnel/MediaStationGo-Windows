@@ -9,6 +9,7 @@ name = "jfn_frame_interpolation"
 crate-type = ["rlib"]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

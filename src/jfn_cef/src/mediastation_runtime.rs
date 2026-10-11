@@ -446,6 +446,16 @@ struct ActiveEnhancement {
     seen: bool,
     missing: u8,
 }
+const VIDEO_FILTER_PROPERTIES: [(&str, &CStr); 3] = [
+    ("enhance_nr", c"vf-metadata/enhance_nr/status"),
+    ("enhance_vfg", c"vf-metadata/enhance_vfg/status"),
+    ("enhance_vsr", c"vf-metadata/enhance_vsr/status"),
+];
+fn query_enhancement_status(
+    query: impl Fn(&CStr) -> Option<String>,
+) -> [(&'static str, Option<String>); 3] {
+    VIDEO_FILTER_PROPERTIES.map(|(label, property)| (label, query(property)))
+}
 const VIDEO_FILTER_INACTIVE: &str = "video_enhancement_filter_inactive";
 const RIFE_FILTER_INACTIVE: &str = "frame_interpolation_filter_inactive";
 const RIFE_FILTER_MISSING_SAMPLE_LIMIT: u8 = 3;
@@ -759,18 +769,7 @@ impl MediaStationRuntime {
             .then(|| mpv_property_string(c"vf-metadata/rife/status"));
         let enhancement_status = (event.kind == PlaybackEventKind::PositionChanged
             && !event.snapshot.seeking)
-            .then(|| {
-                [
-                    (
-                        "enhance_vfg",
-                        mpv_property_string(c"vf-metadata/enhance_vfg/status"),
-                    ),
-                    (
-                        "enhance_vsr",
-                        mpv_property_string(c"vf-metadata/enhance_vsr/status"),
-                    ),
-                ]
-            });
+            .then(|| query_enhancement_status(mpv_property_string));
         let mut dispatched_event = None;
         let (jobs, reconcile) = {
             let mut state = self.state.lock();
@@ -1626,12 +1625,14 @@ impl MediaStationRuntime {
         }
         state.active_subtitle = load.subtitle;
         state.active_enhancements = [
-            (load.enhancement.vfg, "enhance_vfg"),
-            (load.enhancement.vsr, "enhance_vsr"),
+            load.enhancement.nr,
+            load.enhancement.vfg,
+            load.enhancement.vsr,
         ]
         .into_iter()
+        .zip(VIDEO_FILTER_PROPERTIES)
         .filter(|(enabled, _)| *enabled)
-        .map(|(_, label)| ActiveEnhancement {
+        .map(|(_, (label, _))| ActiveEnhancement {
             label,
             seen: false,
             missing: 0,
@@ -6293,18 +6294,16 @@ fn execute_load(
 ) -> Result<Value, LoadFailure> {
     runtime.ensure_generation(snapshot.generation)?;
     let active_media_id_before = runtime.active_playback_media_id(snapshot)?;
-    let runtime_metadata = if request.interpolation_mode == InterpolationMode::Off
-        && !request.enhancement.vsr
-        && !request.enhancement.vfg
-    {
-        None
-    } else if active_media_id_before.as_deref() == Some(request.media_id.as_str()) {
-        jfn_mpv_get_property_node(c"track-list")
-            .ok()
-            .map(|track_list| current_runtime_video_metadata(&track_list))
-    } else {
-        None
-    };
+    let runtime_metadata =
+        if request.interpolation_mode == InterpolationMode::Off && !request.enhancement.enabled() {
+            None
+        } else if active_media_id_before.as_deref() == Some(request.media_id.as_str()) {
+            jfn_mpv_get_property_node(c"track-list")
+                .ok()
+                .map(|track_list| current_runtime_video_metadata(&track_list))
+        } else {
+            None
+        };
     let source = runtime
         .api
         .load_playback_source(
@@ -6342,7 +6341,7 @@ fn execute_load(
         audio_summary,
         source.subtitles.len()
     ));
-    if (request.enhancement.vsr || request.enhancement.vfg)
+    if request.enhancement.enabled()
         && let Some(video) = source.video.as_ref().or(runtime_video)
     {
         let inputs = interpolation_video_inputs(video, runtime_video);
@@ -6524,7 +6523,7 @@ fn execute_load(
             "The generated frame interpolation filter contains an invalid byte",
         )
     })?;
-    let interpolation_hwdec = if request.enhancement.vsr || request.enhancement.vfg {
+    let interpolation_hwdec = if request.enhancement.enabled() {
         Some("d3d11va")
     } else {
         interpolation.as_ref().map(|plan| plan.hwdec)
@@ -9154,6 +9153,26 @@ mod tests {
 
         let payload = playback_event_payload(&event);
         assert_eq!(payload["errorCode"], RIFE_FILTER_INACTIVE);
+    }
+
+    #[test]
+    fn dlssnr_filter_health_reads_its_actual_metadata_and_reports_loss() {
+        let statuses = query_enhancement_status(|property| {
+            (property == c"vf-metadata/enhance_nr/status").then(|| "active".to_string())
+        });
+        let status = statuses
+            .iter()
+            .find(|(label, _)| *label == "enhance_nr")
+            .and_then(|(_, value)| value.as_deref());
+        let mut seen = false;
+        let mut missing = 0;
+        assert!(!interpolation_filter_failed(
+            &mut seen,
+            &mut missing,
+            status
+        ));
+        assert!(seen);
+        assert!(interpolation_filter_failed(&mut seen, &mut missing, None));
     }
 
     #[test]

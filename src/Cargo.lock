@@ -2293,6 +2293,7 @@ dependencies = [
 name = "jfn-frame-interpolation"
 version = "1.0.6"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

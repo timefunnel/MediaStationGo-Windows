@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -52,6 +53,10 @@ struct nvvideo_session {
     NVSDK_NGX_Handle *feature = nullptr;
     NVSDK_NGX_Parameter *params = nullptr;
     bool ngx_initialized = false;
+    void *nr = nullptr;
+    void *(__cdecl *nr_create)(const nvvideo_config *, char *, size_t) = nullptr;
+    int (__cdecl *nr_process)(void *, ID3D11Texture2D *, ID3D11Texture2D *, char *, size_t) = nullptr;
+    void (__cdecl *nr_destroy)(void *) = nullptr;
     void *effect = nullptr, *stream = nullptr;
     Image images[3]{};
     int (__cdecl *set_device)(int) = nullptr;
@@ -90,6 +95,7 @@ struct nvvideo_session {
         std::unique_ptr<ContextGuard> guard;
         if (multithread && context1 && isolated) guard = std::make_unique<ContextGuard>(multithread.Get(), context1.Get(), isolated.Get());
         if (stream && stream_sync) { int result = stream_sync(stream); cleanup_result(result, "CUDA stream synchronize", result == 0); }
+        if (nr && nr_destroy) nr_destroy(nr);
         if (effect && destroy_effect) destroy_effect(effect);
         if (dealloc) for (auto &image : images) if (image.pixels) dealloc(&image);
         if (stream && stream_destroy) { int result = stream_destroy(stream); cleanup_result(result, "CUDA stream destroy", result == 0); }
@@ -110,7 +116,7 @@ struct nvvideo_session {
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = config.out_width; desc.Height = config.out_height; desc.MipLevels = desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (config.mode == 1 ? D3D11_BIND_UNORDERED_ACCESS : 0);
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (config.mode != 2 ? D3D11_BIND_UNORDERED_ACCESS : 0);
         hr = config.device->CreateTexture2D(&desc, nullptr, &output); check(hr, "D3D11 output texture", SUCCEEDED(hr));
         if (config.mode == 1) {
             library(L"nvngx_vsr.dll");
@@ -121,6 +127,17 @@ struct nvvideo_session {
             int available = 0; ngx(params->Get(NVSDK_NGX_Parameter_VSR_Available, &available), "VSR available");
             check(available, "VSR not supported by this GPU/driver", available == 1);
             ngx(NVSDK_NGX_D3D11_CreateFeature(config.context, NVSDK_NGX_Feature_VSR, params, &feature), "VSR CreateFeature");
+        } else if (config.mode == 3) {
+            HMODULE self = nullptr;
+            check(GetLastError(), "Native bridge module", GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&nvvideo_abi), &self) != 0);
+            wchar_t path[32768]; DWORD length = GetModuleFileNameW(self, path, 32768);
+            check(GetLastError(), "Native bridge path", length && length < 32768);
+            std::wstring adapter_path(path); adapter_path.resize(adapter_path.find_last_of(L"\\/") + 1); adapter_path += L"nvngx.dll";
+            auto module = LoadLibraryExW(adapter_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            check(GetLastError(), "DLSSNR adapter load", module != nullptr); modules.push_back(module);
+            symbol(module, "nr_create", nr_create); symbol(module, "nr_process", nr_process); symbol(module, "nr_destroy", nr_destroy);
+            char detail[512]{}; nr = nr_create(&config, detail, sizeof(detail));
+            if (!nr) throw std::runtime_error(detail);
         } else {
             auto runtime = library(L"cudart64_12.dll");
             library(L"nvngxruntime.dll"); auto image = library(L"NVCVImage.dll");
@@ -145,9 +162,9 @@ struct nvvideo_session {
             for (auto &im : images) cuda(alloc(&im, config.width, config.height, 7, 1, 0, 1, 32), "VFG BGRA image allocation");
             cuda(set_stream(effect, "CudaStream", stream), "VFG stream");
             cuda(set_u32(effect, "InputWidth", config.width), "VFG width"); cuda(set_u32(effect, "InputHeight", config.height), "VFG height");
-            cuda(set_u32(effect, "Mode", 0), "VFG Low mode");
-            cuda(set_u32(effect, "FrameMultiplier", 2), "VFG multiplier");
-            cuda(set_u32(effect, "AutomaticShotChangeDetectionEnabled", 1), "VFG scene detection");
+            cuda(set_u32(effect, "Mode", config.vfg_quality), "VFG quality");
+            cuda(set_u32(effect, "FrameMultiplier", config.multiplier), "VFG multiplier");
+            cuda(set_u32(effect, "AutomaticShotChangeDetectionEnabled", config.scene_detection), "VFG scene detection");
             cuda(set_image(effect, "SrcImage0", &images[0]), "VFG input0"); cuda(set_image(effect, "SrcImage1", &images[1]), "VFG input1"); cuda(set_image(effect, "DstImage0", &images[2]), "VFG output");
             cuda(load(effect), "VFG Load");
         }
@@ -170,15 +187,19 @@ struct nvvideo_session {
         }
         cuda(unregister_texture(resource), "CUDA D3D11 unregister");
     }
-    void process(ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *destination) {
+    void process(ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *destination, uint32_t index) {
         if (config.mode == 1) {
             NVSDK_NGX_D3D11_VSR_Eval_Params eval{}; eval.pInput = current; eval.pOutput = output.Get();
-            eval.InputSubrectSize = {config.width, config.height}; eval.OutputSubrectSize = {config.out_width, config.out_height}; eval.QualityLevel = NVSDK_NGX_VSR_Quality_Ultra;
+            eval.InputSubrectSize = {config.width, config.height}; eval.OutputSubrectSize = {config.out_width, config.out_height}; eval.QualityLevel = static_cast<NVSDK_NGX_VSR_QualityLevel>(config.vsr_quality);
             ngx(NGX_D3D11_EVALUATE_VSR_EXT(config.context, feature, params, &eval), "VSR EvaluateFeature");
+        } else if (config.mode == 3) {
+            char detail[512]{};
+            if (!nr_process(nr, current, output.Get(), detail, sizeof(detail))) throw std::runtime_error(detail);
         } else {
             check(0, "VFG previous frame missing", previous != nullptr);
-            transfer(previous, images[0], true); transfer(current, images[1], true);
-            cuda(set_u32(effect, "FrameIndex", 1), "VFG midpoint"); cuda(run(effect, 0), "VFG Run");
+            if (index == 1) { transfer(previous, images[0], true); transfer(current, images[1], true); }
+            check(index, "VFG frame index", index > 0 && index < config.multiplier);
+            cuda(set_u32(effect, "FrameIndex", index), "VFG frame index"); cuda(run(effect, 0), "VFG Run");
             cuda(stream_sync(stream), "VFG inference synchronize"); transfer(output.Get(), images[2], false);
         }
         config.context->CopyResource(destination, output.Get());
@@ -187,18 +208,21 @@ struct nvvideo_session {
     }
 };
 
-uint32_t __cdecl nvvideo_abi() { return 1; }
+uint32_t __cdecl nvvideo_abi() { return 2; }
 nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *error, size_t size) {
     try {
-        if (!config || config->abi != 1 || (config->mode != 1 && config->mode != 2) || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode == 2 && (config->width != config->out_width || config->height != config->out_height)))
+        if (!config || config->abi != 2 || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier < 2 || config->multiplier > 8 || config->scene_detection > 1)
             throw std::runtime_error("Invalid native enhancement configuration");
+        if (config->nr_style < 0 || config->nr_style > 2 || config->nr_auto_mask < 0 || config->nr_auto_mask > 1 || config->nr_ui_correction < 0 || config->nr_ui_correction > 1 || !std::isfinite(config->nr_skin) || !(config->nr_skin == -1.f || (config->nr_skin >= 0.f && config->nr_skin <= 2.f))) throw std::runtime_error("Invalid DLSSNR configuration");
+        if (config->nr_target != 0 && config->nr_target != 480 && config->nr_target != 720 && config->nr_target != 900 && config->nr_target != 1080 && config->nr_target != 1440) throw std::runtime_error("Invalid DLSSNR processing size");
+        for (float value : {config->nr_intensity, config->nr_tone, config->nr_structure}) if (!std::isfinite(value) || value < 0.f || value > 1.f) throw std::runtime_error("Invalid DLSSNR strength");
         auto session = std::make_unique<nvvideo_session>(); session->config = *config; session->initialize(); return session.release();
     } catch (const std::exception &exception) { report(error, size, exception.what()); return nullptr; }
 }
-int __cdecl nvvideo_process(nvvideo_session *session, ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *output, char *error, size_t size) {
+int __cdecl nvvideo_process(nvvideo_session *session, ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *output, uint32_t index, char *error, size_t size) {
     try {
         if (!session || !current || !output) throw std::runtime_error("Missing native enhancement frame");
-        ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get()); session->process(previous, current, output); return 1;
+        ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get()); session->process(previous, current, output, index); return 1;
     } catch (const std::exception &exception) { report(error, size, exception.what()); return 0; }
 }
 void __cdecl nvvideo_destroy(nvvideo_session *session) { delete session; }

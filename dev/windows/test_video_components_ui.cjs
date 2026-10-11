@@ -33,7 +33,7 @@ async function main() {
     await context.refreshVideoComponents(); assert.match(byId('component-rtx-video-status').textContent, /network unavailable/); assert.equal([...timers.values()][0].delay, 3000);
     failure = undefined; response = { components: [status('rtx-video', { error: { message: '包尚未发布' } })] }; await context.refreshVideoComponents(); assert.equal(timers.size, 0); assert.match(byId('component-rtx-video-status').textContent, /包尚未发布/);
     response = { restarting: false }; await context.changeVideoComponent('rtx-video', 'restart'); assert.match(byId('component-rtx-video-status').textContent, /未确认就绪/);
-    const reloadStart = source.indexOf('    async function setFrameInterpolation(');
+    const reloadStart = source.indexOf('    const videoEnhancementDefaults = ');
     const reloadEnd = source.indexOf('    function togglePlayerFullscreen(', reloadStart);
     const requests = [], toasts = []; let pauses = 0, plays = 0;
     Object.assign(context, {
@@ -57,16 +57,29 @@ async function main() {
     context.player = makePlayer(); await context.setFrameInterpolation(null, { vsr: true, vfg: true });
     const firstLoad = requests.find((request) => request.operation === 'load');
     assert.deepEqual(Array.from(firstLoad.args).slice(0, 3), ['media-a', 45678, 'off']);
-    assert.equal(firstLoad.args[7], 'version-b'); assert.deepEqual(JSON.parse(firstLoad.args[8]), { vsr: true, vfg: true });
+    assert.equal(firstLoad.args[7], 'version-b'); assert.equal(JSON.parse(firstLoad.args[8]).vsr, true); assert.equal(JSON.parse(firstLoad.args[8]).vfg, true); assert.equal(JSON.parse(firstLoad.args[8]).vsrQuality, 4);
     assert.equal(context.player.videoEnhancement.vfg, true); assert.equal(pauses, 1); assert.equal(plays, 1);
     requests.length = 0;
     context.player = makePlayer({ playing: false, videoEnhancement: { vsr: true, vfg: true } });
     await context.setFrameInterpolation('rife-v4.26', { vsr: true, vfg: true });
     const rifeLoad = requests.find((request) => request.operation === 'load');
-    assert.equal(rifeLoad.args[2], '2x'); assert.deepEqual(JSON.parse(rifeLoad.args[8]), { vsr: true, vfg: false });
+    assert.equal(rifeLoad.args[2], '2x'); assert.equal(JSON.parse(rifeLoad.args[8]).vsr, true); assert.equal(JSON.parse(rifeLoad.args[8]).vfg, false);
     assert.equal(context.player.interpolationResumePlaying, false, 'paused state must survive the warmup reload');
     assert.equal(pauses, 1, 'switching a paused player must not send a pause command');
     assert.equal(toasts.length, 0);
-    console.log('VIDEO_COMPONENT_UI_TEST_OK independent-status/damaged-pending/experimental-NR/retry/restart-failure/native-reload-progress-version/RIFE-VFG-exclusion');
+    requests.length = 0;
+    const parameters = { vsr: true, vfg: true, nr: true, vsrQuality: 2, vsrTarget: 2160, vfgQuality: 2, multiplier: 8, sceneDetection: false, nrStyle: 2, nrTarget: 720, nrIntensity: 0.7, nrTone: 0.6, nrStructure: 0.8, nrSkin: 1.5, nrAutoMask: true, nrUiCorrection: true };
+    context.player = makePlayer({ playing: false }); await context.setFrameInterpolation(null, parameters);
+    assert.deepEqual(JSON.parse(requests[0].args[8]), parameters, 'all configured values must reach the native load request');
+    assert.equal(context.player.videoEnhancement.nrStyle, 2); assert.equal(context.player.interpolationResumePlaying, false);
+    const oldLoad = context.player.loadInfo;
+    context.player.interpolationChanging = false;
+    context.nativeRequest = async () => ({ mediaSourceId: 'version-b', videoEnhancement: { ...parameters, nrTone: 1 } });
+    await context.setFrameInterpolation(null, { ...parameters, nrTone: 0.3 });
+    assert.equal(context.player.loadInfo, oldLoad, 'a mismatched parameter acknowledgement must not replace the active selection');
+    assert.match(toasts.at(-1), /参数与请求不一致/);
+    context.updateVideoComponents({ components: [status('dlssnr', { installed: true, runtime: { playbackAvailable: true, experimental: false } })] });
+    assert.match(byId('component-dlssnr-status').textContent, /已安装.*原生处理/);
+    console.log('VIDEO_COMPONENT_UI_TEST_OK independent-status/damaged-pending/retry/restart-failure/native-reload-progress-version/RIFE-VFG-exclusion/NR-ready/all-provider-parameters/parameter-mismatch');
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

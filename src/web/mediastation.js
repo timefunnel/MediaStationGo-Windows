@@ -5836,7 +5836,13 @@
         if (player.started) showPlayerFeedback({ icon: player.playing ? 'play' : 'pause' }, 750);
     }
 
-    async function setFrameInterpolation(modelId, enhancement = player?.videoEnhancement || { vsr: false, vfg: false }) {
+    const videoEnhancementDefaults = Object.freeze({ vsr: false, vfg: false, nr: false, vsrQuality: 4, vsrTarget: 0, vfgQuality: 0, multiplier: 2, sceneDetection: true, nrStyle: 0, nrTarget: 1080, nrIntensity: 1, nrTone: 1, nrStructure: 1, nrSkin: -1, nrAutoMask: false, nrUiCorrection: false });
+    function videoEnhancementSelection(value) { return { ...videoEnhancementDefaults, ...value }; }
+    function sameVideoEnhancement(left, right) {
+        const a = videoEnhancementSelection(left), b = videoEnhancementSelection(right);
+        return Object.keys(videoEnhancementDefaults).every((key) => typeof a[key] === 'number' && typeof b[key] === 'number' ? Math.abs(a[key] - b[key]) < 0.00001 : a[key] === b[key]);
+    }
+    async function setFrameInterpolation(modelId, enhancement = player?.videoEnhancement) {
         const activePlayer = player;
         if (!activePlayer?.started || !activePlayer.loadInfo
             || activePlayer.interpolationChanging || activePlayer.exiting) return;
@@ -5847,11 +5853,12 @@
             return;
         }
         const requestedModel = modelId;
-        const requestedEnhancement = { vsr: enhancement.vsr === true, vfg: !modelId && enhancement.vfg === true };
+        const requestedEnhancement = videoEnhancementSelection(enhancement);
+        if (modelId) requestedEnhancement.vfg = false;
         const activeModel = activePlayer.interpolationEnabled
             ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId)
             : null;
-        if (requestedModel === activeModel && Boolean(activePlayer.videoEnhancement?.vsr) === requestedEnhancement.vsr && Boolean(activePlayer.videoEnhancement?.vfg) === requestedEnhancement.vfg) {
+        if (requestedModel === activeModel && sameVideoEnhancement(activePlayer.videoEnhancement, requestedEnhancement)) {
             closePlayerPanel(false);
             return;
         }
@@ -5896,7 +5903,7 @@
                 60000,
             );
             if (player !== activePlayer || activePlayer.exiting) return;
-            if (loadInfo.videoEnhancement?.vsr !== requestedEnhancement.vsr || loadInfo.videoEnhancement?.vfg !== requestedEnhancement.vfg) throw new Error('播放器返回的画面增强选择与请求不一致');
+            if (!loadInfo.videoEnhancement || !Object.keys(requestedEnhancement).every((key) => Object.prototype.hasOwnProperty.call(loadInfo.videoEnhancement, key)) || !sameVideoEnhancement(loadInfo.videoEnhancement, requestedEnhancement)) throw new Error('播放器返回的画面增强参数与请求不一致');
             const actualModel = loadInfo.frameInterpolation?.modelId || null;
             if (actualModel !== requestedModel) {
                 const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
@@ -6111,9 +6118,9 @@
                 ? '画面增强组件未就绪'
                 : interpolationEnabled
                 ? `RTX 插帧：${interpolationModels[interpolationModel]?.label || '已开启'}`
-                : (player?.videoEnhancement?.vfg ? 'NVIDIA VFG 插帧' : player?.videoEnhancement?.vsr ? 'RTX Video 超分' : '画面增强'));
+                : (player?.videoEnhancement?.vfg ? 'NVIDIA VFG 插帧' : player?.videoEnhancement?.vsr ? 'RTX Video 超分' : player?.videoEnhancement?.nr ? 'DLSSNR 画面增强' : '画面增强'));
         interpolation.setAttribute('aria-label', interpolation.title);
-        interpolation.setAttribute('aria-pressed', String(interpolationEnabled));
+        interpolation.setAttribute('aria-pressed', String(interpolationEnabled || player?.videoEnhancement?.vsr || player?.videoEnhancement?.vfg || player?.videoEnhancement?.nr || false));
         infoButton.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info;
         fullscreen.disabled = !player || exiting || episodeChanging || autoAdvancePending;
         fullscreen.classList.toggle('is-fullscreen', fullscreenActive);
@@ -6521,24 +6528,54 @@
                 title: '关闭插帧',
                 meta: '超分保持当前选择',
                 selected: selectedModel === null && !player.videoEnhancement?.vfg,
-                onSelect: () => setFrameInterpolation(null, { vsr: player.videoEnhancement?.vsr === true, vfg: false }),
+                onSelect: () => setFrameInterpolation(null, { ...videoEnhancementSelection(player.videoEnhancement), vfg: false }),
             }));
             for (const [modelId, model] of Object.entries(interpolationModels)) {
                 const option = createTrackOption({ title: model.label, meta: model.name, selected: selectedModel === modelId, onSelect: () => setFrameInterpolation(modelId) });
                 option.disabled = byId('player-interpolation').dataset.componentReady !== 'true'; group.append(option);
             }
             playerPanelContent.append(group);
-            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR · 2 倍分辨率 · Ultra'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR · 2 倍帧率 · Low']]) {
+            const draft = videoEnhancementSelection(player.videoEnhancement);
+            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR · 风格与增强强度可配置']]) {
                 const ready = videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
                 const selected = player.videoEnhancement?.[key] === true;
                 const button = createTrackOption({ title, meta: ready ? meta : '请先在组件管理安装', selected, onSelect: () => {
-                    const next = { ...(player.videoEnhancement || { vsr: false, vfg: false }), [key]: !selected };
+                    const next = { ...draft, [key]: !selected };
                     const model = key === 'vfg' ? null : (player.interpolationEnabled ? player.interpolationModel : null);
                     setFrameInterpolation(model, next);
                 } });
                 button.disabled = !ready || player.interpolationChanging; playerPanelContent.append(button);
+                const form = element('details', 'enhancement-parameters');
+                form.append(element('summary', '', `${title}参数`));
+                const select = (key, label, choices) => {
+                    const row = element('label', 'enhancement-parameter'); row.append(element('span', '', label));
+                    const control = element('select'); control.setAttribute('aria-label', label);
+                    for (const [value, text] of choices) { const option = element('option', '', text); option.value = String(value); option.selected = draft[key] === value; control.append(option); }
+                    control.value = String(draft[key]); control.addEventListener('change', () => { draft[key] = Number(control.value); }); row.append(control); form.append(row);
+                };
+                const range = (key, label, min, max) => {
+                    const row = element('label', 'enhancement-parameter'); const text = element('span', '', `${label}：${draft[key]}`);
+                    const control = element('input'); control.type = 'range'; control.min = String(min); control.max = String(max); control.step = '0.05'; control.value = String(draft[key]); control.setAttribute('aria-label', label);
+                    control.addEventListener('input', () => { draft[key] = Number(control.value); text.textContent = `${label}：${draft[key]}`; }); row.append(text, control); form.append(row);
+                };
+                const toggle = (key, label) => { const row = element('label', 'enhancement-parameter'); const control = element('input'); control.type = 'checkbox'; control.checked = draft[key]; control.addEventListener('change', () => { draft[key] = control.checked; }); row.append(element('span', '', label), control); form.append(row); };
+                if (key === 'vsr') {
+                    select('vsrQuality', '超分质量', [[1, '1 · Low'], [2, '2 · Medium'], [3, '3 · High'], [4, '4 · Ultra']]);
+                    select('vsrTarget', '目标尺寸（保持比例）', [[0, '原尺寸的 2 倍'], [1440, 'QHD · 1440p'], [2160, '4K · 2160p'], [2880, '5K · 2880p'], [3456, '6K · 3456p'], [4032, '7K · 4032p'], [4320, '8K · 4320p']]);
+                } else if (key === 'vfg') {
+                    select('vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
+                    select('multiplier', '帧率倍数', [2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])); toggle('sceneDetection', '自动检测镜头切换');
+                    form.append(element('p', 'enhancement-help', '高倍率和高质量会增加处理耗时。出现音画不同步时，可降低倍率或质量；播放器不会自动降档。'));
+                } else {
+                    select('nrStyle', '模型风格', [[0, '风格 0'], [1, '风格 1'], [2, '风格 2']]);
+                    select('nrTarget', '处理尺寸上限（保持比例）', [[1080, '实时 · 1080p'], [0, '原始尺寸'], [480, '480p'], [720, '720p'], [900, '900p'], [1440, '1440p']]);
+                    range('nrIntensity', '增强强度', 0, 1); range('nrTone', '局部色调', 0, 1); range('nrStructure', '局部结构', 0, 1);
+                    select('nrSkin', '皮肤结构', [[-1, '自动'], [0, '0'], [0.5, '0.5'], [1, '1'], [1.5, '1.5'], [2, '2']]); toggle('nrAutoMask', '自动遮罩'); toggle('nrUiCorrection', 'UI 修正');
+                }
+                const apply = element('button', 'secondary-command', '应用参数并启用'); apply.type = 'button'; apply.disabled = !ready || player.interpolationChanging;
+                apply.addEventListener('click', () => setFrameInterpolation(key === 'vfg' ? null : selectedModel, { ...draft, [key]: true })); form.append(apply); playerPanelContent.append(form);
             }
-            playerPanelContent.append(element('p', 'player-panel-state', 'DLSSNR 推理接入尚未验证，暂不可选择。VFG 与 RIFE 互斥；HDR 暂不支持这些新增组件。'));
+            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；这些新增组件仅支持 SDR。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
             return;
         }
 
@@ -6578,8 +6615,10 @@
         } else {
             appendInfoRow(interpolation.list, 'RIFE 插帧', '关闭');
         }
-        appendInfoRow(interpolation.list, 'RTX Video 超分', player.videoEnhancement?.vsr ? '已选择 · SDR · 2 倍分辨率 · Ultra' : '关闭');
-        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', player.videoEnhancement?.vfg ? '已选择 · SDR · 2 倍帧率 · Low' : '关闭');
+        const enhancement = videoEnhancementSelection(player.videoEnhancement);
+        appendInfoRow(interpolation.list, 'RTX Video 超分', enhancement.vsr ? `已选择 · 质量 ${enhancement.vsrQuality} · ${enhancement.vsrTarget ? `${enhancement.vsrTarget}p` : '2 倍尺寸'}` : '关闭');
+        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', enhancement.vfg ? `已选择 · ${enhancement.multiplier} 倍帧率 · ${['Low', 'Medium', 'High'][enhancement.vfgQuality]}` : '关闭');
+        appendInfoRow(interpolation.list, 'DLSSNR', enhancement.nr ? `已选择 · 风格 ${enhancement.nrStyle} · 强度 ${enhancement.nrIntensity}` : '关闭');
         appendInfoRow(interpolation.list, '容器 / VF / 显示', [
             diagnostics.containerFps,
             diagnostics.estimatedVfFps,

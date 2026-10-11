@@ -18,11 +18,13 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 
 最近更新：2026-10-11，分支 `codex/mediastation-windows-spike`。RIFE 安装管理已迁入
 独立“组件管理”，泛化安装事务复用原有校验、租约、取消与重启机制；RTX Video 和
-NVIDIA VFG 已接入原生 mpv 并通过 RTX 5070 Ti/596.49 的 SDK 与三条播放链路
-（精确跳转、EOF、输出尺寸）验证。134 项常规 Rust、JS 状态/重载回归、实包安装
-卸载和标准 Release 构建通过。RIFE ABI 8、三档模型和 profile 未变。新增处理限
-渐进 SDR，VFG 与 RIFE 互斥；DLSSNR 仅支持原版运行库管理，推理尚未完成，不能
-标记为播放可用。完整证据、来源、未验证边界见 [视频组件记录](windows-video-components.md)。
+NVIDIA VFG 与 DLSSNR 已接入原生 mpv；三者核心参数已配置到实际 SDK 调用。
+RTX 5070 Ti/596.49 上完成原生推理、NR RGB 输出/参数差异、七条播放链路的跳转、
+EOF 与尺寸验证，包括 1080p NR 按 720p 推理并合成回原尺寸。136 项常规 Rust、
+JS 参数/状态/重载回归、scoped Clippy 和标准 Release 构建通过。RIFE ABI 8、三档
+模型和 profile 未变。新增处理限渐进 SDR，VFG 与 RIFE 互斥。High VFG 8x 超出
+本机实时预算，出现音画不同步，未标记为实时流畅通过；NR 短片验证通过，长片和
+其他 GPU 尚未验收。完整证据、来源、边界见 [视频组件记录](windows-video-components.md)。
 本次仅本地实现与验证，未推送或发布；提交记录以 Git 历史为准。
 
 此前 2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地

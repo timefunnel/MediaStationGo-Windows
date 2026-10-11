@@ -1591,3 +1591,9 @@ html[data-ui-theme="light"] .player-panel .player-info-section + .player-info-se
 .component-pending, .component-confirm { margin-top: 16px; }
 @media (max-width: 1000px) { .component-grid { grid-template-columns: 1fr; } }
 @media (max-width: 760px) { .components-page { padding: 20px 16px 36px; } .component-card { padding: 18px; } }
+.enhancement-parameters { margin: 8px 0 18px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
+.enhancement-parameters summary { cursor: pointer; font-size: 13px; }
+.enhancement-parameter { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; font-size: 12px; }
+.enhancement-parameter select { max-width: 60%; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 5px; }
+.enhancement-parameter input[type="range"] { width: 52%; }
+.enhancement-help { color: var(--muted); font-size: 12px; line-height: 1.6; }

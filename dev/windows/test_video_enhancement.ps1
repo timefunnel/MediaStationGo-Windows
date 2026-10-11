@@ -15,7 +15,9 @@ try {
     $Ffmpeg = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
     & $Ffmpeg -hide_banner -loglevel error -f lavfi -i 'testsrc2=size=640x360:rate=24:duration=4' -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest (Join-Path $TestRoot 'source.mp4')
     if ($LASTEXITCODE -ne 0) { throw 'Local synthetic video generation failed' }
-    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot
+    & $Ffmpeg -hide_banner -loglevel error -f lavfi -i 'testsrc2=size=1920x1080:rate=24:duration=4' -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest (Join-Path $TestRoot 'source-hd.mp4')
+    if ($LASTEXITCODE -ne 0) { throw 'Local HD synthetic video generation failed' }
+    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\experimental\nr-original" (Join-Path $TestRoot 'source-hd.mp4')
     if ($LASTEXITCODE -ne 0) { throw 'Native mpv playback/seek/EOF test failed' }
 } finally {
     $Absolute = [IO.Path]::GetFullPath($TestRoot)
