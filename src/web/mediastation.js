@@ -105,7 +105,6 @@
     let imageStatsTimer = 0;
     let interpolationComponentTimer = 0;
     let interpolationComponentTracking = false;
-    let interpolationRestartPrompted = false;
     let interpolationComponentRestarting = false;
     let requestSequence = 0;
     let toastTimer = 0;
@@ -2037,26 +2036,10 @@
         interpolationEntry.dataset.componentInstalled = String(componentInstalled);
         interpolationEntry.dataset.componentReady = String(componentReady);
         interpolationEntry.classList.toggle('hidden', !componentInstalled);
-        if (typeof videoComponentStatuses !== 'undefined') refreshVideoEnhancementEntry();
         if (component.restarting) interpolationComponentRestarting = true;
-        const blocked = interpolationComponentRestarting || component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
-        byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
-        byId('settings-import-frame-interpolation').disabled = Boolean(blocked || component.installed);
-        byId('settings-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
-        byId('settings-confirm-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
-        const pendingInstall = component.pendingOperation === 'install';
-        byId('settings-pending-frame-interpolation-install').classList.toggle('hidden', !pendingInstall);
-        byId('settings-cancel-install-frame-interpolation').disabled = Boolean(interpolationComponentRestarting || component.supported === false || component.busy || !pendingInstall);
-        const startupFailure = ['frame_interpolation_component_busy', 'frame_interpolation_component_invalid'].includes(status.failureCode);
-        const canRestart = pendingInstall && component.restartRequired && !component.busy && !component.error && component.supported !== false && status.failureCode !== 'frame_interpolation_component_invalid';
-        byId('settings-restart-frame-interpolation').disabled = !canRestart || interpolationComponentRestarting;
-        byId('settings-confirm-restart-frame-interpolation').disabled = !canRestart || interpolationComponentRestarting;
-        byId('settings-later-restart-frame-interpolation').disabled = interpolationComponentRestarting;
-        if (!pendingInstall) interpolationRestartPrompted = false;
-        if (!canRestart) byId('settings-confirm-frame-interpolation-restart').classList.add('hidden');
-        if (canRestart && !startupFailure && !interpolationRestartPrompted && !interpolationComponentRestarting) {
-            showFrameInterpolationRestartConfirmation();
-        }
+        videoComponentStatuses.set('rife', { ...component, runtime: { playbackAvailable: componentReady, failureCode: status.failureCode, failureDetail: status.failureDetail } });
+        renderComponentActions('rife');
+        refreshVideoEnhancementEntry();
         window.clearTimeout(interpolationComponentTimer);
         interpolationComponentTimer = 0;
         interpolationComponentTracking = Boolean(component.busy);
@@ -2084,7 +2067,6 @@
                 label.textContent = `启动时未能执行组件变更：${status.failureDetail}。待重启操作已保留。`;
             }
             label.dataset.state = 'pending';
-            byId('settings-confirm-frame-interpolation-uninstall').classList.add('hidden');
         } else if (component.error) {
             label.textContent = component.error.message;
             label.dataset.state = 'error';
@@ -2111,57 +2093,6 @@
             interpolationComponentTimer = 0;
             return refreshFrameInterpolationStatus();
         }, delayMs);
-    }
-
-    function showFrameInterpolationRestartConfirmation() {
-        if (byId('settings-restart-frame-interpolation').disabled) return;
-        interpolationRestartPrompted = true;
-        byId('settings-confirm-frame-interpolation-restart').classList.remove('hidden');
-        byId('settings-confirm-restart-frame-interpolation').focus();
-    }
-
-    function deferFrameInterpolationRestart() {
-        if (interpolationComponentRestarting) return;
-        byId('settings-confirm-frame-interpolation-restart').classList.add('hidden');
-        byId('settings-restart-frame-interpolation').focus();
-    }
-
-    async function restartForFrameInterpolationInstall() {
-        if (interpolationComponentRestarting || byId('settings-confirm-restart-frame-interpolation').disabled) return;
-        interpolationComponentRestarting = true;
-        for (const id of ['settings-restart-frame-interpolation', 'settings-confirm-restart-frame-interpolation', 'settings-later-restart-frame-interpolation', 'settings-cancel-install-frame-interpolation']) {
-            byId(id).disabled = true;
-        }
-        const label = byId('settings-frame-interpolation-status');
-        label.textContent = '正在准备退出并重新启动播放器...';
-        label.dataset.state = 'pending';
-        try {
-            const result = await nativeRequest('mediaStationFrameInterpolation', 'frame_interpolation_component_restart', ['frame_interpolation_component_restart'], 15000);
-            if (result?.restarting !== true) throw new Error('重启助手未确认退出与重新启动请求');
-            label.textContent = '正在退出并重新启动播放器...';
-        } catch (error) {
-            interpolationComponentRestarting = false;
-            await refreshFrameInterpolationStatus();
-            label.textContent = `自动重启请求失败：${friendlyError(error)}。待安装操作仍保留；不会自动重复重启。`;
-            label.dataset.state = 'error';
-        }
-    }
-
-    async function changeFrameInterpolationComponent(operation) {
-        interpolationComponentTracking = true;
-        byId('settings-install-frame-interpolation').disabled = true;
-        byId('settings-uninstall-frame-interpolation').disabled = true;
-        byId('settings-confirm-uninstall-frame-interpolation').disabled = true;
-        byId('settings-cancel-install-frame-interpolation').disabled = true;
-        try {
-            const status = await nativeRequest('mediaStationFrameInterpolation', operation, [operation], 15000);
-            updateFrameInterpolationStatus(status);
-        } catch (error) {
-            await refreshFrameInterpolationStatus();
-            const label = byId('settings-frame-interpolation-status');
-            label.textContent = `组件操作失败：${friendlyError(error)}`;
-            label.dataset.state = 'error';
-        }
     }
 
     async function refreshFrameInterpolationStatus() {
@@ -4826,35 +4757,80 @@
     let videoComponentsTimer = 0;
     let videoComponentsTracking = false;
     let videoComponentsRestarting = false;
+    const componentNames = { rife: 'RIFE 插帧', 'rtx-video': 'RTX Video 超分', dlssnr: 'DLSSNR 画面增强', 'nvidia-vfg': 'NVIDIA VFG 插帧' };
+    let componentDialogTrigger = null;
+    function componentStatusLabel(id) {
+        return byId(id === 'rife' ? 'settings-frame-interpolation-status' : `component-${id}-status`);
+    }
+    function renderComponentActions(id) {
+        const status = videoComponentStatuses.get(id) || {};
+        const card = document.querySelector(`[data-component-id="${id}"]`);
+        const primary = card.querySelector('[data-component-action="primary"]');
+        const secondary = card.querySelector('[data-component-action="secondary"]');
+        const restarting = videoComponentsRestarting || interpolationComponentRestarting || status.restarting;
+        const blocked = restarting || status.busy || status.supported === false || typeof status.installed !== 'boolean';
+        const pending = status.pendingOperation === 'install';
+        primary.dataset.operation = pending ? 'restart' : 'install';
+        primary.dataset.busy = String(Boolean(status.busy || restarting));
+        primary.textContent = restarting ? '正在重启' : status.busy ? '正在处理' : pending ? '重启生效' : status.restartRequired ? '等待重启' : status.installed ? '已安装' : '安装组件';
+        primary.disabled = Boolean(blocked || (pending ? !status.restartRequired || status.error || status.runtime?.failureCode === 'frame_interpolation_component_invalid' : status.installed || status.restartRequired));
+        secondary.dataset.operation = pending ? 'cancel' : 'uninstall';
+        secondary.textContent = pending ? '取消安装' : '卸载组件';
+        secondary.disabled = Boolean(blocked || (!pending && (!status.installed || status.restartRequired)));
+        const dialog = byId('component-dialog');
+        if (dialog.open && dialog.dataset.componentId === id) {
+            const action = dialog.dataset.operation;
+            const active = action === 'uninstall' ? secondary : primary;
+            if (active.disabled || active.dataset.operation !== action) closeComponentDialog();
+        }
+    }
+    function showComponentDialog(id, operation, trigger) {
+        if (!Object.prototype.hasOwnProperty.call(componentNames, id) || !['install', 'uninstall', 'restart'].includes(operation)) throw new Error('组件操作无效');
+        const dialog = byId('component-dialog');
+        componentDialogTrigger = trigger;
+        dialog.dataset.componentId = id;
+        dialog.dataset.operation = operation;
+        byId('component-dialog-title').textContent = `${operation === 'install' ? '安装' : operation === 'restart' ? '重启以启用' : '卸载'}${componentNames[id]}`;
+        byId('component-dialog-copy').textContent = operation === 'install' ? '选择安装来源。组件包会先校验，安装完成后在原按钮位置选择重启生效。'
+            : operation === 'restart' ? '将停止当前播放，退出并重新启动播放器。请先关闭其他播放器实例；重启后可在播放菜单开启组件。'
+            : '下次启动时删除本组件及其专属缓存，不影响媒体、账号和其他组件。';
+        byId('component-dialog-local').hidden = operation !== 'install';
+        byId('component-dialog-confirm').textContent = operation === 'install' ? '下载并安装' : operation === 'restart' ? '确认并重启' : '确认卸载';
+        byId('component-dialog-cancel').textContent = operation === 'restart' ? '稍后' : '取消';
+        dialog.showModal();
+        byId('component-dialog-confirm').focus();
+    }
+    function closeComponentDialog() {
+        byId('component-dialog').close();
+        if (componentDialogTrigger?.isConnected) componentDialogTrigger.focus();
+        componentDialogTrigger = null;
+    }
+    function confirmComponentDialog(local = false) {
+        const dialog = byId('component-dialog');
+        if (!dialog.open) return;
+        const { componentId: id, operation } = dialog.dataset;
+        closeComponentDialog();
+        return changeVideoComponent(id, local && operation === 'install' ? 'import' : operation);
+    }
     function updateVideoComponents(payload) {
         if (!Array.isArray(payload?.components)) throw new Error('组件状态列表缺失');
-        let busy = false;
         for (const status of payload.components) {
             if (!['rtx-video', 'dlssnr', 'nvidia-vfg'].includes(status.id)) throw new Error('组件身份无效');
             videoComponentStatuses.set(status.id, status);
-            const card = document.querySelector(`[data-component-id="${status.id}"]`);
-            const label = byId(`component-${status.id}-status`);
-            const blocked = videoComponentsRestarting || status.restarting || status.busy || status.supported === false || typeof status.installed !== 'boolean';
-            card.querySelectorAll('[data-component-operation]').forEach((button) => {
-                const op = button.dataset.componentOperation;
-                button.disabled = Boolean(blocked || (['install', 'import'].includes(op) && (status.installed || status.restartRequired))
-                    || (op === 'uninstall' && (!status.installed || status.restartRequired))
-                    || (op === 'cancel' && status.pendingOperation !== 'install')
-                    || (op === 'restart' && (status.pendingOperation !== 'install' || status.error || status.runtime?.failureCode === 'frame_interpolation_component_invalid')));
-            });
-            card.querySelector('.component-pending').classList.toggle('hidden', status.pendingOperation !== 'install');
+            renderComponentActions(status.id);
+            const label = componentStatusLabel(status.id);
             const runtime = status.runtime || {};
             label.dataset.state = status.error || runtime.failureCode ? 'error' : status.busy || status.restartRequired ? 'pending' : 'ready';
-            label.textContent = status.busy ? (status.progress?.phase === 'selecting' ? '请选择本地组件包...' : status.progress?.phase === 'downloading'
+            label.textContent = status.restarting || videoComponentsRestarting ? '正在退出并重新启动播放器...'
+                : status.busy ? (status.progress?.phase === 'selecting' ? '请选择本地组件包...' : status.progress?.phase === 'downloading'
                 ? `正在下载：${formatBytes(status.progress.downloadedBytes)} / ${formatBytes(status.progress.totalBytes)}` : '正在校验组件包...')
                 : status.error ? status.error.message : status.restartRequired ? (runtime.failureCode ? `启动时未能执行组件变更：${runtime.failureDetail}；待操作已保留。` : '组件变更已排队，退出所有实例并重新启动后生效。')
                 : runtime.failureCode ? runtime.failureDetail : !status.installed ? '未安装，可按需安装。'
                 : runtime.experimental ? `已安装运行库。${runtime.failureDetail}` : runtime.playbackAvailable ? '已安装；播放时验证 GPU 支持并运行原生处理。' : '已安装，原生播放桥不可用。';
-            busy ||= Boolean(status.busy);
         }
-        videoComponentsTracking = busy;
+        videoComponentsTracking = [...videoComponentStatuses].some(([id, status]) => id !== 'rife' && status.busy);
         window.clearTimeout(videoComponentsTimer); videoComponentsTimer = 0;
-        if (busy) scheduleVideoComponentsRefresh();
+        if (videoComponentsTracking) scheduleVideoComponentsRefresh();
         refreshVideoEnhancementEntry();
     }
     function scheduleVideoComponentsRefresh(delay = 1500) {
@@ -4873,20 +4849,33 @@
         }
     }
     async function changeVideoComponent(id, operation) {
-        if (videoComponentsRestarting) return;
-        const label = byId(`component-${id}-status`);
+        if (!Object.prototype.hasOwnProperty.call(componentNames, id) || !['install', 'import', 'uninstall', 'cancel', 'restart'].includes(operation)) throw new Error('组件操作无效');
+        const status = videoComponentStatuses.get(id);
+        if (videoComponentsRestarting || interpolationComponentRestarting || status?.busy || status?.restarting) return;
+        const label = componentStatusLabel(id);
+        const isRife = id === 'rife';
+        if (operation === 'restart') videoComponentsRestarting = true;
+        if (isRife) interpolationComponentTracking = true; else videoComponentsTracking = true;
+        videoComponentStatuses.set(id, { ...status, busy: true });
+        for (const componentId of videoComponentStatuses.keys()) renderComponentActions(componentId);
+        label.textContent = operation === 'restart' ? '正在准备退出并重新启动播放器...' : '正在提交组件操作...';
+        label.dataset.state = 'pending';
         try {
-            if (operation === 'restart') videoComponentsRestarting = true;
-            videoComponentsTracking = true;
             const op = `video_component_${operation}`;
             const result = await nativeRequest('mediaStationFrameInterpolation', op, [op, id], 15000);
             if (operation === 'restart') {
                 if (result?.restarting !== true) throw new Error('重启助手未确认就绪');
                 label.textContent = '正在退出并重新启动播放器...';
-            } else updateVideoComponents(result);
+            } else {
+                updateVideoComponents(result);
+                if (isRife) await refreshFrameInterpolationStatus();
+            }
         } catch (error) {
-            videoComponentsRestarting = false; await refreshVideoComponents();
-            label.textContent = `组件操作失败：${friendlyError(error)}`; label.dataset.state = 'error';
+            videoComponentsRestarting = false;
+            if (isRife) await refreshFrameInterpolationStatus(); else await refreshVideoComponents();
+            for (const componentId of videoComponentStatuses.keys()) renderComponentActions(componentId);
+            label.textContent = `组件操作失败：${friendlyError(error)}${operation === 'restart' ? '；待操作仍保留，不会自动重复重启。' : ''}`;
+            label.dataset.state = 'error';
         }
     }
     function refreshVideoEnhancementEntry() {
@@ -5618,6 +5607,7 @@
                         player.interpolationModel = player.interpolationTargetModel;
                         player.interpolationChanging = false;
                         player.interpolationTargetModel = null;
+                        player.enhancementTransitionLabel = null;
                     }
                     if (episodeChanged) {
                         player.episodeChanging = false;
@@ -5754,10 +5744,7 @@
     }
 
     function interpolationLoadingLabel(activePlayer) {
-        const target = activePlayer?.interpolationTargetModel;
-        return target
-            ? `正在加载${interpolationModels[target]?.label || ''}插帧`
-            : '正在关闭 RTX 插帧';
+        return activePlayer?.enhancementTransitionLabel || '正在加载视频';
     }
 
     function playerTransitionLoadingLabel(activePlayer) {
@@ -5847,6 +5834,121 @@
         const a = videoEnhancementSelection(left), b = videoEnhancementSelection(right);
         return Object.keys(videoEnhancementDefaults).every((key) => typeof a[key] === 'number' && typeof b[key] === 'number' ? Math.abs(a[key] - b[key]) < 0.00001 : a[key] === b[key]);
     }
+    function videoEnhancementTransitionLabel(activeModel, requestedModel, current, requested) {
+        const before = videoEnhancementSelection(current), after = videoEnhancementSelection(requested);
+        const changes = [];
+        const interpolationChanged = activeModel !== requestedModel || before.vfg !== after.vfg
+            || (after.vfg && ['vfgQuality', 'multiplier', 'sceneDetection'].some((key) => before[key] !== after[key]));
+        if (interpolationChanged) {
+            const wasEnabled = Boolean(activeModel || before.vfg), enabled = Boolean(requestedModel || after.vfg);
+            changes.push(!enabled ? '正在关闭插帧' : !wasEnabled ? `正在开启${requestedModel ? ' RIFE' : ' NVIDIA VFG'} 插帧`
+                : activeModel !== requestedModel || before.vfg !== after.vfg ? '正在切换插帧' : '正在应用插帧参数');
+        }
+        for (const [key, name, parameters] of [
+            ['vsr', '超分', ['vsrQuality', 'vsrTarget']],
+            ['nr', '画面增强', ['nrStyle', 'nrTarget', 'nrIntensity', 'nrTone', 'nrStructure', 'nrSkin', 'nrAutoMask', 'nrUiCorrection']],
+        ]) {
+            if (before[key] !== after[key]) changes.push(`正在${after[key] ? '开启' : '关闭'}${name}`);
+            else if (after[key] && parameters.some((parameter) => before[parameter] !== after[parameter])) changes.push(`正在应用${name}参数`);
+        }
+        return changes.length === 1 ? changes[0] : '正在应用画面设置';
+    }
+    function renderVideoEnhancementSettings(activePlayer) {
+        if (!activePlayer.enhancementDraft) {
+            activePlayer.enhancementDraft = {
+                model: activePlayer.interpolationEnabled ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId) : null,
+                selection: videoEnhancementSelection(activePlayer.videoEnhancement),
+            };
+        }
+        const draft = activePlayer.enhancementDraft, selection = draft.selection;
+        const ready = (id) => id === 'rife' ? byId('player-interpolation').dataset.componentReady === 'true' : videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
+        const unavailable = (id) => {
+            const status = videoComponentStatuses.get(id);
+            return status?.installed ? status.runtime?.failureDetail || '组件已安装，当前运行环境不可用' : '请先在组件管理安装';
+        };
+        const body = element('div', 'enhancement-settings');
+        const footer = element('div', 'enhancement-footer');
+        const apply = element('button', 'primary-command', '应用设置'); apply.type = 'button';
+        const updateApply = () => {
+            const activeModel = activePlayer.interpolationEnabled ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId) : null;
+            apply.disabled = activePlayer.interpolationChanging || (activeModel === draft.model && sameVideoEnhancement(activePlayer.videoEnhancement, selection));
+        };
+        const select = (parent, key, label, choices, value, onChange, disabled = false) => {
+            const row = element('label', 'enhancement-parameter'); row.append(element('span', '', label));
+            const control = element('select'); control.setAttribute('aria-label', label); control.dataset.enhancementKey = key; control.disabled = disabled;
+            for (const [optionValue, text, optionDisabled] of choices) {
+                const option = element('option', '', text); option.value = String(optionValue); option.selected = value === optionValue; option.disabled = Boolean(optionDisabled); control.append(option);
+            }
+            control.value = String(value);
+            control.addEventListener('change', () => { onChange(control.value); updateApply(); }); row.append(control); parent.append(row); return control;
+        };
+        const parameterSelect = (parent, key, label, choices) => select(parent, key, label, choices, selection[key], (value) => { selection[key] = Number(value); });
+        const toggle = (parent, key, label, disabled = false, onChange) => {
+            const row = element('label', 'enhancement-parameter'); const control = element('input'); control.type = 'checkbox'; control.checked = selection[key]; control.disabled = disabled; control.dataset.enhancementKey = key;
+            control.setAttribute('aria-label', label); control.addEventListener('change', () => { selection[key] = control.checked; onChange?.(); updateApply(); }); row.append(element('span', '', label), control); parent.append(row); return control;
+        };
+        const range = (parent, key, label) => {
+            const row = element('label', 'enhancement-parameter'); const text = element('span', '', `${label}：${selection[key]}`);
+            const control = element('input'); control.type = 'range'; control.min = '0'; control.max = '1'; control.step = '0.05'; control.value = String(selection[key]); control.dataset.enhancementKey = key; control.setAttribute('aria-label', label);
+            control.addEventListener('input', () => { selection[key] = Number(control.value); text.textContent = `${label}：${selection[key]}`; updateApply(); }); row.append(text, control); parent.append(row);
+        };
+        const group = (key, title) => {
+            const section = element('section', 'enhancement-group'); section.dataset.enhancementGroup = key;
+            section.append(element('h3', '', title)); body.append(section); return section;
+        };
+        const parameters = (parent, disabled) => {
+            const details = element('details', 'enhancement-parameters'); details.append(element('summary', '', '参数设置'));
+            const fields = element('fieldset'); fields.disabled = disabled; details.append(fields); parent.append(details); return fields;
+        };
+        const interpolation = group('interpolation', '插帧');
+        const backend = draft.model ? 'rife' : selection.vfg ? 'nvidia-vfg' : 'off';
+        select(interpolation, 'backend', '插帧引擎', [['off', '关闭'], ['rife', ready('rife') ? 'RIFE' : 'RIFE · 不可用', !ready('rife')], ['nvidia-vfg', ready('nvidia-vfg') ? 'NVIDIA VFG' : 'NVIDIA VFG · 不可用', !ready('nvidia-vfg')]], backend, (value) => {
+            draft.model = value === 'rife' ? preferredInterpolationModel : null;
+            selection.vfg = value === 'nvidia-vfg';
+            const scrollTop = playerPanelContent.querySelector('.enhancement-settings')?.scrollTop || 0;
+            renderPlayerPanel();
+            const nextBody = playerPanelContent.querySelector('.enhancement-settings'); if (nextBody) nextBody.scrollTop = scrollTop;
+            playerPanelContent.querySelector('[data-enhancement-key="backend"]')?.focus();
+        }, activePlayer.interpolationChanging);
+        if (backend === 'rife') {
+            const fields = parameters(interpolation, !ready('rife'));
+            select(fields, 'rifeModel', '效果档位', Object.entries(interpolationModels).map(([id, model]) => [id, model.label]), draft.model, (value) => { draft.model = value; });
+            fields.append(element('p', 'enhancement-help', '固定 2 倍插帧，三档模型按画质与性能选择。'));
+        } else if (backend === 'nvidia-vfg') {
+            const fields = parameters(interpolation, !ready('nvidia-vfg'));
+            parameterSelect(fields, 'vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
+            parameterSelect(fields, 'multiplier', '帧率倍数', [2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])); toggle(fields, 'sceneDetection', '检测镜头切换');
+            fields.append(element('p', 'enhancement-help', '高倍率与高质量会增加耗时，可按实际播放表现调整。'));
+        }
+        for (const [id, key, title] of [['rtx-video', 'vsr', 'RTX Video 超分'], ['dlssnr', 'nr', 'DLSSNR 画面增强']]) {
+            const section = group(key, title);
+            const fields = parameters(section, !ready(id));
+            const details = section.children[1];
+            details.classList.toggle('hidden', !selection[key]);
+            const row = element('div');
+            const enabledToggle = toggle(row, key, '启用', (!ready(id) && !selection[key]) || activePlayer.interpolationChanging, () => {
+                details.classList.toggle('hidden', !selection[key]);
+                if (!ready(id)) enabledToggle.disabled = !selection[key];
+            });
+            section.insertBefore(row.children[0], details);
+            if (!ready(id)) section.append(element('p', 'enhancement-help', unavailable(id)));
+            if (key === 'vsr') {
+                parameterSelect(fields, 'vsrQuality', '超分质量', [[1, '1 · Low'], [2, '2 · Medium'], [3, '3 · High'], [4, '4 · Ultra']]);
+                parameterSelect(fields, 'vsrTarget', '目标尺寸', [[0, '原尺寸的 2 倍'], [1440, 'QHD · 1440p'], [2160, '4K · 2160p'], [2880, '5K · 2880p'], [3456, '6K · 3456p'], [4032, '7K · 4032p'], [4320, '8K · 4320p']]);
+            } else {
+                parameterSelect(fields, 'nrStyle', '模型风格', [[0, '风格 0'], [1, '风格 1'], [2, '风格 2']]);
+                parameterSelect(fields, 'nrTarget', '处理尺寸上限', [[1080, '实时 · 1080p'], [0, '原始尺寸'], [480, '480p'], [720, '720p'], [900, '900p'], [1440, '1440p']]);
+                range(fields, 'nrIntensity', '增强强度'); range(fields, 'nrTone', '局部色调'); range(fields, 'nrStructure', '局部结构');
+                parameterSelect(fields, 'nrSkin', '皮肤结构', [[-1, '自动'], [0, '0'], [0.5, '0.5'], [1, '1'], [1.5, '1.5'], [2, '2']]); toggle(fields, 'nrAutoMask', '自动遮罩'); toggle(fields, 'nrUiCorrection', 'UI 修正');
+            }
+        }
+        body.append(element('p', 'enhancement-help', '支持 SDR / HDR10 / HLG；RIFE 暂不支持 HLG。HDR10+ 和 Dolby Vision 暂不支持增强。'));
+        apply.addEventListener('click', () => { if (!apply.disabled && player === activePlayer) setFrameInterpolation(draft.model, { ...selection }); });
+        const cancel = element('button', 'secondary-command', '取消'); cancel.type = 'button'; cancel.addEventListener('click', () => closePlayerPanel());
+        footer.append(element('p', 'enhancement-help', '统一应用，保留进度与暂停状态。'), element('div', 'enhancement-footer-actions'));
+        footer.children[1].append(cancel, apply);
+        updateApply(); playerPanelContent.append(body, footer);
+    }
     async function setFrameInterpolation(modelId, enhancement = player?.videoEnhancement) {
         const activePlayer = player;
         if (!activePlayer?.started || !activePlayer.loadInfo
@@ -5870,6 +5972,7 @@
         const previousLoadInfo = activePlayer.loadInfo;
         const previousModel = activePlayer.interpolationModel;
         const reloadPositionMs = Math.max(0, Math.round(activePlayer.positionMs || 0));
+        activePlayer.enhancementTransitionLabel = videoEnhancementTransitionLabel(activeModel, requestedModel, activePlayer.videoEnhancement, requestedEnhancement);
         activePlayer.interpolationChanging = true;
         activePlayer.interpolationTargetModel = requestedModel;
         activePlayer.interpolationResumePlaying = activePlayer.playing;
@@ -5927,6 +6030,7 @@
             if (player !== activePlayer || activePlayer.exiting) return;
             activePlayer.interpolationChanging = false;
             activePlayer.interpolationTargetModel = null;
+            activePlayer.enhancementTransitionLabel = null;
             activePlayer.interpolationModel = previousModel;
             activePlayer.loadInfo = previousLoadInfo;
             activePlayer.playing = activePlayer.interpolationResumePlaying;
@@ -6523,64 +6627,7 @@
 
         if (kind === 'interpolation') {
             byId('player-panel-title').textContent = '画面增强';
-            const selectedModel = player.interpolationChanging
-                ? player.interpolationTargetModel
-                : (player.interpolationEnabled
-                    ? (player.interpolationModel || info.frameInterpolation?.modelId)
-                    : null);
-            const group = element('div');
-            group.append(createTrackOption({
-                title: '关闭插帧',
-                meta: '超分保持当前选择',
-                selected: selectedModel === null && !player.videoEnhancement?.vfg,
-                onSelect: () => setFrameInterpolation(null, { ...videoEnhancementSelection(player.videoEnhancement), vfg: false }),
-            }));
-            for (const [modelId, model] of Object.entries(interpolationModels)) {
-                const option = createTrackOption({ title: model.label, meta: model.name, selected: selectedModel === modelId, onSelect: () => setFrameInterpolation(modelId) });
-                option.disabled = byId('player-interpolation').dataset.componentReady !== 'true'; group.append(option);
-            }
-            playerPanelContent.append(group);
-            const draft = videoEnhancementSelection(player.videoEnhancement);
-            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR / HDR10 / HLG · 质量与目标尺寸可配置'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR / HDR10 / HLG · 2–8 倍帧率'], ['dlssnr', 'nr', 'DLSSNR 画面增强', 'SDR / HDR10 / HLG · 风格与增强强度可配置']]) {
-                const ready = videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
-                const selected = player.videoEnhancement?.[key] === true;
-                const button = createTrackOption({ title, meta: ready ? meta : '请先在组件管理安装', selected, onSelect: () => {
-                    const next = { ...draft, [key]: !selected };
-                    const model = key === 'vfg' ? null : (player.interpolationEnabled ? player.interpolationModel : null);
-                    setFrameInterpolation(model, next);
-                } });
-                button.disabled = !ready || player.interpolationChanging; playerPanelContent.append(button);
-                const form = element('details', 'enhancement-parameters');
-                form.append(element('summary', '', `${title}参数`));
-                const select = (key, label, choices) => {
-                    const row = element('label', 'enhancement-parameter'); row.append(element('span', '', label));
-                    const control = element('select'); control.setAttribute('aria-label', label);
-                    for (const [value, text] of choices) { const option = element('option', '', text); option.value = String(value); option.selected = draft[key] === value; control.append(option); }
-                    control.value = String(draft[key]); control.addEventListener('change', () => { draft[key] = Number(control.value); }); row.append(control); form.append(row);
-                };
-                const range = (key, label, min, max) => {
-                    const row = element('label', 'enhancement-parameter'); const text = element('span', '', `${label}：${draft[key]}`);
-                    const control = element('input'); control.type = 'range'; control.min = String(min); control.max = String(max); control.step = '0.05'; control.value = String(draft[key]); control.setAttribute('aria-label', label);
-                    control.addEventListener('input', () => { draft[key] = Number(control.value); text.textContent = `${label}：${draft[key]}`; }); row.append(text, control); form.append(row);
-                };
-                const toggle = (key, label) => { const row = element('label', 'enhancement-parameter'); const control = element('input'); control.type = 'checkbox'; control.checked = draft[key]; control.addEventListener('change', () => { draft[key] = control.checked; }); row.append(element('span', '', label), control); form.append(row); };
-                if (key === 'vsr') {
-                    select('vsrQuality', '超分质量', [[1, '1 · Low'], [2, '2 · Medium'], [3, '3 · High'], [4, '4 · Ultra']]);
-                    select('vsrTarget', '目标尺寸（保持比例）', [[0, '原尺寸的 2 倍'], [1440, 'QHD · 1440p'], [2160, '4K · 2160p'], [2880, '5K · 2880p'], [3456, '6K · 3456p'], [4032, '7K · 4032p'], [4320, '8K · 4320p']]);
-                } else if (key === 'vfg') {
-                    select('vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
-                    select('multiplier', '帧率倍数', [2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])); toggle('sceneDetection', '自动检测镜头切换');
-                    form.append(element('p', 'enhancement-help', '高倍率和高质量会增加处理耗时。出现音画不同步时，可降低倍率或质量；播放器不会自动降档。'));
-                } else {
-                    select('nrStyle', '模型风格', [[0, '风格 0'], [1, '风格 1'], [2, '风格 2']]);
-                    select('nrTarget', '处理尺寸上限（保持比例）', [[1080, '实时 · 1080p'], [0, '原始尺寸'], [480, '480p'], [720, '720p'], [900, '900p'], [1440, '1440p']]);
-                    range('nrIntensity', '增强强度', 0, 1); range('nrTone', '局部色调', 0, 1); range('nrStructure', '局部结构', 0, 1);
-                    select('nrSkin', '皮肤结构', [[-1, '自动'], [0, '0'], [0.5, '0.5'], [1, '1'], [1.5, '1.5'], [2, '2']]); toggle('nrAutoMask', '自动遮罩'); toggle('nrUiCorrection', 'UI 修正');
-                }
-                const apply = element('button', 'secondary-command', '应用参数并启用'); apply.type = 'button'; apply.disabled = !ready || player.interpolationChanging;
-                apply.addEventListener('click', () => setFrameInterpolation(key === 'vfg' ? null : selectedModel, { ...draft, [key]: true })); form.append(apply); playerPanelContent.append(form);
-            }
-            playerPanelContent.append(element('p', 'player-panel-state', 'VFG 与 RIFE 互斥；增强支持 SDR、HDR10 和 HLG，暂不支持 HDR10+ 和 Dolby Vision。HLG 按 1000 尼特参考处理；RIFE 暂不支持 HLG。参数在当前播放和切集时保留，应用时保持进度与暂停状态。'));
+            renderVideoEnhancementSettings(player);
             return;
         }
 
@@ -6662,6 +6709,7 @@
         window.setTimeout(() => {
             const selected = kind === 'subtitles'
                 ? playerPanelContent.querySelector('.player-subtitle-style-reset')
+                : kind === 'interpolation' ? playerPanelContent.querySelector('[data-enhancement-key="backend"]')
                 : playerPanelContent.querySelector('[aria-checked="true"]');
             if (selected) selected.focus();
             else if (playerPanelTrigger?.isConnected) playerPanelTrigger.focus();
@@ -6777,7 +6825,7 @@
     function closePlayerPanel(restoreFocus = true) {
         if (!player?.panelKind && playerPanel.classList.contains('hidden')) return;
         playerPanel.classList.add('hidden');
-        if (player) player.panelKind = '';
+        if (player) { player.panelKind = ''; player.enhancementDraft = null; }
         refreshPlayerTools();
         if (restoreFocus && playerPanelTrigger?.isConnected) playerPanelTrigger.focus();
         playerPanelTrigger = null;
@@ -7258,25 +7306,18 @@
         loadSavedAccounts();
     });
     document.querySelectorAll('[data-component-id]').forEach((card) => {
-        const id = card.dataset.componentId;
-        const confirmation = card.querySelector('.component-confirm');
-        card.querySelectorAll('[data-component-operation]').forEach((button) => button.addEventListener('click', () => {
-            const op = button.dataset.componentOperation;
-            if (['uninstall', 'restart'].includes(op)) {
-                confirmation.dataset.operation = op;
-                card.querySelector('.component-confirm-copy').textContent = op === 'restart' ? '将停止播放并重启以完成安装。请先关闭其他播放器实例。' : '下次启动时删除本组件和专属缓存；媒体和其他组件不受影响。';
-                confirmation.classList.remove('hidden'); card.querySelector('[data-component-confirm]').focus();
-            } else changeVideoComponent(id, op);
+        card.querySelectorAll('[data-component-action]').forEach((button) => button.addEventListener('click', () => {
+            if (button.disabled) return;
+            const id = card.dataset.componentId, operation = button.dataset.operation;
+            if (operation === 'cancel') changeVideoComponent(id, operation);
+            else showComponentDialog(id, operation, button);
         }));
-        card.querySelector('[data-component-confirm]').addEventListener('click', () => { const op = confirmation.dataset.operation; confirmation.classList.add('hidden'); changeVideoComponent(id, op); });
-        card.querySelector('[data-component-dismiss]').addEventListener('click', () => confirmation.classList.add('hidden'));
     });
-    byId('settings-import-frame-interpolation').addEventListener('click', async () => {
-        interpolationComponentTracking = true;
-        try { await nativeRequest('mediaStationFrameInterpolation', 'video_component_import', ['video_component_import', 'rife'], 15000); }
-        catch (error) { showToast(friendlyError(error)); }
-        await refreshFrameInterpolationStatus();
-    });
+    byId('component-dialog-confirm').addEventListener('click', () => confirmComponentDialog());
+    byId('component-dialog-local').addEventListener('click', () => confirmComponentDialog(true));
+    byId('component-dialog-cancel').addEventListener('click', closeComponentDialog);
+    byId('component-dialog-close').addEventListener('click', closeComponentDialog);
+    byId('component-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeComponentDialog(); });
     byId('components-open').addEventListener('click', () => setCurrentView({ kind: 'components', data: {} }));
     byId('settings-open').addEventListener('click', (event) => {
         openSettings(event.currentTarget);
@@ -7387,20 +7428,6 @@
         refreshUpdateControls();
         window.jmpNative.updateInstall();
     });
-    byId('settings-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_install'));
-    byId('settings-cancel-install-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_cancel_install'));
-    byId('settings-restart-frame-interpolation').addEventListener('click', showFrameInterpolationRestartConfirmation);
-    byId('settings-confirm-restart-frame-interpolation').addEventListener('click', restartForFrameInterpolationInstall);
-    byId('settings-later-restart-frame-interpolation').addEventListener('click', deferFrameInterpolationRestart);
-    byId('settings-uninstall-frame-interpolation').addEventListener('click', () => {
-        byId('settings-confirm-frame-interpolation-uninstall').classList.remove('hidden');
-        byId('settings-confirm-uninstall-frame-interpolation').focus();
-    });
-    byId('settings-cancel-uninstall-frame-interpolation').addEventListener('click', () => {
-        byId('settings-confirm-frame-interpolation-uninstall').classList.add('hidden');
-        byId('settings-uninstall-frame-interpolation').focus();
-    });
-    byId('settings-confirm-uninstall-frame-interpolation').addEventListener('click', () => changeFrameInterpolationComponent('frame_interpolation_component_uninstall'));
     byId('settings-clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;

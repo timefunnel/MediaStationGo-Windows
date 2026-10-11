@@ -122,6 +122,8 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .primary-command { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; margin: 0; padding: 0 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; box-shadow: none; font-size: 13px; font-weight: 650; cursor: pointer; }
 .primary-command:not(:disabled):hover { background: color-mix(in srgb, var(--accent) 86%, #000); color: #fff; box-shadow: none; }
 .primary-command:disabled { cursor: wait; opacity: 0.62; }
+.component-card button:disabled, .enhancement-footer .primary-command:disabled { cursor: default; }
+.component-card button[data-busy="true"] { cursor: progress; }
 .login-submit-spinner {
   display: none;
   width: 15px;
@@ -1587,9 +1589,12 @@ html[data-ui-theme="light"] .player-panel .player-info-section + .player-info-se
 .component-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .component-card { margin: 0; padding: 24px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
 .component-card h3 { margin-top: 0; }
-.component-card .update-action-row { flex-wrap: wrap; }
-.component-pending, .component-confirm { margin-top: 16px; }
-@media (max-width: 1000px) { .component-grid { grid-template-columns: 1fr; } }
+.component-card { display: flex; flex-direction: column; }
+.component-card > p:first-of-type { margin: 0; min-height: 44px; font-size: 13px; }
+.component-card .component-status { min-height: 44px; font-size: 12px; margin: 14px 0; }
+.component-card .update-action-row { margin-top: auto; flex-wrap: nowrap; }
+.component-card .update-action-row button { white-space: nowrap; }
+@media (max-width: 840px) { .component-grid { grid-template-columns: 1fr; } }
 @media (max-width: 760px) { .components-page { padding: 20px 16px 36px; } .component-card { padding: 18px; } }
 .enhancement-parameters { margin: 8px 0 18px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
 .enhancement-parameters summary { cursor: pointer; font-size: 13px; }
@@ -1597,3 +1602,25 @@ html[data-ui-theme="light"] .player-panel .player-info-section + .player-info-se
 .enhancement-parameter select { max-width: 60%; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 5px; }
 .enhancement-parameter input[type="range"] { width: 52%; }
 .enhancement-help { color: var(--muted); font-size: 12px; line-height: 1.6; }
+
+.component-dialog { width: min(440px, calc(100vw - 32px)); padding: 24px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 48px #0004; }
+.component-dialog::backdrop { background: #0006; backdrop-filter: blur(4px); }
+.component-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.component-dialog h2 { margin: 0; font-size: 18px; }
+.component-dialog p { margin: 16px 0 24px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.component-dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.component-dialog [hidden] { display: none; }
+.player-panel-content:has(.enhancement-settings) { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+.enhancement-settings { padding: 0 16px 12px; overflow-y: auto; min-height: 0; scrollbar-width: thin; }
+.enhancement-group { padding: 12px 0; border-top: 1px solid var(--line); }
+.enhancement-group h3 { margin: 0 0 6px; font-size: 13px; }
+.enhancement-group .enhancement-parameter { margin: 8px 0; }
+.enhancement-group .enhancement-parameters { margin: 12px 0 0; padding: 10px; background: var(--bg-elevated); }
+.enhancement-parameters fieldset { min-width: 0; margin: 0; padding: 4px 0 0; border: 0; }
+.enhancement-parameter input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer; }
+.enhancement-parameter select { min-height: 30px; font: inherit; }
+.enhancement-parameter input:disabled, .enhancement-parameter select:disabled { cursor: default; opacity: .55; }
+.enhancement-footer { flex: none; border-top: 1px solid var(--line); padding: 10px 16px 14px; background: var(--surface); }
+.enhancement-footer p { margin: 0 0 10px; font-size: 11px; }
+.enhancement-footer-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.enhancement-settings > .enhancement-help { margin: 8px 0 0; font-size: 11px; }

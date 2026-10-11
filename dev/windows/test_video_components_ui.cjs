@@ -1,32 +1,23 @@
 // Real embedded component status/reload handlers; no browser or server account.
 const assert = require('node:assert/strict');
-const fs = require('node:fs'); const vm = require('node:vm'); const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '../../src/web/mediastation.js'), 'utf8');
-const html = fs.readFileSync(path.join(__dirname, '../../src/web/mediastation.html'), 'utf8');
-assert.ok(html.indexOf('id="components-page"') < html.indexOf('id="settings-install-frame-interpolation"'));
-assert.ok(!html.slice(html.indexOf('data-settings-section="playback">'), html.indexOf('data-settings-section="storage">')).includes('id="settings-install-frame-interpolation"'));
-function node() { const classes = new Set(); return { dataset: {}, disabled: false, textContent: '', classList: { add: (v) => classes.add(v), remove: (v) => classes.delete(v), contains: (v) => classes.has(v), toggle(v, on) { on ? classes.add(v) : classes.delete(v); } } }; }
-const elements = new Map(); function byId(id) { assert.ok(html.includes(`id="${id}"`), id); if (!elements.has(id)) elements.set(id, node()); return elements.get(id); }
-const cards = new Map();
-for (const id of ['rtx-video', 'dlssnr', 'nvidia-vfg']) {
-    const buttons = ['install', 'import', 'uninstall', 'restart', 'cancel'].map((operation) => { const button = node(); button.dataset.componentOperation = operation; return button; });
-    const pending = node(); cards.set(id, { buttons, pending, querySelectorAll() { return buttons; }, querySelector() { return pending; } });
-}
-const timers = new Map(); let timerId = 0; let failure; let response;
-const context = vm.createContext({ byId, document: { querySelector(selector) { return cards.get(selector.match(/"([^"]+)"/)[1]); } },
-    window: { clearTimeout(id) { timers.delete(id); }, setTimeout(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; } },
-    nativeRequest: async () => { if (failure) throw failure; return response; }, formatBytes: (v) => `${v} B`, friendlyError: (error) => error.message, refreshPlayerTools() {} });
-const start = source.indexOf('    const videoComponentStatuses = new Map();'); const end = source.indexOf('    function openSettings(', start);
-vm.runInContext(source.slice(start, end), context);
+const vm = require('node:vm');
+const { source, html, handler, harness } = require('./video_components_test_dom.cjs');
+const { context, byId, cards, timers } = harness();
+let failure, response;
+context.nativeRequest = async () => { if (failure) throw failure; return response; };
 const status = (id, fields = {}) => ({ id, installed: false, supported: true, ...fields });
+const primary = (id) => cards.get(id).children[0], secondary = (id) => cards.get(id).children[1];
 context.updateVideoComponents({ components: [status('rtx-video'), status('dlssnr'), status('nvidia-vfg')] });
-assert.equal(cards.get('rtx-video').buttons[0].disabled, false); assert.equal(cards.get('rtx-video').buttons[2].disabled, true);
+assert.equal(primary('rtx-video').disabled, false); assert.equal(secondary('rtx-video').disabled, true);
 context.updateVideoComponents({ components: [status('rtx-video', { busy: true, progress: { phase: 'selecting' } }), status('dlssnr', { installed: true, runtime: { experimental: true, failureDetail: '推理不可用' } }), status('nvidia-vfg', { installed: true, runtime: { playbackAvailable: true } })] });
 assert.match(byId('component-rtx-video-status').textContent, /请选择/); assert.equal(timers.size, 1);
 assert.match(byId('component-dlssnr-status').textContent, /推理不可用/); assert.equal(byId('player-interpolation').classList.contains('hidden'), false);
-assert.equal(cards.get('nvidia-vfg').buttons[2].disabled, false, 'another component download must not block this uninstall');
+assert.equal(secondary('nvidia-vfg').disabled, false, 'another component download must not block this uninstall');
+assert.equal(primary('nvidia-vfg').dataset.busy, 'false', 'installed is not busy');
+assert.equal(primary('nvidia-vfg').textContent, '已安装');
 context.updateVideoComponents({ components: [status('rtx-video', { restartRequired: true, pendingOperation: 'install', runtime: { failureCode: 'frame_interpolation_component_invalid', failureDetail: 'payload damaged' } })] });
-assert.match(byId('component-rtx-video-status').textContent, /payload damaged/); assert.equal(cards.get('rtx-video').buttons[3].disabled, true); assert.equal(cards.get('rtx-video').buttons[4].disabled, false);
+assert.match(byId('component-rtx-video-status').textContent, /payload damaged/); assert.equal(primary('rtx-video').disabled, true); assert.equal(secondary('rtx-video').disabled, false);
+assert.equal(cards.get('rtx-video').children.length, 2, 'pending state never adds action rows');
 assert.throws(() => context.updateVideoComponents({ components: [status('arbitrary-directory')] }), /身份无效/);
 async function main() {
     context.updateVideoComponents({ components: [status('rtx-video', { busy: true })] }); failure = new Error('network unavailable');
@@ -35,12 +26,12 @@ async function main() {
     response = { restarting: false }; await context.changeVideoComponent('rtx-video', 'restart'); assert.match(byId('component-rtx-video-status').textContent, /未确认就绪/);
     const reloadStart = source.indexOf('    const videoEnhancementDefaults = ');
     const reloadEnd = source.indexOf('    function togglePlayerFullscreen(', reloadStart);
-    const requests = [], toasts = []; let pauses = 0, plays = 0;
+    const requests = [], toasts = [], loadingLabels = []; let pauses = 0, plays = 0;
     Object.assign(context, {
         interpolationModels: { 'rife-v4.26': {} }, preferredInterpolationModel: 'rife-v4.26',
         playerSubtitleStyle: { fontSize: 30 }, playerPlaybackRate: 1,
-        closePlayerPanel() {}, showPlayerFeedback() {}, setPlayerLoading() {}, showPlayerControls() {},
-        playerTransitionLoadingLabel: () => '正在加载', waitForPlayerPaint: async () => {},
+        closePlayerPanel() {}, showPlayerFeedback() {}, setPlayerLoading(loading, text) { if (loading) loadingLabels.push(text); }, showPlayerControls() {},
+        waitForPlayerPaint: async () => {},
         playbackPreferenceScope: () => 'series-a', playerSubtitlePosition: () => 92,
         applyPlayerPlaybackRate() {}, updateFrameInterpolationStatus() {}, showToast: (message) => toasts.push(message),
         nativeRequest: async (channel, operation, args) => {
@@ -54,7 +45,23 @@ async function main() {
     const makePlayer = (fields = {}) => ({ started: true, playing: true, card: { id: 'media-a' }, positionMs: 45678,
         loadInfo: { mediaSourceId: 'version-b' }, interpolationEnabled: false, videoEnhancement: { vsr: false, vfg: false }, ...fields });
     vm.runInContext(source.slice(reloadStart, reloadEnd), context);
+    vm.runInContext(handler('interpolationLoadingLabel') + handler('playerTransitionLoadingLabel'), context);
+    const label = context.videoEnhancementTransitionLabel;
+    assert.equal(label(null, null, {}, { vsr: true }), '正在开启超分');
+    assert.equal(label(null, null, { vsr: true }, {}), '正在关闭超分');
+    assert.equal(label(null, null, {}, { nr: true }), '正在开启画面增强');
+    assert.equal(label(null, null, { nr: true }, {}), '正在关闭画面增强');
+    assert.match(label(null, null, {}, { vfg: true }), /正在开启 NVIDIA VFG 插帧/);
+    assert.match(label(null, 'rife-v4.26', {}, {}), /正在开启 RIFE 插帧/);
+    assert.equal(label('rife-v4.26', null, {}, {}), '正在关闭插帧');
+    assert.equal(label(null, null, { nr: true }, { nr: true, nrTone: 0.3 }), '正在应用画面增强参数');
+    assert.equal(label(null, null, { vfg: true }, { vfg: true, multiplier: 4 }), '正在应用插帧参数');
+    assert.equal(label(null, null, { vsr: true }, { vsr: true, vsrQuality: 2 }), '正在应用超分参数');
+    assert.equal(label('rife-v4.26', null, {}, { vfg: true }), '正在切换插帧');
+    assert.equal(label(null, null, {}, { nr: true, vsr: true }), '正在应用画面设置');
+    assert.equal(context.interpolationLoadingLabel({}), '正在加载视频');
     context.player = makePlayer(); await context.setFrameInterpolation(null, { vsr: true, vfg: true });
+    assert.deepEqual(loadingLabels, ['正在应用画面设置', '正在应用画面设置'], 'both loading stages retain the current action after native acknowledgement');
     const firstLoad = requests.find((request) => request.operation === 'load');
     assert.deepEqual(Array.from(firstLoad.args).slice(0, 3), ['media-a', 45678, 'off']);
     assert.equal(firstLoad.args[7], 'version-b'); assert.equal(JSON.parse(firstLoad.args[8]).vsr, true); assert.equal(JSON.parse(firstLoad.args[8]).vfg, true); assert.equal(JSON.parse(firstLoad.args[8]).vsrQuality, 4);

@@ -16,9 +16,9 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 
 ## 使用
 
-1. 打开侧栏“组件管理”，点击所需组件的“从本地安装”，选择对应组件 ZIP。
-2. 校验并排队完成后，确认重启；也可稍后重启或取消待安装。
-3. 播放渐进 SDR、HDR10 或 HLG 视频，在播放器“画面增强”菜单开启所需组件，展开参数后应用。
+1. 打开侧栏“组件管理”，点击“安装组件”，在弹窗选择“从本地安装”并选择对应组件 ZIP。
+2. 校验并排队完成后，原按钮变为“重启生效”，点击后确认重启；也可稍后重启或点击“取消安装”。
+3. 播放渐进 SDR、HDR10 或 HLG 视频，在播放器“画面增强”菜单选择插帧引擎、超分或画面增强，配置后统一点击“应用设置”。
    NR、VFG 与超分可叠加；开启 RIFE 会关闭 VFG。关闭插帧保留 NR 与超分选择。
 
 本次三个新组件包仅生成于 `dist/components`，尚未发布 GitHub Release。
@@ -30,6 +30,35 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 | `MediaStationGo-rtx-video-x64-v1.zip` | `6f8c7ca16634437f83f8890433060a93daaca29cdb6bbb361829002d4c431e25` |
 | `MediaStationGo-dlssnr-x64-v1.zip` | `c7daf9e2a8287b228c11055fdc1f598e92697948eef44c7729d113ba8f5ed686` |
 | `MediaStationGo-nvidia-vfg-x64-v1.zip` | `13c2e0493b1aaa6bb8d3b93f9b6a70d60359db78c672d6963dfcea50987f1cdb` |
+
+## 组件操作与播放设置交互修复
+
+2026-10-11，本轮只修改界面与调用组织，复用既有组件安装事务和播放重载。
+
+- 四项组件始终保留两颗操作按钮。已安装状态显示“已安装”并使用正常指针；只有正在处理或重启时显示进度指针。安装来源、卸载、重启确认共用弹窗，不再往卡片底部展开操作区。
+- 安装完成后在原位置提供“重启生效 / 取消安装”，不会自动弹出重启确认；损坏的待安装包明确禁止重启，仍可取消。卸载沿用下次启动生效的原合同。
+- 播放设置按插帧、RTX Video 超分、DLSSNR 画面增强分组。先选关闭 / RIFE / VFG，再配置对应引擎；RIFE 三档属于 RIFE 内部参数。所有参数与开关先保留为面板草稿，统一应用时只调用一次既有重载；关闭面板丢弃未应用修改。
+- 应用时保留播放位置、媒体版本和暂停状态。不可用的组件可以关闭，但不能重新启用；错误保持明确可见。
+- 重载提示按实际差异显示开启、关闭、切换或参数应用。只改超分显示“正在开启超分 / 正在关闭超分 / 正在应用超分参数”，只改 NR 显示对应画面增强提示，多项变化显示“正在应用画面设置”。提示持续到重载完成，不会因原生参数回执更新而变成插帧关闭。
+
+验证使用真实 JS 处理函数、故障注入与浏览器离线状态：
+`test_frame_interpolation_ui.cjs`、`test_video_components_ui.cjs`、
+`test_video_components_detection.cjs` 与 `test_modern_cinema_ui.cjs`。
+浏览器验证由 `render_video_parameters_ui.cjs` 生成真实 HTML/CSS/渲染函数测试页面，
+`test_video_settings_browser.cjs` 检查浅色/深色、1280×800 与 480×800、模态确认不挤压卡片、
+Escape 焦点恢复、固定操作数、草稿编辑不重载、RIFE 三档嵌套及统一应用。
+浏览器脚本需要可用的 `playwright` 和 Chrome，Chrome 路径可通过 `VIDEO_UI_CHROME` 指定。
+
+标准 Release 构建通过。真实用户目录首次首页检查再次确认 DLSSNR/VFG 已安装且原生可用，
+RTX Video 未安装；随后在实际 CEF 页面检查“已安装”指针、安装来源弹窗及卸载弹窗，均取消，
+未执行组件变更或启动用户媒体。记录为
+`build/video-enhancement/component-settings-app.json` 与
+`build/video-parameters-ui/browser-validation.json`；可复现真实页面检查
+`node dev/windows/test_video_settings_app.cjs <调试端口>`。
+标准应用 SHA-256：`cf21fbeed23c4d0ed238da6cfa77be98797451cebae30c7cb0956cf31d00ebf7`，
+启动状态汇总见 `build/video-enhancement/component-settings-release-validation.json`。
+本轮未重复 GPU 算法/画质验收，未改组件 ZIP、HDR 格式边界、RIFE 模型/profile/ABI 或刷新路径。
+仅本地更新与提交，未推送或发布。
 
 ## 实现边界
 
@@ -360,7 +389,7 @@ NR 适配器 `5d075b793d9d9e11ed09641a77b20212137fe6f4153532b206ede35730e36f5d`�
 ![组件管理浅色布局](images/video-components-light.png)
 ![组件管理深色布局](images/video-components-dark.png)
 
-以下参数面板由真实渲染函数与 CSS 生成离线测试状态；NR 安装状态为测试输入，
+以下分组参数面板由真实渲染函数与 CSS 生成离线测试状态；NR 安装状态为测试输入，
 不代表真实用户组件已安装。可复现 `node dev/windows/render_video_parameters_ui.cjs`。
 
 ![DLSSNR 参数浅色布局](images/video-parameters-light.png)

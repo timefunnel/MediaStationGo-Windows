@@ -344,33 +344,36 @@
     </section>
   </aside>
 
-  <section id="components-page" class="components-page hidden" aria-labelledby="components-title"><header><p class="eyebrow">播放器扩展</p><h2 id="components-title">组件管理</h2><p>按需安装画面增强组件。安装或卸载在重启后生效，安装完成后可在播放菜单选择使用。</p><p>请先关闭其他播放器实例。尚未发布的组件可从本地组件包安装。</p></header><div class="component-grid">            <div class="setting-block component-card frame-interpolation-settings">
-              <h3>RIFE 插帧</h3>
-              <p>NVIDIA RTX 使用，包含 RIFE 的三档模型，固定 2 倍插帧。安装完成后确认即可自动重启生效。</p>
-              <p id="settings-frame-interpolation-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
-              <div class="update-action-row">
-                <button id="settings-install-frame-interpolation" class="primary-command" type="button" disabled>下载并安装</button>
-                <button id="settings-import-frame-interpolation" class="secondary-command" type="button" disabled>从本地安装</button>
-                <button id="settings-uninstall-frame-interpolation" class="secondary-command" type="button" disabled>卸载组件</button>
-              </div>
-              <div id="settings-pending-frame-interpolation-install" class="hidden">
-                <p>若待安装文件校验失败，可取消后重新下载安装。取消只清理待安装文件，不动现有组件和缓存。</p>
-                <button id="settings-restart-frame-interpolation" class="primary-command" type="button" disabled>重启并安装</button>
-                <button id="settings-cancel-install-frame-interpolation" class="secondary-command" type="button" disabled>取消待安装</button>
-              </div>
-              <div id="settings-confirm-frame-interpolation-restart" class="update-confirm hidden" role="group" aria-label="确认重启安装插帧组件">
-                <p>安装包已下载并校验。确认后将停止当前播放，自动退出并重新启动播放器以完成安装。请先关闭其他播放器实例；重启不会自动开启插帧。</p>
-                <div class="update-confirm-actions">
-                  <button id="settings-confirm-restart-frame-interpolation" class="primary-command" type="button">确认并重启</button>
-                  <button id="settings-later-restart-frame-interpolation" class="secondary-command" type="button">稍后</button>
-                </div>
-              </div>
-              <div id="settings-confirm-frame-interpolation-uninstall" class="hidden">
-                <p>下次启动时删除插帧组件、专属 Engine 缓存和组件下载缓存。不影响媒体、账号及其他缓存。</p>
-                <button id="settings-confirm-uninstall-frame-interpolation" class="secondary-command" type="button">确认卸载</button>
-                <button id="settings-cancel-uninstall-frame-interpolation" class="secondary-command" type="button">取消</button>
-              </div>
-            </div><section class="setting-block component-card" data-component-id="rtx-video" aria-labelledby="component-rtx-video-title"><h3 id="component-rtx-video-title">RTX Video 超分</h3><p>NVIDIA RTX 视频超分，支持质量与目标尺寸设置。</p><p id="component-rtx-video-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p><div class="update-action-row"><button data-component-operation="install" class="primary-command" type="button" disabled>下载并安装</button><button data-component-operation="import" class="secondary-command" type="button" disabled>从本地安装</button><button data-component-operation="uninstall" class="secondary-command" type="button" disabled>卸载组件</button></div><div class="component-confirm hidden" role="group"><p class="component-confirm-copy"></p><button class="primary-command" data-component-confirm type="button">确认</button><button class="secondary-command" data-component-dismiss type="button">取消</button></div><div class="component-pending hidden"><button data-component-operation="restart" class="primary-command" type="button">重启生效</button><button data-component-operation="cancel" class="secondary-command" type="button">取消待安装</button></div></section><section class="setting-block component-card" data-component-id="dlssnr" aria-labelledby="component-dlssnr-title"><h3 id="component-dlssnr-title">DLSSNR 画面增强</h3><p>DLSSNR 神经画面增强，支持风格、强度、局部色调与结构设置。</p><p id="component-dlssnr-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p><div class="update-action-row"><button data-component-operation="install" class="primary-command" type="button" disabled>下载并安装</button><button data-component-operation="import" class="secondary-command" type="button" disabled>从本地安装</button><button data-component-operation="uninstall" class="secondary-command" type="button" disabled>卸载组件</button></div><div class="component-confirm hidden" role="group"><p class="component-confirm-copy"></p><button class="primary-command" data-component-confirm type="button">确认</button><button class="secondary-command" data-component-dismiss type="button">取消</button></div><div class="component-pending hidden"><button data-component-operation="restart" class="primary-command" type="button">重启生效</button><button data-component-operation="cancel" class="secondary-command" type="button">取消待安装</button></div></section><section class="setting-block component-card" data-component-id="nvidia-vfg" aria-labelledby="component-nvidia-vfg-title"><h3 id="component-nvidia-vfg-title">NVIDIA VFG 插帧</h3><p>NVIDIA 视频帧生成，支持 2–8 倍帧率与质量设置；与 RIFE 插帧互斥。</p><p id="component-nvidia-vfg-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p><div class="update-action-row"><button data-component-operation="install" class="primary-command" type="button" disabled>下载并安装</button><button data-component-operation="import" class="secondary-command" type="button" disabled>从本地安装</button><button data-component-operation="uninstall" class="secondary-command" type="button" disabled>卸载组件</button></div><div class="component-confirm hidden" role="group"><p class="component-confirm-copy"></p><button class="primary-command" data-component-confirm type="button">确认</button><button class="secondary-command" data-component-dismiss type="button">取消</button></div><div class="component-pending hidden"><button data-component-operation="restart" class="primary-command" type="button">重启生效</button><button data-component-operation="cancel" class="secondary-command" type="button">取消待安装</button></div></section></div></section>
+  <section id="components-page" class="components-page hidden" aria-labelledby="components-title">
+    <header><p class="eyebrow">播放器扩展</p><h2 id="components-title">组件管理</h2><p>按需安装，播放时选择使用。安装或卸载在重启后生效。</p></header>
+    <div class="component-grid">
+      <section class="setting-block component-card" data-component-id="rife" aria-labelledby="component-rife-title">
+        <h3 id="component-rife-title">RIFE 插帧</h3><p>NVIDIA RTX · 三档模型可选，固定 2 倍插帧。</p>
+        <p id="settings-frame-interpolation-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
+      </section>
+      <section class="setting-block component-card" data-component-id="rtx-video" aria-labelledby="component-rtx-video-title">
+        <h3 id="component-rtx-video-title">RTX Video 超分</h3><p>NVIDIA RTX · 支持超分质量与目标尺寸设置。</p>
+        <p id="component-rtx-video-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
+      </section>
+      <section class="setting-block component-card" data-component-id="dlssnr" aria-labelledby="component-dlssnr-title">
+        <h3 id="component-dlssnr-title">DLSSNR 画面增强</h3><p>支持模型风格、增强强度、局部色调与结构设置。</p>
+        <p id="component-dlssnr-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
+      </section>
+      <section class="setting-block component-card" data-component-id="nvidia-vfg" aria-labelledby="component-nvidia-vfg-title">
+        <h3 id="component-nvidia-vfg-title">NVIDIA VFG 插帧</h3><p>支持 2–8 倍帧率与质量设置，与 RIFE 插帧互斥。</p>
+        <p id="component-nvidia-vfg-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
+      </section>
+    </div>
+  </section>
+  <dialog id="component-dialog" class="component-dialog" aria-labelledby="component-dialog-title" aria-describedby="component-dialog-copy">
+    <header><h2 id="component-dialog-title"></h2><button id="component-dialog-close" class="icon-button" type="button" aria-label="关闭">&#10005;</button></header>
+    <p id="component-dialog-copy"></p>
+    <div class="component-dialog-actions"><button id="component-dialog-local" class="secondary-command" type="button">从本地安装</button><button id="component-dialog-confirm" class="primary-command" type="button">下载并安装</button><button id="component-dialog-cancel" class="secondary-command" type="button">取消</button></div>
+  </dialog>
 
   <div id="overview-scrim" class="modal-scrim hidden">
     <section id="overview-dialog" class="reading-panel" role="dialog" aria-modal="true" aria-labelledby="overview-title">
