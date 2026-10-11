@@ -1,5 +1,6 @@
-//! Versioned, validated per-user RIFE package. Mutations apply on next startup.
+//! Versioned, validated per-user native component packages. Mutations apply on next startup.
 
+use super::components::ComponentKind;
 use super::{InterpolationError, RIFE_RUNTIME_ABI, RIFE_TENSORRT_VERSION};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,7 +17,7 @@ const MAX_UNPACKED_BYTES: u64 = 768 * 1024 * 1024;
 const MANIFEST: &str = "component-manifest.json";
 const STAGING_OWNER: &str = "staging-owner.txt";
 const STAGING_IDENTITY: &[u8] = b"MediaStationGo RIFE operation staging v1\n";
-const FILES: &[&str] = &[
+pub(crate) const FILES: &[&str] = &[
     "rife_runtime.dll",
     "cudart64_12.dll",
     "tensorrt_rtx_1_4.dll",
@@ -44,6 +45,7 @@ fn io_error(operation: &str, cause: impl std::fmt::Display) -> InterpolationErro
 
 #[derive(Clone)]
 struct Paths {
+    kind: ComponentKind,
     root: PathBuf,
     active: PathBuf,
     pending: PathBuf,
@@ -53,9 +55,13 @@ struct Paths {
 
 impl Paths {
     fn new(cache_root: &Path) -> Result<Self, InterpolationError> {
-        if !cache_root.is_absolute()
-            || cache_root.file_name().and_then(|name| name.to_str()) != Some("frame-interpolation")
-        {
+        let kind = ComponentKind::ALL
+            .into_iter()
+            .find(|kind| {
+                cache_root.file_name().and_then(|name| name.to_str()) == Some(kind.cache_name())
+            })
+            .ok_or_else(|| error("Unknown component cache directory"))?;
+        if !cache_root.is_absolute() {
             return Err(error(
                 "Component cache root must be an absolute frame-interpolation directory",
             ));
@@ -63,8 +69,9 @@ impl Paths {
         let parent = cache_root
             .parent()
             .ok_or_else(|| error("Component cache has no parent"))?;
-        let root = parent.join("components").join("rife");
+        let root = parent.join("components").join(kind.id());
         Ok(Self {
+            kind,
             active: root.join("active"),
             pending: root.join("pending"),
             cache: cache_root.join("engine-cache"),
@@ -150,7 +157,7 @@ fn lock(_paths: &Paths, _name: &str, _exclusive: bool) -> Result<File, Interpola
     ))
 }
 
-fn sha256(path: &Path) -> Result<String, InterpolationError> {
+pub fn sha256(path: &Path) -> Result<String, InterpolationError> {
     let mut file = File::open(path).map_err(|cause| io_error("Open component file", cause))?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 256 * 1024];
@@ -177,18 +184,25 @@ fn valid_sha(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn parse_manifest(bytes: &[u8]) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
+fn parse_manifest_for(
+    kind: ComponentKind,
+    bytes: &[u8],
+) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
     if bytes.len() > 64 * 1024 {
         return Err(error("Component manifest exceeds 64 KiB"));
     }
     let manifest: Value = serde_json::from_slice(bytes)
         .map_err(|cause| io_error("Parse component manifest", cause))?;
     if manifest["schema"] != 1
-        || manifest["component"] != "rife"
+        || manifest["component"] != kind.id()
         || manifest["version"] != "1"
         || manifest["platform"] != "windows-x64"
-        || manifest["runtimeAbi"] != RIFE_RUNTIME_ABI
-        || manifest["tensorRtVersion"] != RIFE_TENSORRT_VERSION
+        || (kind == ComponentKind::Rife
+            && (manifest["runtimeAbi"] != RIFE_RUNTIME_ABI
+                || manifest["tensorRtVersion"] != RIFE_TENSORRT_VERSION))
+        || (kind != ComponentKind::Rife
+            && (manifest["runtimeAbi"] != 1
+                || manifest["providerVersion"] != kind.runtime_version()))
     {
         return Err(error(
             "Unsupported component version, platform or runtime tuple",
@@ -209,7 +223,11 @@ fn parse_manifest(bytes: &[u8]) -> Result<BTreeMap<String, (u64, String)>, Inter
         let hash = entry["sha256"]
             .as_str()
             .ok_or_else(|| error("Component SHA missing"))?;
-        if !FILES.contains(&path) || size == 0 || !valid_sha(hash) || files.contains_key(path) {
+        if !kind.files().contains(&path)
+            || size == 0
+            || !valid_sha(hash)
+            || files.contains_key(path)
+        {
             return Err(error(
                 "Unexpected, empty, duplicated or unverified component file",
             ));
@@ -222,16 +240,16 @@ fn parse_manifest(bytes: &[u8]) -> Result<BTreeMap<String, (u64, String)>, Inter
         }
         files.insert(path.to_string(), (size, hash.to_string()));
     }
-    if files.len() != FILES.len() {
+    if files.len() != kind.files().len() {
         return Err(error("Component file set is incomplete"));
     }
     Ok(files)
 }
 
-pub fn validate_directory(directory: &Path) -> Result<(), InterpolationError> {
+fn validate_directory_for(kind: ComponentKind, directory: &Path) -> Result<(), InterpolationError> {
     reject_links(directory)?;
-    validate_file_set(directory, directory)?;
-    for (name, (size, hash)) in manifest_files(directory)? {
+    validate_file_set(kind, directory, directory)?;
+    for (name, (size, hash)) in manifest_files(kind, directory)? {
         let path = directory.join(name);
         for ancestor in path
             .ancestors()
@@ -251,7 +269,10 @@ pub fn validate_directory(directory: &Path) -> Result<(), InterpolationError> {
     Ok(())
 }
 
-fn manifest_files(directory: &Path) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
+fn manifest_files(
+    kind: ComponentKind,
+    directory: &Path,
+) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
     let manifest_path = directory.join(MANIFEST);
     reject_links(&manifest_path)?;
     let mut bytes = Vec::new();
@@ -260,10 +281,14 @@ fn manifest_files(directory: &Path) -> Result<BTreeMap<String, (u64, String)>, I
         .take(65537)
         .read_to_end(&mut bytes)
         .map_err(|cause| io_error("Read component manifest", cause))?;
-    parse_manifest(&bytes)
+    parse_manifest_for(kind, &bytes)
 }
 
-fn validate_file_set(root: &Path, directory: &Path) -> Result<(), InterpolationError> {
+fn validate_file_set(
+    kind: ComponentKind,
+    root: &Path,
+    directory: &Path,
+) -> Result<(), InterpolationError> {
     for entry in
         fs::read_dir(directory).map_err(|cause| io_error("Inspect component files", cause))?
     {
@@ -280,14 +305,15 @@ fn validate_file_set(root: &Path, directory: &Path) -> Result<(), InterpolationE
             .map_err(|cause| io_error("Inspect component file type", cause))?
             .is_dir()
         {
-            if !matches!(
-                relative.as_str(),
-                "frame-interpolation" | "frame-interpolation/models" | "licenses"
-            ) {
+            if !kind
+                .files()
+                .iter()
+                .any(|name| name.starts_with(&(relative.clone() + "/")))
+            {
                 return Err(error("Unexpected directory in the installed component"));
             }
-            validate_file_set(root, &path)?;
-        } else if relative != MANIFEST && !FILES.contains(&relative.as_str()) {
+            validate_file_set(kind, root, &path)?;
+        } else if relative != MANIFEST && !kind.files().contains(&relative.as_str()) {
             return Err(error("Unexpected file in the installed component"));
         }
     }
@@ -351,7 +377,8 @@ pub fn status(cache_root: &Path) -> Result<Value, InterpolationError> {
         json!({"installed": installed, "supported": SUPPORTED, "version": "1",
         "pendingOperation": action.as_ref().and_then(|value| value["operation"].as_str()),
         "restartRequired": action.is_some(), "installPath": paths.active,
-        "releaseTag": RELEASE_TAG, "assetName": ASSET_NAME}),
+        "id": paths.kind.id(), "name": paths.kind.name(),
+        "releaseTag": paths.kind.release_tag(), "assetName": paths.kind.asset_name()}),
     )
 }
 
@@ -421,6 +448,7 @@ fn write_staging_identity(directory: &Path) -> Result<(), InterpolationError> {
 fn validate_staging_contents(
     directory: &Path,
     allow_cancelled: bool,
+    kind: ComponentKind,
 ) -> Result<(), InterpolationError> {
     reject_links(directory)?;
     for child in fs::read_dir(directory)
@@ -428,25 +456,25 @@ fn validate_staging_contents(
     {
         let child = child.map_err(|cause| io_error("Inspect staging content", cause))?;
         reject_links(&child.path())?;
-        let kind = child
+        let file_type = child
             .file_type()
             .map_err(|cause| io_error("Inspect staging content type", cause))?;
         match child.file_name().to_str() {
-            Some("runtime") if kind.is_dir() => {
-                validate_file_set(&child.path(), &child.path())?;
+            Some("runtime") if file_type.is_dir() => {
+                validate_file_set(kind, &child.path(), &child.path())?;
             }
-            Some("cancelled-install") if allow_cancelled && kind.is_dir() => {
-                validate_staging_contents(&child.path(), false)?;
+            Some("cancelled-install") if allow_cancelled && file_type.is_dir() => {
+                validate_staging_contents(&child.path(), false, kind)?;
             }
-            Some(STAGING_OWNER | "action.json") if kind.is_file() => {}
+            Some(STAGING_OWNER | "action.json") if file_type.is_file() => {}
             _ => return Err(error("Unexpected content in abandoned component staging")),
         }
     }
     Ok(())
 }
 
-fn remove_owned_staging(directory: &Path) -> Result<(), InterpolationError> {
-    validate_staging_contents(directory, true)?;
+fn remove_owned_staging(directory: &Path, kind: ComponentKind) -> Result<(), InterpolationError> {
+    validate_staging_contents(directory, true, kind)?;
     for child in fs::read_dir(directory)
         .map_err(|cause| io_error("Inspect component staging cleanup", cause))?
     {
@@ -513,12 +541,12 @@ fn cleanup_abandoned_staging(paths: &Paths) -> Result<(), InterpolationError> {
             // manifest plus only known payload paths identifies its ownership;
             // payload files may still be incomplete after an interrupted copy.
             reject_links(&runtime)?;
-            manifest_files(&runtime)?;
+            manifest_files(paths.kind, &runtime)?;
         } else {
             // A matching directory prefix alone never authorizes deletion.
             continue;
         }
-        validate_staging_contents(&path, true)?;
+        validate_staging_contents(&path, true, paths.kind)?;
         owned.push(path);
     }
     // Validate all candidates before deleting any of them.
@@ -526,7 +554,7 @@ fn cleanup_abandoned_staging(paths: &Paths) -> Result<(), InterpolationError> {
         if !exists(&path.join(STAGING_OWNER))? {
             write_staging_identity(&path)?;
         }
-        remove_owned_staging(&path)?;
+        remove_owned_staging(&path, paths.kind)?;
     }
     Ok(())
 }
@@ -560,7 +588,7 @@ pub fn startup(cache_root: &Path) -> Result<(PathBuf, File), InterpolationError>
                                 "Existing component must be uninstalled before installation",
                             ));
                         }
-                        validate_directory(&incoming)?;
+                        validate_directory_for(paths.kind, &incoming)?;
                         if sha256(&incoming.join(MANIFEST))? != hash {
                             return Err(error("Pending install manifest changed"));
                         }
@@ -568,7 +596,7 @@ pub fn startup(cache_root: &Path) -> Result<(PathBuf, File), InterpolationError>
                             .map_err(|cause| io_error("Activate component", cause))?;
                     } else {
                         // Explicit crash recovery after the atomic directory move.
-                        validate_directory(&paths.active)?;
+                        validate_directory_for(paths.kind, &paths.active)?;
                         if sha256(&paths.active.join(MANIFEST))? != hash {
                             return Err(error(
                                 "Interrupted install does not match the pending operation",
@@ -609,14 +637,14 @@ pub fn cancel_pending_install(cache_root: &Path) -> Result<(), InterpolationErro
     if action["operation"] != "install" {
         return Err(error("Only a pending component install can be cancelled"));
     }
-    validate_staging_contents(&paths.pending, false)?;
+    validate_staging_contents(&paths.pending, false, paths.kind)?;
     let staging = operation_staging(&paths)?;
     fs::rename(&paths.pending, staging.path().join("cancelled-install"))
         .map_err(|cause| io_error("Cancel pending component installation", cause))?;
     // The queue is removed atomically; preserve the owned staging directory
     // if cleanup fails, rather than leaving a half-deleted pending action.
     let directory = staging.keep();
-    remove_owned_staging(&directory)
+    remove_owned_staging(&directory, paths.kind)
 }
 
 fn commit_action(
@@ -697,7 +725,7 @@ pub fn queue_install(
         File::open(archive_path).map_err(|cause| io_error("Open component ZIP", cause))?,
     )
     .map_err(|cause| io_error("Parse component ZIP", cause))?;
-    if archive.len() != FILES.len() + 1 {
+    if archive.len() != paths.kind.files().len() + 1 {
         return Err(error("Component ZIP file count is invalid"));
     }
     let mut manifest_bytes = Vec::new();
@@ -707,7 +735,7 @@ pub fn queue_install(
         .take(65537)
         .read_to_end(&mut manifest_bytes)
         .map_err(|cause| io_error("Read ZIP manifest", cause))?;
-    let files = parse_manifest(&manifest_bytes)?;
+    let files = parse_manifest_for(paths.kind, &manifest_bytes)?;
     let mut seen = BTreeSet::new();
     for index in 0..archive.len() {
         let mut entry = archive
@@ -761,7 +789,7 @@ pub fn queue_install(
         file.sync_all()
             .map_err(|cause| io_error("Sync component file", cause))?;
     }
-    validate_directory(&runtime)?;
+    validate_directory_for(paths.kind, &runtime)?;
     let manifest_hash = sha256(&runtime.join(MANIFEST))?;
     commit_action(
         &paths,
@@ -770,10 +798,119 @@ pub fn queue_install(
     )
 }
 
+pub fn validate_directory(directory: &Path) -> Result<(), InterpolationError> {
+    validate_directory_for(ComponentKind::Rife, directory)
+}
+
+pub fn validate_component_directory(
+    kind: ComponentKind,
+    directory: &Path,
+) -> Result<(), InterpolationError> {
+    validate_directory_for(kind, directory)
+}
+
+pub fn prepare_runtime_cache(cache_root: &Path) -> Result<PathBuf, InterpolationError> {
+    let paths = Paths::new(cache_root)?;
+    reject_existing_ancestors(&paths.cache)?;
+    fs::create_dir_all(&paths.cache)
+        .map_err(|cause| io_error("Create native runtime cache", cause))?;
+    reject_links(&paths.cache)?;
+    Ok(paths.cache)
+}
+
+#[cfg(all(test, windows))]
+fn parse_manifest(bytes: &[u8]) -> Result<BTreeMap<String, (u64, String)>, InterpolationError> {
+    parse_manifest_for(ComponentKind::Rife, bytes)
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    fn native_package(root: &Path, kind: ComponentKind) -> (PathBuf, String) {
+        let path = root.join(format!("{}.zip", kind.id()));
+        let hash = format!("{:x}", Sha256::digest(b"fixture"));
+        let files = kind
+            .files()
+            .iter()
+            .map(|name| json!({"path": name, "bytes": 7, "sha256": hash}))
+            .collect::<Vec<_>>();
+        let manifest = json!({"schema": 1, "component": kind.id(), "version": "1", "platform": "windows-x64", "runtimeAbi": 1, "providerVersion": kind.runtime_version(), "files": files});
+        let mut archive = zip::ZipWriter::new(File::create(&path).unwrap());
+        archive
+            .start_file(MANIFEST, SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        for name in kind.files() {
+            archive
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"fixture").unwrap();
+        }
+        archive.finish().unwrap();
+        let sha = sha256(&path).unwrap();
+        (path, sha)
+    }
+
+    #[test]
+    fn native_components_are_isolated_and_reject_a_different_provider_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let vsr_cache = temp.path().join("rtx-video");
+        let vfg_cache = temp.path().join("nvidia-vfg");
+        let (vsr_zip, vsr_sha) = native_package(temp.path(), ComponentKind::RtxVideo);
+        let (vfg_zip, vfg_sha) = native_package(temp.path(), ComponentKind::NvidiaVfg);
+        assert!(queue_install(&vfg_cache, &vsr_zip, &vsr_sha).is_err());
+        assert!(
+            !status(&vfg_cache).unwrap()["restartRequired"]
+                .as_bool()
+                .unwrap()
+        );
+        queue_install(&vsr_cache, &vsr_zip, &vsr_sha).unwrap();
+        queue_install(&vfg_cache, &vfg_zip, &vfg_sha).unwrap();
+        let (vsr_root, vsr_lease) = startup(&vsr_cache).unwrap();
+        let (vfg_root, vfg_lease) = startup(&vfg_cache).unwrap();
+        assert!(vsr_root.join("nvngx_vsr.dll").is_file());
+        assert!(vfg_root.join("nvVFXVideoFrameGeneration.dll").is_file());
+        queue_uninstall(&vsr_cache).unwrap();
+        drop(vsr_lease);
+        let (_, lease) = startup(&vsr_cache).unwrap();
+        drop(lease);
+        assert!(!vsr_root.exists());
+        assert!(vfg_root.join("nvVFXVideoFrameGeneration.dll").is_file());
+        assert_eq!(status(&vfg_cache).unwrap()["pendingOperation"], Value::Null);
+        drop(vfg_lease);
+    }
+
+    #[test]
+    #[ignore = "requires locally packaged original NVIDIA components"]
+    fn real_native_packages_install_validate_and_uninstall_without_touching_user_components() {
+        let packages = PathBuf::from(
+            std::env::var_os("MEDIASTATION_VIDEO_COMPONENT_DIR")
+                .expect("local package directory required"),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        for kind in [
+            ComponentKind::RtxVideo,
+            ComponentKind::DlssNr,
+            ComponentKind::NvidiaVfg,
+        ] {
+            let cache = temp.path().join(kind.cache_name());
+            let archive = packages.join(kind.asset_name());
+            queue_install(&cache, &archive, &sha256(&archive).unwrap()).unwrap();
+            assert_eq!(status(&cache).unwrap()["pendingOperation"], "install");
+            let (active, lease) = startup(&cache).unwrap();
+            validate_component_directory(kind, &active).unwrap();
+            assert_eq!(status(&cache).unwrap()["installed"], true);
+            queue_uninstall(&cache).unwrap();
+            drop(lease);
+            let (_, lease) = startup(&cache).unwrap();
+            drop(lease);
+            assert!(!active.exists());
+        }
+    }
 
     fn package(root: &Path, bad_path: Option<&str>, bad_hash: bool) -> (PathBuf, String) {
         let archive = root.join("component.zip");

@@ -1009,14 +1009,17 @@ fn download_release_package_to(
 
 /// The optional component shares the app's trusted GitHub transport, configured
 /// download sources, bounded transfer, resume validation and checksum checks.
-pub(crate) fn download_rife_component(
+pub(crate) fn download_component(
+    kind: jfn_frame_interpolation::components::ComponentKind,
     directory: &Path,
     progress: impl Fn(u64, u64, &str),
 ) -> Result<(PathBuf, String), (&'static str, String)> {
     let component = || -> Result<(PathBuf, String), UpdateError> {
-        use jfn_frame_interpolation::component::{ASSET_NAME, MAX_PACKAGE_BYTES, RELEASE_TAG};
+        use jfn_frame_interpolation::component::MAX_PACKAGE_BYTES;
+        let release_tag = kind.release_tag();
+        let asset_name = kind.asset_name();
         let url = format!(
-            "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/tags/{RELEASE_TAG}"
+            "https://api.github.com/repos/timefunnel/MediaStationGo-Windows/releases/tags/{release_tag}"
         );
         let agent = github_agent(Duration::from_secs(45));
         let response = agent
@@ -1028,7 +1031,7 @@ pub(crate) fn download_rife_component(
         if response.status().as_u16() == 404 {
             return Err(UpdateError::new(
                 "frame_interpolation_component_not_published",
-                "插帧组件包尚未发布，暂时不能在线安装",
+                "组件包尚未发布，请使用经过校验的本地组件包",
             ));
         }
         if response.status().as_u16() != 200 {
@@ -1043,10 +1046,10 @@ pub(crate) fn download_rife_component(
             .limit(MAX_METADATA_BYTES)
             .read_to_string()
             .map_err(|error| UpdateError::new("component_metadata_invalid", error.to_string()))?;
-        let release = parse_rife_component_metadata(&text)?;
+        let release = parse_component_metadata(&text, kind)?;
         fs::create_dir_all(directory)
             .map_err(|error| UpdateError::new("component_directory_failed", error.to_string()))?;
-        let destination = directory.join(ASSET_NAME);
+        let destination = directory.join(asset_name);
         let metadata = match fs::symlink_metadata(&destination) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1127,11 +1130,16 @@ pub(crate) fn download_rife_component(
     component().map_err(|error| (error.code, error.message))
 }
 
-fn parse_rife_component_metadata(text: &str) -> Result<DownloadArtifact, UpdateError> {
-    use jfn_frame_interpolation::component::{ASSET_NAME, MAX_PACKAGE_BYTES, RELEASE_TAG};
+fn parse_component_metadata(
+    text: &str,
+    kind: jfn_frame_interpolation::components::ComponentKind,
+) -> Result<DownloadArtifact, UpdateError> {
+    use jfn_frame_interpolation::component::MAX_PACKAGE_BYTES;
+    let release_tag = kind.release_tag();
+    let asset_name = kind.asset_name();
     let payload: Value = serde_json::from_str(text)
         .map_err(|error| UpdateError::new("component_metadata_invalid", error.to_string()))?;
-    if payload["tag_name"] != RELEASE_TAG
+    if payload["tag_name"] != release_tag
         || payload["draft"] != false
         || payload["prerelease"] != true
     {
@@ -1145,7 +1153,7 @@ fn parse_rife_component_metadata(text: &str) -> Result<DownloadArtifact, UpdateE
         .ok_or_else(|| UpdateError::new("component_metadata_invalid", "组件文件列表缺失"))?;
     let matches = assets
         .iter()
-        .filter(|asset| asset["name"] == ASSET_NAME)
+        .filter(|asset| asset["name"] == asset_name)
         .collect::<Vec<_>>();
     if matches.len() != 1 {
         return Err(UpdateError::new(
@@ -1157,7 +1165,7 @@ fn parse_rife_component_metadata(text: &str) -> Result<DownloadArtifact, UpdateE
     let url = asset["browser_download_url"]
         .as_str()
         .ok_or_else(|| UpdateError::new("component_metadata_invalid", "组件下载地址缺失"))?;
-    validate_asset_url(url, RELEASE_TAG, ASSET_NAME)?;
+    validate_asset_url(url, release_tag, asset_name)?;
     let size = asset["size"]
         .as_u64()
         .filter(|size| *size > 0 && *size <= MAX_PACKAGE_BYTES)
@@ -1683,7 +1691,12 @@ mod tests {
     #[ignore = "read-only request to the fixed public GitHub component tag"]
     fn unpublished_component_is_reported_explicitly() {
         let temp = tempfile::tempdir().unwrap();
-        let failure = download_rife_component(temp.path(), |_, _, _| {}).unwrap_err();
+        let failure = download_component(
+            jfn_frame_interpolation::components::ComponentKind::Rife,
+            temp.path(),
+            |_, _, _| {},
+        )
+        .unwrap_err();
         assert_eq!(
             failure.0, "frame_interpolation_component_not_published",
             "{failure:?}"
@@ -1924,4 +1937,12 @@ mod tests {
         assert!(validate_content_range(Some("bytes 1024-4096/4096"), 1024, 4096).is_err());
         assert!(validate_content_range(None, 1024, 4096).is_err());
     }
+}
+
+#[cfg(test)]
+fn parse_rife_component_metadata(text: &str) -> Result<DownloadArtifact, UpdateError> {
+    parse_component_metadata(
+        text,
+        jfn_frame_interpolation::components::ComponentKind::Rife,
+    )
 }

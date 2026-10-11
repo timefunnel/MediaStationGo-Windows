@@ -322,8 +322,11 @@ fn dispatch_playback_event(event: &PlaybackEvent) {
 fn playback_event_payload(event: &PlaybackEvent) -> Value {
     let kind = playback_event_kind_label(event.kind);
     let error_code = (event.kind == PlaybackEventKind::Error
-        && event.error_message == RIFE_FILTER_INACTIVE)
-        .then_some(RIFE_FILTER_INACTIVE);
+        && matches!(
+            event.error_message.as_str(),
+            RIFE_FILTER_INACTIVE | VIDEO_FILTER_INACTIVE
+        ))
+    .then_some(event.error_message.as_str());
     json!({
         "kind": kind,
         "errorCode": error_code,
@@ -427,6 +430,7 @@ struct RuntimeState {
     active_image_request_ids: HashSet<String>,
     active_subtitle: Option<PreparedExternalSubtitle>,
     active_interpolation: Option<ActiveInterpolation>,
+    active_enhancements: Vec<ActiveEnhancement>,
     active_report: Option<ActivePlaybackReport>,
 }
 
@@ -437,6 +441,12 @@ struct ActiveInterpolation {
     missing_filter_samples: u8,
 }
 
+struct ActiveEnhancement {
+    label: &'static str,
+    seen: bool,
+    missing: u8,
+}
+const VIDEO_FILTER_INACTIVE: &str = "video_enhancement_filter_inactive";
 const RIFE_FILTER_INACTIVE: &str = "frame_interpolation_filter_inactive";
 const RIFE_FILTER_MISSING_SAMPLE_LIMIT: u8 = 3;
 
@@ -475,6 +485,7 @@ struct NativeLoadRequest<'a> {
     options: &'a JfnMpvLoadOptions,
     subtitle: Option<PreparedExternalSubtitle>,
     interpolation: Option<InterpolationPlan>,
+    enhancement: jfn_frame_interpolation::enhancement::Selection,
 }
 
 enum TrackSelection {
@@ -662,6 +673,7 @@ impl MediaStationRuntime {
                 active_image_request_ids: HashSet::new(),
                 active_subtitle: None,
                 active_interpolation: None,
+                active_enhancements: Vec::new(),
                 active_report: None,
             }),
         })
@@ -688,6 +700,7 @@ impl MediaStationRuntime {
                 state.session = Some(session);
                 state.active_subtitle = None;
                 state.active_interpolation = None;
+                state.active_enhancements.clear();
                 stopped
             } else {
                 None
@@ -711,6 +724,7 @@ impl MediaStationRuntime {
             state.session_profile = None;
             state.active_subtitle = None;
             state.active_interpolation = None;
+            state.active_enhancements.clear();
             (state.generation, stopped)
         };
         self.enqueue_report(stopped);
@@ -721,6 +735,7 @@ impl MediaStationRuntime {
         let mut state = self.state.lock();
         state.active_subtitle = None;
         state.active_interpolation = None;
+        state.active_enhancements.clear();
     }
 
     fn handle_playback_event(self: &Arc<Self>, event: &PlaybackEvent) {
@@ -742,6 +757,20 @@ impl MediaStationRuntime {
         }
         let filter_status = (event.kind == PlaybackEventKind::PositionChanged)
             .then(|| mpv_property_string(c"vf-metadata/rife/status"));
+        let enhancement_status = (event.kind == PlaybackEventKind::PositionChanged
+            && !event.snapshot.seeking)
+            .then(|| {
+                [
+                    (
+                        "enhance_vfg",
+                        mpv_property_string(c"vf-metadata/enhance_vfg/status"),
+                    ),
+                    (
+                        "enhance_vsr",
+                        mpv_property_string(c"vf-metadata/enhance_vsr/status"),
+                    ),
+                ]
+            });
         let mut dispatched_event = None;
         let (jobs, reconcile) = {
             let mut state = self.state.lock();
@@ -754,10 +783,24 @@ impl MediaStationRuntime {
                     )
                 })
             });
-            if filter_failed {
+            let enhancement_failed = enhancement_status.as_ref().is_some_and(|statuses| {
+                state.active_enhancements.iter_mut().any(|active| {
+                    let status = statuses
+                        .iter()
+                        .find(|(label, _)| *label == active.label)
+                        .and_then(|(_, status)| status.as_deref());
+                    interpolation_filter_failed(&mut active.seen, &mut active.missing, status)
+                })
+            });
+            if filter_failed || enhancement_failed {
                 let mut failure = event.clone();
                 failure.kind = PlaybackEventKind::Error;
-                failure.error_message = RIFE_FILTER_INACTIVE.to_string();
+                failure.error_message = if enhancement_failed {
+                    VIDEO_FILTER_INACTIVE
+                } else {
+                    RIFE_FILTER_INACTIVE
+                }
+                .to_string();
                 dispatched_event = Some(failure);
             }
             let effective_event = dispatched_event.as_ref().unwrap_or(event);
@@ -769,6 +812,7 @@ impl MediaStationRuntime {
             ) {
                 state.active_subtitle = None;
                 state.active_interpolation = None;
+                state.active_enhancements.clear();
             } else if effective_event.kind == PlaybackEventKind::Started
                 && let Some(active) = state.active_interpolation.as_ref()
             {
@@ -824,7 +868,7 @@ impl MediaStationRuntime {
             }
         }
         if let Some(failure) = dispatched_event.as_ref() {
-            log_error("RIFE native filter is missing or inactive; stopping playback");
+            log_error("Requested native video filter is missing or inactive; stopping playback");
             dispatch_playback_event(failure);
             jfn_mpv_stop();
         } else {
@@ -861,6 +905,7 @@ impl MediaStationRuntime {
             let mut state = self.state.lock();
             state.active_subtitle = None;
             state.active_interpolation = None;
+            state.active_enhancements.clear();
             take_stopped_report(&mut state)
         };
         self.enqueue_report(stopped);
@@ -1065,6 +1110,7 @@ impl MediaStationRuntime {
                 state.generation = state.generation.wrapping_add(1);
                 state.active_subtitle = None;
                 state.active_interpolation = None;
+                state.active_enhancements.clear();
                 stopped
             } else {
                 None
@@ -1097,6 +1143,7 @@ impl MediaStationRuntime {
             });
             state.active_subtitle = None;
             state.active_interpolation = None;
+            state.active_enhancements.clear();
             (session_status_payload(&state), stopped)
         };
         self.enqueue_report(stopped);
@@ -1175,6 +1222,7 @@ impl MediaStationRuntime {
             state.session_profile = None;
             state.active_subtitle = None;
             state.active_interpolation = None;
+            state.active_enhancements.clear();
             (active_deleted || account_deleted, stopped, removed_session)
         };
         self.enqueue_report(stopped);
@@ -1254,6 +1302,7 @@ impl MediaStationRuntime {
             });
             state.active_subtitle = None;
             state.active_interpolation = None;
+            state.active_enhancements.clear();
             (session_status_payload(&state), stopped)
         };
         self.enqueue_report(stopped);
@@ -1366,6 +1415,7 @@ impl MediaStationRuntime {
                 state.session_profile = None;
                 state.active_subtitle = None;
                 state.active_interpolation = None;
+                state.active_enhancements.clear();
                 stopped
             } else {
                 None
@@ -1521,6 +1571,7 @@ impl MediaStationRuntime {
                 });
                 state.active_subtitle = None;
                 state.active_interpolation = None;
+                state.active_enhancements.clear();
                 (session_status_payload(&state), stopped)
             } else {
                 (
@@ -1574,6 +1625,18 @@ impl MediaStationRuntime {
             ));
         }
         state.active_subtitle = load.subtitle;
+        state.active_enhancements = [
+            (load.enhancement.vfg, "enhance_vfg"),
+            (load.enhancement.vsr, "enhance_vsr"),
+        ]
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, label)| ActiveEnhancement {
+            label,
+            seen: false,
+            missing: 0,
+        })
+        .collect();
         state.active_interpolation = load.interpolation.map(|plan| ActiveInterpolation {
             media_id: load.media_id.to_string(),
             plan,
@@ -5018,6 +5081,12 @@ pub(crate) fn handle_frame_interpolation_message(
     }
     let operation = list_string(args, 1);
     let result = match operation.as_str() {
+        "video_components_status" => Ok(video_components_status_payload()),
+        "video_component_install"
+        | "video_component_import"
+        | "video_component_uninstall"
+        | "video_component_cancel"
+        | "video_component_restart" => video_component_operation(args, &operation),
         "frame_interpolation_status" => Ok(frame_interpolation_status_payload()),
         "frame_interpolation_component_install" => crate::business_interpolation::install()
             .map(|()| frame_interpolation_status_payload())
@@ -5048,7 +5117,9 @@ pub(crate) fn handle_frame_interpolation_message(
     match result {
         Ok(payload) => {
             dispatch_response(&layer, &request_id, &operation, true, payload);
-            if operation == "frame_interpolation_component_restart" {
+            if operation == "frame_interpolation_component_restart"
+                || operation == "video_component_restart"
+            {
                 jfn_playback::shutdown::jfn_shutdown_initiate();
             }
         }
@@ -5061,6 +5132,46 @@ pub(crate) fn handle_frame_interpolation_message(
         }
     }
     true
+}
+
+fn video_components_status_payload() -> Value {
+    use jfn_frame_interpolation::components::ComponentKind;
+    json!({"components": ComponentKind::ALL.into_iter().filter(|kind| *kind != ComponentKind::Rife).map(|kind| {
+        let mut status = crate::business_interpolation::status_for(kind);
+        status["id"] = json!(kind.id()); status["name"] = json!(kind.name());
+        status["runtime"] = jfn_frame_interpolation::enhancement::status(kind);
+        status
+    }).collect::<Vec<_>>()})
+}
+fn video_component_operation(args: &ListValue, operation: &str) -> Result<Value, LoadFailure> {
+    use jfn_frame_interpolation::components::ComponentKind;
+    if args.size() != 3 || args.get_type(2).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+        return Err(LoadFailure::new(
+            "component_request_invalid",
+            "A component identity is required",
+        ));
+    }
+    let kind = ComponentKind::parse(&list_string(args, 2))
+        .ok_or_else(|| LoadFailure::new("component_request_invalid", "Unknown component"))?;
+    match operation {
+        "video_component_install" => crate::business_interpolation::install_for(kind),
+        "video_component_import" => crate::business_interpolation::import_for(kind),
+        "video_component_uninstall" => crate::business_interpolation::uninstall_for(kind),
+        "video_component_cancel" => crate::business_interpolation::cancel_install_for(kind),
+        "video_component_restart" => crate::business_interpolation::restart_for(kind),
+        _ => {
+            return Err(LoadFailure::new(
+                "component_request_invalid",
+                "Unknown operation",
+            ));
+        }
+    }
+    .map_err(|(code, detail)| LoadFailure::dynamic(code, detail))?;
+    if operation == "video_component_restart" {
+        Ok(json!({"restarting": true}))
+    } else {
+        Ok(video_components_status_payload())
+    }
 }
 
 fn frame_interpolation_status_payload() -> Value {
@@ -5879,6 +5990,7 @@ struct LoadRequest {
     start_ms: u64,
     interpolation_mode: InterpolationMode,
     interpolation_model: InterpolationModel,
+    enhancement: jfn_frame_interpolation::enhancement::Selection,
     subtitle_font_size: f64,
     subtitle_position: f64,
     /// 用户选定的片源版本；为空表示沿用服务端偏好顺序中的第一个版本。
@@ -5934,7 +6046,38 @@ fn parse_request(args: Option<&ListValue>) -> Result<LoadRequest, (String, LoadF
         parse_subtitle_style(args).map_err(|failure| (request_id.clone(), failure))?;
     let media_source_id =
         parse_load_media_source_id(args).map_err(|failure| (request_id.clone(), failure))?;
+    let enhancement = if args.size() < 10 {
+        jfn_frame_interpolation::enhancement::Selection::default()
+    } else {
+        if args.get_type(9).as_ref() != &sys::cef_value_type_t::VTYPE_STRING {
+            return Err((
+                request_id,
+                LoadFailure::new(
+                    "video_enhancement_request_invalid",
+                    "Enhancement selection must be JSON",
+                ),
+            ));
+        }
+        jfn_frame_interpolation::enhancement::Selection::parse(&list_string(args, 9)).map_err(
+            |error| {
+                (
+                    request_id.clone(),
+                    LoadFailure::dynamic(error.code, error.detail),
+                )
+            },
+        )?
+    };
+    if enhancement.vfg && interpolation_mode != InterpolationMode::Off {
+        return Err((
+            request_id,
+            LoadFailure::new(
+                "video_enhancement_conflict",
+                "RIFE and VFG cannot run together",
+            ),
+        ));
+    }
     Ok(LoadRequest {
+        enhancement,
         request_id,
         media_id,
         preference_scope_id,
@@ -6150,7 +6293,10 @@ fn execute_load(
 ) -> Result<Value, LoadFailure> {
     runtime.ensure_generation(snapshot.generation)?;
     let active_media_id_before = runtime.active_playback_media_id(snapshot)?;
-    let runtime_metadata = if request.interpolation_mode == InterpolationMode::Off {
+    let runtime_metadata = if request.interpolation_mode == InterpolationMode::Off
+        && !request.enhancement.vsr
+        && !request.enhancement.vfg
+    {
         None
     } else if active_media_id_before.as_deref() == Some(request.media_id.as_str()) {
         jfn_mpv_get_property_node(c"track-list")
@@ -6196,6 +6342,31 @@ fn execute_load(
         audio_summary,
         source.subtitles.len()
     ));
+    if (request.enhancement.vsr || request.enhancement.vfg)
+        && let Some(video) = source.video.as_ref().or(runtime_video)
+    {
+        let inputs = interpolation_video_inputs(video, runtime_video);
+        let range = inputs
+            .dynamic_range
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let transfer = inputs
+            .color_transfer
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if range.starts_with("hdr")
+            || matches!(range.as_str(), "dv" | "dolbyvision" | "dolby vision")
+            || matches!(
+                transfer.as_str(),
+                "pq" | "smpte2084" | "hlg" | "arib-std-b67"
+            )
+        {
+            return Err(LoadFailure::new(
+                "video_enhancement_format_unsupported",
+                "RTX Video and VFG currently require SDR video",
+            ));
+        }
+    }
     let interpolation = frame_interpolation_plan(
         &source,
         request.interpolation_mode,
@@ -6333,26 +6504,39 @@ fn execute_load(
             "The system HTTP proxy URL contains an invalid byte",
         )
     })?;
-    let video_filter = interpolation
-        .as_ref()
-        .map(|plan| CString::new(plan.video_filter.as_str()))
-        .transpose()
-        .map_err(|_| {
-            LoadFailure::new(
-                "frame_interpolation_filter_invalid",
-                "The generated frame interpolation filter contains an invalid byte",
-            )
-        })?;
-    let interpolation_hwdec = interpolation
-        .as_ref()
-        .map(|plan| CString::new(plan.hwdec))
-        .transpose()
-        .map_err(|_| {
-            LoadFailure::new(
-                "frame_interpolation_hwdec_invalid",
-                "The generated frame interpolation decoder mode is invalid",
-            )
-        })?;
+    let filter = request
+        .enhancement
+        .filter(
+            interpolation
+                .as_ref()
+                .map(|plan| plan.video_filter.as_str()),
+        )
+        .map_err(|error| LoadFailure::dynamic(error.code, error.detail))?;
+    let video_filter = if filter.is_empty() {
+        None
+    } else {
+        Some(CString::new(filter))
+    }
+    .transpose()
+    .map_err(|_| {
+        LoadFailure::new(
+            "frame_interpolation_filter_invalid",
+            "The generated frame interpolation filter contains an invalid byte",
+        )
+    })?;
+    let interpolation_hwdec = if request.enhancement.vsr || request.enhancement.vfg {
+        Some("d3d11va")
+    } else {
+        interpolation.as_ref().map(|plan| plan.hwdec)
+    }
+    .map(CString::new)
+    .transpose()
+    .map_err(|_| {
+        LoadFailure::new(
+            "frame_interpolation_hwdec_invalid",
+            "The generated frame interpolation decoder mode is invalid",
+        )
+    })?;
     let options = JfnMpvLoadOptions {
         start_secs: request.start_ms as f64 / 1000.0,
         video_track: plan.video_track,
@@ -6389,6 +6573,7 @@ fn execute_load(
         options: &options,
         subtitle: prepared_subtitle,
         interpolation: interpolation.clone(),
+        enhancement: request.enhancement,
     })?;
 
     Ok(json!({
@@ -6427,6 +6612,8 @@ fn execute_load(
         "preferenceScopeId": request.preference_scope_id,
         "preferenceCorrection": correction_status,
         "preferenceCorrectionErrorCode": correction_error_code,
+        "mediaSourceId": source.media_source_id,
+        "videoEnhancement": request.enhancement.payload(),
         "frameInterpolation": interpolation.as_ref().map(frame_interpolation_payload),
     }))
 }
@@ -9061,6 +9248,7 @@ mod tests {
             active_image_request_ids: HashSet::new(),
             active_subtitle: None,
             active_interpolation: None,
+            active_enhancements: Vec::new(),
             active_report: None,
         };
         let preference = PlaybackTrackPreference {

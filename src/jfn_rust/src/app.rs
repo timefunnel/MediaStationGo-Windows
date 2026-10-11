@@ -575,6 +575,7 @@ pub fn jfn_app_main() -> c_int {
     #[cfg(target_os = "windows")]
     {
         let interpolation_cache = jfn_paths::cache_dir().join("frame-interpolation");
+        jfn_frame_interpolation::enhancement::initialize(&jfn_paths::cache_dir());
         let report = jfn_frame_interpolation::initialize(&interpolation_cache);
         if report.ready {
             tracing::info!(

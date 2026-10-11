@@ -23,6 +23,8 @@ $MpvInstallDir = Join-Path $RepoRoot "third_party\mpv-install"
 $MpvDir = Join-Path $RepoRoot "third_party\mpv"
 if (Test-Path (Join-Path $MpvInstallDir "lib\mpv.lib")) {
     $MpvInstallLibDir = Join-Path $MpvInstallDir "lib"
+    & (Join-Path $PSScriptRoot "build_video_enhancement.ps1")
+    Copy-Item -LiteralPath (Join-Path $BuildDir "video-enhancement\video_enhancement.dll") -Destination (Join-Path $MpvInstallLibDir "video_enhancement.dll") -Force
     & (Join-Path $PSScriptRoot "build_rife_runtime.ps1") `
         -OutputDir $RifeRuntimeBuildDir
     if ($LASTEXITCODE -ne 0) {

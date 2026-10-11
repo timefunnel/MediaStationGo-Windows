@@ -46,6 +46,11 @@ Copy-RequiredFile (Join-Path $RepoRoot "third_party\libplacebo-$LibplaceboCommit
 Copy-RequiredFile (Join-Path $RepoRoot "resources\win\licenses\CEF-LICENSE.txt") `
     (Join-Path $LicenseDir "CEF-LICENSE.txt")
 
+if (Test-Path -LiteralPath (Join-Path $OutputDir 'video_enhancement.dll') -PathType Leaf) {
+    Copy-RequiredFile (Join-Path $RepoRoot 'third_party\video-enhancement-deps\RTX-Video-SDK-1.1.0\NVIDIA_RTX_Video_SDK_License.pdf') `
+        (Join-Path $LicenseDir 'NVIDIA-RTX-Video-SDK-License.pdf')
+}
+
 $CefCredits = @(Get-ChildItem (Join-Path $RepoRoot ".cache\cef") -Recurse `
     -Filter "CREDITS.html" -File -ErrorAction SilentlyContinue)
 if ($CefCredits.Count -ne 1) {
@@ -81,6 +86,7 @@ $PinnedRuntimeNames = @(
     'avutil-60.dll', 'swresample-6.dll', 'swscale-9.dll', 'libmpv-2.dll',
     'libplacebo-364.dll', 'rife_runtime.dll', 'cudart64_12.dll',
     'tensorrt_rtx_1_4.dll', 'tensorrt_onnxparser_rtx_1_4.dll'
+    'video_enhancement.dll'
 )
 $MsysDllPaths = Get-ChildItem -LiteralPath $OutputDir -Filter "*.dll" -File |
     Where-Object {

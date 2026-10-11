@@ -16,7 +16,16 @@ TensorRT optimization profile 之间的边界。本文用于后续 Engine 设计
 播放器产物在其 `build` 目录。C 盘同名旧工作区仅作为本次本地提交迁入来源，
 不是本次播放器的输出目录；编译缓存目录与播放器成品目录分开。
 
-最近更新：2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
+最近更新：2026-10-11，分支 `codex/mediastation-windows-spike`。RIFE 安装管理已迁入
+独立“组件管理”，泛化安装事务复用原有校验、租约、取消与重启机制；RTX Video 和
+NVIDIA VFG 已接入原生 mpv 并通过 RTX 5070 Ti/596.49 的 SDK 与三条播放链路
+（精确跳转、EOF、输出尺寸）验证。134 项常规 Rust、JS 状态/重载回归、实包安装
+卸载和标准 Release 构建通过。RIFE ABI 8、三档模型和 profile 未变。新增处理限
+渐进 SDR，VFG 与 RIFE 互斥；DLSSNR 仅支持原版运行库管理，推理尚未完成，不能
+标记为播放可用。完整证据、来源、未验证边界见 [视频组件记录](windows-video-components.md)。
+本次仅本地实现与验证，未推送或发布；提交记录以 Git 历史为准。
+
+此前 2026-10-09，分支 `codex/mediastation-windows-spike`。基础组件拆分已本地
 提交为 `5d15687`；本轮处理提交审查发现的三个异常恢复问题：取消待安装、状态查询
 失败后继续跟踪任务、回收可确认归属的孤立暂存目录。126 项常规 Rust 单测、JS
 状态/故障注入、实包安装卸载/原生 ABI 和标准 Release 构建/启动检查通过。

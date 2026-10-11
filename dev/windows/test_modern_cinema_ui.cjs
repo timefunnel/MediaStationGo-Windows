@@ -142,11 +142,11 @@ function handlerSource(name) {
     return source.slice(start, start + 1 + next);
 }
 function node() {
-    return { children: [], classList: { remove() {} }, attrs: {},
+    return { children: [], classList: { remove() {}, add() {} }, attrs: {},
         append(...children) { this.children.push(...children); },
         setAttribute(key, value) { this.attrs[key] = value; } };
 }
-const settingsNode = node(); let settingsDestroyed = false;
+const settingsNode = node(); const componentsNode = node(); let settingsDestroyed = false;
 const contentNode = node(); contentNode.children.push(settingsNode);
 contentNode.contains = (item) => contentNode.children.includes(item);
 contentNode.replaceChildren = (...children) => {
@@ -159,7 +159,7 @@ const bodyNode = node(); bodyNode.append = (item) => {
 };
 const lifecycle = vm.createContext({
     content: contentNode, document: { body: bodyNode },
-    byId: () => settingsDestroyed ? null : settingsNode, element: node,
+    byId: (id) => id === 'components-page' ? componentsNode : settingsDestroyed ? null : settingsNode, element: node,
 });
 for (const name of ['parkSettings', 'replaceContent', 'renderLoading']) vm.runInContext(handlerSource(name), lifecycle);
 lifecycle.renderLoading();

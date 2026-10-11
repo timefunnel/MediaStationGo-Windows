@@ -1,6 +1,6 @@
-//! Optional RIFE component operations. Native runtime changes apply on startup.
+//! Optional video component operations. Native runtime changes apply on startup.
 
-use jfn_frame_interpolation::component;
+use jfn_frame_interpolation::{component, components::ComponentKind};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -19,16 +19,28 @@ struct OperationState {
 static STATE: LazyLock<Mutex<OperationState>> =
     LazyLock::new(|| Mutex::new(OperationState::default()));
 
-fn cache_root() -> PathBuf {
-    jfn_paths::cache_dir().join("frame-interpolation")
+static EXTRA_STATES: LazyLock<[Mutex<OperationState>; 3]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(OperationState::default())));
+static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn state_for(kind: ComponentKind) -> &'static Mutex<OperationState> {
+    match kind {
+        ComponentKind::Rife => &STATE,
+        ComponentKind::RtxVideo => &EXTRA_STATES[0],
+        ComponentKind::DlssNr => &EXTRA_STATES[1],
+        ComponentKind::NvidiaVfg => &EXTRA_STATES[2],
+    }
+}
+fn cache_root_for(kind: ComponentKind) -> PathBuf {
+    jfn_paths::cache_dir().join(kind.cache_name())
 }
 
-pub(crate) fn status() -> Value {
-    let state = STATE.lock();
-    match component::status(&cache_root()) {
+pub(crate) fn status_for(kind: ComponentKind) -> Value {
+    let state = state_for(kind).lock();
+    match component::status(&cache_root_for(kind)) {
         Ok(mut status) => {
             status["busy"] = json!(state.busy);
-            status["restarting"] = json!(state.restarting);
+            status["restarting"] =
+                json!(state.restarting || RESTARTING.load(std::sync::atomic::Ordering::Acquire));
             status["progress"] = json!(state.progress);
             status["error"] = state.error.as_ref().map_or(
                 Value::Null,
@@ -55,7 +67,7 @@ fn available(state: &OperationState) -> Result<(), Failure> {
             "组件正在下载或校验，请稍候".into(),
         ));
     }
-    if state.restarting {
+    if state.restarting || RESTARTING.load(std::sync::atomic::Ordering::Acquire) {
         return Err((
             "frame_interpolation_component_busy",
             "播放器正在退出并重新启动，请勿重复操作".into(),
@@ -64,9 +76,10 @@ fn available(state: &OperationState) -> Result<(), Failure> {
     Ok(())
 }
 
-fn prepare(state: &mut OperationState, install: bool) -> Result<(), Failure> {
+fn prepare(state: &mut OperationState, install: bool, kind: ComponentKind) -> Result<(), Failure> {
     available(state)?;
-    let status = component::status(&cache_root()).map_err(|error| (error.code, error.detail))?;
+    let status =
+        component::status(&cache_root_for(kind)).map_err(|error| (error.code, error.detail))?;
     if status["restartRequired"] == true {
         return Err((
             "frame_interpolation_component_busy",
@@ -89,18 +102,18 @@ fn prepare(state: &mut OperationState, install: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-pub(crate) fn install() -> Result<(), Failure> {
+pub(crate) fn install_for(kind: ComponentKind) -> Result<(), Failure> {
     {
-        let mut state = STATE.lock();
-        prepare(&mut state, true)?;
+        let mut state = state_for(kind).lock();
+        prepare(&mut state, true, kind)?;
         state.busy = true;
         state.progress = Some(json!({"phase": "checking"}));
     }
     let spawned = std::thread::Builder::new()
         .name("rife-component-install".into())
-        .spawn(|| {
-            let result = install_package();
-            let mut state = STATE.lock();
+        .spawn(move || {
+            let result = install_package(kind);
+            let mut state = state_for(kind).lock();
             state.busy = false;
             state.progress = None;
             state.error = result.err();
@@ -110,7 +123,7 @@ pub(crate) fn install() -> Result<(), Failure> {
             "frame_interpolation_component_install_failed",
             format!("无法启动组件安装任务：{error}"),
         );
-        let mut state = STATE.lock();
+        let mut state = state_for(kind).lock();
         state.busy = false;
         state.progress = None;
         state.error = Some(failure.clone());
@@ -119,47 +132,79 @@ pub(crate) fn install() -> Result<(), Failure> {
     Ok(())
 }
 
-fn install_package() -> Result<(), Failure> {
-    let _lease =
-        component::download_lease(&cache_root()).map_err(|error| (error.code, error.detail))?;
-    let directory =
-        component::download_directory(&cache_root()).map_err(|error| (error.code, error.detail))?;
-    let (archive, sha) = crate::business_update::download_rife_component(
+fn install_package(kind: ComponentKind) -> Result<(), Failure> {
+    let _lease = component::download_lease(&cache_root_for(kind))
+        .map_err(|error| (error.code, error.detail))?;
+    let directory = component::download_directory(&cache_root_for(kind))
+        .map_err(|error| (error.code, error.detail))?;
+    let (archive, sha) = crate::business_update::download_component(
+        kind,
         &directory,
         |downloaded, total, source| {
-            STATE.lock().progress = Some(
+            state_for(kind).lock().progress = Some(
                 json!({"phase": "downloading", "downloadedBytes": downloaded, "totalBytes": total, "source": source}),
             );
         },
     )?;
-    STATE.lock().progress = Some(json!({"phase": "verifying"}));
-    component::queue_install(&cache_root(), &archive, &sha)
+    state_for(kind).lock().progress = Some(json!({"phase": "verifying"}));
+    component::queue_install(&cache_root_for(kind), &archive, &sha)
         .map_err(|error| (error.code, error.detail))
 }
 
-pub(crate) fn uninstall() -> Result<(), Failure> {
-    let mut state = STATE.lock();
-    prepare(&mut state, false)?;
-    component::queue_uninstall(&cache_root()).map_err(|error| (error.code, error.detail))
+pub(crate) fn uninstall_for(kind: ComponentKind) -> Result<(), Failure> {
+    let mut state = state_for(kind).lock();
+    prepare(&mut state, false, kind)?;
+    component::queue_uninstall(&cache_root_for(kind)).map_err(|error| (error.code, error.detail))
 }
 
-pub(crate) fn cancel_install() -> Result<(), Failure> {
-    let mut state = STATE.lock();
+pub(crate) fn cancel_install_for(kind: ComponentKind) -> Result<(), Failure> {
+    let mut state = state_for(kind).lock();
     available(&state)?;
-    component::cancel_pending_install(&cache_root()).map_err(|error| (error.code, error.detail))?;
+    component::cancel_pending_install(&cache_root_for(kind))
+        .map_err(|error| (error.code, error.detail))?;
     state.error = None;
     state.progress = None;
     Ok(())
 }
 
-pub(crate) fn restart() -> Result<(), Failure> {
-    let mut state = STATE.lock();
-    available(&state)?;
-    let status = component::status(&cache_root()).map_err(|error| (error.code, error.detail))?;
-    require_pending_install(&status)?;
-    launch_restart_helper().map_err(|detail| ("frame_interpolation_restart_failed", detail))?;
-    state.restarting = true;
-    Ok(())
+pub(crate) fn restart_for(kind: ComponentKind) -> Result<(), Failure> {
+    available(&state_for(kind).lock())?;
+    RESTARTING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .map_err(|_| {
+            (
+                "frame_interpolation_component_busy",
+                "已有重启请求正在处理".into(),
+            )
+        })?;
+    let result = (|| {
+        // Reserve restart before inspecting any state, so a second component
+        // cannot start extracting while the helper waits for this process.
+        for component in ComponentKind::ALL {
+            if state_for(component).lock().busy {
+                return Err((
+                    "frame_interpolation_component_busy",
+                    "其他组件仍在下载、选择或校验，请完成后再重启".into(),
+                ));
+            }
+        }
+        let mut state = state_for(kind).lock();
+        let status =
+            component::status(&cache_root_for(kind)).map_err(|error| (error.code, error.detail))?;
+        require_pending_install(&status)?;
+        launch_restart_helper().map_err(|detail| ("frame_interpolation_restart_failed", detail))?;
+        state.restarting = true;
+        Ok(())
+    })();
+    if result.is_err() {
+        RESTARTING.store(false, std::sync::atomic::Ordering::Release);
+    }
+    result
 }
 
 fn require_pending_install(status: &Value) -> Result<(), Failure> {
@@ -244,6 +289,21 @@ fn launch_restart_helper() -> Result<(), String> {
     Err("自动重启只支持 Windows".into())
 }
 
+pub(crate) fn status() -> Value {
+    status_for(ComponentKind::Rife)
+}
+pub(crate) fn install() -> Result<(), Failure> {
+    install_for(ComponentKind::Rife)
+}
+pub(crate) fn uninstall() -> Result<(), Failure> {
+    uninstall_for(ComponentKind::Rife)
+}
+pub(crate) fn cancel_install() -> Result<(), Failure> {
+    cancel_install_for(ComponentKind::Rife)
+}
+pub(crate) fn restart() -> Result<(), Failure> {
+    restart_for(ComponentKind::Rife)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,4 +347,84 @@ mod tests {
             );
         }
     }
+}
+
+pub(crate) fn import_for(kind: ComponentKind) -> Result<(), Failure> {
+    {
+        let mut state = state_for(kind).lock();
+        prepare(&mut state, true, kind)?;
+        state.busy = true;
+        state.progress = Some(json!({"phase": "selecting"}));
+    }
+    let spawned = std::thread::Builder::new()
+        .name("video-component-import".into())
+        .spawn(move || {
+            let result = (|| {
+                let Some(archive) = select_package()? else {
+                    return Ok(());
+                };
+                state_for(kind).lock().progress = Some(json!({"phase": "verifying"}));
+                let sha =
+                    component::sha256(&archive).map_err(|error| (error.code, error.detail))?;
+                component::queue_install(&cache_root_for(kind), &archive, &sha)
+                    .map_err(|error| (error.code, error.detail))
+            })();
+            let mut state = state_for(kind).lock();
+            state.busy = false;
+            state.progress = None;
+            state.error = result.err();
+        });
+    if let Err(error) = spawned {
+        let mut state = state_for(kind).lock();
+        state.busy = false;
+        state.progress = None;
+        let failure = ("component_import_failed", error.to_string());
+        state.error = Some(failure.clone());
+        return Err(failure);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn select_package() -> Result<Option<PathBuf>, Failure> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetOpenFileNameW, OFN_DONTADDTORECENT, OFN_FILEMUSTEXIST,
+        OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut filename = vec![0_u16; 32768];
+    let filter: Vec<u16> = "组件安装包 (*.zip)\0*.zip\0\0".encode_utf16().collect();
+    let title: Vec<u16> = "选择 MediaStationGo 组件包\0".encode_utf16().collect();
+    let mut options: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    options.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    options.lpstrFile = filename.as_mut_ptr();
+    options.nMaxFile = filename.len() as u32;
+    options.lpstrFilter = filter.as_ptr();
+    options.lpstrTitle = title.as_ptr();
+    options.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if unsafe { GetOpenFileNameW(&mut options) } == 0 {
+        let code = unsafe { CommDlgExtendedError() };
+        return if code == 0 {
+            Ok(None)
+        } else {
+            Err((
+                "component_dialog_failed",
+                format!("无法选择组件包：0x{code:08x}"),
+            ))
+        };
+    }
+    use std::os::windows::ffi::OsStringExt as _;
+    let length = filename
+        .iter()
+        .position(|value| *value == 0)
+        .ok_or(("component_dialog_failed", "组件包路径无效".into()))?;
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &filename[..length],
+    ))))
+}
+#[cfg(not(windows))]
+fn select_package() -> Result<Option<PathBuf>, Failure> {
+    Err((
+        "component_platform_unsupported",
+        "组件只支持 Windows x64".into(),
+    ))
 }

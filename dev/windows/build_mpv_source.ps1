@@ -40,12 +40,18 @@ $NvofApiIncludeDir = Join-Path $RepoRoot "third_party\nvofapi\include"
 $RifeTensorRtVersion = "1.4.0.76"
 $NvofMemcPatchApplied = $false
 $NvofMemcSourceCreated = $false
+$NvVideoCreated = @()
+$NvVideoPatch = Join-Path $PSScriptRoot 'mpv\mpv-nvvideo.patch'
+$NvVideoPatchApplied = $false
 $RifeRuntimeHeaderCreated = $false
 
 function Get-MpvSourceContractHash {
     $Material = @(
         $PSCommandPath,
         $NvofMemcSource,
+        (Join-Path $PSScriptRoot "mpv\vf_nvvideo.c"),
+        (Join-Path $PSScriptRoot "mpv\video_enhancement.h"),
+        $NvVideoPatch,
         $NvofMemcPatch,
         $RifeRuntimeHeader,
         $FfmpegBuildScript,
@@ -296,6 +302,16 @@ if ((Test-Path $OutputLib) -and -not $Force) {
 }
 
 try {
+    foreach ($Name in @('vf_nvvideo.c', 'video_enhancement.h')) {
+        $Source = Join-Path $PSScriptRoot "mpv\$Name"
+        $Destination = Join-Path $MpvSourceDir "video\filter\$Name"
+        if (Test-Path -LiteralPath $Destination) {
+            if ((Get-FileHash -LiteralPath $Source).Hash -ne (Get-FileHash -LiteralPath $Destination).Hash) { throw "Existing mpv source differs: $Destination" }
+        } else {
+            Copy-Item -LiteralPath $Source -Destination $Destination
+            $NvVideoCreated += $Destination
+        }
+    }
     if (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $NvofMemcPatch) {
         & git -C $MpvSourceDir apply $NvofMemcPatch
         if ($LASTEXITCODE -ne 0) {
@@ -308,6 +324,13 @@ try {
         }
     }
 
+    if (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $NvVideoPatch) {
+        & git -C $MpvSourceDir apply $NvVideoPatch
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply native video filter patch' }
+        $NvVideoPatchApplied = $true
+    } elseif (-not (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $NvVideoPatch -Reverse)) {
+        throw 'The mpv source does not match the native video filter patch'
+    }
     if (Test-Path -LiteralPath $NvofMemcDestination) {
         $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofMemcSource).Hash
         $DestinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $NvofMemcDestination).Hash
@@ -657,6 +680,16 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
     Write-Host "  $($_.FullName.Substring($OutputDir.Length + 1))"
 }
 } finally {
+    if ($NvVideoPatchApplied) {
+        & git -C $MpvSourceDir apply --reverse $NvVideoPatch
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to restore native video source patch' }
+    }
+    foreach ($Path in $NvVideoCreated) {
+        $Absolute = [System.IO.Path]::GetFullPath($Path)
+        $Allowed = [System.IO.Path]::GetFullPath((Join-Path $MpvSourceDir 'video\filter')) + '\'
+        if (-not $Absolute.StartsWith($Allowed, [StringComparison]::OrdinalIgnoreCase)) { throw "Unexpected cleanup target: $Absolute" }
+        Remove-Item -LiteralPath $Absolute -Force
+    }
     if ($RifeRuntimeHeaderCreated -and (Test-Path -LiteralPath $RifeRuntimeHeaderDestination)) {
         Remove-Item -LiteralPath $RifeRuntimeHeaderDestination -Force
     }

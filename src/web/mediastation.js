@@ -1151,6 +1151,8 @@
             frame_interpolation_item_setting_invalid: '无法保存该影片的插帧设置',
             frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
             frame_interpolation_filter_inactive: 'RIFE 原生滤镜未生效',
+            video_enhancement_filter_inactive: '画面增强原生滤镜未生效，播放已停止；请检查组件、GPU 和媒体格式',
+            video_enhancement_format_unsupported: '新增画面增强组件暂只支持 SDR 视频',
         };
         return codes[error.code] || error.message || '请求失败';
     }
@@ -1700,6 +1702,7 @@
             case 'resume': renderResume(currentView.data); break;
             case 'favorites': renderFavorites(currentView.data); break;
             case 'settings': renderSettings(); break;
+            case 'components': renderComponents(); break;
             case 'libraries': renderLibraries(currentView.data); break;
             case 'library': renderLibrary(currentView.data); break;
             case 'detail': renderDetail(currentView.data); break;
@@ -1711,6 +1714,8 @@
     }
 
     function parkSettings() {
+        const components = byId('components-page');
+        if (content.contains(components)) { components.classList.add('hidden'); document.body.append(components); }
         const settings = byId('settings-drawer');
         if (content.contains(settings)) {
             settings.classList.remove('settings-page', 'open');
@@ -1751,7 +1756,7 @@
         updateSidebarLibraries(); const kind = currentView?.kind;
         byId('view-title').textContent = kind === 'library' ? currentView.data.library.title
             : kind === 'detail' ? cardTitle(currentView.data.item, true)
-            : ({ home: '首页', libraries: '媒体库', resume: '继续观看', favorites: '收藏', settings: '设置', search: '搜索', person: '演职人员',
+            : ({ home: '首页', libraries: '媒体库', resume: '继续观看', favorites: '收藏', settings: '设置', components: '组件管理', search: '搜索', person: '演职人员',
                 'library-loading': '媒体库', 'detail-loading': '作品详情' })[kind] || '你的媒体空间';
         byId('nav-home').classList.toggle('active', currentView?.kind === 'home');
         byId('nav-library').classList.toggle('active', ['libraries', 'library'].includes(currentView?.kind));
@@ -1759,6 +1764,7 @@
         byId('nav-favorites').classList.toggle('active', kind === 'favorites');
         byId('nav-resume-count').textContent = homeData?.resume?.length || '';
         byId('settings-open').classList.toggle('active', kind === 'settings');
+        byId('components-open').classList.toggle('active', kind === 'components');
     }
 
     function updateTopbarState() {
@@ -2030,9 +2036,11 @@
         interpolationEntry.dataset.componentInstalled = String(componentInstalled);
         interpolationEntry.dataset.componentReady = String(componentReady);
         interpolationEntry.classList.toggle('hidden', !componentInstalled);
+        if (typeof videoComponentStatuses !== 'undefined') refreshVideoEnhancementEntry();
         if (component.restarting) interpolationComponentRestarting = true;
         const blocked = interpolationComponentRestarting || component.supported === false || component.busy || component.restartRequired || typeof component.installed !== 'boolean';
         byId('settings-install-frame-interpolation').disabled = Boolean(blocked || component.installed);
+        byId('settings-import-frame-interpolation').disabled = Boolean(blocked || component.installed);
         byId('settings-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
         byId('settings-confirm-uninstall-frame-interpolation').disabled = Boolean(blocked || !component.installed);
         const pendingInstall = component.pendingOperation === 'install';
@@ -2062,7 +2070,7 @@
             label.dataset.state = 'error';
         } else if (component.busy) {
             const progress = component.progress || {};
-            label.textContent = progress.phase === 'downloading'
+            label.textContent = progress.phase === 'selecting' ? '请选择本地组件包...' : progress.phase === 'downloading'
                 ? `正在下载：${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${progress.source}`
                 : progress.phase === 'verifying' ? '正在校验并准备安装组件...' : '正在查询组件发行包...';
             label.dataset.state = 'pending';
@@ -4813,12 +4821,84 @@
         }).catch(() => {});
     }
 
+    const videoComponentStatuses = new Map();
+    let videoComponentsTimer = 0;
+    let videoComponentsTracking = false;
+    let videoComponentsRestarting = false;
+    function updateVideoComponents(payload) {
+        if (!Array.isArray(payload?.components)) throw new Error('组件状态列表缺失');
+        let busy = false;
+        for (const status of payload.components) {
+            if (!['rtx-video', 'dlssnr', 'nvidia-vfg'].includes(status.id)) throw new Error('组件身份无效');
+            videoComponentStatuses.set(status.id, status);
+            const card = document.querySelector(`[data-component-id="${status.id}"]`);
+            const label = byId(`component-${status.id}-status`);
+            const blocked = videoComponentsRestarting || status.restarting || status.busy || status.supported === false || typeof status.installed !== 'boolean';
+            card.querySelectorAll('[data-component-operation]').forEach((button) => {
+                const op = button.dataset.componentOperation;
+                button.disabled = Boolean(blocked || (['install', 'import'].includes(op) && (status.installed || status.restartRequired))
+                    || (op === 'uninstall' && (!status.installed || status.restartRequired))
+                    || (op === 'cancel' && status.pendingOperation !== 'install')
+                    || (op === 'restart' && (status.pendingOperation !== 'install' || status.error || status.runtime?.failureCode === 'frame_interpolation_component_invalid')));
+            });
+            card.querySelector('.component-pending').classList.toggle('hidden', status.pendingOperation !== 'install');
+            const runtime = status.runtime || {};
+            label.dataset.state = status.error || runtime.failureCode ? 'error' : status.busy || status.restartRequired ? 'pending' : 'ready';
+            label.textContent = status.busy ? (status.progress?.phase === 'selecting' ? '请选择本地组件包...' : status.progress?.phase === 'downloading'
+                ? `正在下载：${formatBytes(status.progress.downloadedBytes)} / ${formatBytes(status.progress.totalBytes)}` : '正在校验组件包...')
+                : status.error ? status.error.message : status.restartRequired ? (runtime.failureCode ? `启动时未能执行组件变更：${runtime.failureDetail}；待操作已保留。` : '组件变更已排队，退出所有实例并重新启动后生效。')
+                : runtime.failureCode ? runtime.failureDetail : !status.installed ? '未安装，可按需安装。'
+                : runtime.experimental ? `已安装运行库。${runtime.failureDetail}` : runtime.playbackAvailable ? '已安装；播放时验证 GPU 支持并运行原生处理。' : '已安装，原生播放桥不可用。';
+            busy ||= Boolean(status.busy);
+        }
+        videoComponentsTracking = busy;
+        window.clearTimeout(videoComponentsTimer); videoComponentsTimer = 0;
+        if (busy) scheduleVideoComponentsRefresh();
+        refreshVideoEnhancementEntry();
+    }
+    function scheduleVideoComponentsRefresh(delay = 1500) {
+        window.clearTimeout(videoComponentsTimer);
+        videoComponentsTimer = window.setTimeout(() => { videoComponentsTimer = 0; refreshVideoComponents(); }, delay);
+    }
+    async function refreshVideoComponents() {
+        try { updateVideoComponents(await nativeRequest('mediaStationFrameInterpolation', 'video_components_status', ['video_components_status'], 15000)); }
+        catch (error) {
+            for (const id of ['rtx-video', 'dlssnr', 'nvidia-vfg']) { const label = byId(`component-${id}-status`); label.textContent = `状态查询失败：${friendlyError(error)}`; label.dataset.state = 'error'; }
+            if (videoComponentsTracking) scheduleVideoComponentsRefresh(3000);
+        }
+    }
+    async function changeVideoComponent(id, operation) {
+        if (videoComponentsRestarting) return;
+        const label = byId(`component-${id}-status`);
+        try {
+            if (operation === 'restart') videoComponentsRestarting = true;
+            videoComponentsTracking = true;
+            const op = `video_component_${operation}`;
+            const result = await nativeRequest('mediaStationFrameInterpolation', op, [op, id], 15000);
+            if (operation === 'restart') {
+                if (result?.restarting !== true) throw new Error('重启助手未确认就绪');
+                label.textContent = '正在退出并重新启动播放器...';
+            } else updateVideoComponents(result);
+        } catch (error) {
+            videoComponentsRestarting = false; await refreshVideoComponents();
+            label.textContent = `组件操作失败：${friendlyError(error)}`; label.dataset.state = 'error';
+        }
+    }
+    function refreshVideoEnhancementEntry() {
+        const entry = byId('player-interpolation');
+        const installed = entry.dataset.componentInstalled === 'true' || [...videoComponentStatuses.values()].some((status) => status.installed === true && !status.runtime?.experimental);
+        entry.classList.toggle('hidden', !installed);
+        const ready = entry.dataset.componentReady === 'true' || [...videoComponentStatuses.values()].some((status) => status.runtime?.playbackAvailable === true);
+        entry.dataset.enhancementReady = String(ready);
+        refreshPlayerTools();
+    }
+
     function openSettings(trigger) {
         selectSettingsSection(activeSettingsSection);
         refreshProxySettings();
         if (session) {
             if (currentView?.kind !== 'settings') setCurrentView({ kind: 'settings', data: {} });
-            refreshFrameInterpolationStatus(); refreshUpdateControls();
+            refreshFrameInterpolationStatus(); refreshVideoComponents(); refreshUpdateControls();
             return;
         }
         openDrawer(byId('settings-drawer'), trigger);
@@ -4827,6 +4907,12 @@
             refreshFrameInterpolationStatus();
             refreshUpdateControls();
         }
+    }
+
+    function renderComponents() {
+        replaceContent();
+        const page = byId('components-page'); page.classList.remove('hidden'); content.append(page);
+        refreshFrameInterpolationStatus(); refreshVideoComponents();
     }
 
     function renderSettings() {
@@ -5750,7 +5836,7 @@
         if (player.started) showPlayerFeedback({ icon: player.playing ? 'play' : 'pause' }, 750);
     }
 
-    async function setFrameInterpolation(modelId) {
+    async function setFrameInterpolation(modelId, enhancement = player?.videoEnhancement || { vsr: false, vfg: false }) {
         const activePlayer = player;
         if (!activePlayer?.started || !activePlayer.loadInfo
             || activePlayer.interpolationChanging || activePlayer.exiting) return;
@@ -5761,10 +5847,11 @@
             return;
         }
         const requestedModel = modelId;
+        const requestedEnhancement = { vsr: enhancement.vsr === true, vfg: !modelId && enhancement.vfg === true };
         const activeModel = activePlayer.interpolationEnabled
             ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId)
             : null;
-        if (requestedModel === activeModel) {
+        if (requestedModel === activeModel && Boolean(activePlayer.videoEnhancement?.vsr) === requestedEnhancement.vsr && Boolean(activePlayer.videoEnhancement?.vfg) === requestedEnhancement.vfg) {
             closePlayerPanel(false);
             return;
         }
@@ -5803,10 +5890,13 @@
                     playbackPreferenceScope(activePlayer.card),
                     playerSubtitleStyle.fontSize,
                     playerSubtitlePosition(),
+                    activePlayer.loadInfo.mediaSourceId || '',
+                    JSON.stringify(requestedEnhancement),
                 ],
                 60000,
             );
             if (player !== activePlayer || activePlayer.exiting) return;
+            if (loadInfo.videoEnhancement?.vsr !== requestedEnhancement.vsr || loadInfo.videoEnhancement?.vfg !== requestedEnhancement.vfg) throw new Error('播放器返回的画面增强选择与请求不一致');
             const actualModel = loadInfo.frameInterpolation?.modelId || null;
             if (actualModel !== requestedModel) {
                 const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
@@ -5814,6 +5904,7 @@
                 throw error;
             }
             activePlayer.loadInfo = loadInfo;
+            activePlayer.videoEnhancement = loadInfo.videoEnhancement;
             applyPlayerPlaybackRate(playerPlaybackRate);
             if (activePlayer.interpolationChanging) {
                 setPlayerLoading(true, playerTransitionLoadingLabel(activePlayer));
@@ -6010,17 +6101,17 @@
         const interpolationModel = player?.interpolationChanging
             ? player.interpolationTargetModel
             : (player?.interpolationModel || info?.frameInterpolation?.modelId || null);
-        const interpolationInstalled = interpolation.dataset.componentInstalled === 'true';
-        const interpolationReady = interpolation.dataset.componentReady === 'true';
+        const interpolationInstalled = interpolation.dataset.componentInstalled === 'true' || [...videoComponentStatuses.values()].some((status) => status.installed === true && !status.runtime?.experimental);
+        const interpolationReady = interpolation.dataset.componentReady === 'true' || interpolation.dataset.enhancementReady === 'true';
         interpolation.classList.toggle('hidden', !interpolationInstalled);
         interpolation.disabled = !interpolationReady || exiting || episodeChanging || autoAdvancePending || trackChanging || !player?.started || !info || player.interpolationChanging;
         interpolation.title = player?.interpolationChanging
             ? playerTransitionLoadingLabel(player)
             : (!interpolationReady
-                ? 'RTX 插帧组件未就绪'
+                ? '画面增强组件未就绪'
                 : interpolationEnabled
                 ? `RTX 插帧：${interpolationModels[interpolationModel]?.label || '已开启'}`
-                : 'RTX 插帧');
+                : (player?.videoEnhancement?.vfg ? 'NVIDIA VFG 插帧' : player?.videoEnhancement?.vsr ? 'RTX Video 超分' : '画面增强'));
         interpolation.setAttribute('aria-label', interpolation.title);
         interpolation.setAttribute('aria-pressed', String(interpolationEnabled));
         infoButton.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info;
@@ -6419,7 +6510,7 @@
         }
 
         if (kind === 'interpolation') {
-            byId('player-panel-title').textContent = 'RTX 插帧';
+            byId('player-panel-title').textContent = '画面增强';
             const selectedModel = player.interpolationChanging
                 ? player.interpolationTargetModel
                 : (player.interpolationEnabled
@@ -6427,20 +6518,27 @@
                     : null);
             const group = element('div');
             group.append(createTrackOption({
-                title: '关闭',
-                meta: '',
-                selected: selectedModel === null,
-                onSelect: () => setFrameInterpolation(null),
+                title: '关闭插帧',
+                meta: '超分保持当前选择',
+                selected: selectedModel === null && !player.videoEnhancement?.vfg,
+                onSelect: () => setFrameInterpolation(null, { vsr: player.videoEnhancement?.vsr === true, vfg: false }),
             }));
             for (const [modelId, model] of Object.entries(interpolationModels)) {
-                group.append(createTrackOption({
-                    title: model.label,
-                    meta: model.name,
-                    selected: selectedModel === modelId,
-                    onSelect: () => setFrameInterpolation(modelId),
-                }));
+                const option = createTrackOption({ title: model.label, meta: model.name, selected: selectedModel === modelId, onSelect: () => setFrameInterpolation(modelId) });
+                option.disabled = byId('player-interpolation').dataset.componentReady !== 'true'; group.append(option);
             }
             playerPanelContent.append(group);
+            for (const [id, key, title, meta] of [['rtx-video', 'vsr', 'RTX Video 超分', 'SDR · 2 倍分辨率 · Ultra'], ['nvidia-vfg', 'vfg', 'NVIDIA VFG 插帧', 'SDR · 2 倍帧率 · Low']]) {
+                const ready = videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
+                const selected = player.videoEnhancement?.[key] === true;
+                const button = createTrackOption({ title, meta: ready ? meta : '请先在组件管理安装', selected, onSelect: () => {
+                    const next = { ...(player.videoEnhancement || { vsr: false, vfg: false }), [key]: !selected };
+                    const model = key === 'vfg' ? null : (player.interpolationEnabled ? player.interpolationModel : null);
+                    setFrameInterpolation(model, next);
+                } });
+                button.disabled = !ready || player.interpolationChanging; playerPanelContent.append(button);
+            }
+            playerPanelContent.append(element('p', 'player-panel-state', 'DLSSNR 推理接入尚未验证，暂不可选择。VFG 与 RIFE 互斥；HDR 暂不支持这些新增组件。'));
             return;
         }
 
@@ -6468,7 +6566,7 @@
         appendInfoRow(network.list, '解析', Number.isFinite(info.resolveMs) ? `${info.resolveMs} ms` : '-');
         appendInfoRow(network.list, '会话直链', info.reused ? '已复用' : '本次解析');
         appendInfoRow(network.list, '目标主机', infoValue(info.targetHost));
-        const interpolation = createInfoSection('RTX 插帧');
+        const interpolation = createInfoSection('画面增强');
         const activeInterpolation = info.frameInterpolation;
         const diagnostics = info.frameInterpolationDiagnostics || {};
         if (activeInterpolation) {
@@ -6478,8 +6576,10 @@
             appendInfoRow(interpolation.list, '精度 / Scale', `${activeInterpolation.precision} · ${activeInterpolation.scale}`);
             appendInfoRow(interpolation.list, '硬件解码', infoValue(diagnostics.hwdecCurrent || activeInterpolation.hwdec));
         } else {
-            appendInfoRow(interpolation.list, '状态', '关闭');
+            appendInfoRow(interpolation.list, 'RIFE 插帧', '关闭');
         }
+        appendInfoRow(interpolation.list, 'RTX Video 超分', player.videoEnhancement?.vsr ? '已选择 · SDR · 2 倍分辨率 · Ultra' : '关闭');
+        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', player.videoEnhancement?.vfg ? '已选择 · SDR · 2 倍帧率 · Low' : '关闭');
         appendInfoRow(interpolation.list, '容器 / VF / 显示', [
             diagnostics.containerFps,
             diagnostics.estimatedVfFps,
@@ -6706,6 +6806,8 @@
                     playbackPreferenceScope(episode),
                     playerSubtitleStyle.fontSize,
                     playerSubtitlePosition(),
+                    '',
+                    JSON.stringify(activePlayer.videoEnhancement || { vsr: false, vfg: false }),
                 ],
                 60000,
             );
@@ -7092,7 +7194,7 @@
         const button = byId(id); button.replaceChildren(playerIcon(icon));
         if (label) button.append(element('span', 'player-tool-label', label));
     }
-    [['player-interpolation', 'interpolation', 'RTX 插帧'], ['player-danmaku', 'danmaku', '弹幕'], ['player-info', 'info', '播放信息']].forEach(([id, icon, label]) => byId(id).replaceChildren(playerIcon(icon), element('span', 'player-tool-label', label)));
+    [['player-interpolation', 'interpolation', '画面增强'], ['player-danmaku', 'danmaku', '弹幕'], ['player-info', 'info', '播放信息']].forEach(([id, icon, label]) => byId(id).replaceChildren(playerIcon(icon), element('span', 'player-tool-label', label)));
     byId('topbar-search').addEventListener('submit', (event) => {
         event.preventDefault();
         const query = byId('search-open').value;
@@ -7103,6 +7205,27 @@
         openDrawer(byId('account-drawer'), event.currentTarget);
         loadSavedAccounts();
     });
+    document.querySelectorAll('[data-component-id]').forEach((card) => {
+        const id = card.dataset.componentId;
+        const confirmation = card.querySelector('.component-confirm');
+        card.querySelectorAll('[data-component-operation]').forEach((button) => button.addEventListener('click', () => {
+            const op = button.dataset.componentOperation;
+            if (['uninstall', 'restart'].includes(op)) {
+                confirmation.dataset.operation = op;
+                card.querySelector('.component-confirm-copy').textContent = op === 'restart' ? '将停止播放并重启以完成安装。请先关闭其他播放器实例。' : '下次启动时删除本组件和专属缓存；媒体和其他组件不受影响。';
+                confirmation.classList.remove('hidden'); card.querySelector('[data-component-confirm]').focus();
+            } else changeVideoComponent(id, op);
+        }));
+        card.querySelector('[data-component-confirm]').addEventListener('click', () => { const op = confirmation.dataset.operation; confirmation.classList.add('hidden'); changeVideoComponent(id, op); });
+        card.querySelector('[data-component-dismiss]').addEventListener('click', () => confirmation.classList.add('hidden'));
+    });
+    byId('settings-import-frame-interpolation').addEventListener('click', async () => {
+        interpolationComponentTracking = true;
+        try { await nativeRequest('mediaStationFrameInterpolation', 'video_component_import', ['video_component_import', 'rife'], 15000); }
+        catch (error) { showToast(friendlyError(error)); }
+        await refreshFrameInterpolationStatus();
+    });
+    byId('components-open').addEventListener('click', () => setCurrentView({ kind: 'components', data: {} }));
     byId('settings-open').addEventListener('click', (event) => {
         openSettings(event.currentTarget);
     });

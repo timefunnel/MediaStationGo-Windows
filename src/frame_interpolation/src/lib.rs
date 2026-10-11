@@ -23,6 +23,8 @@ const RIFE_PROFILE_OPT_WIDTH: u32 = 3_840;
 const RIFE_PROFILE_OPT_HEIGHT: u32 = 2_176;
 
 pub mod component;
+pub mod components;
+pub mod enhancement;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InterpolationMode {
