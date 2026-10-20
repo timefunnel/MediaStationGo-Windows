@@ -55,6 +55,7 @@ function Get-MpvSourceContractHash {
         $NvofMemcPatch,
         $RifeRuntimeHeader,
         $FfmpegBuildScript,
+        (Join-Path $FfmpegInstallDir "lib\mediastation-ffmpeg-source.sha256"),
         $LibplaceboBuildScript,
         $LibplaceboHdrPeakPatch
     ) | ForEach-Object {

@@ -20,6 +20,9 @@ $BuildDir = Join-Path $ThirdPartyDir "ffmpeg-build-$FfmpegCommit"
 $InstallDir = Join-Path $ThirdPartyDir "ffmpeg-install-$FfmpegCommit"
 $BuildStamp = Join-Path $InstallDir "lib\mediastation-ffmpeg-source.sha256"
 $CachedConfigHeader = Join-Path $InstallDir "lib\mediastation-ffmpeg-config.h"
+$TrueHdPatch = Join-Path $PSScriptRoot "ffmpeg\truehd-single-substream-layout.patch"
+$TrueHdTest = Join-Path $PSScriptRoot "test_ffmpeg_truehd.ps1"
+$TrueHdFixture = Join-Path $PSScriptRoot "ffmpeg\single-substream-5point1.thd.hex"
 
 if ($Arch -eq "arm64") {
     $MsysEnv = "CLANGARM64"
@@ -85,7 +88,7 @@ function Invoke-Msys2 {
     }
 }
 
-function Assert-FfmpegSource {
+function Initialize-PinnedFfmpegSource {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceDir "configure") -PathType Leaf)) {
         throw "Pinned FFmpeg source is incomplete: $SourceDir"
     }
@@ -93,9 +96,35 @@ function Assert-FfmpegSource {
     if ($LASTEXITCODE -ne 0 -or $ActualCommit -ne $FfmpegCommit) {
         throw "Pinned FFmpeg commit mismatch: expected=$FfmpegCommit actual=$ActualCommit"
     }
-    $Dirty = (& git -C $SourceDir status --porcelain) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $Dirty) {
-        throw "Pinned FFmpeg source must remain unmodified: $SourceDir"
+    $Untracked = (& git -C $SourceDir ls-files --others --exclude-standard) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $Untracked) {
+        throw "Unexpected untracked files in pinned FFmpeg source: $SourceDir"
+    }
+    $Diff = (& git -C $SourceDir diff --no-ext-diff --no-color --full-index HEAD --) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect pinned FFmpeg source"
+    }
+    $ExpectedDiff = (Get-Content -LiteralPath $TrueHdPatch -Raw).Replace("`r`n", "`n").TrimEnd("`n")
+    if (-not $Diff) {
+        & git -C $SourceDir apply --check $TrueHdPatch
+        if ($LASTEXITCODE -ne 0) { throw "The TrueHD layout patch does not apply to pinned FFmpeg" }
+        & git -C $SourceDir apply $TrueHdPatch
+        if ($LASTEXITCODE -ne 0) { throw "Failed to apply the TrueHD layout patch" }
+        $Diff = (& git -C $SourceDir diff --no-ext-diff --no-color --full-index HEAD --) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "Failed to verify the patched FFmpeg source" }
+    }
+    if ($Diff -ne $ExpectedDiff) {
+        throw "Pinned FFmpeg source differs from the tracked TrueHD layout patch: $SourceDir"
+    }
+}
+
+function Test-PinnedFfmpegTrueHd {
+    $PreviousPath = $env:PATH
+    try {
+        $env:PATH = (Join-Path $InstallDir "bin") + ";" + (Join-Path $MsysPath "$MsysEnv\bin") + ";" + $PreviousPath
+        & $TrueHdTest -FfmpegPath (Join-Path $InstallDir "bin\ffmpeg.exe")
+    } finally {
+        $env:PATH = $PreviousPath
     }
 }
 
@@ -148,7 +177,10 @@ if (-not (Test-Path -LiteralPath $MsysBash -PathType Leaf)) {
 $ContractMaterial = @(
     $FfmpegVersion,
     $FfmpegCommit,
-    (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(),
+    (Get-FileHash -LiteralPath $TrueHdPatch -Algorithm SHA256).Hash.ToLowerInvariant(),
+    (Get-FileHash -LiteralPath $TrueHdTest -Algorithm SHA256).Hash.ToLowerInvariant(),
+    (Get-FileHash -LiteralPath $TrueHdFixture -Algorithm SHA256).Hash.ToLowerInvariant()
 ) -join "`n"
 $Hasher = [System.Security.Cryptography.SHA256]::Create()
 try {
@@ -163,8 +195,9 @@ try {
 $StampMatches = (Test-Path -LiteralPath $BuildStamp -PathType Leaf) -and
     ((Get-Content -LiteralPath $BuildStamp -Raw).Trim() -eq $SourceContractHash)
 if (-not $Force -and $StampMatches) {
-    Assert-FfmpegSource
+    Initialize-PinnedFfmpegSource
     Assert-FfmpegInstall
+    Test-PinnedFfmpegTrueHd
     Sync-FfmpegLinkPrefix
     Write-Host "Pinned LGPL FFmpeg already built at $InstallDir" -ForegroundColor Green
     exit 0
@@ -194,7 +227,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $SourceDir ".git") -PathType Contain
         throw "Failed to clone pinned FFmpeg $FfmpegTag"
     }
 }
-Assert-FfmpegSource
+Initialize-PinnedFfmpegSource
 
 foreach ($Path in @($BuildDir, $InstallDir)) {
     Assert-ManagedPath -Path $Path -Root $ThirdPartyDir -Description "FFmpeg build output"
@@ -267,6 +300,8 @@ fi
 '$MsysLinkDir/bin/ffmpeg.exe' -hide_banner -decoders 2>&1 | grep -Eq '^[. ][A-Z.]{6} +vp9 '
 '$MsysLinkDir/bin/ffmpeg.exe' -hide_banner -decoders 2>&1 | grep -Eq '^[. ][A-Z.]{6} +aac '
 "@ -Description "Validating LGPL FFmpeg runtime capabilities"
+
+Test-PinnedFfmpegTrueHd
 
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($BuildStamp, $SourceContractHash, $Utf8NoBom)
