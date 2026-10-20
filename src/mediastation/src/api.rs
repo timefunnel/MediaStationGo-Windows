@@ -1281,25 +1281,8 @@ impl MediaStationApiClient {
             .append_pair("tag", &image.tag)
             .append_pair("maxWidth", &max_width.to_string())
             .append_pair("quality", "86");
-        let agent = self.agent_for_session(session)?;
-        let mut response = agent
-            .get(url.as_str())
-            .header(
-                HEADER_USER_AGENT,
-                self.user_agent_for_profile(session.connection),
-            )
-            .header(HEADER_EMBY_TOKEN, &session.token)
-            .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
-            .call()
-            .map_err(|error| transport_error(&url, error))?;
-        let status_code = response.status().as_u16();
-        if !(200..300).contains(&status_code) {
-            return Err(ApiError::HttpStatus {
-                url: redacted_url(&url),
-                status_code,
-                message: format!("HTTP {status_code}"),
-            });
-        }
+        let (url, mut response, _) =
+            self.get_resource_following_redirects(session, &url, "image_url")?;
         if response
             .headers()
             .get(HEADER_CONTENT_LENGTH)
@@ -1336,6 +1319,12 @@ impl MediaStationApiClient {
                     message: other.to_string(),
                 },
             })?;
+        if bytes.len() > maximum_bytes {
+            return Err(ApiError::ResponseTooLarge {
+                url: redacted_url(&url),
+                maximum_bytes,
+            });
+        }
         if bytes.is_empty() {
             return Err(ApiError::EmptyResponse {
                 url: redacted_url(&url),
@@ -1483,25 +1472,18 @@ impl MediaStationApiClient {
         parse_preference(&self.put_json(session, &url, &Value::Object(payload))?)
     }
 
-    pub fn download_external_subtitle(
+    fn get_resource_following_redirects(
         &self,
         session: &MediaStationSession,
         url: &Url,
-        maximum_bytes: usize,
-    ) -> Result<ExternalSubtitleDownload, ApiError> {
-        if maximum_bytes == 0 {
-            return Err(ApiError::InvalidInput {
-                field: "maximum_bytes",
-                reason: "must be greater than zero".to_string(),
-            });
-        }
-        validate_http_url("subtitle_url", url)?;
-
+        field: &'static str,
+    ) -> Result<(Url, ureq::http::Response<ureq::Body>, usize), ApiError> {
+        validate_http_url(field, url)?;
         let mut current = url.clone();
         let mut redirect_count = 0;
         let agent = self.agent_for_session(session)?;
         loop {
-            reject_cross_origin_private_query(session, &current)?;
+            reject_cross_origin_private_query(session, &current, field)?;
             let mut request = agent.get(current.as_str()).header(
                 HEADER_USER_AGENT,
                 self.user_agent_for_profile(session.connection),
@@ -1511,7 +1493,7 @@ impl MediaStationApiClient {
                     .header(HEADER_EMBY_TOKEN, &session.token)
                     .header(HEADER_EMBY_AUTHORIZATION, &session.authorization);
             }
-            let mut response = request
+            let response = request
                 .call()
                 .map_err(|error| transport_error(&current, error))?;
             let status_code = response.status().as_u16();
@@ -1533,22 +1515,7 @@ impl MediaStationApiClient {
                         url: redacted_url(&current),
                         message: error.to_string(),
                     })?;
-                let next =
-                    current
-                        .join(location)
-                        .map_err(|error| ApiError::RedirectLocationInvalid {
-                            url: redacted_url(&current),
-                            message: error.to_string(),
-                        })?;
-                validate_http_url("subtitle_url", &next)?;
-                if current.scheme() == "https" && next.scheme() != "https" {
-                    return Err(ApiError::RedirectSecurityDowngrade {
-                        from: redacted_url(&current),
-                        to: redacted_url(&next),
-                    });
-                }
-                reject_cross_origin_private_query(session, &next)?;
-                current = next;
+                current = resolve_resource_redirect(session, &current, location, field)?;
                 redirect_count += 1;
                 continue;
             }
@@ -1560,57 +1527,74 @@ impl MediaStationApiClient {
                 });
             }
 
-            if response
-                .headers()
-                .get(HEADER_CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length > maximum_bytes as u64)
-            {
-                return Err(ApiError::ResponseTooLarge {
-                    url: redacted_url(&current),
-                    maximum_bytes,
-                });
-            }
-            let content_type = response
-                .headers()
-                .get(HEADER_CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let read_limit = maximum_bytes.saturating_add(1);
-            let bytes = response
-                .body_mut()
-                .with_config()
-                .limit(read_limit as u64)
-                .read_to_vec()
-                .map_err(|error| match error {
-                    ureq::Error::BodyExceedsLimit(_) => ApiError::ResponseTooLarge {
-                        url: redacted_url(&current),
-                        maximum_bytes,
-                    },
-                    other => ApiError::Transport {
-                        url: redacted_url(&current),
-                        message: other.to_string(),
-                    },
-                })?;
-            if bytes.len() > maximum_bytes {
-                return Err(ApiError::ResponseTooLarge {
-                    url: redacted_url(&current),
-                    maximum_bytes,
-                });
-            }
-            if bytes.is_empty() {
-                return Err(ApiError::EmptyResponse {
-                    url: redacted_url(&current),
-                });
-            }
-            return Ok(ExternalSubtitleDownload {
-                bytes,
-                content_type,
-                redirect_count,
-                target_host: current.host_str().unwrap_or_default().to_string(),
+            return Ok((current, response, redirect_count));
+        }
+    }
+
+    pub fn download_external_subtitle(
+        &self,
+        session: &MediaStationSession,
+        url: &Url,
+        maximum_bytes: usize,
+    ) -> Result<ExternalSubtitleDownload, ApiError> {
+        if maximum_bytes == 0 {
+            return Err(ApiError::InvalidInput {
+                field: "maximum_bytes",
+                reason: "must be greater than zero".to_string(),
             });
         }
+        let (current, mut response, redirect_count) =
+            self.get_resource_following_redirects(session, url, "subtitle_url")?;
+        if response
+            .headers()
+            .get(HEADER_CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(ApiError::ResponseTooLarge {
+                url: redacted_url(&current),
+                maximum_bytes,
+            });
+        }
+        let content_type = response
+            .headers()
+            .get(HEADER_CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let read_limit = maximum_bytes.saturating_add(1);
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(read_limit as u64)
+            .read_to_vec()
+            .map_err(|error| match error {
+                ureq::Error::BodyExceedsLimit(_) => ApiError::ResponseTooLarge {
+                    url: redacted_url(&current),
+                    maximum_bytes,
+                },
+                other => ApiError::Transport {
+                    url: redacted_url(&current),
+                    message: other.to_string(),
+                },
+            })?;
+        if bytes.len() > maximum_bytes {
+            return Err(ApiError::ResponseTooLarge {
+                url: redacted_url(&current),
+                maximum_bytes,
+            });
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::EmptyResponse {
+                url: redacted_url(&current),
+            });
+        }
+        Ok(ExternalSubtitleDownload {
+            bytes,
+            content_type,
+            redirect_count,
+            target_host: current.host_str().unwrap_or_default().to_string(),
+        })
     }
 
     fn report_event(
@@ -3033,6 +3017,7 @@ fn is_credential_query_name(name: &str) -> bool {
 fn reject_cross_origin_private_query(
     session: &MediaStationSession,
     url: &Url,
+    field: &'static str,
 ) -> Result<(), ApiError> {
     if !same_origin(&session.base_url, url)
         && url
@@ -3040,11 +3025,34 @@ fn reject_cross_origin_private_query(
             .any(|(name, _)| is_credential_query_name(&name))
     {
         return Err(ApiError::InvalidInput {
-            field: "subtitle_url",
+            field,
             reason: "cross-origin credential query parameters are prohibited".to_string(),
         });
     }
     Ok(())
+}
+
+fn resolve_resource_redirect(
+    session: &MediaStationSession,
+    current: &Url,
+    location: &str,
+    field: &'static str,
+) -> Result<Url, ApiError> {
+    let next = current
+        .join(location)
+        .map_err(|error| ApiError::RedirectLocationInvalid {
+            url: redacted_url(current),
+            message: error.to_string(),
+        })?;
+    validate_http_url(field, &next)?;
+    if current.scheme() == "https" && next.scheme() != "https" {
+        return Err(ApiError::RedirectSecurityDowngrade {
+            from: redacted_url(current),
+            to: redacted_url(&next),
+        });
+    }
+    reject_cross_origin_private_query(session, &next, field)?;
+    Ok(next)
 }
 
 fn is_redirect(status_code: u16) -> bool {
@@ -4090,6 +4098,215 @@ mod tests {
         assert!(request_lower.contains("x-emby-token: secret-token"));
         assert_eq!(downloaded.bytes, image_bytes);
         assert_eq!(downloaded.content_type, "image/jpeg");
+    }
+
+    #[test]
+    fn image_download_follows_cross_origin_redirect_without_server_credentials() {
+        let image_bytes = b"cdn-jpeg";
+        let (target_url, target_server) = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            image_bytes.len(),
+            String::from_utf8_lossy(image_bytes)
+        ));
+        let (base_url, server) = serve_once(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}poster.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+        let image = MediaImageRef {
+            item_id: "item-1".to_string(),
+            image_type: MediaImageType::Primary,
+            image_index: None,
+            tag: "image-tag".to_string(),
+        };
+
+        let downloaded = client
+            .download_media_image(&session(base_url), &image, 360, 1024)
+            .expect("redirected image should download");
+        let server_request = server
+            .join()
+            .expect("server thread should finish")
+            .to_ascii_lowercase();
+        let target_request = target_server
+            .join()
+            .expect("CDN thread should finish")
+            .to_ascii_lowercase();
+
+        assert_eq!(downloaded.bytes, image_bytes);
+        assert_eq!(downloaded.content_type, "image/jpeg");
+        assert!(server_request.starts_with("get /items/item-1/images/primary?"));
+        assert!(server_request.contains("x-emby-token: secret-token"));
+        assert!(server_request.contains("x-emby-authorization:"));
+        assert!(target_request.starts_with("get /poster.jpg http/1.1"));
+        assert!(target_request.contains("user-agent: mediastationwindows/0.1"));
+        assert!(!target_request.contains("x-emby-token:"));
+        assert!(!target_request.contains("x-emby-authorization:"));
+        assert!(!target_request.contains("secret-token"));
+    }
+
+    fn primary_image() -> MediaImageRef {
+        MediaImageRef {
+            item_id: "item-1".to_string(),
+            image_type: MediaImageType::Primary,
+            image_index: None,
+            tag: "image-tag".to_string(),
+        }
+    }
+
+    #[test]
+    fn image_download_follows_relative_redirects_with_same_origin_auth() {
+        let mut responses = [301, 302, 303, 307, 308]
+            .iter()
+            .map(|status| format!(
+                "HTTP/1.1 {status} Redirect\r\nLocation: /poster.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .collect::<Vec<_>>();
+        responses.push("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\npng".to_string());
+        let (base_url, server) = serve_sequence(responses);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let downloaded = client
+            .download_media_image(&session(base_url), &primary_image(), 360, 1024)
+            .expect("same-origin redirects should download");
+        let requests = server.join().expect("server thread should finish");
+
+        assert_eq!(downloaded.bytes, b"png");
+        assert_eq!(downloaded.content_type, "image/png");
+        assert_eq!(requests.len(), 6);
+        for request in &requests {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("x-emby-token: secret-token"));
+            assert!(request.contains("x-emby-authorization:"));
+        }
+        assert!(requests[5].starts_with("GET /poster.jpg HTTP/1.1"));
+    }
+
+    #[test]
+    fn image_download_limits_redirect_loops() {
+        let responses = vec![
+            "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+            MAX_EXTERNAL_RESOURCE_REDIRECTS + 1
+        ];
+        let (base_url, server) = serve_sequence(responses);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let error = client
+            .download_media_image(&session(base_url), &primary_image(), 360, 1024)
+            .expect_err("redirect loop should fail");
+        let requests = server.join().expect("server thread should finish");
+
+        assert!(matches!(error, ApiError::RedirectLimitExceeded { .. }));
+        assert_eq!(requests.len(), MAX_EXTERNAL_RESOURCE_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn image_download_rejects_invalid_redirect_targets() {
+        for (location, expected) in [
+            (None, "missing"),
+            (Some("http://["), "invalid"),
+            (Some("file:///poster.jpg"), "scheme"),
+            (
+                Some("https://user:password@cdn.example/poster.jpg"),
+                "credentials",
+            ),
+            (
+                Some("https://cdn.example/poster.jpg?api_key=secret-token"),
+                "query",
+            ),
+        ] {
+            let location = location
+                .map(|location| format!("Location: {location}\r\n"))
+                .unwrap_or_default();
+            let (base_url, server) = serve_once(format!(
+                "HTTP/1.1 302 Found\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ));
+            let client = MediaStationApiClient::new("MediaStationWindows/0.1")
+                .expect("client should be valid");
+
+            let error = client
+                .download_media_image(&session(base_url), &primary_image(), 360, 1024)
+                .expect_err("invalid redirect should fail");
+            server.join().expect("server thread should finish");
+
+            let actual = match error {
+                ApiError::RedirectMissingLocation { .. } => "missing",
+                ApiError::RedirectLocationInvalid { .. } => "invalid",
+                ApiError::UnsupportedScheme {
+                    field: "image_url", ..
+                } => "scheme",
+                ApiError::EmbeddedCredentials { field: "image_url" } => "credentials",
+                ApiError::InvalidInput {
+                    field: "image_url", ..
+                } => "query",
+                other => panic!("unexpected redirect failure: {other}"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn image_redirect_rejects_https_downgrade() {
+        let current = Url::parse("https://media.example/Items/item-1/Images/Primary")
+            .expect("image URL should parse");
+        let session = session(current.clone());
+
+        let error = resolve_resource_redirect(
+            &session,
+            &current,
+            "http://cdn.example/poster.jpg",
+            "image_url",
+        )
+        .expect_err("HTTPS downgrade should fail");
+
+        assert!(matches!(error, ApiError::RedirectSecurityDowngrade { .. }));
+    }
+
+    #[test]
+    fn image_download_rejects_oversized_redirected_body_without_content_length() {
+        let (base_url, server) = serve_sequence(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /poster.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\nhello".to_string(),
+        ]);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let error = client
+            .download_media_image(&session(base_url), &primary_image(), 360, 4)
+            .expect_err("oversized redirected image should fail");
+        server.join().expect("server thread should finish");
+
+        assert!(matches!(
+            error,
+            ApiError::ResponseTooLarge {
+                maximum_bytes: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn image_download_preserves_redirect_target_http_failure() {
+        let (base_url, server) = serve_sequence(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /missing.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ]);
+        let client =
+            MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
+
+        let error = client
+            .download_media_image(&session(base_url), &primary_image(), 360, 1024)
+            .expect_err("missing redirected image should fail");
+        server.join().expect("server thread should finish");
+
+        assert!(matches!(
+            error,
+            ApiError::HttpStatus {
+                status_code: 404,
+                ..
+            }
+        ));
     }
 
     #[test]
