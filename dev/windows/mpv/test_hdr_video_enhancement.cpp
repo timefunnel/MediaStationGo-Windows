@@ -108,7 +108,7 @@ int wmain(int argc,wchar_t **argv) {
         if(!adapter)throw std::runtime_error("NVIDIA adapter unavailable");
         ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
         HdrPipeline::hr(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context),"test D3D11");
-        nvvideo_config c{4,2,W,H,W,H,device.Get(),context.Get(),argv[2],argv[3],4,0,2,1,1,0,0,.7f,.6f,.8f,1.f,1080,1,0,0};
+        nvvideo_config c{NVVIDEO_ABI,2,W,H,W,H,device.Get(),context.Get(),argv[2],argv[3],4,0,2,1,1,0,0,.7f,.6f,.8f,1.f,1080,1,0,0};
         for(unsigned transfer:{NVVIDEO_PQ,NVVIDEO_HLG})for(unsigned range=0;range<2;range++)for(unsigned chroma=0;chroma<6;chroma++) {
             c.transfer=transfer;c.full_range=range;c.chroma_location=chroma;auto data=pixels(range!=0,0,transfer);auto input=texture(device.Get(),W,H,&data);
             for(bool packed:{false,true}) {
@@ -139,6 +139,17 @@ int wmain(int argc,wchar_t **argv) {
             auto *s=nvvideo_create(&c,detail,sizeof(detail));if(!s)throw std::runtime_error(detail);
             bool ok=true;for(unsigned i=0;i<6;i++)if(!nvvideo_process(s,first.Get(),second.Get(),output.Get(),1,detail,sizeof(detail))){ok=false;break;}
             nvvideo_destroy(s);if(!ok)throw std::runtime_error(detail);
+            if(mode==2) {
+                c.multiplier=0;s=nvvideo_create(&c,detail,sizeof(detail));if(!s)throw std::runtime_error(detail);
+                std::vector<uint16_t> early;
+                for(unsigned i=0;i<6;i++) {
+                    if(!nvvideo_process_timestep(s,first.Get(),second.Get(),output.Get(),i%2+1,i%2?.7f:.3f,detail,sizeof(detail)))throw std::runtime_error(detail);
+                    if(i==0)early=read(device.Get(),context.Get(),output.Get());
+                }
+                auto late=read(device.Get(),context.Get(),output.Get());nvvideo_destroy(s);c.multiplier=2;
+                if(early==late||!std::all_of(late.begin(),late.end(),[](uint16_t v){return !(v&63);}))throw std::runtime_error("HDR VFG timestep/10-bit acceptance failed");
+                std::printf("HDR_VFG_TIMESTEP_OK transfer=%u distinct-t=0.3/0.7 P010\n",transfer);
+            }
             auto result=read(device.Get(),context.Get(),output.Get());unsigned error=gray_error(b,result,scale);
             unsigned protected_error=0;
             for(unsigned bar:{0u,5u})protected_error=(std::max)(protected_error,static_cast<unsigned>(std::abs(int(b[80*W+bar*80+40]>>6)-int(result[80*scale*W*scale+(bar*80+40)*scale]>>6))));

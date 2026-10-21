@@ -300,6 +300,7 @@ fn decodes_first_live_video_frame_through_native_load_path() {
             .map_or(c"".as_ptr(), |value| value.as_ptr()),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
+        vfg_display_sync: false,
         subtitle_style_override: false,
         subtitle_font_size: 0.0,
         subtitle_position: 100.0,

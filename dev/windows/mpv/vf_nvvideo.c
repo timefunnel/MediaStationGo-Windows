@@ -19,9 +19,10 @@
 #include "video/hwdec.h"
 #include "video/d3d.h"
 #include "video_enhancement.h"
+#include "vfg_timing.h"
 
 struct opts {
-    int mode, quality, target_height, multiplier, scene_detection, nr_style, nr_target, nr_auto_mask, nr_ui_correction;
+    int mode, quality, target_height, multiplier, display_divisor, scene_detection, nr_style, nr_target, nr_auto_mask, nr_ui_correction;
     float nr_intensity, nr_tone, nr_structure, nr_skin;
     char *bridge, *runtime, *cache;
 };
@@ -31,15 +32,22 @@ struct priv {
     struct nvvideo_session *session;
     struct nvvideo_session *(__cdecl *create)(const struct nvvideo_config *, char *, size_t);
     int (__cdecl *process)(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, char *, size_t);
+    int (__cdecl *process_timestep)(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, float, char *, size_t);
     void (__cdecl *destroy_session)(struct nvvideo_session *);
     ID3D11Device *device;
     ID3D11DeviceContext *context;
     ID3D11Texture2D *previous;
-    struct mp_image *pending[8];
-    int pending_count, pending_index, out_width, out_height;
+    ID3D11Texture2D *current, *result;
+    struct mp_image *previous_image, *current_image;
+    int next_index, out_width, out_height;
     AVBufferRef *hw_pool;
     struct mp_image_params params;
     double previous_pts;
+    struct vfg_plan timing;
+    struct vfg_clock clock;
+    double source_end_pts, last_output_pts, output_end_pts, max_timing_error_ms;
+    uint64_t output_frames;
+    bool draining;
     uint64_t sdk_frames, input_frames, resets;
     uint64_t session_frames;
     double process_ms, max_process_ms;
@@ -57,8 +65,15 @@ static wchar_t *utf8_to_wide(void *parent, const char *value) {
 
 static void reset(struct mp_filter *f) {
     struct priv *p = f->priv;
-    for (int i = 0; i < 8; i++) TA_FREEP(&p->pending[i]);
-    p->pending_count = p->pending_index = 0;
+    TA_FREEP(&p->previous_image);
+    TA_FREEP(&p->current_image);
+    if (p->current) ID3D11Texture2D_Release(p->current);
+    if (p->result) ID3D11Texture2D_Release(p->result);
+    p->current = p->result = NULL;
+    p->next_index = 1;
+    p->draining = false;
+    p->clock = (struct vfg_clock){0};
+    p->last_output_pts = MP_NOPTS_VALUE;
     if (p->previous) ID3D11Texture2D_Release(p->previous);
     p->previous = NULL;
     if (p->session) p->destroy_session(p->session);
@@ -97,6 +112,19 @@ static struct mp_image *output_frame(struct mp_filter *f, struct mp_image *input
     if (output) { mp_image_copy_attributes(output, input); output->params.crop = (struct mp_rect){0, 0, p->out_width, p->out_height}; }
     return output;
 }
+static struct mp_image *copy_original(struct mp_filter *f, struct mp_image *input) {
+    struct priv *p = f->priv;
+    /* Referring directly to the decoder/converter frame would alternate its
+     * AVHWFramesContext with our generated frames. d3d11vpp reinitializes on
+     * every pool change, so originals use the same output pool as SDK frames. */
+    struct mp_image *output = output_frame(f, input);
+    if (!output) { fail(f, "Cannot allocate an original VFG output frame"); return NULL; }
+    D3D11_BOX box = {0, 0, 0, input->w, input->h, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(p->context, (void *)output->planes[0],
+        (UINT)(uintptr_t)output->planes[1], 0, 0, 0, (void *)input->planes[0],
+        (UINT)(uintptr_t)input->planes[1], &box);
+    return output;
+}
 static bool initialize(struct mp_filter *f, struct mp_image *input) {
     struct priv *p = f->priv;
     if (!p->module) {
@@ -107,10 +135,11 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         uint32_t (__cdecl *abi)(void) = (void *)GetProcAddress(p->module, "nvvideo_abi");
         p->create = (void *)GetProcAddress(p->module, "nvvideo_create");
         p->process = (void *)GetProcAddress(p->module, "nvvideo_process");
+        p->process_timestep = (void *)GetProcAddress(p->module, "nvvideo_process_timestep");
         p->destroy_session = (void *)GetProcAddress(p->module, "nvvideo_destroy");
-        if (!abi || !p->create || !p->process || !p->destroy_session) { MP_ERR(f, "Native video bridge is missing required exports\n"); return false; }
+        if (!abi || !p->create || !p->process || !p->process_timestep || !p->destroy_session) { MP_ERR(f, "Native video bridge is missing required exports\n"); return false; }
         uint32_t version = abi();
-        if (version != 4) { MP_ERR(f, "Native video bridge ABI mismatch: expected=4 actual=%u\n", version); return false; }
+        if (version != NVVIDEO_ABI) { MP_ERR(f, "Native video bridge ABI mismatch: expected=%d actual=%u\n", NVVIDEO_ABI, version); return false; }
     }
     if (p->context) ID3D11DeviceContext_Release(p->context);
     if (p->device) ID3D11Device_Release(p->device);
@@ -126,7 +155,7 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         if (scale > 1.0) { p->out_width = ((int)(input->w * scale + 1e-6)) & ~1; p->out_height = ((int)(input->h * scale + 1e-6)) & ~1; }
     }
     struct nvvideo_config config = {
-        .abi = 4, .mode = p->opts->mode, .width = input->w, .height = input->h,
+        .abi = NVVIDEO_ABI, .mode = p->opts->mode, .width = input->w, .height = input->h,
         .out_width = p->out_width, .out_height = p->out_height, .device = p->device, .context = p->context,
         .runtime_directory = runtime, .cache_directory = cache,
         .vsr_quality = p->opts->mode == 1 && p->opts->quality >= 0 ? p->opts->quality : 4,
@@ -153,16 +182,156 @@ static bool valid_input(struct mp_image *input) {
     }
     return input->params.hw_subfmt == IMGFMT_BGRA && input->params.color.transfer != PL_COLOR_TRC_HLG;
 }
+static bool update_timing(struct mp_filter *f, struct mp_image *input) {
+    struct priv *p = f->priv;
+    if (p->opts->multiplier) {
+        p->timing = (struct vfg_plan){.source_fps = input->nominal_fps,
+            .target_fps = input->nominal_fps * p->opts->multiplier};
+        return true;
+    }
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    double display = info && info->get_display_fps ? info->get_display_fps(info) : 0;
+    struct vfg_plan next;
+    bool planned = p->opts->display_divisor
+        ? vfg_plan_divisor(input->nominal_fps, display, p->opts->display_divisor, &next)
+        : vfg_plan_auto(input->nominal_fps, display, &next);
+    if (!planned) {
+        MP_ERR(f, "Display-aligned VFG cannot plan source=%.6f display=%.6f requested-divisor=%d; requires known rates and a target above source\n", input->nominal_fps, display, p->opts->display_divisor);
+        return false;
+    }
+    if (!p->previous || fabs(next.display_fps - p->timing.display_fps) > 0.01 ||
+        fabs(next.source_fps - p->timing.source_fps) > 0.001) {
+        p->timing = next;
+        if (p->previous) {
+            /* A display change starts a new phase at the source-pair boundary;
+             * never request a sample before the retained previous source. */
+            vfg_clock_start(&p->clock, p->previous_pts, next.target_fps);
+            p->last_output_pts = MP_NOPTS_VALUE;
+        }
+        MP_INFO(f, "VFG %s cadence source=%.6f display=%.6f divisor=%d target=%.6f; source timeline and playback speed unchanged\n",
+                p->opts->display_divisor ? "explicit-divisor" : "automatic",
+                next.source_fps, next.display_fps, next.display_divisor, next.target_fps);
+    }
+    return true;
+}
+
+static void write_output(struct mp_filter *f, struct mp_image *output,
+                         double pts, double duration) {
+    struct priv *p = f->priv;
+    output->pts = pts;
+    output->dts = MP_NOPTS_VALUE;
+    output->pkt_duration = duration;
+    if (p->timing.target_fps > 0)
+        output->nominal_fps = p->timing.target_fps;
+    if (p->opts->mode == 2 && !p->opts->multiplier && p->last_output_pts != MP_NOPTS_VALUE)
+        p->max_timing_error_ms = fmax(p->max_timing_error_ms,
+            fabs(pts - p->last_output_pts - 1 / p->timing.target_fps) * 1000);
+    p->last_output_pts = pts;
+    p->output_end_pts = pts + duration;
+    p->output_frames++;
+    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, output));
+}
+
+static struct mp_image *generate_frame(struct mp_filter *f, float timestep) {
+    struct priv *p = f->priv;
+    struct mp_image *output = output_frame(f, p->current_image);
+    if (!output) { fail(f, "Cannot allocate a native output frame"); return NULL; }
+    if (!p->result) {
+        D3D11_TEXTURE2D_DESC desc; ID3D11Texture2D_GetDesc(p->current, &desc);
+        desc.Width = p->out_width; desc.Height = p->out_height;
+        if (p->opts->mode == 3) desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(ID3D11Device_CreateTexture2D(p->device, &desc, NULL, &p->result))) {
+            talloc_free(output); fail(f, "Cannot allocate the SDK result texture"); return NULL;
+        }
+    }
+    char detail[512] = {0};
+    LARGE_INTEGER before, after, frequency; QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&before);
+    bool automatic = p->opts->mode == 2 && !p->opts->multiplier;
+    bool ok = automatic
+        ? p->process_timestep(p->session, p->previous, p->current, p->result, p->next_index, timestep, detail, sizeof(detail))
+        : p->process(p->session, p->previous, p->current, p->result, p->next_index, detail, sizeof(detail));
+    QueryPerformanceCounter(&after);
+    if (!ok) { talloc_free(output); fail(f, detail[0] ? detail : "Native provider failed without an error detail"); return NULL; }
+    double duration = (after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
+    p->process_ms += duration; p->max_process_ms = fmax(p->max_process_ms, duration);
+    p->sdk_frames++; p->session_frames++; p->next_index++;
+    ID3D11DeviceContext_CopySubresourceRegion(p->context, (void *)output->planes[0], (UINT)(uintptr_t)output->planes[1], 0, 0, 0, (void *)p->result, 0, NULL);
+    return output;
+}
+
+static void finish_pair(struct mp_filter *f) {
+    struct priv *p = f->priv;
+    TA_FREEP(&p->previous_image);
+    if (p->previous) ID3D11Texture2D_Release(p->previous);
+    p->previous = p->current; p->current = NULL;
+    p->previous_image = p->current_image; p->current_image = NULL;
+    p->previous_pts = p->previous_image->pts;
+    p->next_index = 1;
+}
+
+/* Generate only the single output requested downstream. Keep the two original
+ * inputs alive until every target timestamp between them has been consumed. */
+static void process_pair(struct mp_filter *f) {
+    struct priv *p = f->priv;
+    double delta = p->current_image->pts - p->previous_pts;
+    if (p->opts->multiplier) {
+        double duration = delta / p->opts->multiplier;
+        double pts = p->previous_pts + duration * p->next_index;
+        if (p->next_index < p->opts->multiplier) {
+            struct mp_image *output = generate_frame(f, 0.5f);
+            if (output) write_output(f, output, pts, duration);
+        } else {
+            struct mp_image *output = copy_original(f, p->current_image);
+            if (!output) return;
+            finish_pair(f); write_output(f, output, pts, duration);
+        }
+        return;
+    }
+    double pts = vfg_clock_next(&p->clock);
+    if (pts > p->current_image->pts + 1e-7) {
+        finish_pair(f); mp_filter_internal_mark_progress(f); return;
+    }
+    struct mp_image *output;
+    if (fabs(pts - p->current_image->pts) <= 1e-7) {
+        output = copy_original(f, p->current_image);
+        if (!output) return;
+    } else {
+        float timestep = (float)((pts - p->previous_pts) / delta);
+        output = generate_frame(f, timestep);
+        if (!output) return;
+    }
+    vfg_clock_advance(&p->clock);
+    write_output(f, output, pts, 1 / p->timing.target_fps);
+}
+
+static void drain_eof(struct mp_filter *f) {
+    struct priv *p = f->priv;
+    double pts = vfg_clock_next(&p->clock);
+    if (pts < p->source_end_pts - 1e-7) {
+        struct mp_image *output = copy_original(f, p->previous_image);
+        if (!output) return;
+        vfg_clock_advance(&p->clock);
+        write_output(f, output, pts, fmin(1 / p->clock.fps, p->source_end_pts - pts));
+        return;
+    }
+    reset(f);
+    mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
+}
+
 static void process(struct mp_filter *f) {
     struct priv *p = f->priv;
     if (p->failed || !mp_pin_in_needs_data(f->ppins[1])) return;
-    if (p->pending_index < p->pending_count) {
-        struct mp_image *next = p->pending[p->pending_index]; p->pending[p->pending_index++] = NULL;
-        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, next)); return;
-    }
+    if (p->draining) { drain_eof(f); return; }
+    if (p->current_image) { process_pair(f); return; }
     struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
     if (!frame.type) return;
-    if (frame.type != MP_FRAME_VIDEO) { if (frame.type == MP_FRAME_EOF) reset(f); mp_pin_in_write(f->ppins[1], frame); return; }
+    if (frame.type != MP_FRAME_VIDEO) {
+        if (frame.type == MP_FRAME_EOF && p->previous && !p->opts->multiplier) {
+            p->draining = true; drain_eof(f); return;
+        }
+        if (frame.type == MP_FRAME_EOF) reset(f);
+        mp_pin_in_write(f->ppins[1], frame); return;
+    }
     struct mp_image *input = frame.data;
     if (!valid_input(input)) {
         MP_ERR(f, "Unsupported enhancement input: %s\n", mp_image_params_to_str(&input->params));
@@ -170,56 +339,41 @@ static void process(struct mp_filter *f) {
     }
     if (p->session && !mp_image_params_static_equal(&p->params, &input->params)) reset(f);
     if (!p->session && !initialize(f, input)) { mp_frame_unref(&frame); fail(f, "Cannot initialize installed native provider; see preceding SDK error"); return; }
+    if (p->opts->mode == 2) {
+        if (!isfinite(input->pts) || input->pts == MP_NOPTS_VALUE ||
+            (p->previous && (input->pts <= p->previous_pts || input->pts - p->previous_pts > 0.25))) {
+            mp_frame_unref(&frame); fail(f, "VFG requires strictly increasing source PTS with intervals no greater than 250 ms"); return;
+        }
+        if (!update_timing(f, input)) { mp_frame_unref(&frame); fail(f, "Cannot align VFG to this source and display; see preceding rate diagnostic"); return; }
+        double duration = input->pkt_duration;
+        if (!(isfinite(duration) && duration > 0))
+            duration = p->previous ? input->pts - p->previous_pts : input->nominal_fps > 0 ? 1 / input->nominal_fps : 0;
+        if (!(isfinite(duration) && duration > 0)) { mp_frame_unref(&frame); fail(f, "VFG source duration is unknown"); return; }
+        p->source_end_pts = input->pts + duration;
+    }
     p->input_frames++;
-    ID3D11Texture2D *current = single_texture(f, input);
-    if (!current) { mp_frame_unref(&frame); fail(f, "Cannot allocate an input texture"); return; }
-    if (p->opts->mode == 2 && !p->previous) {
-        p->previous = current; p->previous_pts = input->pts;
-        input->pkt_duration /= p->opts->multiplier;
-        mp_pin_in_write(f->ppins[1], frame); return;
+    p->current = single_texture(f, input);
+    if (!p->current) { mp_frame_unref(&frame); fail(f, "Cannot allocate an input texture"); return; }
+    p->current_image = input;
+    p->next_index = 1;
+    if (p->opts->mode != 2) {
+        struct mp_image *output = generate_frame(f, 0.5f);
+        if (!output) return;
+        ID3D11Texture2D_Release(p->current); p->current = NULL;
+        TA_FREEP(&p->current_image);
+        p->output_frames++;
+        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, output)); return;
     }
-    if (p->opts->mode == 2 && (input->pts == MP_NOPTS_VALUE || p->previous_pts == MP_NOPTS_VALUE || input->pts <= p->previous_pts || input->pts - p->previous_pts > 0.25)) {
-        ID3D11Texture2D_Release(current); mp_frame_unref(&frame); fail(f, "VFG requires strictly increasing source PTS with intervals no greater than 250 ms"); return;
+    if (!p->previous) {
+        struct mp_image *output = copy_original(f, input);
+        if (!output) return;
+        double pts = input->pts;
+        double duration = p->opts->multiplier ? (p->source_end_pts - pts) / p->opts->multiplier : 1 / p->timing.target_fps;
+        finish_pair(f);
+        if (!p->opts->multiplier) vfg_clock_start(&p->clock, pts, p->timing.target_fps);
+        write_output(f, output, pts, duration); return;
     }
-    int count = p->opts->mode == 2 ? p->opts->multiplier - 1 : 1;
-    p->pending_index = p->pending_count = 0;
-    ID3D11Texture2D *result = NULL;
-    D3D11_TEXTURE2D_DESC desc; ID3D11Texture2D_GetDesc(current, &desc);
-    desc.Width = p->out_width; desc.Height = p->out_height;
-    if (p->opts->mode == 3) desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-    HRESULT hr = ID3D11Device_CreateTexture2D(p->device, &desc, NULL, &result);
-    char detail[512] = {0};
-    bool ok = SUCCEEDED(hr);
-    for (int i = 1; ok && i <= count; i++) {
-        struct mp_image *output = output_frame(f, input);
-        LARGE_INTEGER before, after, frequency; QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&before);
-        ok = output && p->process(p->session, p->previous, current, result, i, detail, sizeof(detail));
-        QueryPerformanceCounter(&after);
-        double duration = (after.QuadPart - before.QuadPart) * 1000.0 / frequency.QuadPart;
-        if (!ok) { TA_FREEP(&output); break; }
-        p->process_ms += duration; p->max_process_ms = fmax(p->max_process_ms, duration);
-        ID3D11DeviceContext_CopySubresourceRegion(p->context, (void *)output->planes[0], (UINT)(uintptr_t)output->planes[1], 0, 0, 0, (void *)result, 0, NULL);
-        p->sdk_frames++;
-        p->session_frames++;
-        if (p->opts->mode == 2) {
-            output->pkt_duration = (input->pts - p->previous_pts) / p->opts->multiplier;
-            output->pts = p->previous_pts + output->pkt_duration * i;
-            input->pkt_duration = output->pkt_duration;
-        }
-        p->pending[p->pending_count++] = output;
-    }
-    if (ok) {
-        if (p->opts->mode == 2) {
-            p->pending[p->pending_count++] = input; frame = MP_NO_FRAME;
-            ID3D11Texture2D_Release(p->previous); p->previous = current; current = NULL; p->previous_pts = input->pts;
-        }
-        struct mp_image *next = p->pending[p->pending_index]; p->pending[p->pending_index++] = NULL;
-        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, next));
-    }
-    if (result) ID3D11Texture2D_Release(result);
-    if (current) ID3D11Texture2D_Release(current);
-    mp_frame_unref(&frame);
-    if (!ok) fail(f, detail[0] ? detail : "Native output allocation failed");
+    process_pair(f);
 }
 static bool command(struct mp_filter *f, struct mp_filter_command *cmd) {
     if (cmd->type != MP_FILTER_COMMAND_GET_META) return false;
@@ -232,6 +386,15 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd) {
     mp_tags_set_str(tags, "hdr-processing", !hdr ? "none" : p->opts->mode == 2 ? "native-10bit" : "proxy-residual");
     if (p->params.color.transfer == PL_COLOR_TRC_HLG) mp_tags_set_str(tags, "hlg-reference", "1000-nits-gamma-1.2");
     mp_tags_set_str(tags, "multiplier", mp_tprintf(30, "%d", p->opts->mode == 2 ? p->opts->multiplier : 1));
+    mp_tags_set_str(tags, "rate-mode", p->opts->multiplier ? "fixed-multiplier" : p->opts->display_divisor ? "display-divisor" : "display-aligned");
+    mp_tags_set_str(tags, "source-fps", mp_tprintf(30, "%.9f", p->timing.source_fps));
+    mp_tags_set_str(tags, "target-fps", mp_tprintf(30, "%.9f", p->timing.target_fps));
+    mp_tags_set_str(tags, "display-fps", mp_tprintf(30, "%.9f", p->timing.display_fps));
+    mp_tags_set_str(tags, "display-divisor", mp_tprintf(30, "%d", p->timing.display_divisor));
+    mp_tags_set_str(tags, "output-frames", mp_tprintf(30, "%llu", (unsigned long long)p->output_frames));
+    mp_tags_set_str(tags, "max-timing-error-ms", mp_tprintf(30, "%.6f", p->max_timing_error_ms));
+    mp_tags_set_str(tags, "source-end-pts", mp_tprintf(30, "%.9f", p->source_end_pts));
+    mp_tags_set_str(tags, "output-end-pts", mp_tprintf(30, "%.9f", p->output_end_pts));
     mp_tags_set_str(tags, "quality", mp_tprintf(30, "%d", p->opts->quality));
     mp_tags_set_str(tags, "avg-process-ms", mp_tprintf(40, "%.3f", p->sdk_frames ? p->process_ms / p->sdk_frames : 0));
     mp_tags_set_str(tags, "max-process-ms", mp_tprintf(40, "%.3f", p->max_process_ms));
@@ -249,13 +412,18 @@ static const struct mp_filter_info info = {.name = "nvvideo", .process = process
 static struct mp_filter *create(struct mp_filter *parent, void *options) {
     struct mp_filter *f = mp_filter_create(parent, &info);
     if (!f) { talloc_free(options); return NULL; }
-    struct priv *p = f->priv; p->opts = talloc_steal(p, options); p->previous_pts = MP_NOPTS_VALUE;
+    struct priv *p = f->priv; p->opts = talloc_steal(p, options); p->previous_pts = p->last_output_pts = MP_NOPTS_VALUE;
+    if (p->opts->multiplier == 1) { MP_ERR(f, "VFG multiplier must be automatic (0) or 2 through 8\n"); talloc_free(f); return NULL; }
+    if (p->opts->display_divisor && (p->opts->mode != 2 || p->opts->multiplier)) {
+        MP_ERR(f, "display-divisor requires VFG mode with multiplier=0\n"); talloc_free(f); return NULL;
+    }
     mp_filter_add_pin(f, MP_PIN_IN, "in"); mp_filter_add_pin(f, MP_PIN_OUT, "out"); return f;
 }
 #define OPT_BASE_STRUCT struct opts
 static const m_option_t options[] = {
     {"mode", OPT_INT(mode), M_RANGE(1, 3)}, {"quality", OPT_INT(quality), M_RANGE(-1, 4)},
-    {"target-height", OPT_INT(target_height), M_RANGE(0, 4320)}, {"multiplier", OPT_INT(multiplier), M_RANGE(2, 8)},
+    {"target-height", OPT_INT(target_height), M_RANGE(0, 4320)}, {"multiplier", OPT_INT(multiplier), M_RANGE(0, 8)},
+    {"display-divisor", OPT_INT(display_divisor), M_RANGE(0, INT_MAX)},
     {"scene-detection", OPT_INT(scene_detection), M_RANGE(0, 1)}, {"nr-style", OPT_INT(nr_style), M_RANGE(0, 2)},
     {"nr-target", OPT_INT(nr_target), M_RANGE(0, 1440)},
     {"nr-intensity", OPT_FLOAT(nr_intensity), M_RANGE(0, 1)}, {"nr-tone", OPT_FLOAT(nr_tone), M_RANGE(0, 1)},

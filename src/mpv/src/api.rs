@@ -609,6 +609,9 @@ pub struct JfnMpvLoadOptions {
     pub video_filter: *const c_char,
     /// Per-file hardware decoder mode. Empty preserves the configured mode.
     pub hwdec: *const c_char,
+    /// VFG presentation follows display vblanks without changing audio speed.
+    /// Per-file: mpv restores the configured video sync on the next load.
+    pub vfg_display_sync: bool,
     /// Apply the MediaStation text-subtitle style for this file only.
     pub subtitle_style_override: bool,
     pub subtitle_font_size: f64,
@@ -733,6 +736,9 @@ pub unsafe fn jfn_mpv_load_file(
     }
     if !hwdec.is_empty() {
         load_options.push(("hwdec".to_string(), hwdec));
+    }
+    if o.vfg_display_sync {
+        load_options.push(("video-sync".to_string(), "display-vdrop".to_string()));
     }
 
     let mut command =

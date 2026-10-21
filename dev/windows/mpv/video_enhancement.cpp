@@ -76,6 +76,7 @@ struct nvvideo_session {
     int (__cdecl *create_effect)(const char *, void **) = nullptr;
     void (__cdecl *destroy_effect)(void *) = nullptr;
     int (__cdecl *set_u32)(void *, const char *, unsigned) = nullptr;
+    int (__cdecl *set_f32)(void *, const char *, float) = nullptr;
     int (__cdecl *set_image)(void *, const char *, Image *) = nullptr;
     int (__cdecl *set_stream)(void *, const char *, void *) = nullptr;
     int (__cdecl *load)(void *) = nullptr;
@@ -154,6 +155,7 @@ struct nvvideo_session {
 #undef CUDA_SYMBOL
             symbol(vfx, "NvVFX_CreateEffect", create_effect); symbol(vfx, "NvVFX_DestroyEffect", destroy_effect);
             symbol(vfx, "NvVFX_SetU32", set_u32); symbol(vfx, "NvVFX_SetImage", set_image); symbol(vfx, "NvVFX_SetCudaStream", set_stream);
+            symbol(vfx, "NvVFX_SetF32", set_f32);
             symbol(vfx, "NvVFX_Load", load); symbol(vfx, "NvVFX_Run", run);
             symbol(image, "NvCVImage_Alloc", alloc); symbol(image, "NvCVImage_Dealloc", dealloc);
             ComPtr<IDXGIDevice> dxgi_device; ComPtr<IDXGIAdapter> adapter;
@@ -190,7 +192,7 @@ struct nvvideo_session {
         }
         cuda(unregister_texture(resource), "CUDA D3D11 unregister");
     }
-    void process(ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *destination, uint32_t index) {
+    void process(ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *destination, uint32_t index, float timestep = 0.5f) {
         for (auto *texture : {current, destination, previous}) {
             if (!texture) continue;
             D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
@@ -212,8 +214,14 @@ struct nvvideo_session {
                 transfer(hdr ? hdr->previous.Get() : previous, images[0], true);
                 transfer(hdr ? hdr->current.Get() : current, images[1], true);
             }
-            check(index, "VFG frame index", index > 0 && index < config.multiplier);
-            cuda(set_u32(effect, "FrameIndex", index), "VFG frame index"); cuda(run(effect, 0), "VFG Run");
+            if (config.multiplier == 0) {
+                check(index, "VFG timestep/index", index > 0 && std::isfinite(timestep) && timestep > 0.f && timestep < 1.f);
+                cuda(set_f32(effect, "Timestep", timestep), "VFG timestep");
+            } else {
+                check(index, "VFG frame index", index > 0 && index < config.multiplier);
+                cuda(set_u32(effect, "FrameIndex", index), "VFG frame index");
+            }
+            cuda(run(effect, 0), "VFG Run");
             cuda(stream_sync(stream), "VFG inference synchronize"); transfer(hdr ? hdr->generated.Get() : output.Get(), images[2], false);
         }
         if (hdr) hdr->finish(config.mode == 2 ? hdr->generated.Get() : output.Get(), config.mode == 2);
@@ -223,10 +231,10 @@ struct nvvideo_session {
     }
 };
 
-uint32_t __cdecl nvvideo_abi() { return 4; }
+uint32_t __cdecl nvvideo_abi() { return NVVIDEO_ABI; }
 nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *error, size_t size) {
     try {
-        if (!config || config->abi != 4 || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier < 2 || config->multiplier > 8 || config->scene_detection > 1)
+        if (!config || config->abi != NVVIDEO_ABI || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier == 1 || config->multiplier > 8 || config->scene_detection > 1)
             throw std::runtime_error("Invalid native enhancement configuration");
         if (config->transfer > NVVIDEO_HLG || config->full_range > 1 || config->chroma_location > 5 || (config->transfer != NVVIDEO_SDR && ((config->width | config->height | config->out_width | config->out_height) & 1))) throw std::runtime_error("Invalid PQ/HLG format/range/chroma configuration");
         if (config->nr_style < 0 || config->nr_style > 2 || config->nr_auto_mask < 0 || config->nr_auto_mask > 1 || config->nr_ui_correction < 0 || config->nr_ui_correction > 1 || !std::isfinite(config->nr_skin) || !(config->nr_skin == -1.f || (config->nr_skin >= 0.f && config->nr_skin <= 2.f))) throw std::runtime_error("Invalid DLSSNR configuration");
@@ -238,7 +246,18 @@ nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *erro
 int __cdecl nvvideo_process(nvvideo_session *session, ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *output, uint32_t index, char *error, size_t size) {
     try {
         if (!session || !current || !output) throw std::runtime_error("Missing native enhancement frame");
+        if (session->config.mode == 2 && session->config.multiplier == 0) throw std::runtime_error("Automatic VFG requires the explicit timestep entry point");
         ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get()); session->process(previous, current, output, index); return 1;
+    } catch (const std::exception &exception) { report(error, size, exception.what()); return 0; }
+}
+int __cdecl nvvideo_process_timestep(nvvideo_session *session, ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *output, uint32_t index, float timestep, char *error, size_t size) {
+    try {
+        if (!session || !current || !output || session->config.mode != 2 || session->config.multiplier != 0)
+            throw std::runtime_error("Explicit VFG timestep requires an automatic VFG session");
+        if (!index || !std::isfinite(timestep) || timestep <= 0.f || timestep >= 1.f)
+            throw std::runtime_error("VFG timestep must be strictly between zero and one, with a positive pair index");
+        ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get());
+        session->process(previous, current, output, index, timestep); return 1;
     } catch (const std::exception &exception) { report(error, size, exception.what()); return 0; }
 }
 void __cdecl nvvideo_destroy(nvvideo_session *session) { delete session; }

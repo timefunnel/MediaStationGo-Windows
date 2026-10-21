@@ -295,6 +295,7 @@ fn handle_player_load(args: &ListValue) {
         http_proxy: c"".as_ptr(),
         video_filter: c"".as_ptr(),
         hwdec: c"".as_ptr(),
+        vfg_display_sync: false,
         subtitle_style_override: false,
         subtitle_font_size: 0.0,
         subtitle_position: 100.0,

@@ -40,6 +40,12 @@ async function main() {
     const engine = content.querySelector('[data-enhancement-key="backend"]'); engine.value = 'rife'; engine.events.change();
     const models = content.querySelector('[data-enhancement-key="rifeModel"]'); assert.equal(models.children.length, 3);
     assert.equal(context.player.enhancementDraft.selection.vfg, false);
+    const vfgEngine = content.querySelector('[data-enhancement-key="backend"]'); vfgEngine.value = 'nvidia-vfg'; vfgEngine.events.change();
+    const rate = content.querySelector('[data-enhancement-key="multiplier"]');
+    assert.equal(rate.value, '0'); assert.equal(rate.children.length, 8);
+    rate.value = '3'; rate.events.change(); assert.equal(context.player.enhancementDraft.selection.multiplier, 3);
+    rate.value = '0'; rate.events.change(); assert.equal(context.player.enhancementDraft.selection.multiplier, 0);
+    assert.equal(calls.length, 1, 'automatic/manual rate edits stay in the draft');
     assert.equal(calls.length, 1, 'engine choice and RIFE quality are draft edits');
     context.closePlayerPanel(); assert.equal(context.player.enhancementDraft, null);
     context.player.panelKind = 'interpolation'; context.renderPlayerPanel();

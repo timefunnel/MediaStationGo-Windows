@@ -1,8 +1,9 @@
-/* MediaStationGo optional video providers, ABI 4. Host owns PTS and presentation. */
+/* MediaStationGo optional video providers, ABI 5. Host owns PTS and presentation. */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 #include <d3d11.h>
+#define NVVIDEO_ABI 5
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +32,8 @@ NVVIDEO_API uint32_t __cdecl nvvideo_abi(void);
 NVVIDEO_API struct nvvideo_session *__cdecl nvvideo_create(const struct nvvideo_config *, char *, size_t);
 /* Single-slice BGRA8 (SDR) or P010 (PQ/HLG). Host retains source color metadata. */
 NVVIDEO_API int __cdecl nvvideo_process(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, char *, size_t);
+/* multiplier=0: index starts at 1 for each new source pair; 0 < timestep < 1. */
+NVVIDEO_API int __cdecl nvvideo_process_timestep(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, float, char *, size_t);
 NVVIDEO_API void __cdecl nvvideo_destroy(struct nvvideo_session *);
 #ifdef __cplusplus
 }

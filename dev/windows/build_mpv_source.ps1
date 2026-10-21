@@ -51,6 +51,7 @@ function Get-MpvSourceContractHash {
         $NvofMemcSource,
         (Join-Path $PSScriptRoot "mpv\vf_nvvideo.c"),
         (Join-Path $PSScriptRoot "mpv\video_enhancement.h"),
+        (Join-Path $PSScriptRoot "mpv\vfg_timing.h"),
         $NvVideoPatch,
         $NvofMemcPatch,
         $RifeRuntimeHeader,
@@ -303,7 +304,7 @@ if ((Test-Path $OutputLib) -and -not $Force) {
 }
 
 try {
-    foreach ($Name in @('vf_nvvideo.c', 'video_enhancement.h')) {
+    foreach ($Name in @('vf_nvvideo.c', 'video_enhancement.h', 'vfg_timing.h')) {
         $Source = Join-Path $PSScriptRoot "mpv\$Name"
         $Destination = Join-Path $MpvSourceDir "video\filter\$Name"
         if (Test-Path -LiteralPath $Destination) {

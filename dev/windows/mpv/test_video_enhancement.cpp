@@ -37,16 +37,31 @@ int wmain(int argc, wchar_t **argv) {
     D3D11_TEXTURE2D_DESC desc{}; desc.Width = 640; desc.Height = 360; desc.MipLevels = desc.ArraySize = 1; desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     D3D11_SUBRESOURCE_DATA sourceA{a.data(), 640 * 4, 0}, sourceB{b.data(), 640 * 4, 0};
     ComPtr<ID3D11Texture2D> first, second; if (FAILED(device->CreateTexture2D(&desc, &sourceA, &first)) || FAILED(device->CreateTexture2D(&desc, &sourceB, &second))) return 6;
-    for (unsigned mode : {1u, 2u, 3u}) {
+    for (unsigned test_mode : {1u, 2u, 3u, 0u}) {
+        const unsigned mode = test_mode ? test_mode : 2u;
         const unsigned scale = mode == 1 ? 2u : 1u; desc.Width = 640 * scale; desc.Height = 360 * scale;
         ComPtr<ID3D11Texture2D> output; if (FAILED(device->CreateTexture2D(&desc, nullptr, &output))) return 7;
-        nvvideo_config config{4, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode == 3 ? 4 : mode], argv[3],4,0,2,1,0,0,0,1.f,1.f,1.f,-1.f,1080,0,0,0}; char error[512]{};
+        nvvideo_config config{NVVIDEO_ABI, mode, 640, 360, desc.Width, desc.Height, device.Get(), context.Get(), argv[mode == 3 ? 4 : mode], argv[3],4,0,test_mode ? 2u : 0u,1,0,0,0,1.f,1.f,1.f,-1.f,1080,0,0,0}; char error[512]{};
         auto session = nvvideo_create(&config, error, sizeof(error)); if (!session) { std::fprintf(stderr, "mode=%u create: %s\n", mode, error); return 8; }
+        if (!test_mode && (nvvideo_process_timestep(session,first.Get(),second.Get(),output.Get(),1,0.f,error,sizeof(error)) ||
+            nvvideo_process_timestep(session,first.Get(),second.Get(),output.Get(),1,1.f,error,sizeof(error)))) {
+            std::fprintf(stderr,"VFG accepted an endpoint timestep\n");nvvideo_destroy(session);return 16;
+        }
         bool ok = true;
-        for (unsigned i = 0; i < 6; ++i) if (!nvvideo_process(session, first.Get(), second.Get(), output.Get(),1, error, sizeof(error))) { ok = false; break; }
+        std::vector<unsigned char> early;
+        for (unsigned i = 0; i < 6; ++i) {
+            const unsigned index = i % 3 + 1;
+            const int ran = test_mode
+                ? nvvideo_process(session, first.Get(), second.Get(), output.Get(),1, error, sizeof(error))
+                : nvvideo_process_timestep(session, first.Get(), second.Get(), output.Get(), index, 0.25f * index, error, sizeof(error));
+            if (!ran) { ok = false; break; }
+            if (!test_mode && i == 0) early = read(device.Get(), context.Get(), output.Get());
+        }
         auto result = read(device.Get(), context.Get(), output.Get()); nvvideo_destroy(session);
         if (!ok) { std::fprintf(stderr, "mode=%u process: %s\n", mode, error); return 9; }
         if (result.empty() || !std::any_of(result.begin(), result.end(), [](unsigned char value) { return value != 0; }) || (mode != 1 && (result == a || result == b))) { std::fprintf(stderr, "mode=%u output is empty, zero or equals an input\n", mode); return 10; }
+        if (!test_mode && result == early) { std::fprintf(stderr, "VFG explicit timesteps produced identical outputs\n"); return 15; }
+        if (!test_mode) std::puts("VFG_TIMESTEP_GPU_OK t=0.25/0.5/0.75 distinct-output");
         std::printf("NATIVE_VIDEO_GPU_OK mode=%u output=%ux%u bytes=%zu real-sdk-runs=6\n", mode, desc.Width, desc.Height, result.size());
         if (mode == 3) {
             size_t changed = 0; unsigned long long difference = 0;

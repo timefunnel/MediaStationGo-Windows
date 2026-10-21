@@ -5828,7 +5828,7 @@
         if (player.started) showPlayerFeedback({ icon: player.playing ? 'play' : 'pause' }, 750);
     }
 
-    const videoEnhancementDefaults = Object.freeze({ vsr: false, vfg: false, nr: false, vsrQuality: 4, vsrTarget: 0, vfgQuality: 0, multiplier: 2, sceneDetection: true, nrStyle: 0, nrTarget: 1080, nrIntensity: 1, nrTone: 1, nrStructure: 1, nrSkin: -1, nrAutoMask: false, nrUiCorrection: false });
+    const videoEnhancementDefaults = Object.freeze({ vsr: false, vfg: false, nr: false, vsrQuality: 4, vsrTarget: 0, vfgQuality: 0, multiplier: 0, sceneDetection: true, nrStyle: 0, nrTarget: 1080, nrIntensity: 1, nrTone: 1, nrStructure: 1, nrSkin: -1, nrAutoMask: false, nrUiCorrection: false });
     function videoEnhancementSelection(value) { return { ...videoEnhancementDefaults, ...value }; }
     function sameVideoEnhancement(left, right) {
         const a = videoEnhancementSelection(left), b = videoEnhancementSelection(right);
@@ -5917,8 +5917,8 @@
         } else if (backend === 'nvidia-vfg') {
             const fields = parameters(interpolation, !ready('nvidia-vfg'));
             parameterSelect(fields, 'vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
-            parameterSelect(fields, 'multiplier', '帧率倍数', [2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])); toggle(fields, 'sceneDetection', '检测镜头切换');
-            fields.append(element('p', 'enhancement-help', '高倍率与高质量会增加耗时，可按实际播放表现调整。'));
+            parameterSelect(fields, 'multiplier', '输出帧率', [[0, '自动 · 匹配显示刷新率'], ...[2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])]); toggle(fields, 'sceneDetection', '检测镜头切换');
+            fields.append(element('p', 'enhancement-help', '自动选择接近原片两倍、与显示刷新率对齐的帧率，保持原播放速度。自动采样、高倍率与高质量均可能增加耗时，实际输出见播放信息。'));
         }
         for (const [id, key, title] of [['rtx-video', 'vsr', 'RTX Video 超分'], ['dlssnr', 'nr', 'DLSSNR 画面增强']]) {
             const section = group(key, title);
@@ -6669,7 +6669,15 @@
         }
         const enhancement = videoEnhancementSelection(player.videoEnhancement);
         appendInfoRow(interpolation.list, 'RTX Video 超分', enhancement.vsr ? `已选择 · 质量 ${enhancement.vsrQuality} · ${enhancement.vsrTarget ? `${enhancement.vsrTarget}p` : '2 倍尺寸'}` : '关闭');
-        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', enhancement.vfg ? `已选择 · ${enhancement.multiplier} 倍帧率 · ${['Low', 'Medium', 'High'][enhancement.vfgQuality]}` : '关闭');
+        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', enhancement.vfg ? `已选择 · ${enhancement.multiplier === 0 ? '自动匹配刷新率' : `${enhancement.multiplier} 倍帧率`} · ${['Low', 'Medium', 'High'][enhancement.vfgQuality]}` : '关闭');
+        const vfg = diagnostics.vfg;
+        if (enhancement.vfg && vfg) {
+            const fps = (value) => Number.isFinite(value) && value > 0 ? `${value.toFixed(3)} fps` : '-';
+            appendInfoRow(interpolation.list, 'VFG 原片 / 输出', `${fps(vfg.sourceFps)} / ${fps(vfg.targetFps)}`);
+            appendInfoRow(interpolation.list, 'VFG 显示匹配', vfg.displayDivisor > 0 ? `${fps(vfg.displayFps)} ÷ ${vfg.displayDivisor}` : enhancement.multiplier === 0 ? '等待刷新率规划' : '手动倍率');
+            appendInfoRow(interpolation.list, 'VFG 呈现同步', vfg.displaySyncActive === 'yes' ? '已跟随屏幕刷新' : vfg.videoSync === 'display-vdrop' ? '等待显示同步（暂停或窗口不可见时可能停用）' : (vfg.videoSync || '等待播放'));
+            appendInfoRow(interpolation.list, 'VFG 处理耗时', `${Number.isFinite(vfg.avgProcessMs) ? vfg.avgProcessMs.toFixed(3) : '-'} ms 平均 / ${Number.isFinite(vfg.maxProcessMs) ? vfg.maxProcessMs.toFixed(3) : '-'} ms 最大`);
+        }
         appendInfoRow(interpolation.list, 'DLSSNR', enhancement.nr ? `已选择 · 风格 ${enhancement.nrStyle} · 强度 ${enhancement.nrIntensity}` : '关闭');
         appendInfoRow(interpolation.list, '容器 / VF / 显示', [
             diagnostics.containerFps,

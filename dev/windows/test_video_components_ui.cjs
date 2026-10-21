@@ -63,6 +63,7 @@ async function main() {
     context.player = makePlayer(); await context.setFrameInterpolation(null, { vsr: true, vfg: true });
     assert.deepEqual(loadingLabels, ['正在应用画面设置', '正在应用画面设置'], 'both loading stages retain the current action after native acknowledgement');
     const firstLoad = requests.find((request) => request.operation === 'load');
+    assert.equal(JSON.parse(firstLoad.args[8]).multiplier, 0, 'VFG defaults to display-aligned sampling');
     assert.deepEqual(Array.from(firstLoad.args).slice(0, 3), ['media-a', 45678, 'off']);
     assert.equal(firstLoad.args[7], 'version-b'); assert.equal(JSON.parse(firstLoad.args[8]).vsr, true); assert.equal(JSON.parse(firstLoad.args[8]).vfg, true); assert.equal(JSON.parse(firstLoad.args[8]).vsrQuality, 4);
     assert.equal(context.player.videoEnhancement.vfg, true); assert.equal(pauses, 1); assert.equal(plays, 1);

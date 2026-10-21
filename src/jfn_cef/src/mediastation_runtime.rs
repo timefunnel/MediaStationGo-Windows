@@ -5283,7 +5283,31 @@ fn frame_interpolation_diagnostics_payload(media_id: Option<&str>) -> Result<Val
             "mistimedFrameCount": mistimed_frame_count,
             "voDelayedFrameCount": vo_delayed_frame_count,
             "hwdecCurrent": hwdec_current,
+            "vfg": vfg_diagnostics_payload(),
         },
+    }))
+}
+
+fn vfg_diagnostics_payload() -> Option<Value> {
+    let metadata = jfn_mpv_get_property_node(c"vf-metadata/enhance_vfg").ok()?;
+    let number = |key| {
+        runtime_node_string(&metadata, key)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    };
+    Some(json!({
+        "sourceFps": number("source-fps"),
+        "targetFps": number("target-fps"),
+        "displayFps": number("display-fps"),
+        "displayDivisor": number("display-divisor"),
+        "avgProcessMs": number("avg-process-ms"),
+        "maxProcessMs": number("max-process-ms"),
+        "outputFrames": number("output-frames"),
+        "maxTimingErrorMs": number("max-timing-error-ms"),
+        "videoSync": mpv_property_string(c"video-sync"),
+        "displaySyncActive": mpv_property_string(c"display-sync-active"),
+        "audioSpeedCorrection": mpv_property_double(c"audio-speed-correction"),
+        "videoSpeedCorrection": mpv_property_double(c"video-speed-correction"),
     }))
 }
 
@@ -6573,6 +6597,7 @@ fn execute_load(
         hwdec: interpolation_hwdec
             .as_ref()
             .map_or(c"".as_ptr(), |value| value.as_ptr()),
+        vfg_display_sync: request.enhancement.vfg,
         subtitle_style_override: true,
         subtitle_font_size: request.subtitle_font_size,
         subtitle_position: request.subtitle_position,

@@ -116,7 +116,7 @@ impl Default for Selection {
             vsr_quality: 4,
             vsr_target: 0,
             vfg_quality: 0,
-            multiplier: 2,
+            multiplier: 0,
             scene_detection: true,
             nr_style: 0,
             nr_target: 1080,
@@ -144,7 +144,7 @@ impl Selection {
         if !(1..=4).contains(&s.vsr_quality)
             || !matches!(s.vsr_target, 0 | 1440 | 2160 | 2880 | 3456 | 4032 | 4320)
             || s.vfg_quality > 2
-            || !(2..=8).contains(&s.multiplier)
+            || !(s.multiplier == 0 || (2..=8).contains(&s.multiplier))
             || !(0..=2).contains(&s.nr_style)
             || !matches!(s.nr_target, 0 | 480 | 720 | 900 | 1080 | 1440)
             || [s.nr_intensity, s.nr_tone, s.nr_structure]
@@ -265,6 +265,7 @@ mod tests {
             "{\"vsrTarget\":1080}",
             "{\"vfgQuality\":3}",
             "{\"multiplier\":9}",
+            "{\"multiplier\":1}",
             "{\"nrStyle\":3}",
             "{\"nrIntensity\":1.1}",
             "{\"nrTone\":null}",
@@ -278,6 +279,12 @@ mod tests {
             );
         }
         assert_eq!(Selection::parse("{}").unwrap(), Selection::default());
+        assert_eq!(
+            Selection::parse(r#"{"vfg":true,"multiplier":0}"#)
+                .unwrap()
+                .multiplier,
+            0
+        );
         assert_eq!(
             Selection::parse("{\"vsr\":true,\"vfg\":false}").unwrap(),
             Selection {

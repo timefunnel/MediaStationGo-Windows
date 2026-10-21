@@ -1,5 +1,7 @@
-param([string]$SdkDirectory = '', [switch]$HdrOnly)
+param([string]$SdkDirectory = '', [switch]$HdrOnly, [switch]$AutoOnly,
+    [ValidateSet('640x360', '1920x1080', '3840x2160')][string]$VfgSourceSize = '640x360')
 $ErrorActionPreference = 'Stop'
+if ($VfgSourceSize -ne '640x360' -and -not $AutoOnly) { throw 'VfgSourceSize requires AutoOnly; the provider regression fixtures use fixed dimensions' }
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 . (Join-Path $PSScriptRoot 'env.ps1')
 if (-not $SdkDirectory) { $SdkDirectory = Join-Path $RepoRoot 'third_party\video-enhancement-deps\RTX-Video-SDK-1.1.0' }
@@ -13,7 +15,9 @@ try {
     & cl.exe /nologo /MD /std:c++17 /EHsc /W4 /WX "/I$Mpv\include" (Join-Path $PSScriptRoot 'mpv\test_nvvideo_playback.cpp') "/Fo$TestRoot\test_nvvideo_playback.obj" "/Fe$TestRoot\test_nvvideo_playback.exe" /link "$Mpv\lib\mpv.lib" user32.lib
     if ($LASTEXITCODE -ne 0) { throw 'mpv playback test compilation failed' }
     $Ffmpeg = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
-    & $Ffmpeg -hide_banner -loglevel error -f lavfi -i 'testsrc2=size=640x360:rate=24:duration=4' -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest (Join-Path $TestRoot 'source.mp4')
+    $Subtitle = Join-Path $TestRoot 'sync.srt'
+    [IO.File]::WriteAllText($Subtitle, "1`n00:00:01,300 --> 00:00:02,100`nVFG sync check A`n`n2`n00:00:02,300 --> 00:00:03,800`nVFG sync check B`n", [Text.UTF8Encoding]::new($false))
+    & $Ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=${VfgSourceSize}:rate=24:duration=4" -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -i $Subtitle -map 0:v -map 1:a -map 1:a -map 2:s -c:v libx264 -pix_fmt yuv420p -c:a aac -c:s mov_text (Join-Path $TestRoot 'source.mp4')
     if ($LASTEXITCODE -ne 0) { throw 'Local synthetic video generation failed' }
     & $Ffmpeg -hide_banner -loglevel error -f lavfi -i 'testsrc2=size=1920x1080:rate=24:duration=4' -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=4' -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest (Join-Path $TestRoot 'source-hd.mp4')
     if ($LASTEXITCODE -ne 0) { throw 'Local HD synthetic video generation failed' }
@@ -33,7 +37,7 @@ try {
         if ($Stream.pix_fmt -ne 'yuv420p10le' -or $Stream.color_space -ne 'bt2020nc' -or $Stream.color_transfer -ne 'arib-std-b67' -or $Stream.color_primaries -ne 'bt2020' -or $Stream.color_range -ne 'tv' -or $Stream.chroma_location -ne 'left') { throw 'Generated source does not have the required HLG VUI' }
         Write-Output "HLG_SOURCE_VUI_OK size=$Size format=p010 primaries=bt2020 transfer=hlg matrix=bt2020nc range=limited chroma=left"
     }
-    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\experimental\nr-original" (Join-Path $TestRoot 'source-hd.mp4') (Join-Path $TestRoot 'hdr-640x360.mp4') (Join-Path $TestRoot 'hdr-1920x1080.mp4') ([int]$HdrOnly.IsPresent) (Join-Path $TestRoot 'hlg-640x360.mp4') (Join-Path $TestRoot 'hlg-1920x1080.mp4')
+    & (Join-Path $TestRoot 'test_nvvideo_playback.exe') (Join-Path $TestRoot 'source.mp4') (Join-Path $TestRoot 'video_enhancement.dll') "$SdkDirectory\bin\Windows\x64\rel" "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\nvidia-vfg" $TestRoot "$RepoRoot\third_party\video-enhancement-deps\Veyra-2.0.6-NVIDIA\runtime\experimental\nr-original" (Join-Path $TestRoot 'source-hd.mp4') (Join-Path $TestRoot 'hdr-640x360.mp4') (Join-Path $TestRoot 'hdr-1920x1080.mp4') ([int]$HdrOnly.IsPresent) (Join-Path $TestRoot 'hlg-640x360.mp4') (Join-Path $TestRoot 'hlg-1920x1080.mp4') $Subtitle ([int]$AutoOnly.IsPresent)
     if ($LASTEXITCODE -ne 0) { throw 'Native mpv playback/seek/EOF test failed' }
 } finally {
     $Absolute = [IO.Path]::GetFullPath($TestRoot)

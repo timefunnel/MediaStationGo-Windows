@@ -11,7 +11,7 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 | --- | --- | --- | --- |
 | RIFE | 沿用既有组件，增加本地导入入口 | 原有三档与固定 2 倍插帧 | ABI 8、模型、TensorRT profile 与 HDR 路径保持原合同 |
 | RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
-| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，2–8 倍帧率，可配置自动切镜检测 | 渐进 SDR / HDR10 / HLG；HDR 使用 RGB10A2/PQ；与 RIFE 互斥 |
+| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，自动匹配刷新率或手动 2–8 倍，可配置自动切镜检测 | 渐进 SDR / HDR10 / HLG；HDR 使用 RGB10A2/PQ；与 RIFE 互斥 |
 | DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
 
 ## 使用
@@ -60,6 +60,206 @@ RTX Video 未安装；随后在实际 CEF 页面检查“已安装”指针、�
 本轮未重复 GPU 算法/画质验收，未改组件 ZIP、HDR 格式边界、RIFE 模型/profile/ABI 或刷新路径。
 仅本地更新与提交，未推送或发布。
 
+## 2026-10-20 VFG 按显示刷新率自动规划（本地实现与验证）
+
+- VFG 输出帧率增加“自动”，保留手动 2–8 倍；新选择默认自动，安装组件仍不会自动开启增强。
+- 自动规划只使用原生滤镜收到的源 `nominal_fps` 和 mpv 当前 VO 的实际显示刷新率。
+  选择 `display_hz / divisor` 中高于源帧率、最接近源两倍的帧率；距离相同时取较低者。
+  24 / 23.976 fps 配 152 Hz 得到 50.666667 fps；24 fps 配 144 Hz 得到 48 fps。
+  这是显示节奏规划，并非 GPU 算力自适应；任意采样可能比固定两倍调用更多次 SDK。
+- SDK 使用 `FrameMultiplier=0` 和每次输出独立的 `Timestep`，不是把整数倍率四舍五入。
+  视频按目标时间网格重采样；只有时间戳与网格重合的原帧直接输出，其他网格点由相邻源帧插值。
+  每次下游请求只生成一帧，复用结果纹理，不再提前阻塞生成整组中间帧。
+  原帧与生成帧统一进入同一输出 `AVHWFramesContext`；原帧只在 GPU 内复制可见区域，
+  避免解码/转换帧池与生成帧池交替触发下游 `d3d11vpp` 和 VO 反复重建。
+- 视频保持源 PTS 时间轴和原播放速度，音轨与软字幕继续由 mpv 处理，软字幕在视频滤镜之后渲染。
+  EOF 将最后一个源画面保持到源帧结束时间，再输出 EOF；末帧时长截到准确源结束位置。
+  跳转清空采样历史；跨屏或刷新率变化在下一源帧边界重新规划，保留播放时间轴。
+  烧录字幕属于视频像素，仍会参与插值；本轮没有独立识别或重绘硬字幕。
+- 缺少有效源帧率、显示刷新率，或显示刷新率不高于源帧率时明确失败，不静默改为固定倍率或关闭。
+  UI 的播放信息显示原片/输出帧率、显示分频及 SDK 平均/最大处理耗时。
+- 自写桥升级为 ABI 5，增加显式 timestep 入口；NVIDIA 组件 ZIP、RIFE ABI 8、模型和 profile 不变。
+- 已通过 CPU 分频规划/10 小时时钟、SDR/PQ/HLG 任意 timestep GPU 探针、
+  137 项 Rust 测试（5 项依赖真实环境的既有测试保持忽略），以及前端参数/草稿/重载回归。
+  `build/vfg-playback-validation.log` 记录 22 条原生播放组合全部通过，包含自动档 SDR/HDR10/HLG、
+  手动倍率与既有 NR/VSR 组合；High 8x 仍记录算力不足导致的音画落后，不将其记为实时性能通过。
+  `build/vfg-1080p-validation.log` / `build/vfg-4k-validation.log` 记录额外的 SDR Low 自动档通过。
+  三种 SDR 尺寸均通过音轨切换、暂停跳转、内嵌/外挂软字幕、均匀输出和 EOF 源/输出结束时间一致检查。
+  640×360 / 1080p / 4K 的 SDK 平均处理耗时为 2.604 / 2.957 / 4.117 ms，
+  最大音画时钟偏差为 3.7 / 0.3 / 0.3 ms；包含切轨/跳转的各段实际 VO 重配置均为 3 次，
+  PQ/HLG 小尺寸自动段各为 1 次，不再随原帧与生成帧交替反复重建。
+  可复现命令为 `dev/windows/test_video_enhancement.ps1`；
+  `-AutoOnly -VfgSourceSize 1920x1080` / `3840x2160` 分别验证 SDR 1080p / 4K 自动档。
+  同步样例为 4 秒、24 fps、AAC 48 kHz、双音轨、内嵌 mov_text / 外挂 SRT，音频使用 mpv `ao=null` 时钟。
+  它不代表 TrueHD/DTS 直通、真实声卡延迟、HDR 4K 或长片热稳定性验收。
+  音轨切换推进视频后再单独执行暂停精确跳转；连续同时提交切轨和跳转时，曾观察到 mpv 解码器等待关键帧，
+  本轮没有修改该 demux/decoder 边界，也不将这组并发操作记为通过。
+- 用户授权退出并重开后，标准 `dev/windows/build.ps1` 构建通过（`build/vfg-app-build.log`），
+  `build/jellium-desktop.exe`、`libmpv-2.dll` 与 ABI 5 视频桥已替换，逐文件 SHA-256 与构建源产物一致。
+  2026-10-20 23:43:13 启动的新主进程 PID 3512，主窗口 `MediaStationGo` 存在且响应正常；
+  23:43:14–15 启动日志确认 mpv/CEF 初始化、152 Hz、首页 HTTP 200 与主事件循环，
+  进程实际加载的 `libmpv-2.dll`、`libcef.dll` 均来自本工作区 `build` 目录。
+  此次启动未自动播放用户媒体，不替代上述播放验证或长片验收。
+  旧实例发送正常关闭请求后超时，仅终止核验归属的 PID 7684 及其 CEF 子进程；退出生命周期未修改。
+  已替换 EXE SHA-256：`946b73cd6f5824b040dc05aebf8d5eb22e44e57445bfc995c7b62d138ab5eb4d`；
+  `libmpv-2.dll`：`d87881c4b91972c1fca5a6e3b317b2a0d6d71dc650a47c83152f29eedaf789a2`；
+  本次标准流程重编视频桥：`ea105504c212f51719ab7a3a2274fcaa7889165c9a899233595ee3a1c04daf92`。
+  测试媒体/引擎临时目录已清理；短路径测试盘符映射已撤销。
+  自动审批以策略拦截拒绝递归删除 `build/vfg-rust-test` 编译缓存，该生成缓存保留在工作区内。
+  本轮仅本地修改与验证，未提交、推送或发布；尚不声明长片实播验收。
+
+## 2026-10-21 VFG 50.667 / 76 fps 对比验证
+
+用户同意同场景比较；本轮保留应用的自动默认策略与标准 `build` 播放器产物，
+没有把 76 fps 直接改成默认。原生滤镜增加显式 `display-divisor`（要求 VFG、`multiplier=0`），
+3 / 2 分别选择显示刷新率的三分之一 / 二分之一；非法目标与整数倍率冲突明确拒绝。
+显式与自动选择共用 `vfg_plan_divisor` 校验和既有目标时间网格，不增加另一条插帧实现。
+
+`dev/windows/test_vfg_cadence.ps1` 生成同一 23.976 fps 横移网格画面、双 AAC 音轨与内嵌软字幕，
+两档复用同一个源文件；每档 5 秒预热后测量 60 秒。使用 RTX 5070 Ti / 596.49、152 Hz、
+VFG Low、`gpu-next` / D3D11、`video-sync=audio`，WASAPI 真实声卡时钟、播放器音量为零。
+可见原生测试窗口外框 1920×1080，4K 指源与 VFG 处理分辨率，未覆盖 CEF 合成、全屏 4K 输出或 HDR。
+
+| 源分辨率 | 目标 fps | SDK 平均 / 最大 ms | 最大音画时钟偏差 ms | mpv 掉帧 / 延迟帧 |
+| --- | --- | --- | --- | --- |
+| 1920×1080 | 50.666667 | 2.996 / 7.048 | 0.1731 | 0 / 0 |
+| 1920×1080 | 76 | 2.562 / 7.678 | 0.1984 | 0 / 0 |
+| 3840×2160 | 50.666667 | 4.190 / 10.787 | 0.1860 | 0 / 0 |
+| 3840×2160 | 76 | 3.605 / 10.819 | 0.2190 | 0 / 0 |
+
+原始日志为 `build/vfg-cadence-1080p.log`、`build/vfg-cadence-4k.log`；逐次摘要与采样 CSV 在
+`build/vfg-cadence-1920x1080-20261021-144242`、`build/vfg-cadence-3840x2160-20261021-144607`。
+证据仅支持该合成场景 Low 档的播放端可行性，不代表长片、复杂运动画质、Medium/High 或直通验收。
+`mistimed-frame-count` 在音频同步模式不可用，摘要明确写 `null`，不当成零。
+
+实际呈现采集最初使用 Intel 官方签名的 PresentMon 2.6.0；普通权限启动 ETW 返回 `access denied`。
+用户授权 UAC 后，日志确认 `elevated=true`、开始/停止录制与退出码零，但没有生成显示 CSV；
+2.3.1 同样如此。进程名缩短、取消进程过滤、禁用 GPU 耗时跟踪均未恢复显示记录。
+显式同时关闭显示/GPU 跟踪后，两版都能采到 DXGI 提交事件，故没有将空显示结果或退出码零当成通过，
+也没有把权限问题继续当作本轮失败原因。未更改 Windows 设置或用户组。
+授权后的 60 秒重测和失败日志见 `build/vfg-cadence-1920x1080-20261021-145342`；
+带有效参数、管理员状态与控制台输出的短测见 `...-150252`、`...-150438`、`...-150827`、`...-151157`，
+独立采集探针在 `build/vfg-capture-probes`。
+
+提交节奏另外比较了 `audio` / `display-vdrop`，每档均完成 60 秒播放。
+固定采集定时器早于最后一档播放结束，提交分析明确统一取每档预热后的前 30 秒，
+没有把最后一档的不完整 60 秒当成完整采集。50.667 / 76 fps 在 `audio` 下的提交间隔均值为
+19.7359 / 13.1576 ms，p99 为 21.5103 / 14.7216 ms；
+`display-vdrop` 则每个显示刷新提交一次，重复视频帧也会提交，不能据此认定不同视频帧均匀显示。
+四组播放端掉帧均为零，显示同步组最大内部音画时钟偏差 10.6015 / 17.3539 ms。
+原始 CSV、分析脚本与 `submission-comparison.json` 在 `build/vfg-submission-20261021-151353`，
+输出显式标注 submission-only，未赋予实际显示时间或物理掉帧含义。
+
+为取得显示证据，临时诊断版 mpv 在独立线程约每毫秒查询 `IDXGISwapChain::GetFrameStatistics`，
+仅记录 `PresentCount` 变化。分析使用 Windows 已显示帧对应的 `PresentRefreshCount`；
+要求它与 `SyncRefreshCount` 相同，才将 `SyncQPCTime` 当作该刷新时间，完全不使用查询线程时间估算上屏时间。
+帧计数跨越大于一的区间标记为未观测，不均分成理想间隔、不当成物理掉帧；已知间隔覆盖率低于 99% 明确失败。
+这次单个活动物理显示器、152 Hz、1080p 源与原生窗口、Low、`video-sync=audio`，
+5 秒预热后两档各 60 秒结果如下：
+
+| 目标 fps | Windows 显示 fps | 已知间隔覆盖率 | 显示间隔 p95 / p99 / 最大 ms | 已观测刷新周期及数量 |
+| --- | --- | --- | --- | --- |
+| 50.666667 | 50.6713 | 99.4733% | 19.7378 / 26.3164 / 26.3173 | 2:113、3:2796、4:113 |
+| 76 | 75.9986 | 99.9122% | 13.1583 / 13.1586 / 19.7377 | 1:35、2:4484、3:35 |
+
+两档的真实刷新节奏都存在长短间隔混排，已观测间隔偏离理想周期的比例约 7.48% / 1.54%。
+两档最大 SDK 耗时 10.887 / 9.041 ms、播放端掉帧零，内部音画时钟偏差最大 0.1393 / 0.1761 ms；
+这些内部音画数值不代表屏幕与扬声器实际延迟。
+另一次 5 秒短测中，50.667 fps 全部保持三周期，而 76 fps 有 52/275/52 个一/二/三周期，
+与长测比例不同。因此只支持“目标分频匹配仍不能保证输出相位对齐”；
+初始相位是后续排查方向，尚未证明具体调度修复，也不能宣称 76 fps 始终更稳或达到电视/投影的画质。
+
+证据为 `build/vfg-dxgi-probe/audio-60/{manifest.json,divisor-*-summary.json,divisor-*.log,dxgi-comparison.json}`；
+短测在 `thread-smoke`。同目录保存诊断源码、构建/测试日志及 `analyze-dxgi.ps1`。
+诊断 DLL SHA-256 为 `948ecf032309da25e2bf186a112f6e40be844b5fefcc211c7af6f3f7a3b2b7d0`；
+测试后候选 DLL 恢复为 `042c21f14efc9df594948e0a4ccd908cc586935ef3e77665ac4cf7fa943c93c2`，
+mpv 子模块恢复干净，标准 `build/libmpv-2.dll` 仍为上文 10-20 的 `d87881c...`。
+这属于 Windows 显示统计，不是光学面板响应测量；物理掉帧字段保留 `null`，没有覆盖 4K 显示节奏、CEF 合成或复杂影片画质。
+接口边界见 [微软 DXGI_FRAME_STATISTICS](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ns-dxgi-dxgi_frame_statistics)
+及 [GetFrameStatistics](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-getframestatistics)。
+
+测试脚本支持显式 `-PresentMonPath ... -ElevatePresentationCapture`，仅提升采集助手，
+保留有效参数、控制台日志和退出状态；定时器覆盖两档硬截止时间，异常退出也等采集器结束后清理。
+`dev/windows/analyze_vfg_cadence.ps1` 按进程 ID 与预热后的 QPC 边界分析实际显示 CSV，
+缺少采样、多个交换链或字段不符均明确失败；本机仍未取得 PresentMon 显示 CSV，不能宣称该分析器已完成实测验收。
+字段含义见 [PresentMon 官方文档](https://github.com/GameTechDev/PresentMon/blob/v2.6.0/README-ConsoleApplication.md)。
+
+可复现播放命令为 `dev/windows/test_vfg_cadence.ps1 -Seconds 60`，4K 加 `-SourceSize 3840x2160`。
+CPU 分频边界、默认策略与 10 小时时钟测试、候选 mpv 重编、原生测试 `/W4 /WX` 编译均通过。
+本轮临时媒体、引擎缓存和原生测试程序已由脚本清理，保留 CSV/日志作为测量证据。
+自动审批以策略拦截拒绝清理三处早期试跑目录，暂留在 `build/vfg-cadence-1920x1080-20261021-143945`、
+`...-144039`、`...-144120`。
+收尾时清理 `build/vfg-dxgi-probe` 的 `original-libmpv-2.dll` / `instrumented-libmpv-2.dll` 副本，
+及 `build/vfg-capture-probes/{capture.ps1,capture-cpu.ps1}`、
+`build/vfg-submission-20261021-151353/capture.ps1` 也被自动审批以 `blocked by policy` 拒绝。
+这些文件保留，没有重试其他删除方式。正常基准的临时源/媒体/缓存已自动清理；本轮未提交、推送或发布。
+
+### 2026-10-21 晚间 VFG 显示同步修复
+
+本轮只为启用 VFG 的 MediaStationGo 文件设置 per-file `video-sync=display-vdrop`。
+该模式按显示 vblank 调度视频，通过必要的重复/丢弃视频补偿时钟差，保持 mpv 的
+`speed_factor_a=1.0`、`speed_factor_v=1.0`，不使用会改变音频速率的 display-resample。
+loadfile 的文件级选项由 mpv 在后续加载时恢复，普通播放与 RIFE 不传入 VFG 同步覆盖。
+自动目标仍按原策略从显示分频中选择接近源两倍的目标，不凭平均提交率将 76 fps 改成默认。
+
+mpv 在窗口不可见、暂停或刷新信息不可用等条件下可能不启用显示同步；播放信息明确显示
+实际 `display-sync-active`，诊断还包含配置模式和音视频速度修正，不能把配置值当成运行状态。
+原生基准对整个测量阶段检查同步活跃及音视频速度修正均为 1.0，使用 WASAPI 静音真实声卡时钟。
+
+测量脚本 `dev/windows/test_vfg_display.ps1` 临时构建诊断 DLL，采样后恢复 mpv 两个源文件与候选 DLL。
+独立高精度计时线程及 Present 后查询共同记录 DXGI 统计；gpu-next 将实际单幅 libplacebo 源图像 PTS
+关联到 `GetLastPresentCount`。分析只接受有匹配实际刷新 QPC 的显示事件，按源图像 PTS 合并重复呈现，
+不把每次 vblank 的同图重提当成新视频帧。直接读取 mpv 日志文件，不依赖有界客户端日志事件队列。
+计数跳跃时，只有所有中间提交均证明为旧 PTS，才确认新内容起点；其他起点及受影响间隔保持未知。
+覆盖率分母包含可能漏见的内容转换，`physicalDroppedFrames=null`，不估算丢失边界或均分理想时间。
+
+`analyze_vfg_display.ps1` 默认要求至少 99% 完整内容间隔覆盖，失败仍保存报告并抛错。
+显式 `-ReportOnly` 只用于保留部分采样证据，会输出门禁失败警告并在 JSON 中保留
+`meets99PercentCoverageGate=false`；此时分位数仅描述完整观测间隔，不证明未观测部分无卡顿。
+完整保留八组数据而明确报告覆盖门禁失败时，可运行
+`dev/windows/test_vfg_display.ps1 -Seconds 60 -ReportPartialSampling`；不带此开关则首次覆盖不足即失败。
+分析回归覆盖相同图像重复提交、已证明的重复帧采集缺口、未知内容起点拒绝及物理丢帧未知值。
+
+最终对比使用相同 RTX 5070 Ti / 596.49、152 Hz、Low 档、23.976 fps 横移源与 WASAPI；
+每种分辨率/同步模式的两个目标各预热 5 秒、测量 60 秒。下表仅统计完整观测的内容间隔，
+新模式四组均未达到 99% 完整覆盖门禁，因此不是全量上屏节奏验收通过：
+
+| 源分辨率 | 同步模式 | 目标 fps | 完整内容间隔覆盖 | 条件 p99 / 最大 ms | 已观测刷新周期及数量 |
+| --- | --- | --- | --- | --- | --- |
+| 1080p | audio | 50.666667 | 100.0000% | 19.7432 / 19.7499 | 3:3037 |
+| 1080p | audio | 76 | 100.0000% | 19.7373 / 19.7467 | 1:366、2:3827、3:365 |
+| 1080p | display-vdrop | 50.666667 | 96.6436% | 19.7432 / 19.7500 | 3:2937 |
+| 1080p | display-vdrop | 76 | 98.9908% | 13.1620 / 13.1666 | 2:4512 |
+| 4K | audio | 50.666667 | 99.8024% | 26.3167 / 26.3301 | 2:599、3:1832、4:600 |
+| 4K | audio | 76 | 100.0000% | 13.1630 / 19.7379 | 1:9、2:4540、3:9 |
+| 4K | display-vdrop | 50.666667 | 92.2621% | 19.7437 / 19.7498 | 3:2802 |
+| 4K | display-vdrop | 76 | 96.8407% | 13.1796 / 13.1850 | 1:5、2:4409 |
+
+1080p 两档与 4K 50.667 在完整观测部分保持固定分频；4K 76 仍观测到五个单周期短间隔。
+音频同步组不同轮次/目标的混排比例变化，仍不能由一次初相位的结果选定全局最佳目标。
+以上支持显示同步对明显长短混排的改善，不支持完全消除抖动或达到电视/投影画质；
+不可观察区间、复杂影片画质、Medium/High、CEF 合成及全屏 4K/HDR 呈现仍未验收。
+保留自动默认策略。不同显示/声卡时钟的长期漂移仍可能需要 display-vdrop 的视频重复/丢弃补偿，
+不能宣称长片每一帧永久固定刷新周期。
+
+八组播放端掉帧、解码掉帧和延迟帧均为零；新模式测量全程同步活跃，音视频速度修正均为 1.0，
+mistimed 为零，最大内部音画时钟偏差依次为 11.3417、13.0089、16.8540、14.3861 ms。
+这些值不是扬声器/面板实体音画延迟。全部原始直接日志、遥测、manifest 和 JSON 报告位于
+`build/vfg-display-final-20261021-2147/{1920x1080,3840x2160}-{audio,display-vdrop}`。
+诊断 DLL 及源码在 `build/vfg-display-verified-20261021-2132`，短测在 `build/vfg-display-direct-smoke-20261021-2143`。
+
+使用恢复后的正式候选 DLL，1080p/4K 两档分别通过 `-ExerciseControls`：暂停保持、暂停精确跳转、
+继续播放、内部音轨 1→2 后继续推进、关闭内嵌字幕、选择外部字幕、1.3–2.1 / 2.3–3.8 秒字幕按源时间出现、
+暂停跳回字幕 A、结束后清除、VFG EOF、后续无 VFG 文件恢复配置的 audio 同步及正常 EOF。
+音轨切换完成后才继续 seek，未覆盖同一时刻并发切轨/seek；未声明直通音轨验收。
+日志在 `build/vfg-controls-{1920x1080,3840x2160}-20261021-2157`。
+
+Rust 验证共 159 项通过、5 项既有忽略；两组组件 JS 回归、JS 语法、Rust 格式及显示分析回归通过。
+CEF 测试先因缺少路径配置/Windows 长路径而失败，复用短盘符映射与现有 SDK 后 104 项通过；
+盘符映射随命令结束移除。临时媒体、EXE、GPU 引擎缓存与分析夹具均由受路径校验的 finally 清理。
+保留正常编译缓存、原始测量证据及既有被拒清理的文件，未重新尝试删除后者。
+本地标准 Release 更新与重启状态见进度台账；本次按用户要求纳入本地提交，未推送或发布。
+
 ## 实现边界
 
 - `ComponentKind` 固定组件身份、平台、运行库版本与精确文件集。解包仍拒绝路径穿越、
@@ -68,12 +268,13 @@ RTX Video 未安装；随后在实际 CEF 页面检查“已安装”指针、�
 - 用户 cache 下 `components/{rife,rtx-video,dlssnr,nvidia-vfg}/{active,pending}`
   各自存放运行库；专属缓存为 `frame-interpolation`、`rtx-video`、`dlssnr`、`nvidia-vfg`。
   卸载清理仅针对选中组件及其专属缓存。
-- 主程序携带自写 ABI 4 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
+- 主程序携带自写 ABI 5 的 `video_enhancement.dll` 桥和 `nvngx.dll` NR 适配器，不携带上述可选 NVIDIA DLL。
   安装成功只说明文件经过校验；GPU/驱动支持在实际创建 SDK feature 时验证。
 - SDR 链路为 `D3D11 解码 → d3d11vpp BGRA8 → 可选 DLSSNR → 可选 VFG → 可选 VSR →
   d3d11vpp NV12 → 原有 VO`。BGRA→NV12 是输出格式合同的一部分。
   生产帧保持在 GPU，不经过 CPU 读回；GPU 探针中的读回仅用于检查结果。
-- mpv 继续拥有 PTS、音轨、字幕、播放速度和 EOF。VFG 第 i 个中间帧 PTS 为 prev + (current - prev) × i / multiplier；
+- mpv 继续拥有 PTS、音轨、字幕、播放速度和 EOF。手动 VFG 第 i 个中间帧 PTS 为 prev + (current - prev) × i / multiplier；
+  自动 VFG 使用上述显示分频时间网格，并按相邻源 PTS 计算每帧 timestep。
   seek、EOF、分辨率或静态格式变化清空历史并释放 SDK 会话。VFG 要求源 PTS 递增，
   相邻间隔不超过 250 ms。
 - SDK 初始化、执行和释放均隔离共享 D3D11 上下文状态，VFG 使用与解码设备匹配的
