@@ -777,6 +777,21 @@ fn should_defer_audio_to_mpv(requested: bool, audio_track: i64, has_external_aud
     requested && audio_track == TRACK_DISABLE && !has_external_audio
 }
 
+fn set_pending_embedded_subtitle(track: &mut PendingTrack, id: i64) -> bool {
+    if !track.valid || !track.external_sub_url.is_empty() || id <= 0 {
+        return false;
+    }
+    track.sid = id;
+    true
+}
+
+/// Resolve a container subtitle after FILE_LOADED, before the coordinator
+/// applies the queued selectors and unpauses. External subtitles retain the
+/// per-load path that was already prepared by the caller.
+pub fn jfn_mpv_set_pending_embedded_subtitle(id: i64) -> bool {
+    set_pending_embedded_subtitle(&mut pending_slot().lock(), id)
+}
+
 pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     let snapshot = {
         let mut s = pending_slot().lock();
@@ -893,7 +908,33 @@ pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{media_station_subtitle_options, should_defer_audio_to_mpv};
+    use super::{
+        PendingTrack, media_station_subtitle_options, set_pending_embedded_subtitle,
+        should_defer_audio_to_mpv,
+    };
+
+    #[test]
+    fn loaded_subtitle_updates_the_pending_selector_before_playback() {
+        let mut pending = PendingTrack {
+            vid: 1,
+            aid: 2,
+            sid: 0,
+            external_audio_url: String::new(),
+            external_sub_url: String::new(),
+            defer_audio_to_mpv: false,
+            valid: true,
+        };
+        assert!(set_pending_embedded_subtitle(&mut pending, 7));
+        assert_eq!(pending.sid, 7);
+        assert_eq!(pending.aid, 2);
+        assert!(!set_pending_embedded_subtitle(&mut pending, 0));
+        pending.external_sub_url = "prepared.srt".to_string();
+        assert!(!set_pending_embedded_subtitle(&mut pending, 8));
+        assert_eq!(pending.sid, 7);
+        pending.external_sub_url.clear();
+        pending.valid = false;
+        assert!(!set_pending_embedded_subtitle(&mut pending, 8));
+    }
 
     #[test]
     fn media_station_subtitle_style_uses_vertical_position_not_layout_margin() {

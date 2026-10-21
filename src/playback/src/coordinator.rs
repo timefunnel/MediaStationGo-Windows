@@ -315,6 +315,28 @@ mod tests {
     }
 
     #[test]
+    fn file_loaded_prepares_tracks_before_builtin_selection_and_play() {
+        let mut coord = PlaybackCoordinator::new().unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let prepared = Arc::clone(&order);
+        coord.add_action_sink(Box::new(move |_action| {
+            prepared.lock().push("prepare-subtitle");
+        }));
+        let selected = Arc::clone(&order);
+        let (tx, rx) = mpsc::sync_channel(1);
+        coord.add_builtin_action_sink(Box::new(move |_action| {
+            selected.lock().push("select-and-play");
+            tx.send(()).expect("test receiver should be alive");
+        }));
+        coord.start();
+        coord.enqueue(Input::FileLoaded);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("file-loaded action should complete");
+        assert_eq!(*order.lock(), vec!["prepare-subtitle", "select-and-play"]);
+        coord.stop();
+    }
+
+    #[test]
     fn worker_updates_snapshot_after_input() {
         let mut coord = PlaybackCoordinator::new().unwrap();
         coord.start();

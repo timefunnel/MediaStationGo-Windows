@@ -5297,7 +5297,7 @@
             panelKind: '',
             trackChanging: false,
             trackRefreshing: false,
-            metadataRefreshMediaId: null,
+            metadataRefreshLoadInfo: null,
             scrubbing: false,
             scrubPositionMs: null,
             interpolationEnabled: false,
@@ -5408,23 +5408,30 @@
         if (player !== activePlayer
             || !activePlayer.started
             || !activePlayer.loadInfo
+            || activePlayer.interpolationChanging
+            || activePlayer.episodeChanging
             || activePlayer.exiting) return;
         const mediaId = activePlayer.card?.id;
-        if (!mediaId || activePlayer.metadataRefreshMediaId === mediaId) return;
-        activePlayer.metadataRefreshMediaId = mediaId;
-        void refreshPlaybackMetadata(activePlayer, mediaId);
+        const loadInfo = activePlayer.loadInfo;
+        if (!mediaId || activePlayer.metadataRefreshLoadInfo === loadInfo) return;
+        activePlayer.metadataRefreshLoadInfo = loadInfo;
+        void refreshPlaybackMetadata(activePlayer, mediaId, loadInfo);
     }
 
-    async function refreshPlaybackMetadata(activePlayer, mediaId) {
+    async function refreshPlaybackMetadata(activePlayer, mediaId, loadInfo) {
         const retryDelaysMs = [0, 1000, 2000, 4000];
+        let refreshError = false;
+        let subtitleRestorePending = false;
         for (const retryDelayMs of retryDelaysMs) {
             if (retryDelayMs > 0) {
                 await new Promise((resolve) => window.setTimeout(resolve, retryDelayMs));
             }
             if (player !== activePlayer
                 || activePlayer.exiting
+                || activePlayer.interpolationChanging
+                || activePlayer.episodeChanging
+                || activePlayer.loadInfo !== loadInfo
                 || activePlayer.card?.id !== mediaId) return;
-            if (retryDelayMs > 0 && !activePlayer.loadInfo?.mediaMetadataPending) return;
             try {
                 const tracks = await nativeRequest(
                     'mediaStationTracks',
@@ -5432,25 +5439,31 @@
                     [mediaId],
                     15000,
                 );
-                if (player !== activePlayer || activePlayer.exiting || activePlayer.card?.id !== mediaId) return;
+                if (player !== activePlayer || activePlayer.exiting
+                    || activePlayer.interpolationChanging || activePlayer.episodeChanging
+                    || activePlayer.loadInfo !== loadInfo || activePlayer.card?.id !== mediaId) return;
                 applyPlaybackMetadataRefresh(activePlayer, tracks);
+                refreshError = false;
+                subtitleRestorePending = tracks.subtitleRestorePending === true;
                 if (tracks.metadataRefreshErrorCode) {
                     console.error(`Playback metadata refresh failed: ${tracks.metadataRefreshErrorCode}`);
                 }
                 refreshPlayerTools();
                 if (activePlayer.panelKind === 'info') renderPlayerPanel();
-                if (!activePlayer.loadInfo.mediaMetadataPending) {
+                if (!loadInfo.mediaMetadataPending && !subtitleRestorePending) {
                     return;
                 }
             } catch (error) {
+                refreshError = true;
                 console.error(`Playback metadata refresh request failed: ${friendlyError(error)}`);
             }
         }
         if (player === activePlayer
             && !activePlayer.exiting
+            && activePlayer.loadInfo === loadInfo
             && activePlayer.card?.id === mediaId
-            && activePlayer.loadInfo?.mediaMetadataPending) {
-            console.warn(`Server playback metadata remained pending after bounded refresh: media_id=${mediaId}`);
+            && (loadInfo.mediaMetadataPending || subtitleRestorePending || refreshError)) {
+            console.warn(`Playback track refresh incomplete after bounded refresh: media_id=${mediaId} metadata_pending=${loadInfo.mediaMetadataPending === true} subtitle_pending=${subtitleRestorePending} request_failed=${refreshError}`);
         }
     }
 
@@ -6020,6 +6033,7 @@
             }
             activePlayer.loadInfo = loadInfo;
             activePlayer.videoEnhancement = loadInfo.videoEnhancement;
+            schedulePlaybackMetadataRefresh(activePlayer);
             applyPlayerPlaybackRate(playerPlaybackRate);
             if (activePlayer.interpolationChanging) {
                 setPlayerLoading(true, playerTransitionLoadingLabel(activePlayer));

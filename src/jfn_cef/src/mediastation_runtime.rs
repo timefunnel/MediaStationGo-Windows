@@ -10,15 +10,16 @@ use jfn_mediastation::{
     MediaSourceOption, MediaStationApiClient, MediaStationClientProfile,
     MediaStationConnectionProfile, MediaStationProxyMode, MediaStationSession,
     PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError, PlaybackSessionResolver,
-    PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference, PlaybackTrackPreferenceUpdate,
-    SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream, build_playback_track_plan,
-    chinese_subtitle_preference_rank,
+    PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference, PlaybackTrackPreferenceState,
+    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream,
+    build_playback_track_plan, chinese_subtitle_preference_rank,
 };
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
     jfn_mpv_get_property_int, jfn_mpv_get_property_node, jfn_mpv_get_property_string,
-    jfn_mpv_load_file, jfn_mpv_set_audio_track_checked, jfn_mpv_set_subtitle_track_checked,
-    jfn_mpv_stop, jfn_mpv_sub_add_checked, jfn_mpv_sub_remove_current_checked,
+    jfn_mpv_load_file, jfn_mpv_set_audio_track_checked, jfn_mpv_set_pending_embedded_subtitle,
+    jfn_mpv_set_subtitle_track_checked, jfn_mpv_stop, jfn_mpv_sub_add_checked,
+    jfn_mpv_sub_remove_current_checked,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::{
@@ -524,6 +525,9 @@ enum RuntimeTrackKind {
 struct RuntimeTrack {
     kind: RuntimeTrackKind,
     key: String,
+    /// Identity from the same mpv track, retained when server metadata supplies
+    /// the public key so an earlier runtime-only preference still matches.
+    runtime_key: Option<String>,
     mpv_id: Option<i64>,
     codec: Option<String>,
     language: Option<String>,
@@ -883,6 +887,39 @@ impl MediaStationRuntime {
         {
             dispatch_danmaku_event(json!({ "kind": "clear" }));
         }
+    }
+
+    fn prepare_loaded_subtitle(&self) -> Result<(), LoadFailure> {
+        // Runs on the coordinator worker, before its builtin FILE_LOADED
+        // action. Only read the local mpv catalog here: network metadata and
+        // preference writes must never delay the first frame.
+        let state = self.state.lock();
+        let Some(active) = state.active_report.as_ref() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let catalog = current_runtime_track_catalog(&active.source)?;
+        let Some(track) = preferred_embedded_subtitle_track(&catalog, &active.preference) else {
+            return Ok(());
+        };
+        let mpv_id = track.mpv_id.ok_or_else(|| {
+            LoadFailure::new(
+                "subtitle_track_unavailable",
+                "The loaded subtitle has no player identifier",
+            )
+        })?;
+        if !jfn_mpv_set_pending_embedded_subtitle(mpv_id) {
+            return Err(LoadFailure::new(
+                "subtitle_startup_restore_failed",
+                "The loaded subtitle could not be added to the pending playback selection",
+            ));
+        }
+        log_debug(&format!(
+            "MediaStation subtitle prepared before playback: media_id={} elapsed_ms={}",
+            active.source.media_id,
+            started.elapsed().as_millis()
+        ));
+        Ok(())
     }
 
     fn enqueue_report(&self, job: Option<ReportJob>) {
@@ -2083,6 +2120,24 @@ fn activate_playback_report(
     stopped
 }
 
+fn playback_reload_preference(
+    active: Option<&ActivePlaybackReport>,
+    source: &PlaybackSource,
+    preference_scope_id: &str,
+) -> Option<PlaybackTrackPreferenceState> {
+    let active = active?;
+    if active.source.media_id != source.media_id
+        || active.source.media_source_id != source.media_source_id
+        || active.preference_scope_id != preference_scope_id
+    {
+        return None;
+    }
+    Some(PlaybackTrackPreferenceState {
+        preference: active.preference.clone(),
+        persistence: active.preference_persistence,
+    })
+}
+
 fn plan_playback_reports(
     state: &mut RuntimeState,
     event: &PlaybackEvent,
@@ -2219,13 +2274,26 @@ fn runtime() -> Result<Arc<MediaStationRuntime>, LoadFailure> {
 }
 
 fn install_playback_cleanup(runtime: Weak<MediaStationRuntime>) {
+    let track_runtime = runtime.clone();
     if !jfn_playback::register_event_sink(Box::new(move |event| {
         if let Some(runtime) = runtime.upgrade() {
             runtime.handle_playback_event(event);
         }
     })) {
         log_error("MediaStation playback event sink registration failed: coordinator unavailable");
+        return;
     }
+    jfn_playback::register_action_sink(Box::new(move |action| {
+        if action.kind == jfn_playback::PlaybackActionKind::ApplyPendingTrackSelectionAndPlay
+            && let Some(runtime) = track_runtime.upgrade()
+            && let Err(failure) = runtime.prepare_loaded_subtitle()
+        {
+            log_error(&format!(
+                "MediaStation subtitle preparation before playback failed: code={}",
+                failure.code
+            ));
+        }
+    }));
 }
 
 pub(crate) fn release_playback_resources() {
@@ -4941,12 +5009,16 @@ fn execute_tracks_request(
         catalog.subtitles.len(),
         catalog.subtitles.iter().any(|track| track.selected),
     ));
-    Ok(runtime_tracks_payload(
+    let preference = runtime.active_playback_preference(snapshot, &request.media_id)?;
+    let mut payload = runtime_tracks_payload(
         &catalog,
         Some(&source),
         Some(&runtime_video),
         metadata_refresh_error,
-    ))
+    );
+    payload["subtitleRestorePending"] =
+        Value::Bool(subtitle_restore_pending(&catalog, &preference));
+    Ok(payload)
 }
 
 pub(crate) fn handle_track_selection_message(
@@ -5710,7 +5782,7 @@ fn reconcile_runtime_track_preference_inner(
             let already_selected = catalog
                 .subtitles
                 .iter()
-                .any(|track| track.key == key && track.selected);
+                .any(|track| subtitle_track_matches_key(track, key) && track.selected);
             if !already_selected {
                 if is_legacy_runtime_subtitle_key(key) {
                     let Some((track, migration)) = legacy_runtime_subtitle_migration(&catalog, key)
@@ -5871,7 +5943,7 @@ fn runtime_subtitle_selection(
     let track = catalog
         .subtitles
         .iter()
-        .find(|track| !track.external && track.key == key)
+        .find(|track| !track.external && subtitle_track_matches_key(track, key))
         .ok_or_else(|| {
             LoadFailure::new(
                 "subtitle_track_unavailable",
@@ -5886,8 +5958,12 @@ fn runtime_subtitle_selection(
     })?;
     Ok(TrackSelection::SubtitleEmbedded {
         mpv_track,
-        key: key.to_string(),
+        key: track.key.clone(),
     })
+}
+
+fn subtitle_track_matches_key(track: &RuntimeTrack, key: &str) -> bool {
+    track.key == key || track.runtime_key.as_deref() == Some(key)
 }
 
 const RUNTIME_SUBTITLE_KEY_PREFIX: &str = "runtime:subtitle:";
@@ -5902,11 +5978,7 @@ fn is_legacy_runtime_subtitle_key(key: &str) -> bool {
 }
 
 fn preferred_runtime_subtitle_track(catalog: &RuntimeTrackCatalog) -> Option<&RuntimeTrack> {
-    let eligible = |track: &&RuntimeTrack| {
-        !track.external
-            && track.mpv_id.is_some()
-            && track.key.starts_with(RUNTIME_SUBTITLE_KEY_V2_PREFIX)
-    };
+    let eligible = |track: &&RuntimeTrack| !track.external && track.mpv_id.is_some();
     catalog
         .subtitles
         .iter()
@@ -5950,25 +6022,54 @@ fn legacy_runtime_subtitle_migration<'a>(
     ))
 }
 
+fn preferred_embedded_subtitle_track<'a>(
+    catalog: &'a RuntimeTrackCatalog,
+    preference: &PlaybackTrackPreference,
+) -> Option<&'a RuntimeTrack> {
+    if !preference.subtitle_enabled {
+        return None;
+    }
+    if let Some(key) = preference.subtitle_track_key.as_deref() {
+        catalog
+            .subtitles
+            .iter()
+            .find(|track| !track.external && subtitle_track_matches_key(track, key))
+            .or_else(|| legacy_runtime_subtitle_migration(catalog, key).map(|(track, _)| track))
+    } else if !preference.configured {
+        preferred_runtime_subtitle_track(catalog)
+    } else {
+        None
+    }
+}
+
 fn pending_embedded_subtitle_preference(
     catalog: &RuntimeTrackCatalog,
     preference: &PlaybackTrackPreference,
 ) -> Option<(i64, String)> {
-    if !preference.subtitle_enabled || catalog.subtitles.iter().any(|track| track.selected) {
+    let track = preferred_embedded_subtitle_track(catalog, preference)?;
+    if track.selected {
         return None;
     }
-    let track = if let Some(key) = preference.subtitle_track_key.as_deref() {
-        catalog
+    Some((track.mpv_id?, track.key.clone()))
+}
+
+fn subtitle_restore_pending(
+    catalog: &RuntimeTrackCatalog,
+    preference: &PlaybackTrackPreference,
+) -> bool {
+    if !preference.subtitle_enabled {
+        return false;
+    }
+    if let Some(key) = preference.subtitle_track_key.as_deref() {
+        let track = catalog
             .subtitles
             .iter()
-            .find(|track| !track.external && track.key == key)
-            .or_else(|| legacy_runtime_subtitle_migration(catalog, key).map(|(track, _)| track))?
-    } else if !preference.configured {
-        preferred_runtime_subtitle_track(catalog)?
-    } else {
-        return None;
-    };
-    Some((track.mpv_id?, track.key.clone()))
+            .find(|track| subtitle_track_matches_key(track, key))
+            .or_else(|| legacy_runtime_subtitle_migration(catalog, key).map(|(track, _)| track));
+        return track.is_none_or(|track| !track.selected);
+    }
+    !preference.configured
+        && preferred_runtime_subtitle_track(catalog).is_some_and(|track| !track.selected)
 }
 
 fn restore_pending_embedded_subtitle_preference(
@@ -5988,7 +6089,7 @@ fn restore_pending_embedded_subtitle_preference(
         TrackSelection::SubtitleEmbedded { mpv_track, key },
     )?;
     log_debug(&format!(
-        "MediaStation pending subtitle preference restored before track panel response: media_id={}",
+        "MediaStation pending subtitle preference restored during track refresh: media_id={}",
         source.media_id
     ));
     Ok(true)
@@ -6450,10 +6551,21 @@ fn execute_load(
     }
 
     runtime.ensure_generation(snapshot.generation)?;
-    let preference_state = runtime
-        .api
-        .load_playback_preference(&snapshot.session, &request.preference_scope_id, &source)
-        .map_err(|error| api_failure("preference_load_failed", &error))?;
+    // A feature toggle reloads the same source. Its current track selection
+    // belongs to this playback, including an explicit subtitle-off choice on
+    // servers that only support session-local preferences.
+    let reload_preference = playback_reload_preference(
+        runtime.state.lock().active_report.as_ref(),
+        &source,
+        &request.preference_scope_id,
+    );
+    let preference_state = match reload_preference {
+        Some(preference) => preference,
+        None => runtime
+            .api
+            .load_playback_preference(&snapshot.session, &request.preference_scope_id, &source)
+            .map_err(|error| api_failure("preference_load_failed", &error))?,
+    };
     let preference = preference_state.preference;
     let preference_persistence = preference_state.persistence;
     log_debug(&format!(
@@ -6794,6 +6906,7 @@ fn runtime_track_catalog(
                 catalog.audio.push(RuntimeTrack {
                     kind: RuntimeTrackKind::Audio,
                     key,
+                    runtime_key: None,
                     mpv_id: Some(track.id),
                     codec: track
                         .codec
@@ -6830,16 +6943,15 @@ fn runtime_track_catalog(
                     .iter()
                     .filter(|candidate| candidate.is_external == track.external)
                     .nth(ordinal);
-                let key = server.map_or_else(
-                    || runtime_fallback_track_key(&track, ordinal),
-                    |server| server.key.clone(),
-                );
+                let runtime_key = runtime_fallback_track_key(&track, ordinal);
+                let key = server.map_or_else(|| runtime_key.clone(), |server| server.key.clone());
                 if server.is_some() {
                     matched_subtitle_keys.insert(key.clone());
                 }
                 catalog.subtitles.push(RuntimeTrack {
                     kind: RuntimeTrackKind::Subtitle,
                     key,
+                    runtime_key: Some(runtime_key),
                     mpv_id: Some(track.id),
                     codec: track
                         .codec
@@ -6869,6 +6981,7 @@ fn runtime_track_catalog(
         catalog.subtitles.push(RuntimeTrack {
             kind: RuntimeTrackKind::Subtitle,
             key: track.key.clone(),
+            runtime_key: None,
             mpv_id: None,
             codec: track.codec.clone(),
             language: track.language.clone(),
@@ -7662,6 +7775,220 @@ mod tests {
             video: None,
             subtitles: Vec::new(),
             audio_tracks: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg, libmpv, and an isolated MPV_HOME configured with vo=null"]
+    fn local_subtitle_is_ready_before_playback_on_load_and_reload() {
+        use jfn_mpv::api::{
+            WaitEvent, jfn_mpv_apply_pending_track_selection_and_play, wait_event_owned,
+        };
+        use jfn_mpv::boot::{
+            DisplayBackend, JfnMpvBoot, jfn_mpv_handle_init, jfn_mpv_handle_terminate,
+        };
+        use jfn_mpv::{EndFileReason, Event, PropertyValue};
+
+        assert!(
+            std::env::var_os("MPV_HOME").is_some(),
+            "isolate mpv configuration"
+        );
+        let fixture = tempfile::tempdir().expect("fixture directory should be created");
+        fs::write(
+            fixture.path().join("sync.srt"),
+            "1\n00:00:00,000 --> 00:00:02,000\nSubtitle synchronization test\n",
+        )
+        .expect("fixture subtitle should be written");
+        let output = std::process::Command::new("ffmpeg")
+            .current_dir(fixture.path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x90:r=24:d=2",
+                "-i",
+                "sync.srt",
+                "-map",
+                "0:v",
+                "-map",
+                "1:s",
+                "-map",
+                "1:s",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:s",
+                "srt",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:0",
+                "title=English",
+                "-metadata:s:s:1",
+                "language=chi",
+                "-metadata:s:s:1",
+                "title=Chinese",
+                "-disposition:s:0",
+                "default",
+                "-disposition:s:1",
+                "0",
+                "fixture.mkv",
+            ])
+            .output()
+            .expect("ffmpeg should be available");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        struct MpvGuard;
+        impl Drop for MpvGuard {
+            fn drop(&mut self) {
+                jfn_mpv_stop();
+                jfn_mpv_handle_terminate();
+            }
+        }
+        let boot = JfnMpvBoot {
+            display_backend: DisplayBackend::Other as u8,
+            hwdec: c"no".as_ptr(),
+            user_agent: c"MediaStationSubtitleTest".as_ptr(),
+            audio_passthrough: std::ptr::null(),
+            audio_exclusive: false,
+            audio_channels: std::ptr::null(),
+            geometry: std::ptr::null(),
+            force_window_position: false,
+            window_maximized_at_boot: false,
+            mpv_log_level: c"warn".as_ptr(),
+            client_side_decorations: false,
+        };
+        let raw = unsafe { jfn_mpv_handle_init(&boot) };
+        assert!(!raw.is_null(), "libmpv should initialize");
+        let _mpv_guard = MpvGuard;
+        assert_eq!(mpv_property_string(c"vo").as_deref(), Some("null"));
+        const PAUSE_OBSERVER: u64 = 0x5355_4250;
+        assert!(
+            unsafe {
+                jfn_mpv::sys::mpv_observe_property(
+                    raw,
+                    PAUSE_OBSERVER,
+                    c"pause".as_ptr(),
+                    jfn_mpv::sys::mpv_format::MPV_FORMAT_FLAG,
+                )
+            } >= 0
+        );
+        struct CacheGuard(std::path::PathBuf);
+        impl Drop for CacheGuard {
+            fn drop(&mut self) {
+                jfn_paths::set_cache_dir_override(self.0.clone());
+            }
+        }
+        let _cache_guard = CacheGuard(jfn_paths::cache_dir());
+        jfn_paths::set_cache_dir_override(fixture.path().join("cache"));
+        let runtime = MediaStationRuntime::new().expect("runtime should initialize");
+        let session = session("user-1");
+        let source = playback_source(&session.base_url);
+        let snapshot = SessionSnapshot {
+            generation: runtime.configure_session(session.clone()),
+            session,
+        };
+        let path = CString::new(
+            fixture
+                .path()
+                .join("fixture.mkv")
+                .to_str()
+                .expect("UTF-8 path"),
+        )
+        .expect("fixture path should contain no NUL");
+        let options = JfnMpvLoadOptions {
+            start_secs: 0.0,
+            video_track: 1,
+            audio_track: 0,
+            sub_track: 0,
+            external_audio_url: c"".as_ptr(),
+            external_sub_url: c"".as_ptr(),
+            http_header_fields: c"".as_ptr(),
+            http_proxy: c"".as_ptr(),
+            video_filter: c"".as_ptr(),
+            hwdec: c"no".as_ptr(),
+            vfg_display_sync: false,
+            subtitle_style_override: false,
+            subtitle_font_size: 0.0,
+            subtitle_position: 100.0,
+            defer_audio_to_mpv: false,
+        };
+        let mut preference = PlaybackTrackPreference {
+            configured: false,
+            subtitle_enabled: true,
+            subtitle_track_key: None,
+            audio_track_key: None,
+        };
+        for (case, expected_sid) in [
+            ("automatic-Chinese", "2"),
+            ("reload-English", "1"),
+            ("reload-off", "no"),
+        ] {
+            activate_playback_report(
+                &mut runtime.state.lock(),
+                &snapshot,
+                &source,
+                &preference,
+                PlaybackPreferencePersistence::SessionOnly,
+                "media-1",
+                0,
+            );
+            unsafe { jfn_mpv_load_file(path.as_ptr(), &options) }
+                .expect("native load should queue");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut loaded_at = None;
+            let mut preparation = Duration::ZERO;
+            let mut playing = false;
+            while Instant::now() < deadline && !playing {
+                match wait_event_owned(0.1) {
+                    WaitEvent::Event(Event::FileLoaded) => {
+                        assert_eq!(mpv_property_string(c"pause").as_deref(), Some("yes"));
+                        loaded_at = Some(Instant::now());
+                        runtime
+                            .prepare_loaded_subtitle()
+                            .expect("subtitle should prepare locally");
+                        preparation = loaded_at.expect("load time recorded").elapsed();
+                        jfn_mpv_apply_pending_track_selection_and_play();
+                    }
+                    WaitEvent::Event(Event::PropertyChange {
+                        id: PAUSE_OBSERVER,
+                        value: PropertyValue::Flag(false),
+                        ..
+                    }) if loaded_at.is_some() => {
+                        assert_eq!(
+                            mpv_property_string(c"sid").as_deref(),
+                            Some(expected_sid),
+                            "{case}"
+                        );
+                        println!(
+                            "LOCAL_SUBTITLE_READY case={case} preparation_us={} loaded_to_playback_ms={}",
+                            preparation.as_micros(),
+                            loaded_at.expect("load time recorded").elapsed().as_millis()
+                        );
+                        playing = true;
+                    }
+                    WaitEvent::Event(Event::EndFile(EndFileReason::Error(error))) => {
+                        panic!("local playback failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(playing, "{case} should start with the intended subtitle");
+            if case == "automatic-Chinese" {
+                let catalog =
+                    current_runtime_track_catalog(&source).expect("local tracks should load");
+                preference.configured = true;
+                preference.subtitle_track_key = Some(catalog.subtitles[0].key.clone());
+            } else {
+                preference.subtitle_enabled = false;
+            }
         }
     }
 
@@ -8613,6 +8940,7 @@ mod tests {
         RuntimeTrack {
             kind: RuntimeTrackKind::Subtitle,
             key: key.to_string(),
+            runtime_key: Some(key.to_string()),
             mpv_id: Some(mpv_id),
             codec: Some("ass".to_string()),
             language: Some(language.to_string()),
@@ -9146,12 +9474,198 @@ mod tests {
             pending_embedded_subtitle_preference(&catalog, &preference),
             None
         );
+        assert!(!subtitle_restore_pending(&catalog, &preference));
         preference.subtitle_enabled = true;
         preference.configured = true;
         assert_eq!(
             pending_embedded_subtitle_preference(&catalog, &preference),
             None
         );
+        assert!(!subtitle_restore_pending(&catalog, &preference));
+    }
+
+    #[test]
+    fn reload_preserves_session_track_choices_only_for_the_same_media_source_and_scope() {
+        let base_url = Url::parse("https://media.example").expect("URL");
+        let source = playback_source(&base_url);
+        let mut active = ActivePlaybackReport {
+            generation: 7,
+            session: session_at(base_url, "user-1"),
+            source: source.clone(),
+            preference: PlaybackTrackPreference {
+                configured: true,
+                subtitle_enabled: false,
+                subtitle_track_key: Some("runtime:subtitle:v2:saved".to_string()),
+                audio_track_key: Some("stream:3".to_string()),
+            },
+            preference_persistence: PlaybackPreferencePersistence::SessionOnly,
+            preference_scope_id: "series-1".to_string(),
+            preference_revision: 1,
+            runtime_tracks_reconciled: true,
+            started: true,
+            paused: true,
+            last_position_ms: 30_000,
+            last_report_at: None,
+        };
+        let disabled = playback_reload_preference(Some(&active), &source, "series-1")
+            .expect("same playback preserves session preference");
+        assert_eq!(disabled.preference, active.preference);
+        assert_eq!(
+            disabled.persistence,
+            PlaybackPreferencePersistence::SessionOnly
+        );
+        active.preference.subtitle_enabled = true;
+        assert_eq!(
+            playback_reload_preference(Some(&active), &source, "series-1")
+                .expect("enabled subtitle retained")
+                .preference,
+            active.preference
+        );
+        assert!(playback_reload_preference(Some(&active), &source, "other-series").is_none());
+        let mut other = source.clone();
+        other.media_source_id = Some("another-version".to_string());
+        assert!(playback_reload_preference(Some(&active), &other, "series-1").is_none());
+        other = source.clone();
+        other.media_id = "another-episode".to_string();
+        assert!(playback_reload_preference(Some(&active), &other, "series-1").is_none());
+        assert!(playback_reload_preference(None, &source, "series-1").is_none());
+    }
+
+    #[test]
+    fn saved_runtime_subtitle_survives_server_metadata_and_mpv_id_changes() {
+        let base_url = Url::parse("https://media.example").expect("URL");
+        let mut source = playback_source(&base_url);
+        source.subtitles.clear();
+        let initial = jfn_mpv::Node::Array(vec![mpv_track_node(
+            "sub",
+            4,
+            7,
+            "ass",
+            "chi",
+            "Simplified Chinese",
+            false,
+            false,
+        )]);
+        let initial_catalog = runtime_track_catalog(&source, &initial).expect("runtime catalog");
+        let saved_key = initial_catalog.subtitles[0].key.clone();
+        let mut preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some(saved_key.clone()),
+            audio_track_key: None,
+        };
+        source.subtitles.push(SubtitleTrack {
+            key: "stream:7".to_string(),
+            stream_index: Some(7),
+            url: None,
+            codec: Some("ass".to_string()),
+            language: Some("chi".to_string()),
+            label: Some("Server subtitle".to_string()),
+            is_default: true,
+            is_forced: false,
+            is_external: false,
+        });
+        let reloaded = jfn_mpv::Node::Array(vec![mpv_track_node(
+            "sub",
+            12,
+            7,
+            "ass",
+            "chi",
+            "Simplified Chinese",
+            false,
+            false,
+        )]);
+        let mut catalog = runtime_track_catalog(&source, &reloaded).expect("reloaded catalog");
+        assert_eq!(catalog.subtitles[0].key, "stream:7");
+        assert!(subtitle_track_matches_key(
+            &catalog.subtitles[0],
+            &saved_key
+        ));
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((12, "stream:7".to_string()))
+        );
+        assert!(subtitle_restore_pending(&catalog, &preference));
+        catalog.subtitles[0].selected = true;
+        assert_eq!(
+            preferred_embedded_subtitle_track(&catalog, &preference).and_then(|track| track.mpv_id),
+            Some(12),
+            "FILE_LOADED must retain the selector even if mpv already selected this track"
+        );
+        assert!(!subtitle_restore_pending(&catalog, &preference));
+        preference.subtitle_enabled = false;
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+        assert!(!subtitle_restore_pending(&catalog, &preference));
+    }
+
+    #[test]
+    fn subtitle_restore_reselects_saved_track_when_another_track_is_active() {
+        let mut catalog = RuntimeTrackCatalog {
+            subtitles: vec![
+                runtime_subtitle_candidate("stream:1", 2, "eng", "English", true, true),
+                runtime_subtitle_candidate("stream:2", 4, "chi", "Chinese", false, false),
+            ],
+            ..RuntimeTrackCatalog::default()
+        };
+        let preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("stream:2".to_string()),
+            audio_track_key: None,
+        };
+        assert!(subtitle_restore_pending(&catalog, &preference));
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            Some((4, "stream:2".to_string()))
+        );
+        catalog.subtitles[1].selected = true;
+        assert!(!subtitle_restore_pending(&catalog, &preference));
+    }
+
+    #[test]
+    fn missing_saved_subtitle_remains_pending_without_changing_preference() {
+        let catalog = RuntimeTrackCatalog::default();
+        let preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("runtime:subtitle:v2:saved".to_string()),
+            audio_track_key: None,
+        };
+        assert!(subtitle_restore_pending(&catalog, &preference));
+        assert_eq!(
+            pending_embedded_subtitle_preference(&catalog, &preference),
+            None
+        );
+        assert_eq!(
+            preference.subtitle_track_key.as_deref(),
+            Some("runtime:subtitle:v2:saved")
+        );
+        let unconfigured = PlaybackTrackPreference {
+            configured: false,
+            subtitle_track_key: None,
+            ..preference
+        };
+        assert!(!subtitle_restore_pending(&catalog, &unconfigured));
+    }
+
+    #[test]
+    fn legacy_subtitle_restore_completes_after_safe_migration() {
+        let catalog = RuntimeTrackCatalog {
+            subtitles: vec![runtime_subtitle_candidate(
+                "stream:2", 4, "chi", "Chinese", true, true,
+            )],
+            ..RuntimeTrackCatalog::default()
+        };
+        let preference = PlaybackTrackPreference {
+            configured: true,
+            subtitle_enabled: true,
+            subtitle_track_key: Some("runtime:subtitle:legacy".to_string()),
+            audio_track_key: None,
+        };
+        assert!(!subtitle_restore_pending(&catalog, &preference));
     }
 
     #[test]
@@ -9160,6 +9674,7 @@ mod tests {
             subtitles: vec![RuntimeTrack {
                 kind: RuntimeTrackKind::Subtitle,
                 key: "runtime:subtitle:v2:saved".to_string(),
+                runtime_key: Some("runtime:subtitle:v2:saved".to_string()),
                 mpv_id: Some(4),
                 codec: Some("subrip".to_string()),
                 language: Some("zho".to_string()),

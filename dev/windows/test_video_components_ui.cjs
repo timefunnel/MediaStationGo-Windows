@@ -34,6 +34,7 @@ async function main() {
         waitForPlayerPaint: async () => {},
         playbackPreferenceScope: () => 'series-a', playerSubtitlePosition: () => 92,
         applyPlayerPlaybackRate() {}, updateFrameInterpolationStatus() {}, showToast: (message) => toasts.push(message),
+        schedulePlaybackMetadataRefresh() {},
         nativeRequest: async (channel, operation, args) => {
             requests.push({ channel, operation, args });
             if (operation === 'frame_interpolation_set_model') return {};
