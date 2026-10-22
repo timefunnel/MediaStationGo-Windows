@@ -22,6 +22,8 @@
 - `cargo test --manifest-path src/Cargo.toml -p jfn-cef danmaku`：5 个用例通过，覆盖原生接口、设置面板和本机文件持久化、账号及物理版本隔离、损坏或写入失败明确报错。
 - 标准 `cargo xtask build --external-mpv $env:EXTERNAL_MPV_DIR` 已完成，产物为 `build/jellium-desktop.exe` 及旁边的 `build/danmaku/`。本路径下的 CEF debug 编译曾触发 C1083 长路径错误，使用现有短路径 `D:/codex-target/jellium` 编译缓存后通过，输出仍为标准 `build/`。
 - 严格 Clippy 受既有 mpv 裸指针接口、runtime 中 expect 和冗余闭包告警阻塞；没有为通过检查修改这些无关逻辑。新增开关代码的 collapsible_if 已修复。
+- 收尾时按提交 `280c04a` 重建 `resources/danmaku/dist` 并同步到 `build/danmaku/`；8 个离线用例、2 个随包进程测试和界面回归再次通过，腾讯源探测仍返回 3 个节目、67 个分集。`build/jellium-desktop.exe` 已包含同步开关与候选搜索调用。
+- 生产只读核对：运行镜像与 `release.yml` 的 `sha256:c0ba2c70…` 一致，容器健康，发布记录中直接回滚镜像仍在；旧 `/api/danmu/:id/raw`、`/api/danmaku/:id` 与 `/emby/api/danmu/:id/raw` 均返回 404。
 
 下图为实际设置面板的离线布局检查，未连接账号或播放媒体：
 
