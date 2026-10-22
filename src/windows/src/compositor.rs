@@ -16,9 +16,10 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
-    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device1,
+    ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -43,6 +44,7 @@ use jfn_platform_abi::JfnRect;
 
 pub(crate) struct Surface {
     swap_chain: Option<IDXGISwapChain1>,
+    captured_texture: Option<ID3D11Texture2D>,
     visual: Option<IDCompositionVisual>,
     sw: i32,
     sh: i32,
@@ -51,6 +53,7 @@ pub(crate) struct Surface {
 
     popup_visual: Option<IDCompositionVisual>,
     popup_swap_chain: Option<IDXGISwapChain1>,
+    popup_captured_texture: Option<ID3D11Texture2D>,
     popup_sw: i32,
     popup_sh: i32,
     popup_visible: bool,
@@ -60,6 +63,7 @@ impl Surface {
     fn new() -> Self {
         Self {
             swap_chain: None,
+            captured_texture: None,
             visual: None,
             sw: 0,
             sh: 0,
@@ -67,6 +71,7 @@ impl Surface {
             in_tree: false,
             popup_visual: None,
             popup_swap_chain: None,
+            popup_captured_texture: None,
             popup_sw: 0,
             popup_sh: 0,
             popup_visible: false,
@@ -83,6 +88,7 @@ impl Surface {
 struct CompositorDevices {
     d3d_device: ID3D11Device1,
     d3d_context: ID3D11DeviceContext,
+    copy_completion: ID3D11Query,
     dxgi_factory: IDXGIFactory2,
     dcomp_device: IDCompositionDevice,
     // Held only to keep the composition target (and its bound root) alive for
@@ -174,6 +180,15 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
         let base_device = base_device.ok_or(windows_core::Error::from_thread())?;
         let context = context.ok_or(windows_core::Error::from_thread())?;
         let d3d_device: ID3D11Device1 = base_device.cast()?;
+        let mut copy_completion = None;
+        d3d_device.CreateQuery(
+            &D3D11_QUERY_DESC {
+                Query: D3D11_QUERY_EVENT,
+                MiscFlags: 0,
+            },
+            Some(&mut copy_completion),
+        )?;
+        let copy_completion = copy_completion.ok_or(windows_core::Error::from_thread())?;
 
         // DXGI factory via the device's adapter.
         let dxgi_device: IDXGIDevice = d3d_device.cast()?;
@@ -190,6 +205,7 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
         Ok(CompositorDevices {
             d3d_device,
             d3d_context: context,
+            copy_completion,
             dxgi_factory,
             dcomp_device,
             dcomp_target,
@@ -245,6 +261,10 @@ fn detach_surface(s: &mut Surface, devices: Option<&CompositorDevices>) {
 // Swap-chain helpers (locked).
 // =====================================================================
 
+// One displayed image and two back buffers keep CEF's shared-texture read
+// from waiting behind a buffer still owned by the desktop compositor.
+const COMPOSITION_BUFFER_COUNT: u32 = 3;
+
 fn create_swap_chain(
     devices: &CompositorDevices,
     width: i32,
@@ -262,7 +282,7 @@ fn create_swap_chain(
             Quality: 0,
         },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
+        BufferCount: COMPOSITION_BUFFER_COUNT,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
         ..Default::default()
@@ -302,7 +322,7 @@ fn ensure_swap_chain(
         }
         let resize = unsafe {
             existing.ResizeBuffers(
-                2,
+                COMPOSITION_BUFFER_COUNT,
                 w as u32,
                 h as u32,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -330,15 +350,83 @@ fn ensure_swap_chain(
     }
 }
 
-fn present_to_swap_chain(devices: &CompositorDevices, sc: &IDXGISwapChain1, src: &ID3D11Texture2D) {
+fn present_to_swap_chain(
+    devices: &CompositorDevices,
+    sc: &IDXGISwapChain1,
+    src: &ID3D11Texture2D,
+) -> bool {
     unsafe {
         match sc.GetBuffer::<ID3D11Texture2D>(0) {
             Ok(bb) => {
                 devices.d3d_context.CopyResource(&bb, src);
-                let _ = sc.Present(0, DXGI_PRESENT(0));
-                let _ = devices.dcomp_device.Commit();
+                // Keep each CEF frame for one refresh. SyncInterval=0 allows
+                // newer arrivals to discard queued frames when OSR callbacks
+                // bunch up, producing uneven animation despite steady rAF.
+                if let Err(e) = sc.Present(1, DXGI_PRESENT(0)).ok() {
+                    tracing::error!(target: "platform", "Present failed: {e:?}");
+                    return false;
+                }
+                if let Err(e) = devices.dcomp_device.Commit() {
+                    tracing::error!(target: "platform", "Commit failed: {e:?}");
+                    return false;
+                }
+                true
             }
-            Err(e) => tracing::error!(target: "platform", "GetBuffer failed: {e:?}"),
+            Err(e) => {
+                tracing::error!(target: "platform", "GetBuffer failed: {e:?}");
+                false
+            }
+        }
+    }
+}
+
+fn copy_shared_texture(
+    devices: &CompositorDevices,
+    owned: &mut Option<ID3D11Texture2D>,
+    source: &ID3D11Texture2D,
+) -> windows_core::Result<ID3D11Texture2D> {
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        source.GetDesc(&mut desc);
+        let replace = owned.as_ref().is_none_or(|texture| {
+            let mut previous = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut previous);
+            previous.Width != desc.Width
+                || previous.Height != desc.Height
+                || previous.Format != desc.Format
+        });
+        if replace {
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            let mut texture = None;
+            devices
+                .d3d_device
+                .CreateTexture2D(&desc, None, Some(&mut texture))?;
+            *owned = Some(texture.ok_or(windows_core::Error::from_thread())?);
+        }
+        let texture = owned.as_ref().ok_or(windows_core::Error::from_thread())?;
+        devices.d3d_context.CopyResource(texture, source);
+        // CEF may reuse the pooled source after this callback. Finish the read
+        // into an owned texture before queuing work that waits for a back buffer.
+        devices.d3d_context.End(&devices.copy_completion);
+        devices.d3d_context.Flush();
+        loop {
+            // GetData's Rust wrapper maps both S_OK and S_FALSE to Ok, so
+            // read the EVENT query's BOOL instead of treating Ok as ready.
+            let mut completed = windows_core::BOOL(0);
+            devices.d3d_context.GetData(
+                &devices.copy_completion,
+                Some((&raw mut completed).cast()),
+                std::mem::size_of_val(&completed) as u32,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+            )?;
+            if completed.as_bool() {
+                return Ok(texture.clone());
+            }
+            devices.d3d_device.GetDeviceRemovedReason()?;
+            std::thread::yield_now();
         }
     }
 }
@@ -560,8 +648,13 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         Some(sc) => sc.clone(),
         None => return false,
     };
-    present_to_swap_chain(devices, &sc, &src);
-    true
+    match copy_shared_texture(devices, &mut surf.captured_texture, &src) {
+        Ok(texture) => present_to_swap_chain(devices, &sc, &texture),
+        Err(e) => {
+            tracing::error!(target: "platform", "CEF texture copy failed: {e:?}");
+            false
+        }
+    }
 }
 
 /// Software fallback: Windows is shared-textures-only in practice.
@@ -830,7 +923,12 @@ pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _l
         Some(sc) => sc.clone(),
         None => return,
     };
-    present_to_swap_chain(devices, &sc, &src);
+    match copy_shared_texture(devices, &mut surf.popup_captured_texture, &src) {
+        Ok(texture) => {
+            present_to_swap_chain(devices, &sc, &texture);
+        }
+        Err(e) => tracing::error!(target: "platform", "CEF popup texture copy failed: {e:?}"),
+    }
 }
 
 pub fn win_popup_present_software(

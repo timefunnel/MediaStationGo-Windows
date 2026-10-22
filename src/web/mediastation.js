@@ -202,7 +202,9 @@
         canvas.className = 'player-danmaku-canvas';
         canvas.setAttribute('aria-hidden', 'true');
         layer.replaceChildren(canvas);
-        const context = canvas.getContext('2d', { alpha: true, desynchronized: true });
+        // CEF captures the composed view into a shared texture. Keep each
+        // animation frame on that path instead of bypassing its composition.
+        const context = canvas.getContext('2d', { alpha: true, desynchronized: false });
         if (!context) throw new Error('Canvas 2D is required for danmaku rendering');
 
         const state = {
@@ -211,6 +213,8 @@
             nextIndex: 0,
             positionMs: 0,
             clockAt: performance.now(),
+            correctionMs: 0,
+            correctionDurationMs: 0,
             playing: false,
             rate: 1,
             enabled: true,
@@ -236,7 +240,11 @@
 
         function currentPositionMs() {
             if (!state.playing) return state.positionMs;
-            return state.positionMs + (performance.now() - state.clockAt) * state.rate;
+            const elapsed = performance.now() - state.clockAt;
+            const correction = state.correctionDurationMs > 0
+                ? state.correctionMs * Math.min(1, elapsed / state.correctionDurationMs)
+                : 0;
+            return state.positionMs + elapsed * state.rate + correction;
         }
 
         function syncCanvasSize() {
@@ -268,8 +276,9 @@
         }
 
         function restartAt(positionMs) {
+            syncCanvasSize();
             state.active = [];
-            const visibleWindowSeconds = Math.max(22, state.style.scrollSeconds * 2, state.style.fixedSeconds);
+            const visibleWindowSeconds = Math.max(scrollDurationMs(), state.style.fixedSeconds * 1000) * 2 / 1000;
             state.nextIndex = commentIndexAt(Math.max(0, positionMs / 1000 - visibleWindowSeconds));
         }
 
@@ -279,10 +288,6 @@
 
         function lineHeight() {
             return Math.ceil(fontSize() * 1.25 + LANE_MARGIN);
-        }
-
-        function laneCount() {
-            return Math.max(1, Math.floor(state.height * state.style.displayArea / 100 / lineHeight()));
         }
 
         function scrollDurationMs() {
@@ -298,119 +303,93 @@
             return `rgb(${(color >>> 16) & 0xFF}, ${(color >>> 8) & 0xFF}, ${color & 0xFF})`;
         }
 
-        function textWidth(text) {
+        function textMetrics(text) {
             context.font = `650 ${fontSize()}px "Microsoft YaHei", sans-serif`;
-            return Math.ceil(context.measureText(text).width);
+            context.textBaseline = 'alphabetic';
+            return context.measureText(text);
         }
 
-        function trackEntries(mode, lane) {
-            return state.active.filter((entry) => entry.mode === mode && entry.lane === lane);
+        function entryLeft(entry, positionMs) {
+            if (entry.mode === 4 || entry.mode === 5) return Math.max(0, (state.width - entry.width) / 2);
+            const distance = (state.width + entry.width) * (positionMs - entry.startMs) / entry.durationMs;
+            return entry.mode === 6 ? -entry.width + distance : state.width - distance;
         }
 
-        function chooseFixedLane(mode, positionMs, lanes) {
+        function canShareRow(entry, previous) {
+            if (entry.top >= previous.top + previous.height || previous.top >= entry.top + entry.height) return true;
+            const start = Math.max(entry.startMs, previous.startMs);
+            const end = Math.min(entry.endMs, previous.endMs);
+            if (start >= end) return true;
+            // Motion is linear. Keeping the same left/right ordering at both
+            // ends guarantees separation throughout their shared lifetime.
+            const staysLeftOf = (left, right) => entryLeft(left, start) + left.width + LANE_MARGIN <= entryLeft(right, start)
+                && entryLeft(left, end) + left.width + LANE_MARGIN <= entryLeft(right, end);
+            return staysLeftOf(entry, previous) || staysLeftOf(previous, entry);
+        }
+
+        function chooseLane(entry) {
+            const height = lineHeight();
+            const area = state.height * state.style.displayArea / 100;
+            const lanes = Math.floor((area - entry.height) / height) + 1;
             for (let lane = 0; lane < lanes; lane += 1) {
-                if (!trackEntries(mode, lane).some((entry) => entry.endMs > positionMs)) return lane;
+                entry.top = entry.mode === 4 ? state.height - entry.height - lane * height : lane * height;
+                if (state.active.every(previous => canShareRow(entry, previous))) return true;
             }
-            return -1;
-        }
-
-        function chooseScrollLane(mode, positionMs, durationMs, width, lanes) {
-            const velocity = (state.width + width) / durationMs;
-            for (let lane = 0; lane < lanes; lane += 1) {
-                const previous = trackEntries(mode, lane)
-                    .filter((entry) => entry.endMs > positionMs)
-                    .sort((left, right) => right.startMs - left.startMs)[0];
-                if (!previous) return lane;
-                const elapsed = Math.max(0, positionMs - previous.startMs);
-                const previousVelocity = (state.width + previous.width) / previous.durationMs;
-                const previousRight = state.width - previousVelocity * elapsed + previous.width;
-                const previousHasEntered = previousRight <= state.width - LANE_MARGIN;
-                if (previousHasEntered && velocity <= previousVelocity) return lane;
-            }
-            return -1;
+            return false;
         }
 
         function addComment(comment, positionMs) {
-            if (!syncCanvasSize()) return;
             const mode = Number(comment.mode) || 1;
             const fixed = mode === 4 || mode === 5;
             const durationMs = fixed ? state.style.fixedSeconds * 1000 : scrollDurationMs();
-            const elapsedMs = Math.max(0, positionMs - comment.time * 1000);
-            if (elapsedMs >= durationMs) return;
-            const lanes = laneCount();
-            const width = textWidth(comment.text);
-            const lane = fixed
-                ? chooseFixedLane(mode, positionMs, lanes)
-                : chooseScrollLane(mode, positionMs, durationMs, width, lanes);
-            if (lane < 0) return;
-            const height = lineHeight();
-            let top;
-            if (fixed) {
-                const top = mode === 5
-                    ? lane * height
-                    : Math.max(0, state.height - (lane + 1) * height);
-                state.active.push({
-                    mode,
-                    lane,
-                    text: comment.text,
-                    color: colorFor(comment.color),
-                    width,
-                    top,
-                    startMs: comment.time * 1000,
-                    endMs: comment.time * 1000 + durationMs,
-                    durationMs,
-                });
-            } else {
-                top = lane * height;
-                state.active.push({
-                    mode,
-                    lane,
-                    text: comment.text,
-                    color: colorFor(comment.color),
-                    width,
-                    top,
-                    startMs: comment.time * 1000,
-                    endMs: comment.time * 1000 + durationMs,
-                    durationMs,
-                });
-            }
+            const metrics = textMetrics(comment.text);
+            const padding = LANE_MARGIN / 2;
+            const inkLeft = Math.max(0, metrics.actualBoundingBoxLeft);
+            const width = Math.ceil(Math.max(metrics.width, metrics.actualBoundingBoxRight) + inkLeft + padding * 2);
+            const height = Math.ceil(metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent + padding * 2);
+            const entry = { mode, width, height, top: 0, startMs: comment.time * 1000, endMs: comment.time * 1000 + durationMs, durationMs };
+            if (!chooseLane(entry)) return;
+            state.active.push(entry);
+            if (entry.endMs <= positionMs) return;
+            // Rasterize accepted text once; animation only composites images.
+            const image = document.createElement('canvas');
+            image.width = Math.ceil(width * state.pixelRatio);
+            image.height = Math.ceil(height * state.pixelRatio);
+            const raster = image.getContext('2d', { alpha: true });
+            if (!raster) throw new Error('Canvas 2D is required for danmaku text caching');
+            raster.setTransform(state.pixelRatio, 0, 0, state.pixelRatio, 0, 0);
+            raster.font = context.font;
+            raster.textBaseline = 'alphabetic';
+            raster.lineJoin = 'round';
+            raster.lineWidth = Math.max(1, fontSize() * 0.08);
+            raster.strokeStyle = '#000';
+            raster.fillStyle = colorFor(comment.color);
+            raster.strokeText(comment.text, padding + inkLeft, padding + metrics.actualBoundingBoxAscent);
+            raster.fillText(comment.text, padding + inkLeft, padding + metrics.actualBoundingBoxAscent);
+            entry.image = image;
         }
 
         function draw(positionMs) {
-            if (!syncCanvasSize()) return;
             context.clearRect(0, 0, state.width, state.height);
-            context.font = `650 ${fontSize()}px "Microsoft YaHei", sans-serif`;
-            context.lineJoin = 'round';
-            context.miterLimit = 2;
-            context.lineWidth = Math.max(1, fontSize() * 0.08);
-            const alpha = state.style.opacity / 100;
+            context.globalAlpha = state.style.opacity / 100;
             for (const entry of state.active) {
                 const elapsed = positionMs - entry.startMs;
                 if (elapsed < 0 || elapsed >= entry.durationMs) continue;
-                let left;
-                if (entry.mode === 4 || entry.mode === 5) {
-                    left = Math.max(0, (state.width - entry.width) / 2);
-                } else {
-                    const progress = elapsed / entry.durationMs;
-                    const distance = state.width + entry.width;
-                    left = entry.mode === 6
-                        ? -entry.width + distance * progress
-                        : state.width - distance * progress;
-                }
-                context.globalAlpha = alpha;
-                context.strokeStyle = '#000';
-                context.fillStyle = entry.color;
-                context.strokeText(entry.text, left, entry.top);
-                context.fillText(entry.text, left, entry.top);
+                context.drawImage(entry.image, entryLeft(entry, positionMs), entry.top, entry.width, entry.height);
             }
             context.globalAlpha = 1;
         }
 
         function render(positionMs) {
             if (!state.enabled || !state.comments.length || !layer.isConnected) return;
+            if (!syncCanvasSize()) return;
             while (state.nextIndex < state.comments.length
                 && state.comments[state.nextIndex].time * 1000 <= positionMs) {
-                addComment(state.comments[state.nextIndex], positionMs);
+                const comment = state.comments[state.nextIndex];
+                // Admit historical comments at their original times, including
+                // expired blockers, so seeking/delayed frames cannot stack rows.
+                state.active = state.active.filter(entry => entry.endMs > comment.time * 1000);
+                addComment(comment, positionMs);
                 state.nextIndex += 1;
             }
             state.active = state.active.filter((entry) => entry.endMs > positionMs);
@@ -425,7 +404,7 @@
         }
 
         function schedule() {
-            if (!state.frame) state.frame = requestAnimationFrame(tick);
+            if (!state.frame && state.playing && state.enabled && state.comments.length) state.frame = requestAnimationFrame(tick);
         }
 
         function setClock(positionMs, playing, rate, restart) {
@@ -433,13 +412,30 @@
             const current = currentPositionMs();
             const nextPosition = Math.max(0, safeNumber(positionMs, current));
             const nextRate = Math.max(0.1, safeNumber(rate, state.rate));
-            state.positionMs = nextPosition;
+            const discontinuity = restart || Math.abs(nextPosition - current) > 1500;
+            const smooth = !discontinuity && state.playing && playing === true;
+            state.positionMs = smooth ? current : nextPosition;
+            state.correctionMs = smooth ? nextPosition - current : 0;
+            // Limit phase correction to 20% of playback speed; regular position
+            // samples may arrive late, but scrolling must never reverse or jump.
+            state.correctionDurationMs = Math.max(400, Math.abs(state.correctionMs) / (nextRate * 0.2));
             state.clockAt = now;
             state.rate = nextRate;
             state.playing = playing === true;
-            if (restart || Math.abs(nextPosition - current) > 1500) restartAt(nextPosition);
-            render(nextPosition);
-            if (state.playing) schedule();
+            if (discontinuity) restartAt(nextPosition);
+            if (state.playing && state.enabled) schedule();
+            else {
+                if (state.frame) cancelAnimationFrame(state.frame);
+                state.frame = 0;
+                render(state.positionMs);
+            }
+        }
+
+        function clearActive() {
+            if (state.frame) cancelAnimationFrame(state.frame);
+            state.frame = 0;
+            state.active = [];
+            if (syncCanvasSize()) context.clearRect(0, 0, state.width, state.height);
         }
 
         new ResizeObserver(() => {
@@ -464,18 +460,15 @@
                 if (!state.enabled) clearActive();
             },
             clear() {
-                if (state.frame) cancelAnimationFrame(state.frame);
-                state.frame = 0;
+                clearActive();
                 state.comments = [];
                 state.nextIndex = 0;
-                state.active = [];
-                if (syncCanvasSize()) context.clearRect(0, 0, state.width, state.height);
+                state.playing = false;
             },
             setEnabled(enabled) {
                 state.enabled = enabled === true;
                 if (!state.enabled) {
-                    state.active = [];
-                    if (syncCanvasSize()) context.clearRect(0, 0, state.width, state.height);
+                    clearActive();
                 } else {
                     const positionMs = currentPositionMs();
                     restartAt(positionMs);
@@ -493,8 +486,11 @@
                 if (state.enabled && state.playing) schedule();
             },
             updatePlayback(event, playing) {
-                const restart = event.kind === 'seeked';
-                setClock(event.positionMs, playing, event.rate, restart);
+                if (event.kind === 'position' || event.kind === 'seeked') {
+                    setClock(event.positionMs, playing, state.rate, event.kind === 'seeked');
+                } else if (['started', 'paused', 'buffering', 'rate'].includes(event.kind)) {
+                    setClock(currentPositionMs(), playing, event.kind === 'rate' ? event.rate : state.rate, false);
+                }
             },
             setRate(rate) {
                 setClock(currentPositionMs(), state.playing, rate, false);
@@ -5615,7 +5611,6 @@
         }
         if (Number.isFinite(event.durationMs) && event.durationMs > 0) player.durationMs = event.durationMs;
         updatePlayerProgress();
-        danmakuRenderer.updatePlayback(event, event.kind === 'paused' ? false : player.playing);
         if (event.kind === 'position') maybeHandleEpisodeAutomation(player, event);
         if (player.exiting && !player.stopSent && event.kind === 'started') {
             sendPlayerStop(player);
@@ -5706,6 +5701,7 @@
                         : (player.episodeChanging ? '剧集切换失败' : '播放失败')));
                 break;
         }
+        if (player) danmakuRenderer.updatePlayback(event, player.playing && !player.buffering);
     }
 
     function setPlayerLoading(visible, label = '') {
