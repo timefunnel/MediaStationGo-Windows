@@ -94,6 +94,34 @@ impl PaintState {
         self.saved_frame_rate.store(target, Ordering::Release);
         true
     }
+
+    fn note_paint(&self, fps: i32, now: i64, period_ns: i64) -> (bool, bool) {
+        let generation = self.resize_gen.load(Ordering::Acquire);
+        let previous = self.last_paint_gen.load(Ordering::Acquire);
+        if generation != previous {
+            self.last_paint_gen.store(generation, Ordering::Release);
+            // The first paint can be the monotonic clock's origin (now == 0).
+            // It must arm the completion budget even inside the first period.
+            // Subsequent resize events remain rate-clamped during a live drag.
+            if previous == 0 || now - self.last_skip_reset_ns.load(Ordering::Acquire) >= period_ns {
+                self.last_skip_reset_ns.store(now, Ordering::Release);
+                self.pump_paint_count
+                    .store(if fps > 0 { 1 + fps } else { 0 }, Ordering::Release);
+                self.paints_since_resize.store(0, Ordering::Release);
+                jfn_logging::log(
+                    jfn_logging::CATEGORY_CEF,
+                    jfn_logging::LEVEL_DEBUG,
+                    &format!("resize paint budget generation={generation} fps={fps} now_ns={now}"),
+                );
+            }
+        }
+        let count = self.paints_since_resize.fetch_add(1, Ordering::AcqRel) + 1;
+        let budget = self.pump_paint_count.load(Ordering::Acquire);
+        (
+            count > SKIP_PAINTS_AFTER_RESIZE,
+            budget > 0 && count == budget,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +267,14 @@ fn active_kick_apply(scheduler: PaintScheduler, state: &PaintState, inner: &Arc<
     if inner.browser_alive() && fps > 0 && state.saved_frame_rate.load(Ordering::Acquire) == 0 {
         state.saved_frame_rate.store(fps, Ordering::Release);
         inner.set_frame_rate(fps * BOOST_MULTIPLIER);
+        jfn_logging::log(
+            jfn_logging::CATEGORY_CEF,
+            jfn_logging::LEVEL_DEBUG,
+            &format!(
+                "resize boost start base_fps={fps} boosted_fps={}",
+                fps * BOOST_MULTIPLIER
+            ),
+        );
     }
     active_invalidate_tick(scheduler, state, inner);
 }
@@ -251,6 +287,14 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
         let saved = state.saved_frame_rate.swap(0, Ordering::AcqRel);
         if inner.browser_alive() && saved > 0 {
             inner.set_frame_rate(saved);
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_DEBUG,
+                &format!(
+                    "resize boost stopped restored_fps={saved} ticks={}",
+                    state.invalidate_tick_count.load(Ordering::Acquire)
+                ),
+            );
         }
         state.invalidate_running.store(false, Ordering::Release);
         return;
@@ -281,35 +325,18 @@ fn active_invalidate_tick(scheduler: PaintScheduler, state: &PaintState, inner: 
 }
 
 fn active_should_present_paint(state: &PaintState, inner: &Inner) -> bool {
-    let cur_gen = state.resize_gen.load(Ordering::Acquire);
-    let last_gen = state.last_paint_gen.load(Ordering::Acquire);
-    if cur_gen != last_gen {
-        state.last_paint_gen.store(cur_gen, Ordering::Release);
-        // Rate-clamp the skip-counter reset. Continuous drag bumps gen
-        // many times per second; resetting on every bump would keep
-        // wiping the counter before any paint clears the skip threshold.
-        let now_ns_val = now_ns();
-        let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-        let period_ns = if hz > 0.0 {
-            (1e9 / hz) as i64
-        } else {
-            16_666_667
-        };
-        if now_ns_val - state.last_skip_reset_ns.load(Ordering::Acquire) >= period_ns {
-            state
-                .last_skip_reset_ns
-                .store(now_ns_val, Ordering::Release);
-            let fps = inner.frame_rate.load(Ordering::Acquire);
-            state
-                .pump_paint_count
-                .store(if fps > 0 { 1 + fps } else { 0 }, Ordering::Release);
-            state.paints_since_resize.store(0, Ordering::Release);
-        }
-    }
-    let count = state.paints_since_resize.fetch_add(1, Ordering::AcqRel) + 1;
-    let pump = state.pump_paint_count.load(Ordering::Acquire);
-    let present = count > SKIP_PAINTS_AFTER_RESIZE;
-    if pump > 0 && count == pump {
+    let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
+    let period_ns = if hz > 0.0 {
+        (1e9 / hz) as i64
+    } else {
+        16_666_667
+    };
+    let (present, stop) = state.note_paint(
+        inner.frame_rate.load(Ordering::Acquire),
+        now_ns(),
+        period_ns,
+    );
+    if stop {
         // Pumped enough frames — signal stop to host Invalidate loop and
         // renderer's rAF loop. Counter remains past pump so subsequent
         // paints don't re-fire.
@@ -317,6 +344,40 @@ fn active_should_present_paint(state: &PaintState, inner: &Inner) -> bool {
         inner.exec_js("window.__cefStopRaf && window.__cefStopRaf();");
     }
     present
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_resize_at_clock_origin_stops_after_its_paint_budget() {
+        let state = PaintState::new();
+        state.begin_resize();
+        let period = 1_000_000_000 / 152;
+        assert_eq!(state.note_paint(152, 0, period), (false, false));
+        for frame in 1..152 {
+            assert_eq!(state.note_paint(152, frame * period, period), (true, false));
+        }
+        assert_eq!(state.note_paint(152, 152 * period, period), (true, true));
+        assert_eq!(state.note_paint(152, 153 * period, period), (true, false));
+    }
+
+    #[test]
+    fn repeated_resize_inside_one_period_does_not_keep_skipping_paints() {
+        let state = PaintState::new();
+        let period = 1_000_000_000 / 60;
+        state.begin_resize();
+        assert_eq!(state.note_paint(60, 0, period), (false, false));
+        state.begin_resize();
+        assert_eq!(state.note_paint(60, period / 2, period), (true, false));
+        state.begin_resize();
+        assert_eq!(state.note_paint(60, period, period), (false, false));
+        assert_eq!(
+            state.note_paint(60, period + period / 2, period),
+            (true, false)
+        );
+    }
 }
 
 wrap_task! {

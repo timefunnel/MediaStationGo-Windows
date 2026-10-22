@@ -834,6 +834,13 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSEWHEEL => {
+            let diagnostic = tracing::enabled!(target: "scroll_latency", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
+            if diagnostic.is_some() {
+                tracing::trace!(target: "scroll_latency", "wheel received unix_us={:?}",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|value| value.as_micros()));
+            }
             let mut pt = POINT {
                 x: get_x_lparam(lp),
                 y: get_y_lparam(lp),
@@ -844,6 +851,10 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let (x, y) = map_client_point(pt.x, pt.y);
             let delta = hiword_i16(wp.0 as u32) as i32;
             jfn_input_dispatch_scroll(x, y, 0, delta, mouse_modifiers(wp));
+            if let Some(started) = diagnostic {
+                tracing::trace!(target: "scroll_latency", "wheel dispatched delta={} elapsed_us={}",
+                    delta, started.elapsed().as_micros());
+            }
             return LRESULT(0);
         }
 

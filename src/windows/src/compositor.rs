@@ -571,6 +571,8 @@ pub fn win_restack(ordered: *const *mut c_void, n: usize) {
 // =====================================================================
 
 pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
+    let diagnostic = tracing::enabled!(target: "scroll_latency", tracing::Level::TRACE)
+        .then(std::time::Instant::now);
     if s.is_null() || raw_info.is_null() {
         return false;
     }
@@ -581,6 +583,7 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     }
 
     let mut st = STATE.lock();
+    let locked_us = diagnostic.map(|start| start.elapsed().as_micros());
     let Some(d3d_device) = st.devices.as_ref().map(|d| d.d3d_device.clone()) else {
         return false;
     };
@@ -648,8 +651,24 @@ pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
         Some(sc) => sc.clone(),
         None => return false,
     };
+    let prepared_us = diagnostic.map(|start| start.elapsed().as_micros());
     match copy_shared_texture(devices, &mut surf.captured_texture, &src) {
-        Ok(texture) => present_to_swap_chain(devices, &sc, &texture),
+        Ok(texture) => {
+            let copied_us = diagnostic.map(|start| start.elapsed().as_micros());
+            let presented = present_to_swap_chain(devices, &sc, &texture);
+            if let (Some(start), Some(locked), Some(prepared), Some(copied)) =
+                (diagnostic, locked_us, prepared_us, copied_us)
+            {
+                tracing::trace!(target: "scroll_latency",
+                    "paint unix_us={:?} lock_us={} prepare_us={} copy_us={} present_us={} total_us={} ok={} size={}x{}",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|value| value.as_micros()),
+                    locked, prepared - locked, copied - prepared,
+                    start.elapsed().as_micros() - copied, start.elapsed().as_micros(),
+                    presented, w, h);
+            }
+            presented
+        }
         Err(e) => {
             tracing::error!(target: "platform", "CEF texture copy failed: {e:?}");
             false
