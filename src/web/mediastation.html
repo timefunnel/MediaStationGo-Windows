@@ -348,6 +348,11 @@
   <section id="components-page" class="components-page hidden" aria-labelledby="components-title">
     <header><p class="eyebrow">播放器扩展</p><h2 id="components-title">组件管理</h2><p>按需安装，播放时选择使用。安装或卸载在重启后生效。</p></header>
     <div class="component-grid">
+      <section class="setting-block component-card" data-component-id="nvidia-vfg" aria-labelledby="component-nvidia-vfg-title">
+        <h3 id="component-nvidia-vfg-title">NVIDIA VFG 插帧</h3><p>支持自动匹配刷新率、手动 2–8 倍与质量设置，与 RIFE 插帧互斥。</p>
+        <p id="component-nvidia-vfg-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
+        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
+      </section>
       <section class="setting-block component-card" data-component-id="rife" aria-labelledby="component-rife-title">
         <h3 id="component-rife-title">RIFE 插帧</h3><p>NVIDIA RTX · 三档模型可选，固定 2 倍插帧。</p>
         <p id="settings-frame-interpolation-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
@@ -361,11 +366,6 @@
       <section class="setting-block component-card" data-component-id="dlssnr" aria-labelledby="component-dlssnr-title">
         <h3 id="component-dlssnr-title">DLSSNR 画面增强</h3><p>支持模型风格、增强强度、局部色调与结构设置。</p>
         <p id="component-dlssnr-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
-        <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
-      </section>
-      <section class="setting-block component-card" data-component-id="nvidia-vfg" aria-labelledby="component-nvidia-vfg-title">
-        <h3 id="component-nvidia-vfg-title">NVIDIA VFG 插帧</h3><p>支持自动匹配刷新率、手动 2–8 倍与质量设置，与 RIFE 插帧互斥。</p>
-        <p id="component-nvidia-vfg-status" class="component-status" role="status" aria-live="polite">正在检测组件...</p>
         <div class="update-action-row"><button data-component-action="primary" class="primary-command" type="button" disabled>检测中</button><button data-component-action="secondary" class="secondary-command" type="button" disabled>卸载组件</button></div>
       </section>
     </div>
