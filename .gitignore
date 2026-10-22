@@ -2,6 +2,7 @@
 build/
 dist/
 src/target/
+output/
 
 # Python
 __pycache__/
