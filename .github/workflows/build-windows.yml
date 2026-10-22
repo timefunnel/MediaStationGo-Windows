@@ -155,6 +155,11 @@ jobs:
             third_party/libplacebo-install-1733c8601edec161b714e4a799c72a9f5e5aa2f0
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
+      - name: Set up Node.js for the bundled danmaku runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25.6.0'
+
       - name: Build
         shell: cmd
         env:
