@@ -22,6 +22,10 @@ instead of being rebuilt in CI.
 | `video_enhancement.dll` SHA-256 | `11050f90014de9ba477d2c9678f7b1de5138465dbe4a90501dabdc3e822330d7` |
 | `nvngx.dll` SHA-256 | `817b413833e96994e7152b0277ab63344ae4a7fc73453c3d04180cf0b8291673` |
 
+`NVIDIA_RTX_Video_SDK_License.pdf` is the SDK notice shipped in the release
+`licenses/` directory; its SHA-256 is
+`5addfcf7c78891a12f1dcd6b5f86c2512351ab71b3872f446ba10e1b6da54464`.
+
 ## Rebuild
 
 With the NVIDIA RTX Video SDK placed under `third_party/video-enhancement-deps`:

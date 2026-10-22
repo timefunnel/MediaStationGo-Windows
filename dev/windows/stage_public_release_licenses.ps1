@@ -47,7 +47,7 @@ Copy-RequiredFile (Join-Path $RepoRoot "resources\win\licenses\CEF-LICENSE.txt")
     (Join-Path $LicenseDir "CEF-LICENSE.txt")
 
 if (Test-Path -LiteralPath (Join-Path $OutputDir 'video_enhancement.dll') -PathType Leaf) {
-    Copy-RequiredFile (Join-Path $RepoRoot 'third_party\video-enhancement-deps\RTX-Video-SDK-1.1.0\NVIDIA_RTX_Video_SDK_License.pdf') `
+    Copy-RequiredFile (Join-Path $RepoRoot 'resources\win\video-bridge\NVIDIA_RTX_Video_SDK_License.pdf') `
         (Join-Path $LicenseDir 'NVIDIA-RTX-Video-SDK-License.pdf')
 }
 
