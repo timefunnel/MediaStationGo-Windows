@@ -16,14 +16,15 @@ ${section('    function updateFrameInterpolationStatus(', '    function schedule
 ${section('    const videoEnhancementDefaults = ', '    async function setFrameInterpolation(')}
 const byId = (id) => document.getElementById(id);
 let interpolationComponentRestarting=false, interpolationComponentTracking=false, interpolationComponentTimer=0;
-const interpolationModels = {'rife-v4.26':{label:'质量优先'},'rife-v4.26-scale0.5':{label:'均衡优先'},'rife-v4.25-lite':{label:'流畅优先'}};
+const interpolationModels = {'rife-v4.26':{name:'RIFE 质量优先',label:'质量优先'},'rife-v4.26-scale0.5':{name:'RIFE 均衡优先',label:'均衡优先'},'rife-v4.25-lite':{name:'RIFE 流畅优先',label:'流畅优先'}};
 let preferredInterpolationModel='rife-v4.26';
 const playerPanelContent=byId('player-panel-content');
-let player={started:true,loadInfo:{},interpolationEnabled:false,videoEnhancement:{vsr:true,vfg:true,nr:true,nrStyle:1,nrIntensity:0.7}};
+let player={started:true,panelKind:'interpolation',loadInfo:{},interpolationEnabled:false,videoEnhancement:{vsr:true,vfg:true,nr:true,nrStyle:1,nrIntensity:0.7}};
 const calls=[];
 function refreshPlayerTools(){} function friendlyError(error){return error.message;} function formatBytes(value){return value+' B';}
 function setFrameInterpolation(model,selection){calls.push({model,selection});}
 function renderPlayerPanel(){playerPanelContent.replaceChildren();renderVideoEnhancementSettings(player);}
+function positionPlayerPanel(){}
 function closePlayerPanel(){player.enhancementDraft=null;}
 async function nativeRequest(){throw new Error('Native operations are unavailable in this layout fixture');}
 updateFrameInterpolationStatus({component:{installed:true,supported:true},componentStatus:'ready',gpuName:'RTX 5070 Ti',models:[{},{},{}],runtimeVersion:'TensorRT RTX'});
@@ -36,7 +37,7 @@ window.fixture={calls,player,showComponentDialog,closeComponentDialog,updateVide
 document.documentElement.dataset.rendered='true';`;
 for (const theme of ['light','dark']) for (const kind of ['components','parameters']) {
     const markup = kind === 'components' ? components.replace('components-page hidden','components-page') : components;
-    const panel = `<div class="player-panel ${kind === 'components' ? 'hidden' : ''}"><header><h2>画面增强</h2><button class="icon-button" aria-label="关闭">×</button></header><div id="player-panel-content" class="player-panel-content"></div></div><button id="player-interpolation" hidden></button>`;
+    const panel = `<div class="player-panel player-panel-enhancement ${kind === 'components' ? 'hidden' : ''}"><header><h2>画面增强</h2><button class="icon-button" aria-label="关闭">×</button></header><div id="player-panel-content" class="player-panel-content"></div></div><button id="player-interpolation" hidden></button>`;
     fs.writeFileSync(path.join(output, `${kind}-${theme}.html`), `<!doctype html><html lang="zh-CN" data-ui-theme="${theme}"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>${css}\nbody{overflow:auto;padding:32px 0}.player-panel{position:relative;right:auto;bottom:auto;width:min(380px,calc(100vw - 32px));max-height:700px;margin:auto}.player-panel-content{max-height:620px}.components-page{padding-top:0}</style>${markup}${panel}<script>${script}</script></html>`, 'utf8');
 }
 console.log(`VIDEO_SETTINGS_UI_FIXTURE_OK ${output}`);

@@ -25,6 +25,7 @@ function node(tag = 'div', className = '', textContent = '') {
         querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
         classList: { add(name) { classes.add(name); }, remove(name) { classes.delete(name); }, contains(name) { return classes.has(name); }, toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
     };
+    Object.defineProperty(n, 'parentElement', { get() { return this.parentNode; } });
     Object.defineProperty(n, 'className', { set(value) { classes.clear(); value.split(' ').filter(Boolean).forEach((c) => classes.add(c)); } });
     return n;
 }
@@ -49,7 +50,7 @@ function harness() {
         window: { clearTimeout(id) { timers.delete(id); }, setTimeout(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; } },
         nativeRequest: async (...args) => { requests.push(args); throw new Error('unexpected request'); },
         interpolationComponentRestarting: false, interpolationComponentTracking: false, interpolationComponentTimer: 0,
-        interpolationModels: { 'rife-v4.26': { label: '质量优先' }, 'rife-v4.26-scale0.5': { label: '均衡优先' }, 'rife-v4.25-lite': { label: '流畅优先' } },
+        interpolationModels: { 'rife-v4.26': { name: 'RIFE 质量优先', label: '质量优先' }, 'rife-v4.26-scale0.5': { name: 'RIFE 均衡优先', label: '均衡优先' }, 'rife-v4.25-lite': { name: 'RIFE 流畅优先', label: '流畅优先' } },
         preferredInterpolationModel: 'rife-v4.26', formatBytes: (v) => `${v} B`, friendlyError: (e) => e.message, refreshPlayerTools() {},
     });
     const start = source.indexOf('    const videoComponentStatuses = new Map();');

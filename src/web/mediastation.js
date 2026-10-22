@@ -40,6 +40,7 @@
     const legacyDefaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v1';
     const danmakuEnabledSettingKey = 'MediaStationGo.Windows.danmakuEnabled.v1';
     const danmakuStyleSettingKey = 'MediaStationGo.Windows.danmakuStyle.v1';
+    const videoEnhancementSettingKey = 'MediaStationGo.Windows.videoEnhancement.v1';
     const seriesPlaybackSettingsKey = 'MediaStationGo.Windows.seriesPlaybackSettings.v1';
     const uiThemeSettingKey = 'MediaStationGo.Windows.uiTheme.v1';
     const playerSubtitleStyleDefaults = Object.freeze({ fontSize: 36, bottomOffset: 8 });
@@ -2162,6 +2163,9 @@
             fullscreen: 'M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5',
             restore: 'M3 8h5V3M16 3v5h5M21 16h-5v5M8 21v-5H3',
             interpolation: 'M8 4h8v16H8ZM4 7H2v10h2M20 7h2v10h-2',
+            sparkles: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5ZM20 2v4M18 4h4',
+            sliders: 'M3 6h8m4 0h6M3 12h2m4 0h12M3 18h12m4 0h2M11 3v6M5 9v6M15 15v6',
+            reset: 'M3 10V4m0 6h6M3 10a9 9 0 1 1 1 8',
             danmaku: 'M3 4h18v13H9l-5 4v-4H3ZM6 8h12M6 12h8',
             info: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM12 11v6M12 7h.01',
         };
@@ -5275,6 +5279,13 @@
             showToast('该项目不能直接播放');
             return;
         }
+        let enhancementSettings;
+        try {
+            enhancementSettings = loadVideoEnhancementSettings();
+        } catch (error) {
+            showToast(friendlyError(error));
+            return;
+        }
         const seriesPlaybackSetting = card.type === 'Episode' && card.seriesId
             ? seriesPlaybackSettingFor(card.seriesId)
             : { ...seriesPlaybackSettingDefaults };
@@ -5300,8 +5311,9 @@
             metadataRefreshLoadInfo: null,
             scrubbing: false,
             scrubPositionMs: null,
-            interpolationEnabled: false,
-            interpolationModel: null,
+            interpolationEnabled: enhancementSettings.model !== null,
+            interpolationModel: enhancementSettings.model,
+            videoEnhancement: enhancementSettings.selection,
             interpolationChanging: false,
             interpolationTargetModel: null,
             interpolationResumePlaying: true,
@@ -5364,17 +5376,20 @@
                 [
                     card.id,
                     Math.max(0, Math.round(startMs || 0)),
-                    'off',
-                    preferredInterpolationModel,
+                    enhancementSettings.model ? '2x' : 'off',
+                    enhancementSettings.model || preferredInterpolationModel,
                     playbackPreferenceScope(card),
                     playerSubtitleStyle.fontSize,
                     playerSubtitlePosition(),
                     mediaSourceId || '',
+                    JSON.stringify(enhancementSettings.selection),
                 ],
                 60000,
             );
             if (player === activePlayer) {
+                validateVideoEnhancementLoad(loadInfo, enhancementSettings);
                 activePlayer.loadInfo = loadInfo;
+                activePlayer.videoEnhancement = loadInfo.videoEnhancement;
                 schedulePlaybackMetadataRefresh(activePlayer);
                 if (activePlayer.exiting) return;
                 applyPlayerPlaybackRate(1);
@@ -5616,11 +5631,8 @@
                         ? player.interpolationResumePlaying
                         : (episodeChanged ? player.episodeResumePlaying : true);
                     if (interpolationChanged) {
-                        player.interpolationEnabled = player.interpolationTargetModel !== null;
-                        player.interpolationModel = player.interpolationTargetModel;
-                        player.interpolationChanging = false;
-                        player.interpolationTargetModel = null;
-                        player.enhancementTransitionLabel = null;
+                        player.enhancementPlaybackStarted = true;
+                        completeVideoEnhancementChange(player);
                     }
                     if (episodeChanged) {
                         player.episodeChanging = false;
@@ -5631,7 +5643,7 @@
                     player.buffering = false;
                     if (!shouldPlay && window.jmpNative) window.jmpNative.playerPause();
                     refreshPlayerTools();
-                    setPlayerLoading(false);
+                    setPlayerLoading(player.interpolationChanging, player.interpolationChanging ? playerTransitionLoadingLabel(player) : '');
                     schedulePlaybackMetadataRefresh(player);
                     if (firstFrame && !player.panelKind) {
                         hidePlayerFeedback();
@@ -5843,6 +5855,63 @@
 
     const videoEnhancementDefaults = Object.freeze({ vsr: false, vfg: false, nr: false, vsrQuality: 4, vsrTarget: 0, vfgQuality: 0, multiplier: 0, sceneDetection: true, nrStyle: 0, nrTarget: 1080, nrIntensity: 1, nrTone: 1, nrStructure: 1, nrSkin: -1, nrAutoMask: false, nrUiCorrection: false });
     function videoEnhancementSelection(value) { return { ...videoEnhancementDefaults, ...value }; }
+    function loadVideoEnhancementSettings() {
+        try {
+            const stored = window.localStorage.getItem(videoEnhancementSettingKey);
+            if (stored === null) return { model: null, selection: videoEnhancementSelection() };
+            const settings = JSON.parse(stored);
+            const selection = settings?.selection;
+            if (!settings || !(settings.model === null || Object.hasOwn(interpolationModels, settings.model))
+                || !selection || Object.keys(selection).length !== Object.keys(videoEnhancementDefaults).length
+                || !Object.entries(videoEnhancementDefaults).every(([key, value]) => typeof selection[key] === typeof value
+                    && (typeof value !== 'number' || Number.isFinite(selection[key])))
+                || (settings.model !== null && selection.vfg)) throw new Error('配置格式无效');
+            return settings;
+        } catch (error) {
+            throw new Error(`无法读取画面增强设置：${error.message}`);
+        }
+    }
+    function validateVideoEnhancementLoad(loadInfo, settings) {
+        if (!loadInfo.videoEnhancement
+            || !Object.keys(videoEnhancementDefaults).every((key) => Object.hasOwn(loadInfo.videoEnhancement, key))
+            || !sameVideoEnhancement(loadInfo.videoEnhancement, settings.selection)) {
+            throw new Error('播放器返回的画面增强参数与请求不一致');
+        }
+        if ((loadInfo.frameInterpolation?.modelId || null) !== settings.model) {
+            const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
+            error.code = 'frame_interpolation_state_mismatch';
+            throw error;
+        }
+    }
+    function refreshVideoEnhancementPanel() {
+        if (player?.panelKind !== 'interpolation') return;
+        const scrollTop = playerPanelContent.querySelector('.enhancement-settings')?.scrollTop || 0;
+        renderPlayerPanel();
+        const body = playerPanelContent.querySelector('.enhancement-settings');
+        if (body) body.scrollTop = scrollTop;
+    }
+    function completeVideoEnhancementChange(activePlayer) {
+        const settings = activePlayer.enhancementToRemember;
+        if (!settings || !activePlayer.enhancementLoadConfirmed || !activePlayer.enhancementPlaybackStarted) return;
+        activePlayer.interpolationEnabled = settings.model !== null;
+        activePlayer.interpolationModel = settings.model;
+        activePlayer.interpolationChanging = false;
+        activePlayer.interpolationTargetModel = null;
+        activePlayer.enhancementTransitionLabel = null;
+        activePlayer.enhancementToRemember = null;
+        activePlayer.enhancementDraft = null;
+        try {
+            window.localStorage.setItem(videoEnhancementSettingKey, JSON.stringify(settings));
+        } catch (error) {
+            showToast(`画面增强已生效，但设置保存失败：${error.message}`);
+        }
+        refreshVideoEnhancementPanel();
+        const key = activePlayer.enhancementFocusKey;
+        if (activePlayer.panelKind === 'interpolation' && key) {
+            playerPanelContent.querySelector(`[data-enhancement-key="${key}"]:checked, [data-enhancement-key="${key}"]`)?.focus();
+        }
+        setPlayerLoading(activePlayer.buffering, activePlayer.buffering ? '正在缓冲' : '');
+    }
     function sameVideoEnhancement(left, right) {
         const a = videoEnhancementSelection(left), b = videoEnhancementSelection(right);
         return Object.keys(videoEnhancementDefaults).every((key) => typeof a[key] === 'number' && typeof b[key] === 'number' ? Math.abs(a[key] - b[key]) < 0.00001 : a[key] === b[key]);
@@ -5867,84 +5936,91 @@
         return changes.length === 1 ? changes[0] : '正在应用画面设置';
     }
     function renderVideoEnhancementSettings(activePlayer) {
-        if (!activePlayer.enhancementDraft) {
-            activePlayer.enhancementDraft = {
-                model: activePlayer.interpolationEnabled ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId) : null,
-                selection: videoEnhancementSelection(activePlayer.videoEnhancement),
-            };
-        }
-        const draft = activePlayer.enhancementDraft, selection = draft.selection;
+        const pending = activePlayer.enhancementToRemember;
+        const activeModel = activePlayer.interpolationEnabled ? activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId : null;
+        activePlayer.enhancementDraft ||= { model: pending ? pending.model : activeModel, selection: videoEnhancementSelection(pending ? pending.selection : activePlayer.videoEnhancement) };
+        const draft = activePlayer.enhancementDraft;
+        let model = draft.model;
+        const selection = draft.selection;
+        const busy = activePlayer.interpolationChanging;
+        const footer = element('div', 'enhancement-footer');
+        const apply = element('button', 'primary-command', busy ? '应用中…' : '应用');
+        apply.dataset.enhancementKey = 'apply';
+        const updateDraft = () => {
+            draft.model = model;
+            apply.disabled = Boolean(busy) || (model === activeModel && sameVideoEnhancement(selection, activePlayer.videoEnhancement));
+        };
+        const refreshDraft = (key) => {
+            updateDraft();
+            refreshVideoEnhancementPanel();
+            playerPanelContent.querySelector(`[data-enhancement-key="${key}"]:checked, [data-enhancement-key="${key}"]`)?.focus();
+        };
+        apply.addEventListener('click', () => { if (player === activePlayer && !activePlayer.interpolationChanging) void setFrameInterpolation(draft.model, draft.selection); });
+        footer.append(apply);
         const ready = (id) => id === 'rife' ? byId('player-interpolation').dataset.componentReady === 'true' : videoComponentStatuses.get(id)?.runtime?.playbackAvailable === true;
         const unavailable = (id) => {
             const status = videoComponentStatuses.get(id);
             return status?.installed ? status.runtime?.failureDetail || '组件已安装，当前运行环境不可用' : '请先在组件管理安装';
         };
         const body = element('div', 'enhancement-settings');
-        const footer = element('div', 'enhancement-footer');
-        const apply = element('button', 'primary-command', '应用设置'); apply.type = 'button';
-        const updateApply = () => {
-            const activeModel = activePlayer.interpolationEnabled ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId) : null;
-            apply.disabled = activePlayer.interpolationChanging || (activeModel === draft.model && sameVideoEnhancement(activePlayer.videoEnhancement, selection));
-        };
         const select = (parent, key, label, choices, value, onChange, disabled = false) => {
             const row = element('label', 'enhancement-parameter'); row.append(element('span', '', label));
-            const control = element('select'); control.setAttribute('aria-label', label); control.dataset.enhancementKey = key; control.disabled = disabled;
+            const control = element('select'); control.setAttribute('aria-label', label); control.dataset.enhancementKey = key; control.disabled = disabled || busy;
             for (const [optionValue, text, optionDisabled] of choices) {
                 const option = element('option', '', text); option.value = String(optionValue); option.selected = value === optionValue; option.disabled = Boolean(optionDisabled); control.append(option);
             }
             control.value = String(value);
-            control.addEventListener('change', () => { onChange(control.value); updateApply(); }); row.append(control); parent.append(row); return control;
+            control.addEventListener('change', () => { onChange(control.value); updateDraft(); }); row.append(control); parent.append(row); return control;
         };
         const parameterSelect = (parent, key, label, choices) => select(parent, key, label, choices, selection[key], (value) => { selection[key] = Number(value); });
-        const toggle = (parent, key, label, disabled = false, onChange) => {
-            const row = element('label', 'enhancement-parameter'); const control = element('input'); control.type = 'checkbox'; control.checked = selection[key]; control.disabled = disabled; control.dataset.enhancementKey = key;
-            control.setAttribute('aria-label', label); control.addEventListener('change', () => { selection[key] = control.checked; onChange?.(); updateApply(); }); row.append(element('span', '', label), control); parent.append(row); return control;
+        const toggle = (parent, key, label, disabled = false) => {
+            const row = element('label', 'enhancement-parameter'); const control = element('input'); control.type = 'checkbox'; control.checked = selection[key]; control.disabled = disabled || busy; control.dataset.enhancementKey = key;
+            control.className = 'enhancement-switch'; control.setAttribute('role', 'switch');
+            control.setAttribute('aria-label', label); control.addEventListener('change', () => { selection[key] = control.checked; if (key === 'vsr' || key === 'nr') refreshDraft(key); else updateDraft(); }); row.append(element('span', '', label), control); parent.append(row); return control;
         };
         const range = (parent, key, label) => {
             const row = element('label', 'enhancement-parameter'); const text = element('span', '', `${label}：${selection[key]}`);
             const control = element('input'); control.type = 'range'; control.min = '0'; control.max = '1'; control.step = '0.05'; control.value = String(selection[key]); control.dataset.enhancementKey = key; control.setAttribute('aria-label', label);
-            control.addEventListener('input', () => { selection[key] = Number(control.value); text.textContent = `${label}：${selection[key]}`; updateApply(); }); row.append(text, control); parent.append(row);
+            control.disabled = busy;
+            control.addEventListener('input', () => { selection[key] = Number(control.value); text.textContent = `${label}：${selection[key]}`; updateDraft(); }); row.append(text, control); parent.append(row);
         };
         const group = (key, title) => {
             const section = element('section', 'enhancement-group'); section.dataset.enhancementGroup = key;
             section.append(element('h3', '', title)); body.append(section); return section;
         };
-        const parameters = (parent, disabled) => {
+        const parameters = (parent, key, disabled) => {
             const details = element('details', 'enhancement-parameters'); details.append(element('summary', '', '参数设置'));
-            const fields = element('fieldset'); fields.disabled = disabled; details.append(fields); parent.append(details); return fields;
+            details.open = activePlayer.enhancementExpanded?.[key] === true;
+            details.addEventListener('toggle', () => { if (details.isConnected) { activePlayer.enhancementExpanded ||= {}; activePlayer.enhancementExpanded[key] = details.open; positionPlayerPanel(); } });
+            const fields = element('fieldset'); fields.disabled = disabled || busy; details.append(fields); parent.append(details); return fields;
         };
         const interpolation = group('interpolation', '插帧');
-        const backend = draft.model ? 'rife' : selection.vfg ? 'nvidia-vfg' : 'off';
-        select(interpolation, 'backend', '插帧引擎', [['off', '关闭'], ['rife', ready('rife') ? 'RIFE' : 'RIFE · 不可用', !ready('rife')], ['nvidia-vfg', ready('nvidia-vfg') ? 'NVIDIA VFG' : 'NVIDIA VFG · 不可用', !ready('nvidia-vfg')]], backend, (value) => {
-            draft.model = value === 'rife' ? preferredInterpolationModel : null;
-            selection.vfg = value === 'nvidia-vfg';
-            const scrollTop = playerPanelContent.querySelector('.enhancement-settings')?.scrollTop || 0;
-            renderPlayerPanel();
-            const nextBody = playerPanelContent.querySelector('.enhancement-settings'); if (nextBody) nextBody.scrollTop = scrollTop;
-            playerPanelContent.querySelector('[data-enhancement-key="backend"]')?.focus();
-        }, activePlayer.interpolationChanging);
-        if (backend === 'rife') {
-            const fields = parameters(interpolation, !ready('rife'));
-            select(fields, 'rifeModel', '效果档位', Object.entries(interpolationModels).map(([id, model]) => [id, model.label]), draft.model, (value) => { draft.model = value; });
-            fields.append(element('p', 'enhancement-help', '固定 2 倍插帧，三档模型按画质与性能选择。'));
-        } else if (backend === 'nvidia-vfg') {
-            const fields = parameters(interpolation, !ready('nvidia-vfg'));
-            parameterSelect(fields, 'vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
-            parameterSelect(fields, 'multiplier', '输出帧率', [[0, '自动 · 匹配显示刷新率'], ...[2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])]); toggle(fields, 'sceneDetection', '检测镜头切换');
-            fields.append(element('p', 'enhancement-help', '自动选择接近原片两倍、与显示刷新率对齐的帧率，保持原播放速度。自动采样、高倍率与高质量均可能增加耗时，实际输出见播放信息。'));
+        const backend = model ? 'rife' : selection.vfg ? 'nvidia-vfg' : 'off';
+        const engines = element('fieldset', 'enhancement-engine-picker'); engines.setAttribute('aria-label', '插帧引擎');
+        for (const [value, label] of [['off', '关闭'], ['nvidia-vfg', 'NVIDIA VFG'], ['rife', 'RIFE']]) {
+            const item = element('label'), input = element('input'); input.type = 'radio'; input.name = 'player-enhancement-engine'; input.value = value; input.dataset.enhancementKey = 'backend'; input.checked = value === backend;
+            input.disabled = busy || (value !== 'off' && value !== backend && !ready(value)); input.setAttribute('aria-label', label);
+            if (input.disabled && !busy) item.title = value === 'rife' ? 'RIFE 组件未就绪' : unavailable(value);
+            input.addEventListener('change', () => { if (input.checked) { model = value === 'rife' ? preferredInterpolationModel : null; selection.vfg = value === 'nvidia-vfg'; refreshDraft('backend'); } });
+            item.append(input, element('span', '', label)); engines.append(item);
         }
+        interpolation.append(engines);
+        if (backend === 'rife') {
+            select(interpolation, 'rifeModel', '效果档位', Object.entries(interpolationModels).map(([id, entry]) => [id, entry.name.replace('RIFE ', '')]), model, (value) => { model = value; }, !ready('rife'));
+            const row = element('div', 'enhancement-parameter'); row.append(element('span', '', '输出帧率'), element('span', 'enhancement-readonly', '2 倍')); interpolation.append(row);
+        } else if (backend === 'nvidia-vfg') {
+            parameterSelect(interpolation, 'multiplier', '输出帧率', [[0, '自动匹配刷新率'], ...[2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])]);
+            const fields = parameters(interpolation, 'vfg', !ready('nvidia-vfg'));
+            parameterSelect(fields, 'vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
+            toggle(fields, 'sceneDetection', '检测镜头切换');
+        }
+        const quality = group('quality', '画质');
         for (const [id, key, title] of [['rtx-video', 'vsr', 'RTX Video 超分'], ['dlssnr', 'nr', 'DLSSNR 画面增强']]) {
-            const section = group(key, title);
-            const fields = parameters(section, !ready(id));
-            const details = section.children[1];
-            details.classList.toggle('hidden', !selection[key]);
-            const row = element('div');
-            const enabledToggle = toggle(row, key, '启用', (!ready(id) && !selection[key]) || activePlayer.interpolationChanging, () => {
-                details.classList.toggle('hidden', !selection[key]);
-                if (!ready(id)) enabledToggle.disabled = !selection[key];
-            });
-            section.insertBefore(row.children[0], details);
-            if (!ready(id)) section.append(element('p', 'enhancement-help', unavailable(id)));
+            const section = element('div'); section.dataset.enhancementGroup = key; quality.append(section);
+            const enabledToggle = toggle(section, key, title, !ready(id) && !selection[key]);
+            if (!ready(id)) enabledToggle.title = unavailable(id);
+            const fields = parameters(section, key, !ready(id));
+            fields.parentElement.classList.toggle('hidden', !selection[key]);
             if (key === 'vsr') {
                 parameterSelect(fields, 'vsrQuality', '超分质量', [[1, '1 · Low'], [2, '2 · Medium'], [3, '3 · High'], [4, '4 · Ultra']]);
                 parameterSelect(fields, 'vsrTarget', '目标尺寸', [[0, '原尺寸的 2 倍'], [1440, 'QHD · 1440p'], [2160, '4K · 2160p'], [2880, '5K · 2880p'], [3456, '6K · 3456p'], [4032, '7K · 4032p'], [4320, '8K · 4320p']]);
@@ -5955,12 +6031,8 @@
                 parameterSelect(fields, 'nrSkin', '皮肤结构', [[-1, '自动'], [0, '0'], [0.5, '0.5'], [1, '1'], [1.5, '1.5'], [2, '2']]); toggle(fields, 'nrAutoMask', '自动遮罩'); toggle(fields, 'nrUiCorrection', 'UI 修正');
             }
         }
-        body.append(element('p', 'enhancement-help', '支持 SDR / HDR10 / HLG；RIFE 暂不支持 HLG。HDR10+ 和 Dolby Vision 暂不支持增强。'));
-        apply.addEventListener('click', () => { if (!apply.disabled && player === activePlayer) setFrameInterpolation(draft.model, { ...selection }); });
-        const cancel = element('button', 'secondary-command', '取消'); cancel.type = 'button'; cancel.addEventListener('click', () => closePlayerPanel());
-        footer.append(element('p', 'enhancement-help', '统一应用，保留进度与暂停状态。'), element('div', 'enhancement-footer-actions'));
-        footer.children[1].append(cancel, apply);
-        updateApply(); playerPanelContent.append(body, footer);
+        updateDraft();
+        playerPanelContent.append(body, footer);
     }
     async function setFrameInterpolation(modelId, enhancement = player?.videoEnhancement) {
         const activePlayer = player;
@@ -5979,7 +6051,6 @@
             ? (activePlayer.interpolationModel || activePlayer.loadInfo.frameInterpolation?.modelId)
             : null;
         if (requestedModel === activeModel && sameVideoEnhancement(activePlayer.videoEnhancement, requestedEnhancement)) {
-            closePlayerPanel(false);
             return;
         }
         const previousLoadInfo = activePlayer.loadInfo;
@@ -5989,8 +6060,12 @@
         activePlayer.interpolationChanging = true;
         activePlayer.interpolationTargetModel = requestedModel;
         activePlayer.interpolationResumePlaying = activePlayer.playing;
+        activePlayer.enhancementToRemember = { model: requestedModel, selection: requestedEnhancement };
+        activePlayer.enhancementLoadConfirmed = false;
+        activePlayer.enhancementPlaybackStarted = false;
+        activePlayer.enhancementFocusKey = document.activeElement?.dataset.enhancementKey;
         if (activePlayer.playing && window.jmpNative) window.jmpNative.playerPause();
-        closePlayerPanel(false);
+        refreshVideoEnhancementPanel();
         setPlayerLoading(true, playerTransitionLoadingLabel(activePlayer));
         showPlayerControls();
         refreshPlayerTools();
@@ -6024,15 +6099,11 @@
                 60000,
             );
             if (player !== activePlayer || activePlayer.exiting) return;
-            if (!loadInfo.videoEnhancement || !Object.keys(requestedEnhancement).every((key) => Object.prototype.hasOwnProperty.call(loadInfo.videoEnhancement, key)) || !sameVideoEnhancement(loadInfo.videoEnhancement, requestedEnhancement)) throw new Error('播放器返回的画面增强参数与请求不一致');
-            const actualModel = loadInfo.frameInterpolation?.modelId || null;
-            if (actualModel !== requestedModel) {
-                const error = new Error('播放器返回的 RTX 插帧状态与请求不一致');
-                error.code = 'frame_interpolation_state_mismatch';
-                throw error;
-            }
+            validateVideoEnhancementLoad(loadInfo, activePlayer.enhancementToRemember);
             activePlayer.loadInfo = loadInfo;
             activePlayer.videoEnhancement = loadInfo.videoEnhancement;
+            activePlayer.enhancementLoadConfirmed = true;
+            completeVideoEnhancementChange(activePlayer);
             schedulePlaybackMetadataRefresh(activePlayer);
             applyPlayerPlaybackRate(playerPlaybackRate);
             if (activePlayer.interpolationChanging) {
@@ -6043,6 +6114,7 @@
         } catch (error) {
             if (player !== activePlayer || activePlayer.exiting) return;
             activePlayer.interpolationChanging = false;
+            activePlayer.enhancementToRemember = null;
             activePlayer.interpolationTargetModel = null;
             activePlayer.enhancementTransitionLabel = null;
             activePlayer.interpolationModel = previousModel;
@@ -6053,6 +6125,7 @@
             }
             setPlayerLoading(activePlayer.buffering, activePlayer.buffering ? '正在缓冲' : '');
             refreshPlayerTools();
+            refreshVideoEnhancementPanel();
             showToast(friendlyError(error));
         }
     }
@@ -6064,7 +6137,7 @@
     }
 
     function isPlayerInteractiveTarget(target) {
-        return target instanceof Element && Boolean(target.closest('button, input, .player-panel, .player-danmaku-panel'));
+        return target instanceof Element && Boolean(target.closest('button, input, select, textarea, .player-bottom, .player-panel, .player-danmaku-panel'));
     }
 
     function seekBy(deltaMs) {
@@ -6220,8 +6293,10 @@
         episodes.title = player?.episodesLoading ? '正在读取选集' : '选集';
         episodes.setAttribute('aria-label', episodes.title);
         danmaku.disabled = !player || exiting || episodeChanging || autoAdvancePending || !info;
-        danmaku.title = `弹幕：${danmakuEnabled ? '显示' : '关闭'}（悬停配置）`;
+        danmaku.title = danmakuEnabled ? '关闭弹幕' : '开启弹幕';
         danmaku.setAttribute('aria-label', danmaku.title);
+        byId('player-danmaku-settings').disabled = danmaku.disabled;
+        if (danmaku.disabled) closeDanmakuPanel();
         subtitles.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !Array.isArray(info.subtitleTracks);
         audio.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info || !Array.isArray(info.audioTracks) || !info.audioTracks.length;
         speed.disabled = !player || exiting || episodeChanging || autoAdvancePending || trackChanging || !player.started;
@@ -6243,6 +6318,7 @@
                 ? `RTX 插帧：${interpolationModels[interpolationModel]?.label || '已开启'}`
                 : (player?.videoEnhancement?.vfg ? 'NVIDIA VFG 插帧' : player?.videoEnhancement?.vsr ? 'RTX Video 超分' : player?.videoEnhancement?.nr ? 'DLSSNR 画面增强' : '画面增强'));
         interpolation.setAttribute('aria-label', interpolation.title);
+        interpolation.setAttribute('aria-expanded', String(player?.panelKind === 'interpolation'));
         interpolation.setAttribute('aria-pressed', String(interpolationEnabled || player?.videoEnhancement?.vsr || player?.videoEnhancement?.vfg || player?.videoEnhancement?.nr || false));
         infoButton.disabled = exiting || episodeChanging || autoAdvancePending || trackChanging || !info;
         fullscreen.disabled = !player || exiting || episodeChanging || autoAdvancePending;
@@ -6529,6 +6605,7 @@
     function renderPlayerPanel() {
         const info = player?.loadInfo;
         const kind = player?.panelKind;
+        playerPanel.classList.toggle('player-panel-enhancement', kind === 'interpolation');
         playerPanelContent.replaceChildren();
         requestAnimationFrame(positionPlayerPanel);
         if (!info || !kind) return;
@@ -6711,13 +6788,18 @@
         const triggerRect = playerPanelTrigger.getBoundingClientRect();
         const panelRect = playerPanel.getBoundingClientRect();
         const safeInset = window.innerWidth <= 760 ? 18 : 30;
-        const viewportLeft = Math.max(safeInset, playerRect.right - safeInset - panelRect.width);
+        const viewportLeft = player?.panelKind === 'interpolation'
+            ? clamp(triggerRect.left + triggerRect.width / 2 + 58 - panelRect.width, playerRect.left + safeInset, playerRect.right - safeInset - panelRect.width)
+            : Math.max(safeInset, playerRect.right - safeInset - panelRect.width);
         playerPanel.style.left = `${Math.round(viewportLeft - playerRect.left)}px`;
         playerPanel.style.bottom = `${Math.round(playerRect.bottom - triggerRect.top + 12)}px`;
+        playerPanel.style.setProperty('--player-panel-arrow', `${Math.round(triggerRect.left + triggerRect.width / 2 - viewportLeft)}px`);
+        playerPanel.style.setProperty('--player-panel-available', `${Math.max(0, triggerRect.top - playerRect.top - 36)}px`);
     }
 
     function presentPlayerPanel(activePlayer, kind, trigger) {
         if (player !== activePlayer || activePlayer.exiting) return;
+        if (activePlayer.panelKind === 'interpolation' && kind !== 'interpolation') activePlayer.enhancementDraft = null;
         activePlayer.panelKind = kind;
         playerPanelTrigger = trigger || null;
         window.clearTimeout(controlsTimer);
@@ -6731,7 +6813,7 @@
         window.setTimeout(() => {
             const selected = kind === 'subtitles'
                 ? playerPanelContent.querySelector('.player-subtitle-style-reset')
-                : kind === 'interpolation' ? playerPanelContent.querySelector('[data-enhancement-key="backend"]')
+                : kind === 'interpolation' ? playerPanelContent.querySelector('[data-enhancement-key="backend"]:checked')
                 : playerPanelContent.querySelector('[aria-checked="true"]');
             if (selected) selected.focus();
             else if (playerPanelTrigger?.isConnected) playerPanelTrigger.focus();
@@ -6786,6 +6868,7 @@
     async function openPlayerPanel(kind, trigger) {
         const panelTrigger = trigger?.closest('.player-more-menu') ? byId('player-more') : trigger;
         closePlayerMore(false);
+        closeDanmakuPanel();
         const activePlayer = player;
         if (!activePlayer?.loadInfo || activePlayer.trackChanging || activePlayer.trackRefreshing || activePlayer.exiting) return;
         if (activePlayer.panelKind === kind && !playerPanel.classList.contains('hidden')) {
@@ -7095,6 +7178,7 @@
     }
 
     function finishPlayer() {
+        closeDanmakuPanel();
         // Update Continue Watching from the player state before returning to
         // the app. Invalidate any older home request so it cannot overwrite
         // this newer local state while the stopped report is still pending.
@@ -7163,7 +7247,7 @@
 
     function isDanmakuConfigurationActive() {
         const control = byId('player-danmaku-control');
-        return control.matches(':hover') || Boolean(control.querySelector(':focus-visible'));
+        return control.classList.contains('is-open');
     }
 
     function hidePlayerControls() {
@@ -7316,7 +7400,8 @@
         const button = byId(id); button.replaceChildren(playerIcon(icon));
         if (label) button.append(element('span', 'player-tool-label', label));
     }
-    [['player-interpolation', 'interpolation', '画面增强'], ['player-danmaku', 'danmaku', '弹幕'], ['player-info', 'info', '播放信息']].forEach(([id, icon, label]) => byId(id).replaceChildren(playerIcon(icon), element('span', 'player-tool-label', label)));
+    [['player-interpolation', 'sparkles'], ['player-danmaku', 'danmaku'], ['player-danmaku-settings', 'sliders'], ['player-danmaku-reset', 'reset']].forEach(([id, icon]) => byId(id).replaceChildren(playerIcon(icon)));
+    byId('player-info').replaceChildren(playerIcon('info'), element('span', 'player-tool-label', '播放信息'));
     byId('topbar-search').addEventListener('submit', (event) => {
         event.preventDefault();
         const query = byId('search-open').value;
@@ -7480,18 +7565,43 @@
     byId('player-speed').addEventListener('click', (event) => openPlayerPanel('speed', event.currentTarget));
     byId('player-danmaku').addEventListener('click', togglePlayerDanmaku);
     const danmakuControl = byId('player-danmaku-control');
-    const keepDanmakuControlsVisible = () => {
+    let danmakuHoverTimer = 0;
+    function positionDanmakuPanel() {
+        const panel = byId('player-danmaku-panel');
+        if (panel.hidden) return;
+        const rect = danmakuControl.getBoundingClientRect(), playerRect = playerView.getBoundingClientRect();
+        const width = Math.min(336, playerRect.width - 32);
+        const left = clamp(rect.right - width, playerRect.left + 16, playerRect.right - width - 16);
+        panel.style.width = `${width}px`; panel.style.left = `${left - rect.left}px`;
+        panel.style.setProperty('--player-panel-arrow', `${rect.left + rect.width / 2 - left}px`);
+    }
+    function closeDanmakuPanel() {
+        window.clearTimeout(danmakuHoverTimer);
+        byId('player-danmaku-panel').hidden = true;
+        byId('player-danmaku-control').classList.remove('is-open');
+        byId('player-danmaku-settings').setAttribute('aria-expanded', 'false');
+    }
+    function openDanmakuPanel() {
+        if (byId('player-danmaku-settings').disabled) return;
+        closePlayerPanel(false);
+        closePlayerMore(false);
+        danmakuControl.classList.add('is-open');
+        byId('player-danmaku-panel').hidden = false;
+        byId('player-danmaku-settings').setAttribute('aria-expanded', 'true');
+        positionDanmakuPanel();
         window.clearTimeout(controlsTimer);
         playerControls.classList.add('visible');
         playerControls.inert = false;
         refreshPlayerCursor();
         refreshDanmakuStyleControls();
-    };
-    danmakuControl.addEventListener('pointerenter', keepDanmakuControlsVisible);
-    danmakuControl.addEventListener('focusin', keepDanmakuControlsVisible);
-    danmakuControl.addEventListener('pointerleave', scheduleControlsHide);
-    danmakuControl.addEventListener('focusout', (event) => {
-        if (!danmakuControl.contains(event.relatedTarget)) scheduleControlsHide();
+    }
+    danmakuControl.addEventListener('pointerenter', () => {
+        window.clearTimeout(danmakuHoverTimer);
+        if (!isDanmakuConfigurationActive()) danmakuHoverTimer = window.setTimeout(openDanmakuPanel, 180);
+    });
+    danmakuControl.addEventListener('pointerleave', () => {
+        window.clearTimeout(danmakuHoverTimer);
+        danmakuHoverTimer = window.setTimeout(() => { closeDanmakuPanel(); scheduleControlsHide(); }, 220);
     });
     for (const definition of danmakuStyleControlDefinitions) {
         const input = byId(definition.id);
@@ -7532,7 +7642,12 @@
     byId('player-info').addEventListener('click', (event) => openPlayerPanel('info', event.currentTarget));
     playerView.addEventListener('mousemove', () => showPlayerControls(false));
     playerView.addEventListener('click', (event) => {
-        if (!player || player.exiting || isPlayerInteractiveTarget(event.target)) return;
+        if (!player || player.exiting) return;
+        if (isPlayerInteractiveTarget(event.target)) {
+            window.clearTimeout(playerClickTimer); playerClickTimer = 0; playerClickAt = 0;
+            return;
+        }
+        if (player.panelKind) { closePlayerPanel(false); return; }
         const now = event.timeStamp || performance.now();
         const withinDoubleClickArea = Math.hypot(event.clientX - playerClickX, event.clientY - playerClickY) <= 24;
         const isDoubleClick = playerClickTimer && withinDoubleClickArea && now - playerClickAt <= 420;
@@ -7601,9 +7716,11 @@
                 event.preventDefault(); closePlayerMore(true); return;
             }
             const active = document.activeElement;
-            const toolButtons = [byId('player-playback'), byId('player-seek-back'), byId('player-seek-forward'), byId('player-next'), byId('player-more'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
+            if (event.key === 'Escape' && isDanmakuConfigurationActive()) { event.preventDefault(); closeDanmakuPanel(); scheduleControlsHide(); return; }
+            const toolButtons = [byId('player-playback'), byId('player-seek-back'), byId('player-seek-forward'), byId('player-next'), byId('player-more'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-danmaku-settings'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
                 .filter((button) => !button.disabled && button.getClientRects().length > 0);
             if (!playerPanel.classList.contains('hidden')) {
+                if (active?.matches('input, select') && !['Escape', 'Backspace'].includes(event.key)) return;
                 if (event.key === 'Escape' || event.key === 'Backspace') {
                     event.preventDefault(); closePlayerPanel(true);
                 } else if ((event.key === 'Enter' || event.key === ' ') && toolButtons.includes(active)) {
@@ -7625,6 +7742,7 @@
                 }
                 return;
             }
+            if (active?.closest('#player-danmaku-panel') && active.matches('input') && !byId('player-danmaku-panel').hidden) return;
             if (active === playerVolumeControl && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
                 event.preventDefault();
                 applyPlayerVolume(playerVolume + (event.key === 'ArrowRight' ? 5 : -5), true);
@@ -7841,6 +7959,7 @@
         content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
         if (currentDrawer === byId('account-drawer')) positionAccountPopover(currentDrawer, drawerTrigger);
         positionPlayerPanel();
+        positionDanmakuPanel();
     }, { passive: true });
 
     content.addEventListener('pointerdown', (event) => {

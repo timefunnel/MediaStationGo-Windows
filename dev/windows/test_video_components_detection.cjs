@@ -7,7 +7,7 @@ const panel = node(), content = node(), toasts = [], requests = [];
 let backend;
 Object.assign(context, { nativeRequest: async (channel, operation, args) => { requests.push({ operation, args }); assert.equal(operation, 'video_components_status'); return backend(); },
     refreshUpdateControls() {}, scheduleAutomaticUpdateCheck() {}, refreshImageCacheStatus() {}, refreshFrameInterpolationStatus() {}, updateSessionUi() {},
-    loadHome: async () => {}, splash: node(), loginView: node(), appShell: node(), closePlayerMore() {}, showToast: (message) => toasts.push(message),
+    loadHome: async () => {}, splash: node(), loginView: node(), appShell: node(), closePlayerMore() {}, closeDanmakuPanel() {}, showToast: (message) => toasts.push(message),
     playerPanel: panel, playerPanelContent: content, playerControls: node(), controlsTimer: 0, playerPanelTrigger: null, scheduleControlsHide() {}, positionPlayerPanel() {}, requestAnimationFrame(callback) { callback(); },
 });
 const defaults = source.indexOf('    const videoEnhancementDefaults = ');
@@ -16,10 +16,10 @@ for (const name of ['element', 'createTrackOption', 'showApp', 'renderPlayerPane
 const payload = { components: ['rtx-video', 'dlssnr', 'nvidia-vfg'].map((id) => ({ id, supported: true, installed: id !== 'rtx-video', runtime: { playbackAvailable: id !== 'rtx-video' } })) };
 function player() { context.player = { card: { id: 'local' }, loadInfo: {}, started: true, panelKind: '', interpolationEnabled: false, interpolationChanging: false }; panel.classList.add('hidden'); content.replaceChildren(); }
 function assertGroups() {
-    assert.deepEqual(descendants(content).filter((n) => n.dataset.enhancementGroup).map((n) => n.dataset.enhancementGroup), ['interpolation', 'vsr', 'nr']);
+    assert.deepEqual(descendants(content).filter((n) => n.dataset.enhancementGroup).map((n) => n.dataset.enhancementGroup), ['interpolation', 'quality', 'vsr', 'nr']);
     assert.equal(descendants(content).find((n) => n.dataset.enhancementKey === 'vsr').disabled, true);
     assert.equal(descendants(content).find((n) => n.dataset.enhancementKey === 'nr').disabled, false);
-    assert.equal(descendants(content).filter((n) => n.textContent === '应用设置').length, 1, 'one common apply button');
+    assert.equal(descendants(content).filter((n) => n.textContent === '应用').length, 1, 'one common apply button');
 }
 async function main() {
     backend = async () => payload; await context.showApp({});
@@ -34,13 +34,13 @@ async function main() {
     const nr = content.querySelector('[data-enhancement-key="nr"]'); nr.checked = true; nr.events.change();
     assert.equal(calls.length, 0, 'editing a toggle never reloads media');
     const style = content.querySelector('[data-enhancement-key="nrStyle"]'); style.value = '2'; style.events.change();
-    const apply = descendants(content).find((n) => n.textContent === '应用设置'); assert.equal(apply.disabled, false); apply.events.click();
+    const apply = descendants(content).find((n) => n.textContent === '应用'); assert.equal(apply.disabled, false); apply.events.click();
     assert.equal(calls.length, 1); assert.equal(calls[0][1].nr, true); assert.equal(calls[0][1].nrStyle, 2);
     byId('player-interpolation').dataset.componentReady = 'true';
-    const engine = content.querySelector('[data-enhancement-key="backend"]'); engine.value = 'rife'; engine.events.change();
+    const engine = descendants(content).find((n) => n.dataset.enhancementKey === 'backend' && n.value === 'rife'); engine.checked = true; engine.events.change();
     const models = content.querySelector('[data-enhancement-key="rifeModel"]'); assert.equal(models.children.length, 3);
     assert.equal(context.player.enhancementDraft.selection.vfg, false);
-    const vfgEngine = content.querySelector('[data-enhancement-key="backend"]'); vfgEngine.value = 'nvidia-vfg'; vfgEngine.events.change();
+    const vfgEngine = descendants(content).find((n) => n.dataset.enhancementKey === 'backend' && n.value === 'nvidia-vfg'); vfgEngine.checked = true; vfgEngine.events.change();
     const rate = content.querySelector('[data-enhancement-key="multiplier"]');
     assert.equal(rate.value, '0'); assert.equal(rate.children.length, 8);
     rate.value = '3'; rate.events.change(); assert.equal(context.player.enhancementDraft.selection.multiplier, 3);
@@ -57,7 +57,7 @@ async function main() {
     const unavailableNr = content.querySelector('[data-enhancement-key="nr"]');
     assert.equal(unavailableNr.disabled, false, 'an unavailable active component can still be disabled');
     unavailableNr.checked = false; unavailableNr.events.change();
-    assert.equal(unavailableNr.disabled, true, 'unavailable component cannot be enabled again');
+    assert.equal(content.querySelector('[data-enhancement-key="nr"]').disabled, true, 'unavailable component cannot be enabled again');
     player(); backend = async () => { throw new Error('native IPC unavailable'); }; await context.openPlayerPanel('interpolation');
     assert.equal(content.children.length, 0); assert.match(toasts.at(-1), /组件状态查询失败/);
     player(); backend = () => new Promise((resolve) => { reply = resolve; }); const stale = context.openPlayerPanel('interpolation'); context.player = null; reply(payload); await stale;
