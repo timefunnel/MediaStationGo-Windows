@@ -112,17 +112,19 @@ static struct mp_image *output_frame(struct mp_filter *f, struct mp_image *input
     if (output) { mp_image_copy_attributes(output, input); output->params.crop = (struct mp_rect){0, 0, p->out_width, p->out_height}; }
     return output;
 }
-static struct mp_image *copy_original(struct mp_filter *f, struct mp_image *input) {
+static struct mp_image *copy_original(struct mp_filter *f, struct mp_image *input,
+                                      ID3D11Texture2D *retained) {
     struct priv *p = f->priv;
     /* Referring directly to the decoder/converter frame would alternate its
      * AVHWFramesContext with our generated frames. d3d11vpp reinitializes on
-     * every pool change, so originals use the same output pool as SDK frames. */
+     * every pool change, so originals use the same output pool as SDK frames.
+     * Read the retained pair texture, just as inference does. The upstream
+     * converter surface may have been reused by the time this output is due. */
     struct mp_image *output = output_frame(f, input);
     if (!output) { fail(f, "Cannot allocate an original VFG output frame"); return NULL; }
     D3D11_BOX box = {0, 0, 0, input->w, input->h, 1};
     ID3D11DeviceContext_CopySubresourceRegion(p->context, (void *)output->planes[0],
-        (UINT)(uintptr_t)output->planes[1], 0, 0, 0, (void *)input->planes[0],
-        (UINT)(uintptr_t)input->planes[1], &box);
+        (UINT)(uintptr_t)output->planes[1], 0, 0, 0, (void *)retained, 0, &box);
     return output;
 }
 static bool initialize(struct mp_filter *f, struct mp_image *input) {
@@ -281,7 +283,7 @@ static void process_pair(struct mp_filter *f) {
             struct mp_image *output = generate_frame(f, 0.5f);
             if (output) write_output(f, output, pts, duration);
         } else {
-            struct mp_image *output = copy_original(f, p->current_image);
+            struct mp_image *output = copy_original(f, p->current_image, p->current);
             if (!output) return;
             finish_pair(f); write_output(f, output, pts, duration);
         }
@@ -293,7 +295,7 @@ static void process_pair(struct mp_filter *f) {
     }
     struct mp_image *output;
     if (fabs(pts - p->current_image->pts) <= 1e-7) {
-        output = copy_original(f, p->current_image);
+        output = copy_original(f, p->current_image, p->current);
         if (!output) return;
     } else {
         float timestep = (float)((pts - p->previous_pts) / delta);
@@ -308,7 +310,7 @@ static void drain_eof(struct mp_filter *f) {
     struct priv *p = f->priv;
     double pts = vfg_clock_next(&p->clock);
     if (pts < p->source_end_pts - 1e-7) {
-        struct mp_image *output = copy_original(f, p->previous_image);
+        struct mp_image *output = copy_original(f, p->previous_image, p->previous);
         if (!output) return;
         vfg_clock_advance(&p->clock);
         write_output(f, output, pts, fmin(1 / p->clock.fps, p->source_end_pts - pts));
@@ -365,7 +367,7 @@ static void process(struct mp_filter *f) {
         mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, output)); return;
     }
     if (!p->previous) {
-        struct mp_image *output = copy_original(f, input);
+        struct mp_image *output = copy_original(f, input, p->current);
         if (!output) return;
         double pts = input->pts;
         double duration = p->opts->multiplier ? (p->source_end_pts - pts) / p->opts->multiplier : 1 / p->timing.target_fps;

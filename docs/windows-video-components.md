@@ -2,7 +2,67 @@
 
 2026-10-22 后续整合：用户已授权首页修复与以下 VFG/播放面板改动一起交付本机。
 首页修复、最终 EXE/视频桥校验及回滚位置见 [首页启动修复](windows-home-startup.md)。
-下面的已安装/未安装、回滚描述均为各阶段记录，当前交付以该文档及安装审计为准。
+下面的已安装/未安装、回滚描述均为各阶段记录，后续 VFG 修复以本节及对应安装审计为准。
+
+## 2026-10-23 VFG 原始帧像素回退修复
+
+用户在真实影片中确认：双倍插帧有整幅画面回退，自动匹配较少，关闭 VFG 后消失；
+关闭镜头检测后仍出现。仅查 PTS 与 SDK 输出不足以解释该问题，因此同时采集 SDK
+保留的两张输入、生成帧和 Present 前的实际渲染像素，并用同一 QPC 时钟对齐。
+
+修复前 8 秒采集得到 1217 次渲染、603 张 SDK 缩略图，均无采集丢失。明确匹配中
+有 18 次渲染用了错误的原始帧，对应 6 个逻辑帧、6 次画面回退。例如 PTS 588.402 秒
+显示的内容属于 588.322 秒，旧了 80 ms；相邻生成帧正确。问题落在原始帧输出路径：
+此前延迟输出时再次读取上游转换纹理，现在直接从该帧对已保留的 `current/previous`
+纹理复制，与推理读取同一份稳定像素。首帧、固定倍率原始端点、自动端点和 EOF
+补帧共用该规则；音频速度、时间线、SDK 档位和镜头检测规则不变。
+
+RTX 5070 Ti / 596.49 / 152 Hz，用户操作同一诊断入口进行修复候选复测：
+
+| 模式 | 渲染记录 | 可明确匹配的帧 | 错位 / 回退 | 用户反馈 |
+| --- | ---: | ---: | ---: | --- |
+| 修复前双倍 | 1217 | 1098 | 18 / 6 | 出现整幅回退 |
+| 修复后双倍 25 → 50 fps | 1217 | 1207 | 0 / 0 | 未看到回退 |
+| 修复后自动 25 → 50.666667 fps | 1217 | 1197 | 0 / 0 | 正常 |
+
+每组连续采集 8 秒；匹配排除两端未覆盖及相似画面歧义，不能把未明确匹配的记录
+当作正确。算法以多数帧的匹配估算时间偏移，并记录偏移分布；它是 Present 前
+SDR 像素核对，不是显示器光学测量，也不证明所有影片或长期播放均不会出现问题。
+一轮混入暂停/拖动的采集只有 7 张渲染记录，明确不计入通过结果。
+
+另以本地移动图案检查固定双倍及自动共 207 帧，顺序与输入/生成内容一致；
+正式无插桩 mpv 另核对 36 张双倍移动图案截图，位移与 PTS 一致且无倒退；
+其 SDR/PQ/HLG 自动输出、seek/EOF、SDR 音轨切换、暂停跳转、
+内嵌/外挂字幕检查通过，均为本地合成源，不循环访问云盘。
+
+诊断工具 `diagnose_vfg.ps1` 只在显式启动时临时替换标准 build 内的桥和 mpv，退出后
+按 hash 恢复；诊断代理不进入正式打包。异步 GPU 回读记录丢失数，采集失败显式报错。
+`test_vfg_display.ps1` 备份并恢复源文件、原 DLL 和对应构建戳，另记录滤镜、插桩源码
+和测量 DLL 指纹，避免诊断构建污染后续正式缓存。
+
+```powershell
+./dev/windows/test_vfg_display.ps1 -BuildOnly -CapturePixels -ResultDirectory build/vfg-pixels-build
+./dev/windows/diagnose_vfg.ps1 -Action Prepare -ResultDirectory "$PWD/build/vfg-pixels-run" -PresentationDll "$PWD/build/vfg-pixels-build/measurement-libmpv-2.dll"
+./dev/windows/diagnose_vfg.ps1 -Action Run -ResultDirectory "$PWD/build/vfg-pixels-run"
+# Run 保持运行，在另一终端显式 Arm；需要连续播放而非暂停/拖动。
+./dev/windows/diagnose_vfg.ps1 -Action Arm -ResultDirectory "$PWD/build/vfg-pixels-run"
+python dev/windows/analyze_vfg_pixels.py build/vfg-pixels-run/capture --source-fps 25
+```
+
+像素分析依赖 numpy；应传入真实源帧率，支持固定与自动 timestep。可用 `--sdk` 与
+`--render` 指定同一次 CSV 配对；检测到错位返回 1，采集不完整或匹配不足显式失败。
+上述修复前样本返回 1 并识别 18/6，修复后两组返回 0。
+原始证据仅在忽略目录 `build/video-enhancement/vfg-user-twitch-20261022/` 保存，
+不提交影片像素、播放地址、账号或缓存。`manual-final/capture` 为旧版证据，
+`manual-private-original/capture` 为候选证据；原生回归为 `production-native-auto.log`。
+此前两会话合并及首页滚动修复均保留，未推送或发布；正式构建和本机交付状态以
+该目录 `delivery-audit.json` 为准。
+
+正式标准构建的 mpv SHA-256 为
+`5265643476e609e7dd6e0483dea767a8a50abf15fc225af85087dd3d9cd77e23`，
+EXE 为 `5c1dc373a634be2504c7ea7574a61ec17e9f6eadf7d833a08e787124fc04a7f7`；
+随包视频桥仍为 `97ffb5fe4d9d8a61ddc28cb0cfe411234fc6bc0661bee54a9b4bfdec41a9808a`。
+本机覆盖前的差异文件备份位于该目录 `installed-backup`；不覆盖用户配置和组件数据。
 
 ## 2026-10-22 VFG 交互延迟与同步修复
 

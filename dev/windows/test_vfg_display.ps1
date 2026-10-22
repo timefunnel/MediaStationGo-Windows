@@ -1,5 +1,5 @@
 param([ValidateRange(1, 600)][int]$Seconds = 60, [string]$ResultDirectory = '',
-    [switch]$ReportPartialSampling)
+    [switch]$ReportPartialSampling, [switch]$BuildOnly, [switch]$CapturePixels)
 $ErrorActionPreference = 'Stop'
 $Repo = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 if (-not $ResultDirectory) { $ResultDirectory = Join-Path $Repo ('build/vfg-display-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
@@ -9,10 +9,12 @@ $ResultDirectory = (Resolve-Path -LiteralPath $ResultDirectory).Path
 $Context = Join-Path $Repo 'third_party/mpv/video/out/d3d11/context.c'
 $Renderer = Join-Path $Repo 'third_party/mpv/video/out/vo_gpu_next.c'
 $Dll = Join-Path $Repo 'third_party/mpv-install/lib/libmpv-2.dll'
+$Stamp = Join-Path $Repo 'third_party/mpv-install/lib/mediastation-mpv-source.sha256'
 if (Get-Process -Name vfgbench -ErrorAction SilentlyContinue) { throw 'Benchmark still running' }
 $OriginalContext = [IO.File]::ReadAllBytes($Context)
 $OriginalRenderer = [IO.File]::ReadAllBytes($Renderer)
 $OriginalDll = [IO.File]::ReadAllBytes($Dll)
+$OriginalStamp = if (Test-Path -LiteralPath $Stamp) { [IO.File]::ReadAllBytes($Stamp) } else { $null }
 function Replace-Once([string]$Text, [string]$From, [string]$To) {
     if (($Text.Split($From)).Count -ne 2) { throw "Unexpected source anchor: $From" }
     return $Text.Replace($From, $To)
@@ -113,23 +115,82 @@ error:
     }
 #endif
 '@
+    if ($CapturePixels) {
+        $Source = Replace-Once $Source '    int trace_mix_frames;' "    int trace_mix_frames;`n    void *trace_capture_module;"
+        $Source = Replace-Once $Source '    sw->fns->swap_buffers(sw);' @'
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    // Diagnostic only: capture the actual rendered pixels before Present.
+    typedef void (__cdecl *capture_fn)(ID3D11Texture2D *, double, unsigned,
+        unsigned, unsigned, unsigned, unsigned, unsigned);
+    if (!p->trace_capture_module) {
+        wchar_t path[32768];
+        DWORD length = GetEnvironmentVariableW(L"VFG_CAPTURE_PROXY", path, 32768);
+        HMODULE module = NULL;
+        if (length && length < 32768 &&
+            GetModuleHandleExW(0, path, &module))
+            p->trace_capture_module = module;
+    }
+    capture_fn capture = p->trace_capture_module
+        ? (capture_fn)GetProcAddress(p->trace_capture_module, "vfg_capture_rendered") : NULL;
+    if (capture) {
+        IDXGISwapChain *chain = ra_d3d11_ctx_get_swapchain(p->ra_ctx);
+        ID3D11Texture2D *texture = NULL;
+        UINT present = 0;
+        if (chain && SUCCEEDED(IDXGISwapChain_GetLastPresentCount(chain, &present)) &&
+            SUCCEEDED(IDXGISwapChain_GetBuffer(chain, 0, &IID_ID3D11Texture2D,
+                (void **)&texture))) {
+            capture(texture, p->trace_pts, present + 1, p->trace_mix_frames,
+                p->dst.x0, p->dst.y0, mp_rect_w(p->dst), mp_rect_h(p->dst));
+            ID3D11Texture2D_Release(texture);
+        }
+        if (chain) IDXGISwapChain_Release(chain);
+    }
+#endif
+    sw->fns->swap_buffers(sw);
+'@
+        $Source = Replace-Once $Source '    pl_queue_destroy(&p->queue); // destroy this first' @'
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->trace_capture_module) {
+        void (__cdecl *destroy_capture)(void) = (void (__cdecl *)(void))
+            GetProcAddress(p->trace_capture_module, "vfg_capture_rendered_destroy");
+        if (destroy_capture) destroy_capture();
+        FreeLibrary(p->trace_capture_module);
+        p->trace_capture_module = NULL;
+    }
+#endif
+    pl_queue_destroy(&p->queue); // destroy this first
+'@
+    }
     [IO.File]::WriteAllText($Renderer, $Source, [Text.UTF8Encoding]::new($false))
     Copy-Item -LiteralPath $Context -Destination (Join-Path $ResultDirectory 'instrumented-context.c')
     Copy-Item -LiteralPath $Renderer -Destination (Join-Path $ResultDirectory 'instrumented-renderer.c')
     & (Join-Path $PSScriptRoot 'build_mpv_source.ps1') -Force *> (Join-Path $ResultDirectory 'build.log')
     if ($LASTEXITCODE -ne 0) { throw 'Measurement build failed; inspect build.log' }
     Copy-Item -LiteralPath $Dll -Destination (Join-Path $ResultDirectory 'measurement-libmpv-2.dll')
-    foreach ($Size in @('1920x1080', '3840x2160')) {
+    [ordered]@{
+        commit = (git -C $Repo rev-parse HEAD)
+        filterSourceSha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'mpv/vf_nvvideo.c')).Hash
+        contextSourceSha256 = (Get-FileHash -LiteralPath $Context).Hash
+        rendererSourceSha256 = (Get-FileHash -LiteralPath $Renderer).Hash
+        measurementMpvSha256 = (Get-FileHash -LiteralPath $Dll).Hash
+        capturesRenderedPixels = [bool]$CapturePixels
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ResultDirectory 'measurement-manifest.json') -Encoding utf8
+    if (-not $BuildOnly) { foreach ($Size in @('1920x1080', '3840x2160')) {
         foreach ($Sync in @('audio', 'display-vdrop')) {
             $Case = Join-Path $ResultDirectory "$Size-$Sync"
             & (Join-Path $PSScriptRoot 'test_vfg_cadence.ps1') -Seconds $Seconds -SourceSize $Size -VideoSync $Sync -ResultDirectory $Case *> "$Case.log"
             if ($LASTEXITCODE -ne 0) { throw "Playback failed: $Case.log" }
             & (Join-Path $PSScriptRoot 'analyze_vfg_display.ps1') -ResultDirectory $Case -ReportOnly:$ReportPartialSampling
         }
-    }
+    } }
 } finally {
     [IO.File]::WriteAllBytes($Context, $OriginalContext)
     [IO.File]::WriteAllBytes($Renderer, $OriginalRenderer)
     [IO.File]::WriteAllBytes($Dll, $OriginalDll)
+    if ($null -ne $OriginalStamp) {
+        [IO.File]::WriteAllBytes($Stamp, $OriginalStamp)
+    } elseif (Test-Path -LiteralPath $Stamp) {
+        Remove-Item -LiteralPath $Stamp
+    }
     Write-Output 'Restored production mpv source and candidate DLL; diagnostic DLL was used only for measurement.'
 }
