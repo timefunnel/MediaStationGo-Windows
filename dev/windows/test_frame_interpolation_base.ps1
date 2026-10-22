@@ -21,7 +21,7 @@ try {
             Where-Object { $_.Name -in $Forbidden -and ($Directory -eq $TestRoot -or $_.DirectoryName -eq $BuildDir -or $_.FullName.StartsWith((Join-Path $BuildDir 'frame-interpolation'))) }
         if ($Found) { throw "Base payload includes optional components: $($Found.FullName -join ', ')" }
     }
-    foreach ($Name in @('jellium-desktop.exe', 'mediastation-portable-updater.exe', 'libmpv-2.dll', 'libcef.dll')) {
+    foreach ($Name in @('jellium-desktop.exe', 'mediastation-portable-updater.exe', 'libmpv-2.dll', 'libcef.dll', 'video_enhancement.dll', 'nvngx.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $TestRoot $Name) -PathType Leaf)) { throw "Base payload missing: $Name" }
     }
     & (Join-Path $PSScriptRoot 'stage_public_release_licenses.ps1') -OutputDir $TestRoot -SourceArchiveName 'MediaStationGo-local-validation-source.zip'

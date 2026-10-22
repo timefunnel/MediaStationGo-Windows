@@ -116,5 +116,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
 
     crate::platform::stage_cef(&out, &cef_info)?;
     crate::platform::stage_mpv(&out, &mpv_info, used_external_mpv, &bin_dst)?;
+    crate::platform::stage_video_bridge(&out)?;
     Ok(())
 }

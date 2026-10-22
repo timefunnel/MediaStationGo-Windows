@@ -103,7 +103,8 @@ if ($Forbidden) {
 }
 foreach ($RequiredRuntime in @(
     'jellium-desktop.exe', 'mediastation-portable-updater.exe',
-    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll'
+    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll',
+    'video_enhancement.dll', 'nvngx.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $RequiredRuntime) -PathType Leaf)) {
         throw "Required public runtime file is missing: $RequiredRuntime"

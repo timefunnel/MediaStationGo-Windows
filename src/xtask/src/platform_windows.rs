@@ -60,6 +60,7 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
             }
         }
     }
+    stage_video_bridge(prefix)?;
     Ok(prefix.to_path_buf())
 }
 
@@ -71,6 +72,22 @@ const COMPONENT_BINARIES: &[&str] = &[
     "rife_engine_builder.exe",
     "tensorrt_rtx.exe",
 ];
+
+const VIDEO_BRIDGE_FILES: &[&str] = &["video_enhancement.dll", "nvngx.dll"];
+
+/// The public runner has no NVIDIA RTX Video SDK, so the project-built bridge
+/// binaries are checked in and staged for every package instead of rebuilt in CI.
+pub fn stage_video_bridge(destination: &Path) -> Result<()> {
+    let source = crate::paths::repo_root()
+        .join("resources")
+        .join("win")
+        .join("video-bridge");
+    for name in VIDEO_BRIDGE_FILES {
+        xfs::copy_file(&source.join(name), &destination.join(name))
+            .with_context(|| format!("stage native video bridge {name}"))?;
+    }
+    Ok(())
+}
 
 fn remove_bundled_interpolation(directory: &Path) -> Result<()> {
     // Only obsolete, formerly managed payloads. Preserve unknown files/caches.
