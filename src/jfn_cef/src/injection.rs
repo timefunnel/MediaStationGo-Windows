@@ -37,7 +37,10 @@ pub(crate) enum NativeFunction {
     PlayerSetAspectMode,
     PlayerOsdActive,
     PlayerSetDanmaku,
+    PlayerSetDanmakuSync,
     PlayerSetDanmakuStyle,
+    PlayerSetDanmakuReference,
+    PlayerSearchDanmaku,
     OpenConfigDir,
     SaveServerUrl,
     NotifyMetadata,
@@ -107,7 +110,10 @@ impl NativeFunction {
             "playerSetAspectMode" => Self::PlayerSetAspectMode,
             "playerOsdActive" => Self::PlayerOsdActive,
             "playerSetDanmaku" => Self::PlayerSetDanmaku,
+            "playerSetDanmakuSync" => Self::PlayerSetDanmakuSync,
             "playerSetDanmakuStyle" => Self::PlayerSetDanmakuStyle,
+            "playerSetDanmakuReference" => Self::PlayerSetDanmakuReference,
+            "playerSearchDanmaku" => Self::PlayerSearchDanmaku,
             "openConfigDir" => Self::OpenConfigDir,
             "saveServerUrl" => Self::SaveServerUrl,
             "notifyMetadata" => Self::NotifyMetadata,
@@ -178,7 +184,10 @@ impl NativeFunction {
             Self::PlayerSetAspectMode => "playerSetAspectMode",
             Self::PlayerOsdActive => "playerOsdActive",
             Self::PlayerSetDanmaku => "playerSetDanmaku",
+            Self::PlayerSetDanmakuSync => "playerSetDanmakuSync",
             Self::PlayerSetDanmakuStyle => "playerSetDanmakuStyle",
+            Self::PlayerSetDanmakuReference => "playerSetDanmakuReference",
+            Self::PlayerSearchDanmaku => "playerSearchDanmaku",
             Self::OpenConfigDir => "openConfigDir",
             Self::SaveServerUrl => "saveServerUrl",
             Self::NotifyMetadata => "notifyMetadata",
@@ -304,7 +313,10 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayerSetAspectMode,
     NativeFunction::PlayerOsdActive,
     NativeFunction::PlayerSetDanmaku,
+    NativeFunction::PlayerSetDanmakuSync,
     NativeFunction::PlayerSetDanmakuStyle,
+    NativeFunction::PlayerSetDanmakuReference,
+    NativeFunction::PlayerSearchDanmaku,
     NativeFunction::OpenConfigDir,
     NativeFunction::SaveServerUrl,
     NativeFunction::NotifyMetadata,
@@ -674,5 +686,17 @@ mod tests {
             WEB_FUNCTIONS.contains(&style_function),
             "the player UI must be allowed to change danmaku style"
         );
+        let reference = NativeFunction::from_name("playerSetDanmakuReference")
+            .expect("playerSetDanmakuReference must exist");
+        assert_eq!(reference.name(), "playerSetDanmakuReference");
+        assert!(WEB_FUNCTIONS.contains(&reference));
+        let search = NativeFunction::from_name("playerSearchDanmaku")
+            .expect("playerSearchDanmaku must exist");
+        assert_eq!(search.name(), "playerSearchDanmaku");
+        assert!(WEB_FUNCTIONS.contains(&search));
+        let sync =
+            NativeFunction::from_name("playerSetDanmakuSync").expect("sync switch must exist");
+        assert_eq!(sync.name(), "playerSetDanmakuSync");
+        assert!(WEB_FUNCTIONS.contains(&sync));
     }
 }

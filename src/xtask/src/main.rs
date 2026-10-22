@@ -6,6 +6,7 @@ mod build;
 #[cfg(target_os = "macos")]
 mod bundle_macos;
 mod cef;
+mod danmaku;
 mod fs;
 mod install;
 mod mpv;

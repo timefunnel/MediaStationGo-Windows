@@ -39,6 +39,7 @@
     const defaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v2';
     const legacyDefaultSubtitleStyleSettingKey = 'MediaStationGo.Windows.defaultSubtitleStyle.v1';
     const danmakuEnabledSettingKey = 'MediaStationGo.Windows.danmakuEnabled.v1';
+    const danmakuSyncSettingKey = 'MediaStationGo.Windows.danmakuSync.v1';
     const danmakuStyleSettingKey = 'MediaStationGo.Windows.danmakuStyle.v1';
     const videoEnhancementSettingKey = 'MediaStationGo.Windows.videoEnhancement.v1';
     const seriesPlaybackSettingsKey = 'MediaStationGo.Windows.seriesPlaybackSettings.v1';
@@ -159,6 +160,7 @@
     let playerPlaybackSettings = loadPlayerPlaybackSettings();
     let defaultPlayerSubtitleStyle = loadDefaultPlayerSubtitleStyle();
     let danmakuEnabled = loadDanmakuEnabled();
+    let danmakuSyncEnabled = loadDanmakuSync();
     let danmakuStyle = loadDanmakuStyle();
     let seriesPlaybackSettings = loadSeriesPlaybackSettings();
     let playerVolume = 100;
@@ -179,6 +181,10 @@
     let automaticUpdateTimer = 0;
     let updateNotificationVersion = '';
     const danmakuRenderer = createDanmakuRenderer(playerDanmakuLayer);
+    let danmakuReferenceContext = null;
+    let danmakuPrograms = [];
+    let danmakuReferenceEditing = false;
+    let danmakuSearchRequest = 0;
 
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -498,16 +504,119 @@
         };
     }
 
+    function selectedDanmakuReference() {
+        const programIndex = byId('player-danmaku-program').value;
+        const episodeIndex = byId('player-danmaku-episode').value;
+        const program = programIndex === '' ? null : danmakuPrograms[Number(programIndex)];
+        const episode = episodeIndex === '' ? null : program?.episodes[Number(episodeIndex)];
+        return episode ? { source: program.source, episode_url: episode.episodeUrl,
+            anime_title: program.animeTitle, episode_title: episode.episodeTitle } : null;
+    }
+
+    function refreshDanmakuEpisodes(selectedUrl = '', episodeNumber = danmakuReferenceContext?.target?.episode) {
+        const programIndex = byId('player-danmaku-program').value;
+        const program = programIndex === '' ? null : danmakuPrograms[Number(programIndex)];
+        const select = byId('player-danmaku-episode');
+        select.replaceChildren(new Option(program ? '请选择集数' : '请先选择节目', ''));
+        for (const [index, episode] of (program?.episodes || []).entries()) {
+            const label = [episode.episodeNumber ? `第 ${episode.episodeNumber} 集` : '', episode.episodeTitle].filter(Boolean).join(' · ');
+            select.add(new Option(label || '正片', String(index)));
+        }
+        const selected = program?.episodes.findIndex(episode => selectedUrl ? episode.episodeUrl === selectedUrl
+            : episodeNumber > 0 && Number(episode.episodeNumber) === episodeNumber) ?? -1;
+        select.value = selected < 0 ? '' : String(selected);
+        select.disabled = !program;
+        byId('player-danmaku-save').disabled = !danmakuReferenceContext || !selectedDanmakuReference();
+    }
+
+    function showDanmakuPrograms(programs, selectedUrl = '') {
+        danmakuPrograms = programs;
+        const select = byId('player-danmaku-program');
+        select.replaceChildren(new Option(programs.length ? '请选择节目' : '请先搜索节目', ''));
+        for (const [index, program] of programs.entries())
+            select.add(new Option(`${program.animeTitle} · ${program.typeDescription || (program.type === 'movie' ? '电影' : '剧集')}`, String(index)));
+        const selected = selectedUrl ? programs.findIndex(program => program.episodes.some(episode => episode.episodeUrl === selectedUrl))
+            : programs.length === 1 ? 0 : -1;
+        select.value = selected < 0 ? '' : String(selected);
+        select.disabled = !programs.length;
+        refreshDanmakuEpisodes(selectedUrl);
+    }
+
+    function updateDanmakuReference(event) {
+        const association = event?.association;
+        const previous = danmakuReferenceContext;
+        if (!event || event.taskId !== previous?.taskId) {
+            danmakuReferenceEditing = false;
+            danmakuSearchRequest++;
+        }
+        danmakuReferenceContext = event ? {
+            mediaId: event.mediaId, playSessionId: event.playSessionId, taskId: event.taskId,
+            revision: association?.revision || event.revision || '0', target: event.target || previous?.target, association,
+            persistence: event.persistence,
+        } : null;
+        byId('player-danmaku-search').disabled = !event;
+        byId('player-danmaku-offset-save').disabled = !association;
+        byId('player-danmaku-sync-status').textContent = `正值延后，负值提前。${event?.notice || (event?.persistence === 'server_extension' ? '同一账号内同步。' : '')}`;
+        byId('player-danmaku-current').textContent = association
+            ? `当前节目：${association.anime_title || '已匹配节目'} · ${association.episode_title || '当前集'}`
+            : '尚未匹配弹幕节目，可展开下方选择节目。';
+        if (!event || event.kind !== 'load' || event.taskId !== previous?.taskId || previous?.association?.episode_url !== association?.episode_url)
+            byId('player-danmaku-offset').value = association?.offset_seconds ?? 0;
+        // An automatic load may finish while the user is choosing a correction.
+        // Keep that selection, but always use the newest account revision when saving.
+        if (event?.kind === 'load' && previous?.taskId === event.taskId && danmakuReferenceEditing) return;
+        byId('player-danmaku-source').value = association?.source || 'tencent';
+        byId('player-danmaku-query').value = association?.anime_title || danmakuReferenceContext?.target?.title || '';
+        byId('player-danmaku-search-status').textContent = association ? '已匹配，可搜索其他节目或直接调整偏移。'
+            : event ? '自动匹配中，也可按名称搜索并点选。' : '开启弹幕后可搜索并选择节目。';
+        showDanmakuPrograms(association ? [{ source: association.source, animeTitle: association.anime_title || '已关联节目',
+            episodes: [{ episodeUrl: association.episode_url, episodeTitle: association.episode_title || '当前集' }] }] : [], association?.episode_url);
+    }
+
+    async function persistDanmakuReference(reference, offsetText, button, confirmation) {
+        const context = danmakuReferenceContext;
+        if (!context || context.mediaId !== player?.card?.id) return;
+        const offset = Number(offsetText);
+        if (!String(offsetText).trim() || !Number.isFinite(offset) || Math.abs(offset) > 600) {
+            showPlayerFeedback('偏移范围为 -600 至 600 秒', 6000);
+            return;
+        }
+        button.disabled = true;
+        try {
+            const saved = await nativeRequest('playerSetDanmakuReference', 'danmaku_association', [JSON.stringify({
+                media_id: context.mediaId, play_session_id: context.playSessionId, task_id: context.taskId,
+                source: reference.source, episode_url: reference.episode_url,
+                anime_title: reference.anime_title, episode_title: reference.episode_title,
+                offset_seconds: offset, expected_revision: context.revision,
+            })]);
+            const message = saved.persistence === 'server_extension' ? `${confirmation}已同步至此账号`
+                : saved.persistence === 'local_only' ? `${confirmation}已保存至本机` : null;
+            if (!message) throw new Error('弹幕设置保存结果缺少生效范围');
+            if (player?.card?.id === context.mediaId) showPlayerFeedback(message);
+        } catch (error) {
+            if (player?.card?.id === context.mediaId) showPlayerFeedback(friendlyError(error), 6000);
+        } finally {
+            byId('player-danmaku-offset-save').disabled = !danmakuReferenceContext?.association;
+            byId('player-danmaku-save').disabled = !danmakuReferenceContext || !selectedDanmakuReference();
+        }
+    }
+
     function handleDanmakuEvent(event) {
         if (!event || typeof event !== 'object') return;
         if (event.kind === 'clear') {
             danmakuRenderer.clear();
+            updateDanmakuReference(null);
         } else if (event.kind === 'enabled') {
             danmakuRenderer.setEnabled(event.enabled === true);
         } else if (event.kind === 'style') {
             danmakuRenderer.setStyle(event.style);
+        } else if (event.kind === 'context' && player?.card?.id === event.mediaId) {
+            updateDanmakuReference(event);
         } else if (event.kind === 'load' && player?.card?.id === event.mediaId) {
+            updateDanmakuReference(event);
             danmakuRenderer.load(event, player.positionMs, player.playing, playerPlaybackRate);
+        } else if (event.kind === 'status' && player?.card?.id === event.mediaId) {
+            showPlayerFeedback(event.message || '弹幕加载失败', 6000);
         }
     }
 
@@ -864,6 +973,21 @@
             console.error(`MediaStation danmaku switch could not be read: ${error}`);
         }
         return true;
+    }
+
+    function loadDanmakuSync() {
+        try {
+            const value = window.localStorage.getItem(danmakuSyncSettingKey);
+            if (value === null || value === 'true') return true;
+            if (value === 'false') return false;
+            console.error('MediaStation danmaku sync switch is invalid');
+        } catch (error) { console.error(`MediaStation danmaku sync switch could not be read: ${error}`); }
+        return true;
+    }
+
+    function pushDanmakuSync() {
+        byId('player-danmaku-sync').checked = danmakuSyncEnabled;
+        if (window.jmpNative?.playerSetDanmakuSync) window.jmpNative.playerSetDanmakuSync(danmakuSyncEnabled);
     }
 
     function pushDanmakuEnabled() {
@@ -7478,6 +7602,7 @@
     refreshDefaultSubtitleStyleControls();
     refreshDanmakuStyleControls();
     // 未开始播放时先下发全局默认和样式；开始播放后继续由全局状态驱动。
+    pushDanmakuSync();
     pushDanmakuEnabled();
     pushDanmakuStyle();
     const autoUpdateToggle = byId('settings-auto-update-check');
@@ -7597,6 +7722,7 @@
     });
     danmakuControl.addEventListener('pointerleave', () => {
         window.clearTimeout(danmakuHoverTimer);
+        if (byId('player-danmaku-panel').contains(document.activeElement)) return;
         danmakuHoverTimer = window.setTimeout(() => { closeDanmakuPanel(); scheduleControlsHide(); }, 220);
     });
     for (const definition of danmakuStyleControlDefinitions) {
@@ -7612,6 +7738,72 @@
         applyDanmakuStyle(danmakuStyleDefaults, true);
         showPlayerFeedback('弹幕样式已恢复');
         showPlayerControls();
+    });
+    byId('player-danmaku-sync').addEventListener('change', (event) => {
+        const enabled = event.currentTarget.checked;
+        try { window.localStorage.setItem(danmakuSyncSettingKey, String(enabled)); }
+        catch (error) {
+            console.error(`MediaStation danmaku sync switch could not be saved: ${error}`);
+            event.currentTarget.checked = danmakuSyncEnabled;
+            showPlayerFeedback('跨设备同步开关保存失败', 6000);
+            return;
+        }
+        danmakuSyncEnabled = enabled;
+        pushDanmakuSync();
+    });
+    byId('player-danmaku-source').addEventListener('change', () => {
+        danmakuReferenceEditing = true;
+        danmakuSearchRequest++;
+        byId('player-danmaku-search').disabled = !danmakuReferenceContext;
+        showDanmakuPrograms([]);
+        byId('player-danmaku-search-status').textContent = '点击搜索，再选择节目和集数。';
+    });
+    byId('player-danmaku-query').addEventListener('input', () => { danmakuReferenceEditing = true; });
+    byId('player-danmaku-program').addEventListener('change', () => {
+        danmakuReferenceEditing = true;
+        refreshDanmakuEpisodes();
+    });
+    byId('player-danmaku-episode').addEventListener('change', () => {
+        danmakuReferenceEditing = true;
+        byId('player-danmaku-save').disabled = !danmakuReferenceContext || !selectedDanmakuReference();
+    });
+    byId('player-danmaku-search').addEventListener('click', async (event) => {
+        const context = danmakuReferenceContext;
+        if (!context || context.mediaId !== player?.card?.id) return;
+        const query = byId('player-danmaku-query').value.trim();
+        if (!query) { byId('player-danmaku-search-status').textContent = '请输入节目名称。'; return; }
+        const button = event.currentTarget;
+        const source = byId('player-danmaku-source').value;
+        const searchId = ++danmakuSearchRequest;
+        danmakuReferenceEditing = true;
+        button.disabled = true;
+        showDanmakuPrograms([]);
+        byId('player-danmaku-search-status').textContent = '正在搜索节目…';
+        try {
+            const result = await nativeRequest('playerSearchDanmaku', 'danmaku_candidates', [JSON.stringify({
+                media_id: context.mediaId, play_session_id: context.playSessionId, task_id: context.taskId, source, query,
+            })], 150000);
+            if (searchId !== danmakuSearchRequest || danmakuReferenceContext?.taskId !== context.taskId || byId('player-danmaku-source').value !== source) return;
+            showDanmakuPrograms(result.programs);
+            byId('player-danmaku-search-status').textContent = result.programs.length ? `找到 ${result.programs.length} 个节目，请确认节目和集数。`
+                : '未找到节目，可以修改名称或换一个弹幕源再搜索。';
+        } catch (error) {
+            if (searchId === danmakuSearchRequest && danmakuReferenceContext?.taskId === context.taskId) byId('player-danmaku-search-status').textContent = `搜索失败：${friendlyError(error)}`;
+        } finally {
+            if (searchId === danmakuSearchRequest) button.disabled = !danmakuReferenceContext;
+        }
+    });
+    byId('player-danmaku-offset-save').addEventListener('click', async (event) => {
+        const association = danmakuReferenceContext?.association;
+        if (!association) return;
+        await persistDanmakuReference(association, byId('player-danmaku-offset').value, event.currentTarget, '弹幕偏移');
+    });
+    byId('player-danmaku-save').addEventListener('click', async (event) => {
+        const reference = selectedDanmakuReference();
+        if (!reference) return;
+        const offset = reference.episode_url === danmakuReferenceContext?.association?.episode_url
+            ? byId('player-danmaku-offset').value : '0';
+        await persistDanmakuReference(reference, offset, event.currentTarget, '弹幕节目');
     });
     const playerVolumeControl = byId('player-volume');
     playerVolumeControl.addEventListener('input', (event) => {
@@ -7681,7 +7873,7 @@
             }
             return;
         }
-        const inputActive = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+        const inputActive = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
         if (player) {
             if (event.key === 'Tab') {
                 showPlayerControls();
@@ -7738,7 +7930,7 @@
                 }
                 return;
             }
-            if (active?.closest('#player-danmaku-panel') && active.matches('input') && !byId('player-danmaku-panel').hidden) return;
+            if (active?.closest('#player-danmaku-panel') && !byId('player-danmaku-panel').hidden) return;
             if (active === playerVolumeControl && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
                 event.preventDefault();
                 applyPlayerVolume(playerVolume + (event.key === 'ArrowRight' ? 5 : -5), true);

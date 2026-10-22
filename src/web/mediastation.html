@@ -160,6 +160,23 @@
                   <label class="player-danmaku-style-row" for="player-danmaku-font-size"><span>弹幕字号</span><input id="player-danmaku-font-size" type="range" min="20" max="40" step="1"><output id="player-danmaku-font-size-value" for="player-danmaku-font-size"></output></label>
                   <label class="player-danmaku-style-row" for="player-danmaku-scroll-seconds"><span>弹幕速度</span><input id="player-danmaku-scroll-seconds" type="range" min="6" max="20" step="1"><output id="player-danmaku-scroll-seconds-value" for="player-danmaku-scroll-seconds"></output></label>
                   <label class="player-danmaku-style-row" for="player-danmaku-fixed-seconds"><span>固定停留</span><input id="player-danmaku-fixed-seconds" type="range" min="3" max="8" step="1"><output id="player-danmaku-fixed-seconds-value" for="player-danmaku-fixed-seconds"></output></label>
+                  <div class="player-danmaku-reference">
+                    <label class="player-danmaku-sync-row" for="player-danmaku-sync"><span>跨设备同步</span><input id="player-danmaku-sync" type="checkbox" checked></label>
+                    <p id="player-danmaku-current">尚未匹配弹幕节目。</p>
+                    <label for="player-danmaku-offset">时间偏移（秒）<input id="player-danmaku-offset" type="number" min="-600" max="600" step="0.1" value="0"></label>
+                    <p id="player-danmaku-sync-status" role="status" aria-live="polite">正值延后，负值提前。</p>
+                    <button id="player-danmaku-offset-save" class="primary-command" type="button" disabled>保存偏移</button>
+                  </div>
+                  <details class="player-danmaku-reference">
+                    <summary>更换弹幕源或节目</summary>
+                    <label for="player-danmaku-source">弹幕源<select id="player-danmaku-source"><option value="tencent">腾讯视频</option><option value="iqiyi">爱奇艺</option><option value="youku">优酷</option></select></label>
+                    <label for="player-danmaku-query">节目名称<input id="player-danmaku-query" type="search" maxlength="100" placeholder="输入节目名称" autocomplete="off"></label>
+                    <button id="player-danmaku-search" class="secondary-command" type="button" disabled>搜索节目</button>
+                    <label for="player-danmaku-program">节目<select id="player-danmaku-program" disabled><option value="">请先搜索节目</option></select></label>
+                    <label for="player-danmaku-episode">集数<select id="player-danmaku-episode" disabled><option value="">请先选择节目</option></select></label>
+                    <p id="player-danmaku-search-status" role="status" aria-live="polite">开启弹幕后可搜索并选择节目。</p>
+                    <button id="player-danmaku-save" class="secondary-command" type="button" disabled>应用所选节目</button>
+                  </details>
                 </div>
               </div>
             </div>

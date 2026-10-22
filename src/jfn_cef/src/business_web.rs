@@ -330,6 +330,13 @@ fn handle_message(message: BrowserMessage) -> bool {
 
     let web_layer = active_web_layer;
 
+    if message.name() == "playerSetDanmakuReference" {
+        return crate::mediastation_runtime::handle_danmaku_reference_message(web_layer(), args);
+    }
+    if message.name() == "playerSearchDanmaku" {
+        return crate::mediastation_runtime::handle_danmaku_search_message(web_layer(), args);
+    }
+
     if message.name() == "mediaStationAuthenticate" {
         return crate::mediastation_runtime::handle_authenticate_message(web_layer(), args);
     }
@@ -520,6 +527,9 @@ fn handle_message(message: BrowserMessage) -> bool {
             if let Some(c) = js_cstr_or_warn("playerSetAspectMode", &mode) {
                 unsafe { jfn_mpv_set_aspect_mode(c.as_ptr()) };
             }
+        }),
+        "playerSetDanmakuSync" => with_args(args, |a| {
+            crate::mediastation_runtime::set_danmaku_sync_enabled(a.bool(0) != 0);
         }),
         "playerSetDanmaku" => with_args(args, |a| {
             let enabled = a.bool(0) != 0;

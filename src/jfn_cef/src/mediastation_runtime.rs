@@ -5,14 +5,14 @@ use jfn_frame_interpolation::{
     InterpolationMode, InterpolationModel, InterpolationPlan, PlanRequest, prepare_plan,
 };
 use jfn_mediastation::{
-    ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard,
-    MediaDanmakuState, MediaDetail, MediaHome, MediaImageRef, MediaImageType, MediaPage,
-    MediaSourceOption, MediaStationApiClient, MediaStationClientProfile,
-    MediaStationConnectionProfile, MediaStationProxyMode, MediaStationSession,
-    PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError, PlaybackSessionResolver,
-    PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference, PlaybackTrackPreferenceState,
-    PlaybackTrackPreferenceUpdate, SessionExpirySource, SubtitleTrack, UreqTransport, VideoStream,
-    build_playback_track_plan, chinese_subtitle_preference_rank,
+    ApiError, DeliveryMode, ExternalSubtitleDownload, HeaderEncodingError, MediaCard, MediaDetail,
+    MediaHome, MediaImageRef, MediaImageType, MediaPage, MediaSourceOption, MediaStationApiClient,
+    MediaStationClientProfile, MediaStationConnectionProfile, MediaStationProxyMode,
+    MediaStationSession, PlaybackPreferencePersistence, PlaybackSession, PlaybackSessionError,
+    PlaybackSessionResolver, PlaybackSource, PlaybackTrackPlan, PlaybackTrackPreference,
+    PlaybackTrackPreferenceState, PlaybackTrackPreferenceUpdate, SessionExpirySource,
+    SubtitleTrack, UreqTransport, VideoStream, build_playback_track_plan,
+    chinese_subtitle_preference_rank, fetch_local_danmaku,
 };
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
@@ -34,7 +34,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::thread::JoinHandle;
@@ -401,6 +401,33 @@ struct ActivePlaybackReport {
     last_report_at: Option<Instant>,
 }
 
+struct ActiveDanmaku {
+    generation: u64,
+    media_id: String,
+    media_source_id: Option<String>,
+    play_session_id: Option<String>,
+    context: Value,
+}
+
+impl ActiveDanmaku {
+    fn matches(&self, snapshot: &SessionSnapshot, source: &PlaybackSource) -> bool {
+        self.generation == snapshot.generation
+            && self.media_id == source.media_id
+            && self.media_source_id == source.media_source_id
+            && self.play_session_id == source.play_session_id
+    }
+
+    fn new(snapshot: &SessionSnapshot, source: &PlaybackSource, context: Value) -> Self {
+        Self {
+            generation: snapshot.generation,
+            media_id: source.media_id.clone(),
+            media_source_id: source.media_source_id.clone(),
+            play_session_id: source.play_session_id.clone(),
+            context,
+        }
+    }
+}
+
 struct RuntimeTrackReconcile {
     snapshot: SessionSnapshot,
     source: PlaybackSource,
@@ -433,6 +460,7 @@ struct RuntimeState {
     active_interpolation: Option<ActiveInterpolation>,
     active_enhancements: Vec<ActiveEnhancement>,
     active_report: Option<ActivePlaybackReport>,
+    active_danmaku: Option<ActiveDanmaku>,
 }
 
 struct ActiveInterpolation {
@@ -469,6 +497,7 @@ struct SessionProfile {
 
 struct MediaStationRuntime {
     api: MediaStationApiClient,
+    danmaku_generation: AtomicU64,
     resolver: PlaybackSessionResolver<UreqTransport>,
     user_agent: String,
     reporter: PlaybackReportDispatcher,
@@ -666,6 +695,7 @@ impl MediaStationRuntime {
         let cache_root = jfn_paths::cache_dir();
         Ok(Self {
             api,
+            danmaku_generation: AtomicU64::new(0),
             resolver: PlaybackSessionResolver::new(UreqTransport::new()),
             user_agent,
             reporter,
@@ -689,6 +719,7 @@ impl MediaStationRuntime {
                 active_interpolation: None,
                 active_enhancements: Vec::new(),
                 active_report: None,
+                active_danmaku: None,
             }),
         })
     }
@@ -1692,69 +1723,133 @@ impl MediaStationRuntime {
         );
         drop(state);
         self.enqueue_report(stopped);
-        self.start_active_danmaku(load.snapshot, load.media_id);
+        self.start_active_danmaku(load.snapshot, load.source);
         Ok(())
     }
 
     /// Fetch danmaku for the item that just started and hand it to the CEF
     /// compositor. The web layer owns the animation timeline, so low source
     /// frame rates cannot quantize scrolling into video-frame-sized steps.
-    fn start_active_danmaku(&self, snapshot: &SessionSnapshot, media_id: &str) {
+    fn start_active_danmaku(&self, snapshot: &SessionSnapshot, source: &PlaybackSource) {
         dispatch_danmaku_event(json!({ "kind": "clear" }));
-
-        let payload = match self
-            .api
-            .fetch_media_danmaku(&snapshot.session, media_id, 0, None)
-        {
-            Ok(MediaDanmakuState::Matched(payload)) => payload,
-            Ok(MediaDanmakuState::Unmatched { message }) => {
-                log_warn(&format!(
-                    "MediaStation danmaku has no match for {media_id}: {message}"
-                ));
-                return;
-            }
-            Ok(MediaDanmakuState::Unavailable { message }) => {
-                log_warn(&format!(
-                    "MediaStation danmaku unavailable for {media_id}: {message}"
-                ));
-                return;
-            }
+        if !DANMAKU_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        let runtime = match runtime() {
+            Ok(runtime) => runtime,
             Err(error) => {
                 log_warn(&format!(
-                    "MediaStation danmaku fetch failed for {media_id}: {error}"
+                    "Cannot initialize local danmaku: {}",
+                    error.message
                 ));
+                dispatch_danmaku_event(
+                    json!({ "kind": "status", "mediaId": source.media_id, "message": error.message }),
+                );
                 return;
             }
         };
-        if payload.comments.is_empty() {
-            return;
+        let snapshot = snapshot.clone();
+        let source = source.clone();
+        let danmaku_generation = self
+            .danmaku_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let spawn_failure_media_id = source.media_id.clone();
+        let spawn = thread::Builder::new().name("mediastation-danmaku".to_string()).spawn(move || {
+            let current = || {
+                let state = runtime.state.lock();
+                runtime.danmaku_generation.load(Ordering::Relaxed) == danmaku_generation && DANMAKU_ENABLED.load(Ordering::Relaxed) && danmaku_playback_matches(&state, &snapshot, &source)
+            };
+            let result = (|| -> Result<Value, String> {
+                let previous = if !danmaku_sync_active(&snapshot) {
+                    runtime.state.lock().active_danmaku.as_ref().filter(|active| active.matches(&snapshot, &source))
+                        .filter(|active| active.context["persistence"] == "local_only")
+                        .map(|active| active.context.clone())
+                } else { None };
+                let mut context = match previous {
+                    Some(context) => context,
+                    None => runtime.api.danmaku_context(&snapshot.session, &source.media_id, source.media_source_id.as_deref(), DANMAKU_SYNC_ENABLED.load(Ordering::Relaxed))
+                        .map_err(|error| error.to_string())?,
+                };
+                if context["persistence"] == "local_only" && context["association"].is_null() {
+                    if let Some(saved) = read_local_danmaku_preference(&local_danmaku_preference_path(&jfn_paths::config_dir(), &snapshot.session, &source))? {
+                        context["association"] = saved["association"].clone();
+                        context["revision"] = saved["revision"].clone();
+                    }
+                }
+                if !current() { return Err("弹幕任务已取消".to_string()); }
+                runtime.store_active_danmaku(&snapshot, &source, danmaku_generation, context.clone())?;
+                dispatch_danmaku_context(&source, danmaku_generation, &context);
+                let module = std::env::current_exe().map_err(|error| error.to_string())?
+                    .parent().ok_or("播放器路径无效")?.join("danmaku");
+                let mut payload = fetch_local_danmaku(&module, &jfn_paths::cache_dir().join("danmaku"), &context, current)?;
+                if payload["status"] == "matched" { payload["association"]["revision"] = context["revision"].clone(); }
+                if payload["status"] == "matched" && context["association"].is_null() && current()
+                    && context["persistence"] == "server_extension" {
+                    let mut association = payload["association"].clone();
+                    association["expected_revision"] = context["revision"].clone();
+                    match runtime.api.save_danmaku_association(&snapshot.session, &source.media_id,
+                        source.media_source_id.as_deref(), &association) {
+                        Ok(saved) => payload["association"] = saved["association"].clone(),
+                        Err(error) => payload["sync_error"] = json!(format!("弹幕已加载，跨设备同步失败：{error}")),
+                    }
+                }
+                if payload["status"] == "matched" && current() {
+                    context["association"] = payload["association"].clone();
+                    context["revision"] = payload["association"]["revision"].clone();
+                    runtime.store_active_danmaku(&snapshot, &source, danmaku_generation, context.clone())?;
+                }
+                payload["persistence"] = context["persistence"].clone();
+                payload["notice"] = context["notice"].clone();
+                payload["target"] = context["target"].clone();
+                Ok(payload)
+            })();
+            if !current() { return; }
+            match result {
+                Ok(payload) if payload["status"] == "matched" => {
+                    dispatch_danmaku_loaded(&source, danmaku_generation, &payload);
+                    if let Some(message) = payload["sync_error"].as_str() {
+                        dispatch_danmaku_event(json!({ "kind": "status", "mediaId": source.media_id, "message": message }));
+                    }
+                },
+                Ok(payload) => dispatch_danmaku_event(json!({ "kind": "status", "mediaId": source.media_id,
+                    "message": payload["message"] })),
+                Err(message) => {
+                    log_warn(&format!("Local danmaku failed: {message}"));
+                    dispatch_danmaku_event(json!({ "kind": "status", "mediaId": source.media_id, "message": message }));
+                }
+            }
+        });
+        if let Err(error) = spawn {
+            log_warn(&format!("Cannot start local danmaku task: {error}"));
+            dispatch_danmaku_event(
+                json!({ "kind": "status", "mediaId": spawn_failure_media_id, "message": "无法启动本地弹幕任务" }),
+            );
         }
+    }
 
-        let comments: Vec<Value> = payload
-            .comments
-            .into_iter()
-            .map(|comment| {
-                json!({
-                    "cid": comment.cid,
-                    "time": comment.time,
-                    "mode": comment.mode,
-                    "color": comment.color,
-                    "text": comment.text,
-                })
-            })
-            .collect();
-        let state = self.state.lock();
-        if state.generation != snapshot.generation || state.session.is_none() {
-            return;
+    fn store_active_danmaku(
+        &self,
+        snapshot: &SessionSnapshot,
+        source: &PlaybackSource,
+        task: u64,
+        context: Value,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock();
+        if !DANMAKU_ENABLED.load(Ordering::Relaxed)
+            || !danmaku_playback_matches(&state, snapshot, source)
+            || self.danmaku_generation.load(Ordering::Relaxed) != task
+        {
+            return Err("弹幕任务已取消".to_string());
         }
-        drop(state);
-        dispatch_danmaku_event(json!({
-            "kind": "load",
-            "mediaId": media_id,
-            "enabled": DANMAKU_ENABLED.load(Ordering::Relaxed),
-            "style": danmaku_style_payload(&stored_danmaku_style()),
-            "comments": comments,
-        }));
+        if !context["association"].is_null() {
+            write_local_danmaku_preference(
+                &local_danmaku_preference_path(&jfn_paths::config_dir(), &snapshot.session, source),
+                &context,
+            )?;
+        }
+        state.active_danmaku = Some(ActiveDanmaku::new(snapshot, source, context));
+        Ok(())
     }
 
     fn active_playback_source(
@@ -2250,6 +2345,7 @@ static RUNTIME: OnceLock<Result<Arc<MediaStationRuntime>, ()>> = OnceLock::new()
 /// The player UI's danmaku switch before/without a runtime. See
 /// [`set_danmaku_enabled`].
 static DANMAKU_ENABLED: AtomicBool = AtomicBool::new(true);
+static DANMAKU_SYNC_ENABLED: AtomicBool = AtomicBool::new(true);
 static DANMAKU_STYLE: OnceLock<Mutex<DanmakuStyle>> = OnceLock::new();
 
 fn stored_danmaku_style() -> DanmakuStyle {
@@ -2311,9 +2407,45 @@ pub(crate) fn release_playback_resources() {
 /// soon as the settings page loads — before any MediaStation session (and
 /// therefore before the runtime) exists. Reading it here must not build the
 /// runtime just to store a boolean.
+pub(crate) fn set_danmaku_sync_enabled(enabled: bool) {
+    if DANMAKU_SYNC_ENABLED.swap(enabled, Ordering::Relaxed) == enabled {
+        return;
+    }
+    if let Some(Ok(runtime)) = RUNTIME.get() {
+        runtime.state.lock().active_danmaku = None;
+    }
+    if DANMAKU_ENABLED.load(Ordering::Relaxed) {
+        set_danmaku_enabled(true);
+    }
+}
+
 pub(crate) fn set_danmaku_enabled(enabled: bool) {
     DANMAKU_ENABLED.store(enabled, Ordering::Relaxed);
     dispatch_danmaku_event(json!({ "kind": "enabled", "enabled": enabled }));
+    if enabled {
+        let runtime = match runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log_warn(&format!("Cannot enable local danmaku: {}", error.message));
+                return;
+            }
+        };
+        let active = {
+            let state = runtime.state.lock();
+            state.active_report.as_ref().map(|active| {
+                (
+                    SessionSnapshot {
+                        session: active.session.clone(),
+                        generation: active.generation,
+                    },
+                    active.source.clone(),
+                )
+            })
+        };
+        if let Some((snapshot, source)) = active {
+            runtime.start_active_danmaku(&snapshot, &source);
+        }
+    }
 }
 
 /// Apply the global danmaku style resolved by the player UI. The CEF compositor
@@ -2384,6 +2516,200 @@ pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
         .map_err(|error| api_error_code(&error).to_string())?;
     runtime.configure_session_profile(session, stored.user_name, true);
     Ok(true)
+}
+
+pub(crate) fn handle_danmaku_reference_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    handle_danmaku_message(layer, args, false)
+}
+
+pub(crate) fn handle_danmaku_search_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+) -> bool {
+    handle_danmaku_message(layer, args, true)
+}
+
+fn handle_danmaku_message(
+    layer: Option<Arc<Inner>>,
+    args: Option<&ListValue>,
+    search: bool,
+) -> bool {
+    let operation = if search {
+        "danmaku_candidates"
+    } else {
+        "danmaku_association"
+    };
+    let Some(layer) = layer else {
+        log_warn("Danmaku association rejected: web layer unavailable");
+        return true;
+    };
+    let request_id = match parse_request_id(args) {
+        Ok(id) => id,
+        Err((id, failure)) => {
+            dispatch_response(&layer, &id, operation, false, failure.payload());
+            return true;
+        }
+    };
+    let preparation = (|| -> Result<_, LoadFailure> {
+        let input: Value =
+            serde_json::from_str(&args.map(|a| list_string(a, 1)).unwrap_or_default())
+                .map_err(|_| LoadFailure::new("invalid_reference", "弹幕关联格式无效"))?;
+        let runtime = runtime()?;
+        let (snapshot, guard) = runtime.begin_catalog_request(&request_id)?;
+        let media_id = input["media_id"]
+            .as_str()
+            .ok_or_else(|| LoadFailure::new("invalid_reference", "缺少播放项目"))?;
+        let source = runtime.active_playback_source(&snapshot, media_id)?;
+        if input["play_session_id"].as_str() != source.play_session_id.as_deref()
+            || input["task_id"].as_str()
+                != Some(
+                    runtime
+                        .danmaku_generation
+                        .load(Ordering::Relaxed)
+                        .to_string()
+                        .as_str(),
+                )
+        {
+            return Err(LoadFailure::new(
+                "playback_changed",
+                "播放项目已切换，请重新打开弹幕设置",
+            ));
+        }
+        Ok((runtime, snapshot, guard, source, input))
+    })();
+    let (runtime, snapshot, guard, source, input) = match preparation {
+        Ok(value) => value,
+        Err(failure) => {
+            dispatch_response(&layer, &request_id, operation, false, failure.payload());
+            return true;
+        }
+    };
+    let worker_layer = Arc::clone(&layer);
+    let worker_request_id = request_id.clone();
+    let spawn = thread::Builder::new().name("mediastation-danmaku-reference".to_string()).spawn(move || {
+        let _guard = guard;
+        if search {
+            let task_id = input["task_id"].as_str().unwrap_or_default().to_string();
+            let current = || {
+                let state = runtime.state.lock();
+                DANMAKU_ENABLED.load(Ordering::Relaxed)
+                    && runtime.danmaku_generation.load(Ordering::Relaxed).to_string() == task_id
+                    && state.generation == snapshot.generation
+                    && state.active_report.as_ref().is_some_and(|active| active.source.media_id == source.media_id
+                        && active.source.play_session_id == source.play_session_id)
+            };
+            let result = (|| -> Result<Value, String> {
+                let module = std::env::current_exe().map_err(|error| error.to_string())?
+                    .parent().ok_or("播放器路径无效")?.join("danmaku");
+                let request = json!({ "action": "candidates", "source": input["source"], "query": input["query"] });
+                fetch_local_danmaku(&module, &jfn_paths::cache_dir().join("danmaku"), &request, current)
+            })();
+            match result {
+                Ok(payload) if current() => dispatch_response(&worker_layer, &worker_request_id, operation, true, payload),
+                Ok(_) => dispatch_response(&worker_layer, &worker_request_id, operation, false,
+                    LoadFailure::new("playback_changed", "播放项目已切换").payload()),
+                Err(error) => dispatch_response(&worker_layer, &worker_request_id, operation, false,
+                    LoadFailure::dynamic("danmaku_search_failed", error).payload()),
+            }
+            return;
+        }
+        if !danmaku_sync_active(&snapshot) {
+            let task = runtime.danmaku_generation.load(Ordering::Relaxed);
+            let current = || {
+                let state = runtime.state.lock();
+                DANMAKU_ENABLED.load(Ordering::Relaxed) && runtime.danmaku_generation.load(Ordering::Relaxed) == task
+                    && input["task_id"].as_str() == Some(task.to_string().as_str())
+                    && danmaku_playback_matches(&state, &snapshot, &source)
+            };
+            let result = (|| -> Result<_, String> {
+                let mut context = runtime.state.lock().active_danmaku.as_ref()
+                    .filter(|active| active.matches(&snapshot, &source)).map(|active| active.context.clone())
+                    .ok_or("本地弹幕尚未就绪，请稍后再试")?;
+                if input["expected_revision"] != context["revision"] { return Err("弹幕设置已变化，请重新调整".to_string()); }
+                let next_revision = context["revision"].as_str().and_then(|revision| revision.parse::<u64>().ok())
+                    .and_then(|revision| revision.checked_add(1)).ok_or("本地弹幕修订号无效")?;
+                let association = json!({ "source": input["source"], "episode_url": input["episode_url"],
+                    "anime_title": input["anime_title"], "episode_title": input["episode_title"], "offset_seconds": input["offset_seconds"] });
+                let module = std::env::current_exe().map_err(|error| error.to_string())?
+                    .parent().ok_or("播放器路径无效")?.join("danmaku");
+                let mut payload = fetch_local_danmaku(&module, &jfn_paths::cache_dir().join("danmaku"),
+                    &json!({ "target": context["target"], "association": association }), current)?;
+                if payload["status"] != "matched" { return Err("所选弹幕节目未能加载".to_string()); }
+                let mut state = runtime.state.lock();
+                if !DANMAKU_ENABLED.load(Ordering::Relaxed) || !danmaku_playback_matches(&state, &snapshot, &source)
+                    || input["task_id"].as_str() != Some(task.to_string().as_str()) {
+                    return Err("播放项目已切换".to_string());
+                }
+                let active = state.active_danmaku.as_mut().filter(|active| active.matches(&snapshot, &source))
+                    .ok_or("播放项目已切换")?;
+                if runtime.danmaku_generation.load(Ordering::Relaxed) != task || active.context["revision"] != input["expected_revision"] {
+                    return Err("弹幕设置已变化，请重新调整".to_string());
+                }
+                payload["association"]["revision"] = json!(next_revision.to_string());
+                context["association"] = payload["association"].clone();
+                context["revision"] = json!(next_revision.to_string());
+                write_local_danmaku_preference(&local_danmaku_preference_path(&jfn_paths::config_dir(), &snapshot.session, &source), &context)?;
+                active.context = context.clone();
+                let next_task = runtime.danmaku_generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                payload["persistence"] = context["persistence"].clone();
+                payload["notice"] = context["notice"].clone();
+                payload["target"] = context["target"].clone();
+                Ok((context, payload, next_task))
+            })();
+            match result {
+                Ok((context, payload, task)) => {
+                    dispatch_danmaku_context(&source, task, &context);
+                    dispatch_danmaku_loaded(&source, task, &payload);
+                    dispatch_response(&worker_layer, &worker_request_id, operation, true, context);
+                },
+                Err(error) => dispatch_response(&worker_layer, &worker_request_id, operation, false,
+                    LoadFailure::dynamic("danmaku_local_apply_failed", error).payload()),
+            }
+            return;
+        }
+        match runtime.api.save_danmaku_association(&snapshot.session, &source.media_id, source.media_source_id.as_deref(), &input) {
+            Ok(saved) => {
+                let current = {
+                    let state = runtime.state.lock();
+                    state.generation == snapshot.generation && state.active_report.as_ref().is_some_and(|active|
+                        active.source.media_id == source.media_id && active.source.media_source_id == source.media_source_id && active.source.play_session_id == source.play_session_id)
+                };
+                if current { runtime.start_active_danmaku(&snapshot, &source); }
+                dispatch_response(&worker_layer, &worker_request_id, operation, true, saved);
+            }
+            Err(error) => {
+                // Surface conflicts and refresh the form; never silently overwrite another device.
+                match runtime.api.danmaku_context(&snapshot.session, &source.media_id, source.media_source_id.as_deref(), true) {
+                    Ok(context) => {
+                    let state = runtime.state.lock();
+                    if state.generation == snapshot.generation && state.active_report.as_ref().is_some_and(|active| active.source.media_id == source.media_id && active.source.media_source_id == source.media_source_id && active.source.play_session_id == source.play_session_id) {
+                        dispatch_danmaku_context(&source, runtime.danmaku_generation.load(Ordering::Relaxed), &context);
+                    }
+                    },
+                    Err(refresh_error) => log_warn(&format!("Cannot refresh danmaku association after a rejected save: {refresh_error}")),
+                }
+                dispatch_response(&worker_layer, &worker_request_id, operation, false,
+                    LoadFailure::dynamic("danmaku_sync_failed", format!("弹幕关联保存失败：{error}")).payload());
+            }
+        }
+    });
+    if let Err(error) = spawn {
+        dispatch_response(
+            &layer,
+            &request_id,
+            operation,
+            false,
+            LoadFailure::dynamic(
+                "request_thread_failed",
+                format!("无法启动弹幕同步任务：{error}"),
+            )
+            .payload(),
+        );
+    }
+    true
 }
 
 pub(crate) fn handle_authenticate_message(
@@ -7715,6 +8041,94 @@ fn danmaku_style_payload(style: &DanmakuStyle) -> Value {
     })
 }
 
+fn danmaku_sync_active(snapshot: &SessionSnapshot) -> bool {
+    DANMAKU_SYNC_ENABLED.load(Ordering::Relaxed)
+        && snapshot
+            .session
+            .protocol_extensions()
+            .supports_danmaku_associations()
+}
+
+fn local_danmaku_preference_path(
+    root: &Path,
+    session: &MediaStationSession,
+    source: &PlaybackSource,
+) -> std::path::PathBuf {
+    let account = account_credential_id(&session.base_url, &session.user_id);
+    let scope = json!([
+        account,
+        source
+            .media_source_id
+            .as_deref()
+            .unwrap_or(&source.media_id)
+    ]);
+    let key = format!("{:x}", Sha256::digest(scope.to_string().as_bytes()));
+    root.join("danmaku-associations")
+        .join(format!("{key}.json"))
+}
+
+fn read_local_danmaku_preference(path: &Path) -> Result<Option<Value>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取本机弹幕设置失败：{error}")),
+    };
+    if bytes.len() > 8192 {
+        return Err("本机弹幕设置超过大小限制".to_string());
+    }
+    let saved: Value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("本机弹幕设置格式无效：{error}"))?;
+    if saved["revision"]
+        .as_str()
+        .and_then(|revision| revision.parse::<u64>().ok())
+        .is_none()
+        || !saved["association"].is_object()
+    {
+        return Err("本机弹幕设置缺少节目关联或修订号".to_string());
+    }
+    Ok(Some(saved))
+}
+
+fn write_local_danmaku_preference(path: &Path, context: &Value) -> Result<(), String> {
+    let saved = json!({ "association": context["association"], "revision": context["revision"] })
+        .to_string();
+    if saved.len() > 8192 {
+        return Err("本机弹幕设置超过大小限制".to_string());
+    }
+    let directory = path.parent().ok_or("本机弹幕设置目录无效")?;
+    fs::create_dir_all(directory).map_err(|error| format!("创建本机弹幕设置目录失败：{error}"))?;
+    jfn_paths::write_atomic(path, saved.as_bytes())
+        .map_err(|error| format!("保存本机弹幕设置失败：{error}"))
+}
+
+fn danmaku_playback_matches(
+    state: &RuntimeState,
+    snapshot: &SessionSnapshot,
+    source: &PlaybackSource,
+) -> bool {
+    state.generation == snapshot.generation
+        && state.active_report.as_ref().is_some_and(|active| {
+            active.source.media_id == source.media_id
+                && active.source.media_source_id == source.media_source_id
+                && active.source.play_session_id == source.play_session_id
+        })
+}
+
+fn dispatch_danmaku_context(source: &PlaybackSource, task: u64, context: &Value) {
+    dispatch_danmaku_event(json!({ "kind": "context", "mediaId": source.media_id,
+        "playSessionId": source.play_session_id, "taskId": task.to_string(), "association": context["association"],
+        "revision": context["revision"], "target": context["target"], "persistence": context["persistence"], "notice": context["notice"] }));
+}
+
+fn dispatch_danmaku_loaded(source: &PlaybackSource, task: u64, payload: &Value) {
+    dispatch_danmaku_event(json!({ "kind": "load", "mediaId": source.media_id,
+        "playSessionId": source.play_session_id, "taskId": task.to_string(),
+        "enabled": DANMAKU_ENABLED.load(Ordering::Relaxed), "style": danmaku_style_payload(&stored_danmaku_style()),
+        "association": payload["association"], "comments": payload["comments"], "target": payload["target"],
+        "persistence": payload["persistence"], "notice": payload["notice"],
+        "total": payload["total"], "filtered": payload["filtered"], "skipped": payload["skipped"] }));
+}
+
 fn dispatch_danmaku_event(payload: Value) {
     let Some(layer) = crate::business_web::active_web_layer() else {
         return;
@@ -7776,6 +8190,46 @@ mod tests {
             subtitles: Vec::new(),
             audio_tracks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn local_danmaku_settings_persist_and_isolate_accounts_and_versions() {
+        let root = tempfile::tempdir().expect("temporary settings directory");
+        let base = Url::parse("https://media.example").expect("test URL");
+        let session = session_at(base.clone(), "user-1");
+        let source = playback_source(&base);
+        let path = local_danmaku_preference_path(root.path(), &session, &source);
+        assert!(
+            read_local_danmaku_preference(&path)
+                .expect("missing settings")
+                .is_none()
+        );
+        let context = json!({ "association": { "source": "iqiyi", "episode_url": "https://www.iqiyi.com/v_test.html", "offset_seconds": -2.5 },
+            "revision": "3", "target": { "title": "节目" }, "unrelated": "must not persist" });
+        write_local_danmaku_preference(&path, &context).expect("save settings");
+        let saved = read_local_danmaku_preference(&path)
+            .expect("read settings")
+            .expect("saved record");
+        assert_eq!(saved["association"], context["association"]);
+        assert_eq!(saved["revision"], "3");
+        assert!(saved.get("target").is_none() && saved.get("unrelated").is_none());
+        let other_account =
+            local_danmaku_preference_path(root.path(), &session_at(base, "user-2"), &source);
+        assert_ne!(path, other_account);
+        let mut other_source = source;
+        other_source.media_source_id = Some("another-version".to_string());
+        assert_ne!(
+            path,
+            local_danmaku_preference_path(root.path(), &session, &other_source)
+        );
+        fs::write(&path, b"broken").expect("write damaged fixture");
+        assert!(
+            read_local_danmaku_preference(&path).is_err(),
+            "damaged settings must remain an explicit error"
+        );
+        let blocked = root.path().join("not-a-directory");
+        fs::write(&blocked, b"file").expect("write blocked directory fixture");
+        assert!(write_local_danmaku_preference(&blocked.join("settings.json"), &context).is_err());
     }
 
     #[test]
@@ -9860,6 +10314,7 @@ mod tests {
             active_interpolation: None,
             active_enhancements: Vec::new(),
             active_report: None,
+            active_danmaku: None,
         };
         let preference = PlaybackTrackPreference {
             configured: false,

@@ -5,6 +5,9 @@ use std::process::Command;
 pub fn run(args: &BuildArgs) -> Result<()> {
     let out = std::path::absolute(&args.out)?;
     std::fs::create_dir_all(&out)?;
+    if cfg!(windows) {
+        crate::danmaku::stage(&out)?;
+    }
 
     let cef_info = match &args.cef_path {
         Some(dir) => cef::explicit(dir)?,

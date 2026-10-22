@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::danmaku::{DanmakuParseError, MediaDanmakuState, danmaku_query, parse_danmaku_response};
 use crate::playback_session::{PlaybackSessionError, ResolveInput, ServerAuth};
 
 const HEADER_EMBY_AUTHORIZATION: &str = "x-emby-authorization";
@@ -24,6 +23,7 @@ const DETAIL_EPISODE_PAGE_SIZE: usize = 100;
 const MAX_DETAIL_EPISODES: usize = 5_000;
 const MAX_PROTOCOL_EXTENSIONS: usize = 64;
 const PLAYBACK_PREFERENCES_EXTENSION_ID: &str = "playback-preferences";
+const DANMAKU_ASSOCIATIONS_EXTENSION_ID: &str = "danmaku-associations";
 const UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID: &str = "update-download-sources";
 const MAX_UPDATE_DOWNLOAD_SOURCES: usize = 8;
 const MIN_UPDATE_POLICY_MAX_AGE_SECONDS: u64 = 300;
@@ -108,10 +108,15 @@ impl MediaStationProxyMode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmbyProtocolExtensions {
     playback_preferences_v1: bool,
+    danmaku_associations_v1: bool,
     update_download_policy_v1: Option<UpdateDownloadPolicy>,
 }
 
 impl EmbyProtocolExtensions {
+    pub const fn supports_danmaku_associations(&self) -> bool {
+        self.danmaku_associations_v1
+    }
+
     pub const fn supports_playback_preferences(&self) -> bool {
         self.playback_preferences_v1
     }
@@ -1638,61 +1643,80 @@ impl MediaStationApiClient {
         self.post_json_empty(session, &url, &Value::Object(payload))
     }
 
-    /// Fetch danmaku for one media item.
-    ///
-    /// The server keeps "matched", "nothing matched" and "danmaku unavailable"
-    /// apart; those states survive here instead of collapsing into an empty
-    /// comment list, because the UI has to explain them differently.
-    pub fn fetch_media_danmaku(
+    /// Read metadata and the shared source reference. This endpoint never fetches comments.
+    pub fn danmaku_context(
         &self,
         session: &MediaStationSession,
         media_id: &str,
-        ch_convert: u8,
-        offset_seconds: Option<f64>,
-    ) -> Result<MediaDanmakuState, ApiError> {
+        source_id: Option<&str>,
+        sync_enabled: bool,
+    ) -> Result<Value, ApiError> {
         validate_non_empty("media_id", media_id)?;
-        let mut url = endpoint(&session.base_url, &["api", "danmaku", media_id])?;
+        if !sync_enabled
+            || !session
+                .protocol_extensions()
+                .supports_danmaku_associations()
         {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in danmaku_query(ch_convert, offset_seconds) {
-                pairs.append_pair(&key, &value);
-            }
+            let mut url = media_detail_endpoint(session, media_id)?;
+            url.query_pairs_mut().append_pair("Fields", "OriginalTitle,ProviderIds,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber");
+            let item = self.get_json(session, &url)?;
+            let episode = item["Type"] == "Episode";
+            let program = if episode {
+                match optional_string(item.get("SeriesId")) {
+                    Some(series_id) => {
+                        self.get_json(session, &media_detail_endpoint(session, &series_id)?)?
+                    }
+                    None => return Err(ApiError::MissingField { field: "SeriesId" }),
+                }
+            } else {
+                item.clone()
+            };
+            return Ok(json!({
+                "media_id": media_id, "association": null, "revision": "0", "persistence": "local_only",
+                "notice": if sync_enabled { "服务端未启用弹幕账号同步，选源和偏移仅保存在本机" } else { "跨设备同步已关闭，选源和偏移仅保存在本机" },
+                "target": {
+                    "title": optional_string(program.get("Name")).unwrap_or_default(),
+                    "original_title": optional_string(program.get("OriginalTitle")).unwrap_or_default(),
+                    "tmdb_id": optional_string(program["ProviderIds"].get("Tmdb")).unwrap_or_default(),
+                    "year": program["ProductionYear"].as_i64().unwrap_or(0),
+                    "season": if episode { item["ParentIndexNumber"].as_i64().unwrap_or(0) } else { 0 },
+                    "episode": if episode { item["IndexNumber"].as_i64().unwrap_or(0) } else { 0 },
+                }
+            }));
         }
-        let agent = self.agent_for_session(session)?;
-        let mut response = agent
-            .get(url.as_str())
-            .header(
-                HEADER_USER_AGENT,
-                self.user_agent_for_profile(session.connection),
-            )
-            .header(HEADER_EMBY_TOKEN, &session.token)
-            .header(HEADER_EMBY_AUTHORIZATION, &session.authorization)
-            .call()
-            .map_err(|error| transport_error(&url, error))?;
-        let status_code = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| ApiError::Transport {
-                url: redacted_url(&url),
-                message: error.to_string(),
-            })?;
-        parse_danmaku_response(status_code, &body).map_err(|error| match error {
-            DanmakuParseError::InvalidJson { message } => ApiError::InvalidJson {
-                url: redacted_url(&url),
-                message,
-            },
-            DanmakuParseError::MissingField { field } => ApiError::MissingField { field },
-            DanmakuParseError::InvalidField { field } => ApiError::InvalidServerContract {
-                field,
-                reason: "danmaku responses must carry an array of comments".to_string(),
-            },
-            DanmakuParseError::UnexpectedStatus { status } => ApiError::HttpStatus {
-                url: redacted_url(&url),
-                status_code: status,
-                message: format!("HTTP {status}"),
-            },
-        })
+        let mut url = endpoint(&session.base_url, &["Items", media_id, "Danmaku"])?;
+        if let Some(source_id) = source_id {
+            url.query_pairs_mut()
+                .append_pair("MediaSourceId", source_id);
+        }
+        let mut context = self.get_json(session, &url)?;
+        context["persistence"] = json!("server_extension");
+        Ok(context)
+    }
+
+    pub fn save_danmaku_association(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+        source_id: Option<&str>,
+        association: &Value,
+    ) -> Result<Value, ApiError> {
+        if !session
+            .protocol_extensions()
+            .supports_danmaku_associations()
+        {
+            return Err(ApiError::UnsupportedProtocolExtension {
+                extension: DANMAKU_ASSOCIATIONS_EXTENSION_ID,
+            });
+        }
+        let mut url = endpoint(&session.base_url, &["Items", media_id, "Danmaku"])?;
+        if let Some(source_id) = source_id {
+            url.query_pairs_mut()
+                .append_pair("MediaSourceId", source_id);
+        }
+        let mut context = self.put_json(session, &url, association)?;
+        context["persistence"] = json!("server_extension");
+        Ok(context)
     }
 
     fn get_json(&self, session: &MediaStationSession, url: &Url) -> Result<Value, ApiError> {
@@ -1976,7 +2000,9 @@ fn parse_protocol_extensions(payload: &Value) -> Result<EmbyProtocolExtensions, 
             })?;
         if !matches!(
             id,
-            PLAYBACK_PREFERENCES_EXTENSION_ID | UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID
+            PLAYBACK_PREFERENCES_EXTENSION_ID
+                | DANMAKU_ASSOCIATIONS_EXTENSION_ID
+                | UPDATE_DOWNLOAD_SOURCES_EXTENSION_ID
         ) {
             continue;
         }
@@ -1992,6 +2018,10 @@ fn parse_protocol_extensions(payload: &Value) -> Result<EmbyProtocolExtensions, 
         }
         if id == PLAYBACK_PREFERENCES_EXTENSION_ID {
             parsed.playback_preferences_v1 = true;
+            continue;
+        }
+        if id == DANMAKU_ASSOCIATIONS_EXTENSION_ID {
+            parsed.danmaku_associations_v1 = true;
             continue;
         }
         if parsed.update_download_policy_v1.is_some() {
@@ -4721,6 +4751,108 @@ mod tests {
                 field: "MediaSources[0].SupportsDirectPlay"
             }
         ));
+    }
+
+    #[test]
+    fn danmaku_sync_capability_and_switch_gate_the_new_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (advertised, enabled) in [(false, true), (true, false), (true, true)] {
+            let remote = advertised && enabled;
+            let body = if remote { json!({ "association": null, "revision": "0", "target": { "title": "电影" } }) }
+                else { json!({ "Id": "movie-1", "Type": "Movie", "Name": "电影", "OriginalTitle": "Movie", "ProviderIds": { "Tmdb": "123" }, "ProductionYear": 2024 }) }.to_string();
+            let (base, server) = serve_once(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ));
+            let mut session = session(base);
+            session.set_protocol_extensions(EmbyProtocolExtensions {
+                danmaku_associations_v1: advertised,
+                ..EmbyProtocolExtensions::default()
+            });
+            let client = MediaStationApiClient::new("test")?;
+            let context =
+                client.danmaku_context(&session, "movie-1", Some("version-1"), enabled)?;
+            let request = server.join().map_err(|_| "server failed")?;
+            if remote {
+                assert!(request.starts_with("GET /Items/movie-1/Danmaku?MediaSourceId=version-1 "));
+                assert_eq!(context["persistence"], "server_extension");
+            } else {
+                assert!(request.starts_with("GET /Users/user-1/Items/movie-1?"));
+                assert!(!request.contains("/Danmaku"));
+                assert_eq!(context["persistence"], "local_only");
+                assert_eq!(context["target"]["tmdb_id"], "123");
+                assert_eq!(context["target"]["season"], 0);
+                assert_eq!(context["target"]["episode"], 0);
+                if !advertised {
+                    assert!(matches!(
+                        client.save_danmaku_association(&session, "movie-1", None, &json!({})),
+                        Err(ApiError::UnsupportedProtocolExtension { .. })
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn danmaku_local_episode_matching_uses_series_identity_and_actual_episode_numbers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bodies = [
+            json!({ "Type": "Episode", "Name": "本集标题", "SeriesId": "series-1", "ParentIndexNumber": 2, "IndexNumber": 5 }),
+            json!({ "Type": "Series", "Name": "剧名", "OriginalTitle": "Series", "ProviderIds": { "Tmdb": "321" }, "ProductionYear": 2023 }),
+        ];
+        let (base, server) = serve_sequence(bodies.into_iter().map(|body| {
+            let body = body.to_string(); format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        }).collect());
+        let context = MediaStationApiClient::new("test")?.danmaku_context(
+            &session(base),
+            "episode-5",
+            None,
+            true,
+        )?;
+        let requests = server.join().map_err(|_| "server failed")?;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /Users/user-1/Items/series-1 "));
+        assert_eq!(
+            context["target"],
+            json!({ "title": "剧名", "original_title": "Series", "tmdb_id": "321", "year": 2023, "season": 2, "episode": 5 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn danmaku_advertised_sync_errors_remain_visible() -> Result<(), Box<dyn std::error::Error>> {
+        let (base, server) = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        let mut session = session(base);
+        session.set_protocol_extensions(EmbyProtocolExtensions {
+            danmaku_associations_v1: true,
+            ..EmbyProtocolExtensions::default()
+        });
+        let result =
+            MediaStationApiClient::new("test")?.danmaku_context(&session, "movie-1", None, true);
+        server.join().map_err(|_| "server failed")?;
+        assert!(matches!(
+            result,
+            Err(ApiError::HttpStatus {
+                status_code: 404,
+                ..
+            })
+        ));
+        assert!(
+            parse_protocol_extensions(
+                &json!({"ProtocolExtensions":[{"Id":"danmaku-associations","Version":1}]})
+            )?
+            .supports_danmaku_associations()
+        );
+        assert!(
+            !parse_protocol_extensions(
+                &json!({"ProtocolExtensions":[{"Id":"danmaku-associations","Version":2}]})
+            )?
+            .supports_danmaku_associations()
+        );
+        Ok(())
     }
 
     #[test]

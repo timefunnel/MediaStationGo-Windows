@@ -1,0 +1,13 @@
+{
+  "name": "mediastation-local-danmaku",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "node --test local.test.mjs",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "danmu-api-server": "https://codeload.github.com/huangxd-/danmu_api/tar.gz/afc8b8119f981492a5caee52f1e1ebf756bd0d41"
+  }
+}

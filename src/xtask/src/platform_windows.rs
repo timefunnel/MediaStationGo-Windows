@@ -34,6 +34,7 @@ pub fn stage_mpv(out: &Path, mpv_info: &mpv::Mpv, used_external: bool, _bin: &Pa
 
 pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<PathBuf> {
     remove_bundled_interpolation(prefix)?;
+    xfs::copy_dir_recursive(&build_dir.join("danmaku"), &prefix.join("danmaku"))?;
     xfs::copy_executable(
         &build_dir.join("jellium-desktop.exe"),
         &prefix.join("jellium-desktop.exe"),

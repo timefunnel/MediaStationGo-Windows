@@ -324,7 +324,8 @@ mod tests {
         assert!(
             js.contains("canvas.getContext('2d'")
                 && js.contains("BILI_COMMON_DURATION_MS")
-                && js.contains("chooseScrollLane"),
+                && js.contains("chooseLane")
+                && js.contains("canShareRow"),
             "the danmaku renderer must retain the canvas and track-allocation contract"
         );
         assert!(

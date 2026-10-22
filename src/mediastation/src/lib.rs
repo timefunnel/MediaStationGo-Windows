@@ -1,7 +1,7 @@
 //! Emby-compatible API and native playback-session support.
 
 mod api;
-mod danmaku;
+mod local_danmaku;
 mod playback_plan;
 mod playback_session;
 
@@ -13,10 +13,7 @@ pub use api::{
     PlaybackPreferencePersistence, PlaybackSource, PlaybackTrackPreference,
     PlaybackTrackPreferenceState, PlaybackTrackPreferenceUpdate, SubtitleTrack, VideoStream,
 };
-pub use danmaku::{
-    DanmakuComment, DanmakuParseError, MediaDanmaku, MediaDanmakuState, danmaku_query,
-    parse_danmaku_response,
-};
+pub use local_danmaku::fetch_local_danmaku;
 pub use playback_plan::{
     PlaybackTrackPlan, TRACK_DISABLE, build_playback_track_plan, chinese_subtitle_preference_rank,
 };
