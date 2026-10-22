@@ -6,7 +6,8 @@ param(
     [string]$ResultDirectory = '',
     [string]$PresentMonPath = '',
     [switch]$ExerciseControls,
-    [switch]$ElevatePresentationCapture
+    [switch]$ElevatePresentationCapture,
+    [ValidateSet('24000/1001', '25')][string]$SourceRate = '24000/1001'
 )
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
@@ -35,12 +36,12 @@ try {
     $SubtitleEnd = [TimeSpan]::FromSeconds($ClipSeconds).ToString('hh\:mm\:ss') + ',000'
     [IO.File]::WriteAllText($Subtitle, "1`n00:00:00,000 --> $SubtitleEnd`nVFG cadence comparison - original subtitle timeline`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $TestRoot 'cadence-timed.srt'), "1`n00:00:01,300 --> 00:00:02,100`nVFG timed subtitle A`n`n2`n00:00:02,300 --> 00:00:03,800`nVFG timed subtitle B`n", [Text.UTF8Encoding]::new($false))
-    $Pan = "color=c=0x283040:size=${CanvasWidth}x$($Dimensions[1]):rate=24000/1001:duration=$ClipSeconds,drawgrid=w=128:h=128:t=3:c=white,drawbox=x=500:y=200:w=500:h=500:c=0xdc5030:t=fill,crop=w=$($Dimensions[0]):h=$($Dimensions[1]):x='(in_w-out_w)*(0.5-0.5*cos(2*PI*t/20))':y=0"
+    $Pan = "color=c=0x283040:size=${CanvasWidth}x$($Dimensions[1]):rate=${SourceRate}:duration=$ClipSeconds,drawgrid=w=128:h=128:t=3:c=white,drawbox=x=500:y=200:w=500:h=500:c=0xdc5030:t=fill,crop=w=$($Dimensions[0]):h=$($Dimensions[1]):x='(in_w-out_w)*(0.5-0.5*cos(2*PI*t/20))':y=0"
     $Source = Join-Path $TestRoot 'pan.mp4'
     & ffmpeg.exe -hide_banner -loglevel error -f lavfi -i $Pan -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=$ClipSeconds" -i $Subtitle -map 0:v -map 1:a -map 1:a -map 2:s -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -c:a aac -c:s mov_text -t $ClipSeconds $Source
     if ($LASTEXITCODE -ne 0) { throw 'Horizontal-pan fixture generation failed' }
     $Manifest = [ordered]@{
-        sourceSize = $SourceSize; sourceRate = '24000/1001'; seconds = $Seconds; warmupSeconds = 5
+        sourceSize = $SourceSize; sourceRate = $SourceRate; seconds = $Seconds; warmupSeconds = 5
         quality = $Quality; videoSync = $VideoSync; divisors = @(3, 2); audio = 'wasapi-muted'
         sourceSha256 = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
         mpvSha256 = (Get-FileHash -LiteralPath "$Mpv\lib\libmpv-2.dll" -Algorithm SHA256).Hash

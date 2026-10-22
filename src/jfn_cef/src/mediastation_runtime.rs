@@ -2341,6 +2341,7 @@ fn report_job(active: &ActivePlaybackReport, kind: ReportKind) -> ReportJob {
 }
 
 static RUNTIME: OnceLock<Result<Arc<MediaStationRuntime>, ()>> = OnceLock::new();
+static STARTUP_SESSION: OnceLock<Result<bool, String>> = OnceLock::new();
 
 /// The player UI's danmaku switch before/without a runtime. See
 /// [`set_danmaku_enabled`].
@@ -2487,7 +2488,7 @@ pub(crate) fn session_is_configured() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn restore_persisted_session_on_startup() -> Result<bool, String> {
+fn restore_persisted_session_on_startup() -> Result<bool, String> {
     let store = WindowsCredentialStore::active();
     let Some(stored) = store.load().map_err(|error| error.code().to_string())? else {
         return Ok(false);
@@ -2827,21 +2828,67 @@ pub(crate) fn handle_session_status_message(
             return true;
         }
     };
-    match runtime() {
-        Ok(runtime) => dispatch_response(
-            &layer,
-            &request_id,
-            OPERATION_SESSION_STATUS,
-            true,
-            runtime.session_status_payload(),
-        ),
-        Err(failure) => dispatch_response(
+    // The first page request restores credentials off the CEF/UI thread. In
+    // particular, server capability discovery must not delay browser creation
+    // or freeze its splash while the network times out. Restore at most once
+    // so later status requests cannot undo logout or account changes.
+    let worker_layer = Arc::clone(&layer);
+    let worker_request_id = request_id.clone();
+    let spawn = thread::Builder::new()
+        .name("mediastation-session-status".to_string())
+        .spawn(move || {
+            let restored = STARTUP_SESSION.get_or_init(|| {
+                let result = restore_persisted_session_on_startup();
+                match &result {
+                    Ok(true) => jfn_logging::log(
+                        jfn_logging::CATEGORY_CEF,
+                        jfn_logging::LEVEL_INFO,
+                        "MediaStation native session restored from Windows Credential Manager",
+                    ),
+                    Ok(false) => {}
+                    Err(code) => log_error(&format!(
+                        "MediaStation native session restore failed: code={code}"
+                    )),
+                }
+                result
+            });
+            let response = runtime().and_then(|runtime| {
+                if restored.is_err() && runtime.state.lock().session.is_none() {
+                    return Err(LoadFailure::new(
+                        "session_restore_failed",
+                        "The saved session could not be restored; select an account to reconnect",
+                    ));
+                }
+                Ok(runtime.session_status_payload())
+            });
+            let (ok, payload) = match response {
+                Ok(payload) => (true, payload),
+                Err(failure) => (false, failure.payload()),
+            };
+            dispatch_response(
+                &worker_layer,
+                &worker_request_id,
+                OPERATION_SESSION_STATUS,
+                ok,
+                payload,
+            );
+        });
+    if let Err(error) = spawn {
+        log_error(&format!(
+            "MediaStation session status worker could not start: kind={}",
+            error.kind()
+        ));
+        dispatch_response(
             &layer,
             &request_id,
             OPERATION_SESSION_STATUS,
             false,
-            failure.payload(),
-        ),
+            LoadFailure::new(
+                "request_thread_failed",
+                "The native session status worker could not be started",
+            )
+            .payload(),
+        );
     }
     true
 }
@@ -5479,6 +5526,48 @@ pub(crate) fn handle_frame_interpolation_message(
         return true;
     }
     let operation = list_string(args, 1);
+    if operation == "frame_interpolation_diagnostics" {
+        let media_id = (args.size() >= 3
+            && args.get_type(2).as_ref() == &sys::cef_value_type_t::VTYPE_STRING)
+            .then(|| list_string(args, 2));
+        let worker_layer = Arc::clone(&layer);
+        let worker_request_id = request_id.clone();
+        // Metadata/property reads wait for the mpv core, including GPU filters.
+        // Never make CEF's UI/paint thread wait for them during playback.
+        let spawn = thread::Builder::new()
+            .name("mediastation-video-diagnostics".to_string())
+            .spawn(move || {
+                let (ok, payload) =
+                    match frame_interpolation_diagnostics_payload(media_id.as_deref()) {
+                        Ok(payload) => (true, payload),
+                        Err(failure) => (false, failure.payload()),
+                    };
+                dispatch_response(
+                    &worker_layer,
+                    &worker_request_id,
+                    "frame_interpolation_diagnostics",
+                    ok,
+                    payload,
+                );
+            });
+        if let Err(error) = spawn {
+            log_error(&format!(
+                "Video diagnostics worker could not start: {error}"
+            ));
+            dispatch_response(
+                &layer,
+                &request_id,
+                &operation,
+                false,
+                LoadFailure::new(
+                    "request_thread_failed",
+                    "The video diagnostics worker could not be started",
+                )
+                .payload(),
+            );
+        }
+        return true;
+    }
     let result = match operation.as_str() {
         "video_components_status" => Ok(video_components_status_payload()),
         "video_component_install"
@@ -5502,12 +5591,6 @@ pub(crate) fn handle_frame_interpolation_message(
             .map(|()| json!({"restarting": true}))
             .map_err(|(code, detail)| LoadFailure::dynamic(code, detail)),
         "frame_interpolation_set_model" => set_frame_interpolation_model(args),
-        "frame_interpolation_diagnostics" => {
-            let media_id = (args.size() >= 3
-                && args.get_type(2).as_ref() == &sys::cef_value_type_t::VTYPE_STRING)
-                .then(|| list_string(args, 2));
-            frame_interpolation_diagnostics_payload(media_id.as_deref())
-        }
         _ => Err(LoadFailure::new(
             "frame_interpolation_operation_invalid",
             "The frame interpolation operation is unsupported",

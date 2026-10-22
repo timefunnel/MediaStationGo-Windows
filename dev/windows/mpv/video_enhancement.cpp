@@ -51,6 +51,8 @@ struct nvvideo_session {
     ComPtr<ID3DDeviceContextState> isolated;
     ComPtr<ID3D11Multithread> multithread;
     ComPtr<ID3D11Texture2D> output;
+    ComPtr<ID3D11Texture2D> vfg_previous, vfg_current;
+    void *vfg_resources[3]{};
     std::unique_ptr<HdrPipeline> hdr;
     NVSDK_NGX_Handle *feature = nullptr;
     NVSDK_NGX_Parameter *params = nullptr;
@@ -98,6 +100,11 @@ struct nvvideo_session {
         std::unique_ptr<ContextGuard> guard;
         if (multithread && context1 && isolated) guard = std::make_unique<ContextGuard>(multithread.Get(), context1.Get(), isolated.Get());
         if (stream && stream_sync) { int result = stream_sync(stream); cleanup_result(result, "CUDA stream synchronize", result == 0); }
+        for (auto &resource : vfg_resources) if (resource) {
+            int result = unregister_texture(resource);
+            cleanup_result(result, "CUDA VFG unregister", result == 0);
+            resource = nullptr;
+        }
         if (nr && nr_destroy) nr_destroy(nr);
         if (effect && destroy_effect) destroy_effect(effect);
         if (dealloc) for (auto &image : images) if (image.pixels) dealloc(&image);
@@ -172,11 +179,23 @@ struct nvvideo_session {
             cuda(set_u32(effect, "AutomaticShotChangeDetectionEnabled", config.scene_detection), "VFG scene detection");
             cuda(set_image(effect, "SrcImage0", &images[0]), "VFG input0"); cuda(set_image(effect, "SrcImage1", &images[1]), "VFG input1"); cuda(set_image(effect, "DstImage0", &images[2]), "VFG output");
             cuda(load(effect), "VFG Load");
+            // Registration is expensive; keep it for the lifetime of the session
+            // and never register decoder/VO-owned allocations with CUDA.
+            if (!hdr) {
+                hr = config.device->CreateTexture2D(&desc, nullptr, &vfg_previous); check(hr, "VFG previous texture", SUCCEEDED(hr));
+                hr = config.device->CreateTexture2D(&desc, nullptr, &vfg_current); check(hr, "VFG current texture", SUCCEEDED(hr));
+            }
+            ID3D11Texture2D *textures[] = {
+                hdr ? hdr->previous.Get() : vfg_previous.Get(),
+                hdr ? hdr->current.Get() : vfg_current.Get(),
+                hdr ? hdr->generated.Get() : output.Get(),
+            };
+            for (unsigned i = 0; i < 3; i++)
+                cuda(register_texture(&vfg_resources[i], textures[i], 0), "CUDA VFG register");
         }
     }
-    void transfer(ID3D11Texture2D *texture, Image &image, bool to_image) {
-        void *resource = nullptr, *array = nullptr;
-        cuda(register_texture(&resource, texture, 0), "CUDA D3D11 register");
+    void transfer(void *resource, Image &image, bool to_image) {
+        void *array = nullptr;
         bool mapped = false;
         try {
             cuda(map(1, &resource, stream), "CUDA D3D11 map"); mapped = true;
@@ -184,13 +203,10 @@ struct nvvideo_session {
             if (to_image) cuda(copy_from_array(image.pixels, static_cast<size_t>(image.pitch), array, 0, 0, config.width * 4ull, config.height, 3, stream), "CUDA input copy");
             else cuda(copy_to_array(array, 0, 0, image.pixels, static_cast<size_t>(image.pitch), config.width * 4ull, config.height, 3, stream), "CUDA output copy");
             cuda(unmap(1, &resource, stream), "CUDA D3D11 unmap"); mapped = false;
-            cuda(stream_sync(stream), "CUDA D3D11 synchronize");
         } catch (...) {
             if (mapped) { int result = unmap(1, &resource, stream); cleanup_result(result, "CUDA failed-transfer unmap", result == 0); }
-            int result = unregister_texture(resource); cleanup_result(result, "CUDA failed-transfer unregister", result == 0);
             throw;
         }
-        cuda(unregister_texture(resource), "CUDA D3D11 unregister");
     }
     void process(ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *destination, uint32_t index, float timestep = 0.5f) {
         for (auto *texture : {current, destination, previous}) {
@@ -199,20 +215,24 @@ struct nvvideo_session {
             bool dest = texture == destination;
             check(0, "Native frame format/dimensions mismatch", desc.ArraySize == 1 && desc.MipLevels == 1 && desc.Format == (hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_B8G8R8A8_UNORM) && desc.Width == (dest ? config.out_width : config.width) && desc.Height == (dest ? config.out_height : config.height));
         }
-        if (hdr && config.mode != 2) { hdr->input(current); current = hdr->proxy.Get(); }
-        if (config.mode == 1) {
-            NVSDK_NGX_D3D11_VSR_Eval_Params eval{}; eval.pInput = current; eval.pOutput = output.Get();
-            eval.InputSubrectSize = {config.width, config.height}; eval.OutputSubrectSize = {config.out_width, config.out_height}; eval.QualityLevel = static_cast<NVSDK_NGX_VSR_QualityLevel>(config.vsr_quality);
-            ngx(NGX_D3D11_EVALUATE_VSR_EXT(config.context, feature, params, &eval), "VSR EvaluateFeature");
-        } else if (config.mode == 3) {
-            char detail[512]{};
-            if (!nr_process(nr, current, output.Get(), detail, sizeof(detail))) throw std::runtime_error(detail);
-        } else {
+        if (config.mode == 2) {
             check(0, "VFG previous frame missing", previous != nullptr);
             if (index == 1) {
-                if (hdr) { hdr->input(previous, hdr->previous.Get()); hdr->input(current, hdr->current.Get()); }
-                transfer(hdr ? hdr->previous.Get() : previous, images[0], true);
-                transfer(hdr ? hdr->current.Get() : current, images[1], true);
+                {
+                    // CUDA/D3D11 map/unmap also use the immediate context.
+                    // Keep them isolated, and finish unmapping before unlock.
+                    ContextGuard guard(multithread.Get(), context1.Get(), isolated.Get());
+                    if (hdr) { hdr->input(previous, hdr->previous.Get()); hdr->input(current, hdr->current.Get()); }
+                    else { config.context->CopyResource(vfg_previous.Get(), previous); config.context->CopyResource(vfg_current.Get(), current); }
+                    transfer(vfg_resources[0], images[0], true);
+                    transfer(vfg_resources[1], images[1], true);
+                    cuda(stream_sync(stream), "VFG inputs synchronize");
+                }
+                // Both bindings signal a new source pair to VFG even when the
+                // allocations are reused. Keep them bound for its later samples.
+                cuda(set_image(effect, "SrcImage0", &images[0]), "VFG new pair input0");
+                cuda(set_image(effect, "SrcImage1", &images[1]), "VFG new pair input1");
+                cuda(set_u32(effect, "ShotChange", 0), "VFG new pair shot change");
             }
             if (config.multiplier == 0) {
                 check(index, "VFG timestep/index", index > 0 && std::isfinite(timestep) && timestep > 0.f && timestep < 1.f);
@@ -222,10 +242,28 @@ struct nvvideo_session {
                 cuda(set_u32(effect, "FrameIndex", index), "VFG frame index");
             }
             cuda(run(effect, 0), "VFG Run");
-            cuda(stream_sync(stream), "VFG inference synchronize"); transfer(hdr ? hdr->generated.Get() : output.Get(), images[2], false);
+            // Inference uses only private CUDA images, with no mapped D3D11
+            // resources. Let decoder and VO use their context during this wait.
+            cuda(stream_sync(stream), "VFG inference synchronize");
+            ContextGuard guard(multithread.Get(), context1.Get(), isolated.Get());
+            transfer(vfg_resources[2], images[2], false);
+            cuda(stream_sync(stream), "VFG result synchronize");
+            if (hdr) hdr->finish(hdr->generated.Get(), true);
+            config.context->CopyResource(destination, hdr ? hdr->output.Get() : output.Get());
+        } else {
+            ContextGuard guard(multithread.Get(), context1.Get(), isolated.Get());
+            if (hdr) { hdr->input(current); current = hdr->proxy.Get(); }
+            if (config.mode == 1) {
+                NVSDK_NGX_D3D11_VSR_Eval_Params eval{}; eval.pInput = current; eval.pOutput = output.Get();
+                eval.InputSubrectSize = {config.width, config.height}; eval.OutputSubrectSize = {config.out_width, config.out_height}; eval.QualityLevel = static_cast<NVSDK_NGX_VSR_QualityLevel>(config.vsr_quality);
+                ngx(NGX_D3D11_EVALUATE_VSR_EXT(config.context, feature, params, &eval), "VSR EvaluateFeature");
+            } else {
+                char detail[512]{};
+                if (!nr_process(nr, current, output.Get(), detail, sizeof(detail))) throw std::runtime_error(detail);
+            }
+            if (hdr) hdr->finish(output.Get(), false);
+            config.context->CopyResource(destination, hdr ? hdr->output.Get() : output.Get());
         }
-        if (hdr) hdr->finish(config.mode == 2 ? hdr->generated.Get() : output.Get(), config.mode == 2);
-        config.context->CopyResource(destination, hdr ? hdr->output.Get() : output.Get());
         const HRESULT reason = config.device->GetDeviceRemovedReason();
         check(reason, "Native D3D11 device removed", SUCCEEDED(reason));
     }
@@ -247,7 +285,7 @@ int __cdecl nvvideo_process(nvvideo_session *session, ID3D11Texture2D *previous,
     try {
         if (!session || !current || !output) throw std::runtime_error("Missing native enhancement frame");
         if (session->config.mode == 2 && session->config.multiplier == 0) throw std::runtime_error("Automatic VFG requires the explicit timestep entry point");
-        ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get()); session->process(previous, current, output, index); return 1;
+        session->process(previous, current, output, index); return 1;
     } catch (const std::exception &exception) { report(error, size, exception.what()); return 0; }
 }
 int __cdecl nvvideo_process_timestep(nvvideo_session *session, ID3D11Texture2D *previous, ID3D11Texture2D *current, ID3D11Texture2D *output, uint32_t index, float timestep, char *error, size_t size) {
@@ -256,7 +294,6 @@ int __cdecl nvvideo_process_timestep(nvvideo_session *session, ID3D11Texture2D *
             throw std::runtime_error("Explicit VFG timestep requires an automatic VFG session");
         if (!index || !std::isfinite(timestep) || timestep <= 0.f || timestep >= 1.f)
             throw std::runtime_error("VFG timestep must be strictly between zero and one, with a positive pair index");
-        ContextGuard guard(session->multithread.Get(), session->context1.Get(), session->isolated.Get());
         session->process(previous, current, output, index, timestep); return 1;
     } catch (const std::exception &exception) { report(error, size, exception.what()); return 0; }
 }

@@ -1183,6 +1183,7 @@
         const codes = {
             invalid_credentials: '用户名或密码不正确',
             session_unavailable: '登录状态已失效',
+            session_restore_failed: '无法恢复登录状态，请选择账号重新连接',
             catalog_load_failed: '媒体内容加载失败',
             image_load_failed: '图片加载失败',
             preference_update_failed: '播放偏好保存失败',
@@ -1962,13 +1963,16 @@
                 if (refreshed.cache?.writeFailed) {
                     console.error('首页同步完成，但首页快照写入失败');
                 }
+                const changed = homeContentChanged(homeData, refreshed);
                 homeData = refreshed;
                 homeRefreshFailures = 0;
                 if (currentView?.kind === 'home') {
-                    const saved = captureView();
                     currentView = { ...currentView, data: homeData };
-                    renderHome(homeData);
-                    if (saved) restoreViewState(saved, { restoreFocus: Boolean(saved.focusKey) });
+                    if (changed) {
+                        const saved = captureView();
+                        renderHome(homeData);
+                        if (saved) restoreViewState(saved, { restoreFocus: Boolean(saved.focusKey) });
+                    }
                 }
             } catch (error) {
                 if (generation !== homeRefreshGeneration || session !== expectedSession) return;
@@ -1981,6 +1985,14 @@
                 }
             }
         }, delayMs);
+    }
+
+    function homeContentChanged(previous, refreshed) {
+        if (!previous) return true;
+        // Cache timestamps/status describe the fetch, not the displayed content.
+        const { cache: previousCache, ...previousContent } = previous;
+        const { cache: refreshedCache, ...refreshedContent } = refreshed;
+        return JSON.stringify(previousContent) !== JSON.stringify(refreshedContent);
     }
 
     function imageWidthFor(ref, landscape, hero = false) {
@@ -2427,6 +2439,24 @@
         return button;
     }
 
+    const pendingCarouselLayouts = new Set();
+    let carouselLayoutFrame = 0;
+
+    function queueCarouselLayout(layout) {
+        pendingCarouselLayouts.add(layout);
+        if (carouselLayoutFrame) return;
+        carouselLayoutFrame = window.requestAnimationFrame(() => {
+            carouselLayoutFrame = 0;
+            const layouts = [...pendingCarouselLayouts].filter((item) => item.visible());
+            pendingCarouselLayouts.clear();
+            // Read and write all rows together. Alternating them per row forces
+            // the entire new home page through layout repeatedly in one frame.
+            for (const phase of ['capture', 'reset', 'measure', 'size', 'measureEnd', 'align', 'scroll']) {
+                for (const item of layouts) item[phase]();
+            }
+        });
+    }
+
     function createRowCarousel(row, title, controlsHost = null, options = {}) {
         row.classList.add('carousel-row');
         const rowShell = element('div', 'media-row-carousel');
@@ -2465,79 +2495,85 @@
             previous.classList.toggle('unavailable', atStart);
             next.classList.toggle('unavailable', atEnd);
         };
+        let rowWidth = 0, cardWidth = 0, gap = 0, previousIndex = 0, limit = 0, artHeight = 0, requestedInitialPosition;
         const measurePageDistance = () => {
+            rowWidth = row.clientWidth;
             const card = row.querySelector('.media-card');
-            if (!card) return row.clientWidth;
-            row.style.removeProperty('--row-card-width');
-            row.style.removeProperty('--row-gap');
+            if (!card) { cardWidth = 0; cardStride = 0; pageDistance = rowWidth; return; }
             const rawGap = Number.parseFloat(window.getComputedStyle(row).columnGap) || 0;
             const rawWidth = card.getBoundingClientRect().width;
             const pixelRatio = window.devicePixelRatio || 1;
-            const gap = Math.round(rawGap * pixelRatio) / pixelRatio;
+            gap = Math.round(rawGap * pixelRatio) / pixelRatio;
             const preferredCardWidth = Math.round(rawWidth * pixelRatio) / pixelRatio;
-            let cardWidth = preferredCardWidth;
+            cardWidth = preferredCardWidth;
             if (row.classList.contains('people-row')) {
                 const cardCount = row.querySelectorAll(':scope > .media-card').length;
                 const preferredContentWidth = cardCount * preferredCardWidth + Math.max(0, cardCount - 1) * gap;
-                if (cardCount > 1 && preferredContentWidth > row.clientWidth + 0.5) {
+                if (cardCount > 1 && preferredContentWidth > rowWidth + 0.5) {
                     const wholeCardCount = clamp(
-                        Math.round((row.clientWidth + gap) / (preferredCardWidth + gap)),
+                        Math.round((rowWidth + gap) / (preferredCardWidth + gap)),
                         1,
                         cardCount,
                     );
-                    const fittedWidth = (row.clientWidth - gap * (wholeCardCount - 1)) / wholeCardCount;
+                    const fittedWidth = (rowWidth - gap * (wholeCardCount - 1)) / wholeCardCount;
                     cardWidth = Math.max(1 / pixelRatio, Math.floor(fittedWidth * pixelRatio) / pixelRatio);
                 }
             }
-            row.style.setProperty('--row-card-width', `${cardWidth}px`);
-            row.style.setProperty('--row-gap', `${gap}px`);
             cardStride = cardWidth + gap;
-            return Math.max(
+            pageDistance = Math.max(
                 cardStride,
-                Math.floor((row.clientWidth * 0.78) / cardStride) * cardStride,
+                Math.floor((rowWidth * 0.78) / cardStride) * cardStride,
             );
         };
-        const alignEndToPage = () => {
+        const layout = {
             // Player mode hides the app shell with display:none. Native window
             // changes can still emit resize events while it is hidden, so do
             // not replace the last valid card metrics with zero-width values.
-            if (!row.isConnected || row.clientWidth <= 0 || !row.getClientRects().length) return;
-            const previousDistance = pageDistance;
-            const previousIndex = previousDistance > 0
-                ? Math.round(row.scrollLeft / previousDistance)
-                : 0;
-            generation += 1;
-            active = false;
-            pendingDirection = 0;
-            stopSmoothScroll(row);
-            row.style.setProperty('--row-end-alignment', '0px');
-            pageDistance = measurePageDistance();
-            if (pageDistance <= 0) {
-                maximumPage = 0;
-                pageIndex = 0;
+            visible: () => row.isConnected && row.clientWidth > 0 && row.getClientRects().length > 0,
+            capture() { previousIndex = pageDistance > 0 ? Math.round(row.scrollLeft / pageDistance) : 0; },
+            reset() {
+                generation += 1;
+                active = false;
+                pendingDirection = 0;
+                stopSmoothScroll(row);
+                row.style.setProperty('--row-end-alignment', '0px');
+                row.style.removeProperty('--row-card-width');
+                row.style.removeProperty('--row-gap');
+            },
+            measure: measurePageDistance,
+            size() {
+                if (!cardWidth) return;
+                row.style.setProperty('--row-card-width', `${cardWidth}px`);
+                row.style.setProperty('--row-gap', `${gap}px`);
+            },
+            measureEnd() {
+                limit = scrollLimit(row, 'x');
+                const art = row.querySelector('.card-art');
+                artHeight = art ? art.getBoundingClientRect().height : 0;
+                requestedInitialPosition = initialScrollTarget?.();
+                initialScrollTarget = null;
+            },
+            align() {
+                maximumPage = pageDistance > 0 ? Math.ceil(Math.max(0, limit - 0.5) / pageDistance) : 0;
+                const alignment = Math.max(0, maximumPage * pageDistance - limit);
+                row.style.setProperty('--row-end-alignment', `${alignment}px`);
+                if (artHeight) rowShell.style.setProperty('--row-button-center', `${artHeight / 2}px`);
+            },
+            scroll() {
+                if (Number.isFinite(requestedInitialPosition)) {
+                    const position = clamp(requestedInitialPosition, 0, limit);
+                    row.scrollLeft = position;
+                    pageIndex = pageDistance > 0 ? clamp(Math.round(position / pageDistance), 0, maximumPage) : 0;
+                } else {
+                    pageIndex = clamp(previousIndex, 0, maximumPage);
+                    row.scrollLeft = pageIndex * pageDistance;
+                }
                 refreshControls();
-                return;
-            }
-            const limit = scrollLimit(row, 'x');
-            maximumPage = Math.ceil(Math.max(0, limit - 0.5) / pageDistance);
-            const alignment = Math.max(0, maximumPage * pageDistance - limit);
-            row.style.setProperty('--row-end-alignment', `${alignment}px`);
-            const art = row.querySelector('.card-art');
-            if (art) rowShell.style.setProperty('--row-button-center', `${art.getBoundingClientRect().height / 2}px`);
-            const requestedInitialPosition = initialScrollTarget?.();
-            initialScrollTarget = null;
-            if (Number.isFinite(requestedInitialPosition)) {
-                row.scrollLeft = clamp(requestedInitialPosition, 0, limit);
-                pageIndex = clamp(Math.round(row.scrollLeft / pageDistance), 0, maximumPage);
-            } else {
-                pageIndex = clamp(previousIndex, 0, maximumPage);
-                row.scrollLeft = pageIndex * pageDistance;
-            }
-            refreshControls();
-            carouselReady = true;
-            const pending = pendingSmoothRequest;
-            pendingSmoothRequest = null;
-            if (pending) startSmoothCarouselTo(pending.getPosition()).then(pending.resolve);
+                carouselReady = true;
+                const pending = pendingSmoothRequest;
+                pendingSmoothRequest = null;
+                if (pending) startSmoothCarouselTo(pending.getPosition()).then(pending.resolve);
+            },
         };
         let refreshFrame = 0;
         row.addEventListener('scroll', () => {
@@ -2585,7 +2621,7 @@
         };
         previous.addEventListener('click', () => moveToPage(pageIndex - 1));
         next.addEventListener('click', () => moveToPage(pageIndex + 1));
-        row._refreshCarousel = alignEndToPage;
+        row._refreshCarousel = () => queueCarouselLayout(layout);
         row._jumpCarouselTo = (requestedPosition) => {
             generation += 1;
             active = false;
@@ -2637,7 +2673,7 @@
         };
         rowShell.append(row);
         (controlsHost || rowShell).append(controls);
-        window.requestAnimationFrame(alignEndToPage);
+        queueCarouselLayout(layout);
         return rowShell;
     }
 
@@ -2732,10 +2768,9 @@
             && art.height >= Math.ceil(art.height * scale * density);
     }
 
-    async function loadHeroArtwork(hero, card) {
+    async function loadHeroArtwork(hero, card, requestWidth = imageWidthFor(null, true, true)) {
         const expectedSession = session;
         const ref = card.backdropImage || card.landscapeImage;
-        const requestWidth = imageWidthFor(ref, true, true);
         const key = JSON.stringify([session?.baseUrl, session?.userId, ref, requestWidth]);
         let art = heroArtworkCache.get(key);
         if (!art) {
@@ -2883,12 +2918,12 @@
         void select(restored >= 0 ? restored : 0, 1);
     }
 
-    async function loadHeroCandidates(hero, candidates, revision) {
+    async function loadHeroCandidates(hero, candidates, revision, initialRequestWidth) {
         hero._artworkPool = [];
-        for (const card of candidates) {
+        for (const [index, card] of candidates.entries()) {
             if (revision !== heroRevision || !hero.isConnected) return;
             try {
-                const art = await loadHeroArtwork(hero, card);
+                const art = await loadHeroArtwork(hero, card, index === 0 ? initialRequestWidth : undefined);
                 if (revision !== heroRevision || !hero.isConnected) return;
                 hero._artworkPool.push({ card, art });
                 // Reveal the first sharp image immediately; complete the carousel in the background.
@@ -2900,6 +2935,9 @@
     }
 
     function renderHome(data) {
+        // Measure before inserting cards; reading clientWidth after insertion
+        // forces the entire new home layout into this same JavaScript task.
+        const initialHeroWidth = imageWidthFor(null, true, true);
         stopHeroCarousel(); replaceContent();
         const revision = heroRevision;
         const resumeItems = Array.isArray(data.resume) ? data.resume.slice(0, maximumContinueWatchingItems) : [];
@@ -2923,7 +2961,7 @@
         if (!band.childElementCount) band.append(element('div', 'empty-state', '媒体库暂无内容'));
         content.append(hero, band);
         const candidates = heroCandidates(data, latestSections);
-        void loadHeroCandidates(hero, candidates, revision);
+        void loadHeroCandidates(hero, candidates, revision, initialHeroWidth);
     }
 
     function renderResume(data) {
@@ -5427,7 +5465,6 @@
             loadInfo: null,
             panelKind: '',
             trackChanging: false,
-            trackRefreshing: false,
             metadataRefreshLoadInfo: null,
             scrubbing: false,
             scrubPositionMs: null,
@@ -6729,6 +6766,11 @@
         playerPanelContent.replaceChildren();
         requestAnimationFrame(positionPlayerPanel);
         if (!info || !kind) return;
+        if (player.panelLoading || player.panelError) {
+            byId('player-panel-title').textContent = { interpolation: '画面增强', audio: '音轨', subtitles: '字幕', info: '播放信息' }[kind] || '播放设置';
+            playerPanelContent.append(element('div', 'player-panel-state', player.panelError || '正在读取…'));
+            return;
+        }
 
         if (kind === 'episodes') {
             byId('player-panel-title').textContent = '选集';
@@ -6990,67 +7032,64 @@
         closePlayerMore(false);
         closeDanmakuPanel();
         const activePlayer = player;
-        if (!activePlayer?.loadInfo || activePlayer.trackChanging || activePlayer.trackRefreshing || activePlayer.exiting) return;
+        if (!activePlayer?.loadInfo || activePlayer.trackChanging || activePlayer.exiting) return;
         if (activePlayer.panelKind === kind && !playerPanel.classList.contains('hidden')) {
             closePlayerPanel(true);
             return;
         }
 
-        if (kind === 'interpolation') {
-            const ready = await refreshVideoComponents();
-            if (player !== activePlayer || activePlayer.exiting) return;
-            if (!ready) {
-                showToast('组件状态查询失败，请稍后重试');
-                return;
-            }
-        }
+        const request = {};
+        activePlayer.panelRequest = request;
+        activePlayer.panelLoading = ['interpolation', 'audio', 'subtitles', 'info'].includes(kind);
+        activePlayer.panelError = '';
+        presentPlayerPanel(activePlayer, kind, panelTrigger);
+        const current = () => player === activePlayer && !activePlayer.exiting
+            && activePlayer.panelRequest === request && activePlayer.panelKind === kind;
         if (kind === 'episodes') {
-            presentPlayerPanel(activePlayer, kind, panelTrigger);
             await loadPlayerEpisodes(activePlayer);
             return;
         }
-        if (kind === 'audio' || kind === 'subtitles') {
-            activePlayer.trackRefreshing = true;
-            try {
+        try {
+            if (kind === 'interpolation') {
+                if (!await refreshVideoComponents()) throw new Error('组件状态查询失败，请关闭面板后重试');
+            }
+            if (kind === 'audio' || kind === 'subtitles') {
                 const tracks = await nativeRequest(
                     'mediaStationTracks',
                     'tracks',
                     [activePlayer.card.id],
                     15000,
                 );
-                if (player !== activePlayer || activePlayer.exiting) return;
+                if (!current()) return;
                 applyPlaybackMetadataRefresh(activePlayer, tracks);
-            } catch (error) {
-                if (player === activePlayer && !activePlayer.exiting) showToast(friendlyError(error));
-                return;
-            } finally {
-                if (player === activePlayer) activePlayer.trackRefreshing = false;
             }
-        }
-        if (kind === 'info') {
-            try {
+            if (kind === 'info') {
                 const diagnostics = await nativeRequest(
                     'mediaStationFrameInterpolation',
                     'frame_interpolation_diagnostics',
                     ['frame_interpolation_diagnostics', activePlayer.card.id],
                     15000,
                 );
-                if (player !== activePlayer || activePlayer.exiting) return;
+                if (!current()) return;
                 activePlayer.loadInfo.frameInterpolation = diagnostics.active || null;
                 activePlayer.loadInfo.frameInterpolationDiagnostics = diagnostics.playback || {};
                 updateFrameInterpolationStatus(diagnostics.status);
-            } catch (error) {
-                console.error(`RTX frame interpolation diagnostics failed: ${friendlyError(error)}`);
-                if (!activePlayer.exiting) showToast(friendlyError(error));
+            }
+        } catch (error) {
+            if (current()) activePlayer.panelError = friendlyError(error);
+        } finally {
+            if (current()) {
+                activePlayer.panelLoading = false;
+                renderPlayerPanel();
+                positionPlayerPanel();
             }
         }
-        presentPlayerPanel(activePlayer, kind, panelTrigger);
     }
 
     function closePlayerPanel(restoreFocus = true) {
         if (!player?.panelKind && playerPanel.classList.contains('hidden')) return;
         playerPanel.classList.add('hidden');
-        if (player) { player.panelKind = ''; player.enhancementDraft = null; }
+        if (player) { player.panelKind = ''; player.enhancementDraft = null; player.panelRequest = null; player.panelLoading = false; player.panelError = ''; }
         refreshPlayerTools();
         if (restoreFocus && playerPanelTrigger?.isConnected) playerPanelTrigger.focus();
         playerPanelTrigger = null;
@@ -8100,30 +8139,9 @@
         }
     });
 
-    function wheelPixels(value, mode, pageSize) {
-        if (!Number.isFinite(value)) return 0;
-        if (mode === WheelEvent.DOM_DELTA_LINE) return value * 30;
-        if (mode === WheelEvent.DOM_DELTA_PAGE) return value * pageSize;
-        return value;
-    }
-
-    content.addEventListener('wheel', (event) => {
-        const row = event.target.closest?.('.media-row');
-        const deltaX = wheelPixels(event.deltaX, event.deltaMode, content.clientWidth);
-        const deltaY = wheelPixels(event.deltaY, event.deltaMode, content.clientHeight);
-        if (row) {
-            // Horizontal media row: keep native behavior, but steer vertical
-            // leftover deltas into the row's own horizontal scroll.
-            if ((event.shiftKey && deltaY) || (deltaX && Math.abs(deltaX) >= Math.abs(deltaY))) {
-                event.preventDefault();
-            }
-            return;
-        }
-        // Vertical main-content scrolling is left to the native Chromium
-        // engine. Custom rAF smoothing proved unstable in the CEF offscreen
-        // render path, so native scrolling with the SmoothScrolling feature
-        // is the reliable baseline.
-    }, { passive: false });
+    // Both axes use Chromium's native scrolling. A non-passive wheel listener
+    // here makes even vertical scrolling wait for the busy renderer thread.
+    // Horizontal rows already contain overscroll in CSS and need no JS veto.
 
     const rowScrollIdleTimers = new WeakMap();
     content.addEventListener('scroll', (event) => {

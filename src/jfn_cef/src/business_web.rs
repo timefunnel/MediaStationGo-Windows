@@ -88,20 +88,6 @@ pub fn jfn_web_init(layer: *mut JfnCefLayer) {
     let inner = unsafe { jfn_cef_layer_inner(layer) };
     install_handlers(layer, Arc::clone(&inner));
 
-    match crate::mediastation_runtime::restore_persisted_session_on_startup() {
-        Ok(true) => jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_INFO,
-            "MediaStation native session restored from Windows Credential Manager",
-        ),
-        Ok(false) => {}
-        Err(code) => jfn_logging::log(
-            jfn_logging::CATEGORY_CEF,
-            jfn_logging::LEVEL_ERROR,
-            &format!("MediaStation native session restore failed: code={code}"),
-        ),
-    }
-
     *INSTANCE.lock() = Some(WebState {
         layer: inner,
         was_fullscreen_before_osd: false,

@@ -25,6 +25,59 @@ static std::vector<unsigned char> read(ID3D11Device *device, ID3D11DeviceContext
     for (unsigned y = 0; y < desc.Height; ++y) memcpy(result.data() + y * desc.Width * 4, static_cast<unsigned char *>(mapped.pData) + y * mapped.RowPitch, desc.Width * 4);
     context->Unmap(staging.Get(), 0); return result;
 }
+// Reuse the same input allocations across changing pairs, as the playback bridge
+// does. A fresh session for each pair provides an independent cache baseline.
+static bool vfg_pairs(nvvideo_config config, ID3D11Texture2D *first,
+                      ID3D11Texture2D *second, ID3D11Texture2D *output) {
+    config.multiplier = config.multiplier ? 4 : 0;
+    const unsigned shifts[][2] = {{0, 12}, {12, 48}, {48, 54}, {54, 30}};
+    for (unsigned quality : {0u, 1u, 2u}) {
+        config.vfg_quality = quality;
+        char error[512]{};
+        std::vector<std::vector<unsigned char>> expected;
+        // Finish all reference sessions before the uninterrupted playback run.
+        for (unsigned phase = 0; phase < 2; phase++) {
+            auto session = phase ? nvvideo_create(&config, error, sizeof(error)) : nullptr;
+            if (phase && !session) { std::fprintf(stderr, "VFG pair create: %s\n", error); return false; }
+            bool ok = true;
+            unsigned pair = 0;
+            for (const auto &shift : shifts) {
+                if (!phase) session = nvvideo_create(&config, error, sizeof(error));
+                if (!session) { std::fprintf(stderr, "VFG reference create: %s\n", error); ok = false; break; }
+                auto a = pixels(shift[0]), b = pixels(shift[1]);
+                config.context->UpdateSubresource(first, 0, nullptr, a.data(), 640 * 4, 0);
+                config.context->UpdateSubresource(second, 0, nullptr, b.data(), 640 * 4, 0);
+                for (unsigned index = 1; index <= 3; index++) {
+                    int ran = config.multiplier
+                        ? nvvideo_process(session, first, second, output, index, error, sizeof(error))
+                        : nvvideo_process_timestep(session, first, second, output, index, 0.25f * index, error, sizeof(error));
+                    if (!ran) { std::fprintf(stderr, "VFG pair run: %s\n", error); ok = false; break; }
+                    auto actual = read(config.device, config.context, output);
+                    if (actual.empty()) { std::fprintf(stderr, "VFG pair readback failed\n"); ok = false; break; }
+                    if (!phase) { expected.push_back(std::move(actual)); continue; }
+                    const auto &baseline = expected[pair * 3 + index - 1];
+                    if (actual.size() != baseline.size()) { std::fprintf(stderr, "VFG pair dimensions changed\n"); ok = false; break; }
+                    unsigned max_error = 0;
+                    for (size_t j = 0; j < actual.size(); j++)
+                        max_error = (std::max)(max_error, unsigned(std::abs(int(actual[j]) - int(baseline[j]))));
+                    if (max_error > 1) {
+                        std::fprintf(stderr, "VFG_PAIR_CACHE_FAIL multiplier=%u quality=%u pair=%u index=%u max-error=%u\n",
+                            config.multiplier, quality, pair, index, max_error);
+                        ok = false; break;
+                    }
+                }
+                if (!phase) { nvvideo_destroy(session); session = nullptr; }
+                if (!ok) break;
+                pair++;
+            }
+            nvvideo_destroy(session);
+            if (!ok) return false;
+        }
+        std::printf("VFG_PAIR_CACHE_OK multiplier=%u quality=%u pairs=4 outputs=12 fresh-session-max-error<=1\n",
+            config.multiplier, quality);
+    }
+    return true;
+}
 int wmain(int argc, wchar_t **argv) {
     if (argc != 5) { std::fprintf(stderr, "Usage: test_video_enhancement vsr-dir vfg-dir cache-dir nr-dir\n"); return 2; }
     ComPtr<IDXGIFactory1> factory; if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -63,6 +116,11 @@ int wmain(int argc, wchar_t **argv) {
         if (!test_mode && result == early) { std::fprintf(stderr, "VFG explicit timesteps produced identical outputs\n"); return 15; }
         if (!test_mode) std::puts("VFG_TIMESTEP_GPU_OK t=0.25/0.5/0.75 distinct-output");
         std::printf("NATIVE_VIDEO_GPU_OK mode=%u output=%ux%u bytes=%zu real-sdk-runs=6\n", mode, desc.Width, desc.Height, result.size());
+        if (mode == 2) {
+            if (!vfg_pairs(config, first.Get(), second.Get(), output.Get())) return 17;
+            context->UpdateSubresource(first.Get(), 0, nullptr, a.data(), 640 * 4, 0);
+            context->UpdateSubresource(second.Get(), 0, nullptr, b.data(), 640 * 4, 0);
+        }
         if (mode == 3) {
             size_t changed = 0; unsigned long long difference = 0;
             for (size_t j = 0; j < result.size(); j++) if (j % 4 != 3) { const auto delta = static_cast<unsigned>(std::abs(int(result[j]) - int(b[j]))); changed += delta != 0; difference += delta; }

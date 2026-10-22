@@ -1,5 +1,128 @@
 # Windows 视频组件管理与接入
 
+2026-10-22 后续整合：用户已授权首页修复与以下 VFG/播放面板改动一起交付本机。
+首页修复、最终 EXE/视频桥校验及回滚位置见 [首页启动修复](windows-home-startup.md)。
+下面的已安装/未安装、回滚描述均为各阶段记录，当前交付以该文档及安装审计为准。
+
+## 2026-10-22 VFG 交互延迟与同步修复
+
+用户补充问题集中在操作栏二级面板及后续操作、弹幕卡顿，并确认修复。当前安装桥
+已经因黑屏回滚至 `11050f90...`；下方 `53d16027...` 安装记录仅代表此前阶段，
+不是本次修复后的已安装状态。本次保留 RIFE、档位、自动目标规划、音频速率和刷新率。
+
+实现：
+
+- 面板先呈现明确的读取状态，再等待音轨、组件或播放诊断。关闭/切换面板会使旧请求
+  失效；同类面板重开也不会被旧响应覆盖。失败显示原错误，不使用缓存伪装查询成功。
+- 播放诊断中的同步 mpv 属性查询在独立工作线程执行，通过既有响应派发返回 CEF；
+  线程启动失败显式报错。音轨和增强应用继续复用原有处理链。
+- VFG 为 SDR 输入创建会话自有 D3D11 纹理，HDR 复用自身转换纹理；三份纹理只在
+  创建/销毁会话时注册/注销 CUDA。每个新帧对上传后重绑两路 SDK 输入并重置
+  `ShotChange=0`，同帧对后续样本不重复上传。纯 CUDA 推理不持有 D3D11 上下文锁；
+  输入/输出拷贝、map/unmap 和完成同步仍在隔离上下文内。其他 provider 保持完整隔离。
+- 同步更新 `resources/win/video-bridge/video_enhancement.dll`：标准打包最后会用
+  此预编译桥覆盖 mpv 目录中的桥，仅修改 C++ 或中间 DLL 不会进入最终产品。ABI 仍为 5。
+
+失败候选：最初把 CUDA map/unmap 也放到上下文锁外，640×360 GPU 对照通过，但
+4K mpv 多线程播放出现 CUDA map `0x3e7` 和 `DXGI_ERROR_DEVICE_HUNG`。该候选废弃，
+未更新用户安装目录。恢复 map/unmap 隔离后，再仅释放纯 CUDA 推理阶段的锁。
+日志为 `build/vfg-latency-4k25/`，稳定中间检查为 `build/vfg-latency-locked-4k25/`。
+
+最终验证（RTX 5070 Ti / 596.49 / 152 Hz，VFG Medium）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 4K25 → 50.666667 fps，预热 5 秒 + 60 秒 | SDK 均值/最大 6.813/23.098 ms；内部音画偏差 P99/最大 13.994/14.039 ms |
+| 4K25 → 76 fps，预热 5 秒 + 60 秒 | SDK 均值/最大 6.557/14.246 ms；内部音画偏差 P99/最大 14.817/14.845 ms |
+| 上述两组播放控制 | 播放/解码丢帧、mistimed/delayed 为零；音视频速度修正均为 1；暂停/跳转及字幕验证通过 |
+| SDR/PQ/HLG 自动输出 | 源/输出结束均为 4 秒，seek/EOF 通过；SDR 音轨切换、暂停跳转、内嵌/外挂字幕通过 |
+| 连续帧对 GPU 对照 | Low/Medium/High，固定倍率/任意 timestep，72 个输出与每对新会话参考逐分量误差 ≤1；HDR 三 provider 检查通过 |
+| CEF + 4K25 VFG，窗口/全屏各 65 秒 | 排除前 5 秒后，弹幕源回调 151.791/152.021 FPS，间隔 P99 8.5/8.2 ms；24 次信息面板打开及倍速选项操作通过 |
+| 面板时延 | 信息面板同步建立读取状态，下一次 rAF 最慢 40.6/5.9 ms；诊断查询连同后续选项操作最慢 68.7/70.0 ms；倍速选项操作 0.4–1.4 ms |
+
+联合测试使用正式 CEF 内的面板处理函数、原生诊断 IPC 和当前弹幕渲染器，播放本地
+合成片及 WASAPI 静音音轨；通过调试器导出局部处理函数并设置测试 player，不使用
+真实账号播放加载。只对比本任务相关的嵌入 JS 函数，工作区并行存在其他首页修改。
+播放端累计掉帧为 8/4（包含初始化，未采样起始计数），不能称为稳定阶段零掉帧。
+桌面 DXGI 采样未能读到有效弹幕标记，**上屏验证未通过**；后续 CEF-only 采样明确
+记录 `presentationCapture=false`，不把 rAF、内部时钟或界面 DOM 状态当作实际显示延迟。
+原片随机回退仍未复现，重绑符合 SDK 合同，但尚不能认定是回退的唯一根因。
+
+新增 `dev/windows/test_player_panel_async.cjs` 覆盖延迟回复、关闭、切换、同类重开、
+查询失败及组件失败；组件/插帧/弹幕 JS 回归、真实浏览器参数面板检查及 110 项 CEF
+Rust 单测通过（4 项依赖外部环境的测试忽略）。严格 Clippy 被 HEAD 已有的
+`collapsible_if` 一处和 `redundant_closure` 两处阻挡，未修改无关实现。
+仅放行这两类既有 lint 的 scoped Clippy 通过。最终随包 DLL 单独重新执行 SDR 连续帧对
+及 PQ/HLG 三 provider GPU 检查通过，记录在 `vfg-latency-packaged-gpu.log`。
+
+复现命令及证据：
+
+```powershell
+node dev/windows/test_player_panel_async.cjs
+./dev/windows/build_video_enhancement.ps1 -TestGpu
+./dev/windows/test_video_enhancement.ps1 -AutoOnly
+./dev/windows/test_vfg_cadence.ps1 -SourceSize 3840x2160 -SourceRate 25 -Quality 1 -VideoSync display-vdrop -Seconds 60 -ExerciseControls -ResultDirectory build/vfg-latency-final-4k25
+./dev/windows/build.ps1
+```
+
+`build/video-enhancement/vfg-latency-{final-gpu,native-auto,rust-tests,clippy}.log`、
+`build/vfg-latency-final-4k25/{manifest.json,divisor-*-summary.json}` 和
+`build/vfg-ui-latency/cef-only-{summary.json,*-manifest.json,*-source.json}` 保存原始结果。
+联合测试的 `run.cjs`、`prepare.cjs` 和 `summarize.cjs` 保留复核方法；测试进程、媒体和
+临时 config/cache/engine 已清理。最终标准构建及随包桥 hash 见
+`build/video-enhancement/vfg-latency-final-audit.json`。未替换用户安装目录、提交、推送或发布。
+
+## 2026-10-22 VFG 帧对切换检查与本机修正
+
+用户报告开启 VFG 后画面随机抽搐回退，暂时无法定位片段。只排查并修正 VFG
+帧对通知，未改 RIFE、音频速率、刷新率、用户档位或自动帧率策略。
+
+- 实际安装目录为 `D:\softwares\MediaStationGo`。原视频桥与本地构建 SHA-256
+  均为 `11050f90014de9ba477d2c9678f7b1de5138465dbe4a90501dabdc3e822330d7`。
+  用户保存的选择为 VFG Medium、自动倍率、切镜检测开启，VSR/NR 关闭。
+  本机日志 21:07–21:21 显示 4K / 25 fps 在 152 Hz 下自动规划 50.666667 fps；
+  21:08:05 和 21:08:26 有音画不同步警告，不能据此判断画面内容是否倒退。
+- `video_enhancement.cpp` 原来只在初始化时绑定 `SrcImage0/1`。现在每次
+  `index == 1` 上传新输入后重新绑定两个图像，同一帧对后续样本保持绑定。
+  [NVIDIA 官方示例固定版本的 628–632 行](https://github.com/NVIDIA-Maxine/VFX-SDK-Samples/blob/52011f89c1741d06b40ea312af1f20be8be9ec62/apps/VideoFrameGenerationEffectApp/VideoFrameGenerationEffectApp.cpp#L628-L632)
+  明确要求即使缓冲地址不变也必须在每个新帧对重绑。新增调用沿用现有显式错误处理，
+  不回退、不改原生 ABI 或组件包。
+- GPU 新增固定 4 倍/任意 timestep、Low/Medium/High、四个变速/反向帧对的
+  72 个逐输出对照。参考会话全部结束后才运行连续会话，复用同一组输入分配；
+  与每对新建会话的基线逐分量最大差不超过 1。**旧桥也通过该合成对照**，
+  所以这只能验证更改后的连续帧对处理，不能当作已复现并修复随机回退的证据。
+- `build_video_enhancement.ps1 -TestGpu` 的时钟、三类 provider、PQ/HLG 数值检查
+  通过；`test_video_enhancement.ps1 -AutoOnly` 的 SDR/PQ/HLG 原生 seek/EOF 和
+  时间轴通过，SDR 的切音轨、内嵌/外挂字幕、暂停跳转通过。最大音画偏差分别约
+  0.2 / 0.0 / 0.0 ms，均为短合成源的内部时钟检查。
+- 基准脚本新增可选 `-SourceRate 25`，默认仍为 `24000/1001`。RTX 5070 Ti /
+  596.49 / 152 Hz，3840×2160 / 25 fps / Medium / display-vdrop，预热 5 秒、
+  各采样 15 秒、WASAPI 静音时钟，50.666667 / 76 fps 的 SDK 平均耗时为
+  6.997 / 5.974 ms，最大 13.468 / 14.309 ms；播放端掉帧为 1 / 0，解码掉帧
+  均为零，延迟帧为 1 / 0，音画偏差 P99 为 19.887 / 2.753 ms，音视频速率修正
+  均为零。前者仍有调度异常；短测不能证明 76 fps 始终更稳，也不是物理上屏测量。
+
+复现命令：
+
+```powershell
+./dev/windows/build_video_enhancement.ps1 -TestGpu
+./dev/windows/test_video_enhancement.ps1 -AutoOnly
+./dev/windows/test_vfg_cadence.ps1 -SourceSize 3840x2160 -SourceRate 25 -Quality 1 -VideoSync display-vdrop -Seconds 15 -ResultDirectory build/vfg-pair-4k25-medium
+```
+
+证据为 `build/video-enhancement/vfg-pairs-{before,after}.log`、
+`vfg-pair-playback.log`、`vfg-pair-install-audit.json` 和
+`build/vfg-pair-4k25-medium/{manifest.json,divisor-*-summary.json}`。
+测试媒体、测试进程和临时缓存已清理，保留测量日志与回滚产物。
+
+确认播放器全部退出后，将新桥复制到标准 `build/video_enhancement.dll`、
+`third_party/mpv-install/lib/video_enhancement.dll` 和安装目录，逐一校验 SHA-256 为
+`53d1602726d3bf4a1dd6549e441c4b146229e3167d51ea8e9d5a5c8bb510c5a7`。
+旧桥保存在 `build/video-enhancement/vfg-pair-rollback/video_enhancement.dll`。
+未重新编译 EXE、启动用户播放器、提交、推送或发布；下次启动加载新桥，实际随机
+回退是否消失仍待观察。若继续出现，应采集同一片段的输入/生成帧及呈现 PTS，
+区分 SDK 生成伪影、切镜行为与呈现调度，不静默降档或改变目标帧率。
+
 2026-10-11，分支 `codex/mediastation-windows-spike`，本地实现与验证记录。
 
 侧栏新增“组件管理”，原设置中的 RIFE 安装、卸载、待安装取消与重启确认均迁入。

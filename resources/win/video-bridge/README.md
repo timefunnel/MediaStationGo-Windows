@@ -18,8 +18,9 @@ instead of being rebuilt in CI.
 | Build date | 2026-10-22 |
 | SDK | `third_party/video-enhancement-deps/RTX-Video-SDK-1.1.0` |
 | Sources | `dev/windows/mpv/video_enhancement.cpp`, `dev/windows/mpv/nr_adapter.cpp` |
-| Source commit | `364e5ca` (unchanged since) |
-| `video_enhancement.dll` SHA-256 | `11050f90014de9ba477d2c9678f7b1de5138465dbe4a90501dabdc3e822330d7` |
+| Video bridge source | Git blob `4af3bb9024abe32cdc278c7c4a5c116d9c96d845` (`dev/windows/mpv/video_enhancement.cpp`) |
+| NR adapter source | `364e5ca` (unchanged since) |
+| `video_enhancement.dll` SHA-256 | `97ffb5fe4d9d8a61ddc28cb0cfe411234fc6bc0661bee54a9b4bfdec41a9808a` |
 | `nvngx.dll` SHA-256 | `817b413833e96994e7152b0277ab63344ae4a7fc73453c3d04180cf0b8291673` |
 
 `NVIDIA_RTX_Video_SDK_License.pdf` is the SDK notice shipped in the release
