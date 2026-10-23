@@ -617,7 +617,7 @@
             updateDanmakuReference(event);
             danmakuRenderer.load(event, player.positionMs, player.playing, playerPlaybackRate);
         } else if (event.kind === 'status' && player?.card?.id === event.mediaId) {
-            showPlayerFeedback(event.message || '弹幕加载失败', 6000);
+            console.info('MediaStation danmaku status:', event.message);
         }
     }
 

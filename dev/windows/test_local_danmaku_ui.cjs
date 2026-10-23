@@ -15,12 +15,13 @@ const byId = id => {
 };
 const programs = [0, 1].map(index => ({ source: 'tencent', animeTitle: `候选节目${index}`, type: 'tv',
     episodes: [{ episodeUrl: `https://v.qq.com/x/cover/test/episode${index}.html`, episodeTitle: '第二集', episodeNumber: 2 }] }));
-const calls = [], feedback = [], storage = new Map(), syncCalls = [];
+const calls = [], feedback = [], loads = [], statuses = [], storage = new Map(), syncCalls = [];
 let persistence = 'server_extension';
 const context = vm.createContext({ byId, player: { card: { id: 'item' }, positionMs: 0 },
     Option: function (text, value) { this.text = text; this.value = String(value); },
     danmakuReferenceContext: null, danmakuPrograms: [], danmakuReferenceEditing: false, danmakuSearchRequest: 0,
-    danmakuRenderer: { clear() {}, load() {} }, playerPlaybackRate: 1,
+    danmakuRenderer: { clear() {}, load: event => loads.push(event) }, playerPlaybackRate: 1,
+    console: { info: (...args) => statuses.push(args) },
     danmakuSyncEnabled: true, danmakuSyncSettingKey: 'sync',
     window: { localStorage: { setItem: (key, value) => storage.set(key, value) }, jmpNative: { playerSetDanmakuSync: value => syncCalls.push(value) } },
     showPlayerFeedback: text => feedback.push(text), friendlyError: error => error.message,
@@ -40,6 +41,19 @@ vm.runInContext(source.slice(start, end), context);
 const click = id => byId(id).click({ currentTarget: byId(id) });
 
 (async () => {
+    const automaticLoad = { kind: 'load', mediaId: 'item', taskId: '7',
+        comments: [{ text: '测试弹幕', time: 0, mode: 1, color: 0xFFFFFF }] };
+    context.handleDanmakuEvent({ kind: 'context', mediaId: 'item', taskId: '7', target: { title: '测试影片' } });
+    context.handleDanmakuEvent(automaticLoad);
+    assert.equal(loads[0], automaticLoad, 'automatic success still reaches the renderer');
+    assert.equal(feedback.length, 0, 'automatic context and successful loading stay quiet');
+    const messages = ['未找到唯一准确的弹幕节目', '本地弹幕匹配或下载超时', '弹幕已加载，跨设备同步失败'];
+    for (const message of messages) context.handleDanmakuEvent({ kind: 'status', mediaId: 'item', message });
+    assert.equal(feedback.length, 0, 'automatic fetch outcomes never show player feedback');
+    assert.deepEqual(statuses.map(args => args[1]), messages, 'automatic statuses remain available in logs');
+    context.handleDanmakuEvent({ kind: 'status', mediaId: 'other-item', message: '过期任务' });
+    assert.equal(statuses.length, messages.length, 'another item cannot report status for this playback');
+
     context.handleDanmakuEvent({ kind: 'context', mediaId: 'item', playSessionId: 'play-1', taskId: '8', revision: '3',
         target: { title: '当前节目', episode: 2 }, association: { source: 'iqiyi',
             episode_url: 'https://www.iqiyi.com/v_test.html', anime_title: '当前节目', episode_title: '第二集', offset_seconds: 2 } });
