@@ -176,6 +176,7 @@
         ? 'system'
         : 'direct';
     let activeSettingsSection = 'appearance';
+    let uiThemeTransition = null;
     let proxySettingsStatus = { state: '', text: '' };
     let appUpdateState = { status: 'idle', payload: {} };
     let automaticUpdateTimer = 0;
@@ -4658,6 +4659,52 @@
         }
     }
 
+    async function toggleUiTheme() {
+        if (uiThemeTransition) return;
+        const root = document.documentElement;
+        const theme = root.dataset.uiTheme === 'dark' ? 'light' : 'dark';
+        if (prefersReducedMotion() || typeof document.startViewTransition !== 'function') {
+            applyUiTheme(theme, true);
+            return;
+        }
+        const button = byId('theme-toggle');
+        const bounds = button.getBoundingClientRect();
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        const x = bounds.left + bounds.width / 2;
+        const y = bounds.top + bounds.height / 2;
+        const radius = Math.hypot(Math.max(x, width - x), Math.max(y, height - y)) + 2;
+        // Percentages keep snapshot coordinates aligned at fractional Windows display scales.
+        const center = `${x / width * 100}% ${y / height * 100}%`;
+        const radiusPercent = radius / (Math.hypot(width, height) / Math.SQRT2) * 100;
+        const collapsed = `circle(0% at ${center})`;
+        const expanded = `circle(${radiusPercent}% at ${center})`;
+        button.setAttribute('aria-disabled', 'true');
+        root.dataset.uiThemeTransition = 'active';
+        root.style.setProperty('--ui-theme-reveal-start', collapsed);
+        try {
+            uiThemeTransition = document.startViewTransition(() => applyUiTheme(theme, true));
+            await Promise.all([
+                uiThemeTransition.finished,
+                uiThemeTransition.ready.then(() => root.animate({ clipPath: [collapsed, expanded] }, {
+                    duration: 600,
+                    easing: 'cubic-bezier(.4,0,.2,1)',
+                    fill: 'both',
+                    pseudoElement: '::view-transition-new(root)',
+                })),
+            ]);
+        } catch (error) {
+            uiThemeTransition?.skipTransition();
+            console.error(`MediaStation UI theme transition failed: ${error}`);
+            showToast('主题切换动效未完成');
+        } finally {
+            delete root.dataset.uiThemeTransition;
+            root.style.removeProperty('--ui-theme-reveal-start');
+            button.removeAttribute('aria-disabled');
+            uiThemeTransition = null;
+        }
+    }
+
     function setProxySettingsStatus(state, text) {
         proxySettingsStatus = { state, text };
         const status = byId('settings-proxy-status');
@@ -7559,7 +7606,7 @@
     });
     narrowSidebar.addEventListener('change', updateSidebarToggle);
     updateSidebarToggle();
-    byId('theme-toggle').addEventListener('click', () => applyUiTheme(document.documentElement.dataset.uiTheme === 'dark' ? 'light' : 'dark', true));
+    byId('theme-toggle').addEventListener('click', toggleUiTheme);
     byId('player-seek-back').addEventListener('click', () => { seekBy(-10000); showPlayerFeedback('−10 秒', 750); showPlayerControls(); });
     byId('player-seek-forward').addEventListener('click', () => { seekBy(10000); showPlayerFeedback('+10 秒', 750); showPlayerControls(); });
     byId('player-next').addEventListener('click', async () => {

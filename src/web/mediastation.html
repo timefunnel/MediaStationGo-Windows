@@ -97,7 +97,12 @@
       <span id="view-title" class="view-title">首页</span>
       <div class="top-actions">
         <form id="topbar-search" class="search-entry" role="search"><span class="search-glyph" aria-hidden="true"></span><input id="search-open" type="search" placeholder="搜索你的媒体库…" aria-label="搜索媒体库" data-focus-key="top:search"></form>
-        <button id="theme-toggle" class="icon-button" type="button" title="切换主题" aria-label="切换主题"><svg class="shell-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z"/></svg></button>
+        <button id="theme-toggle" class="icon-button" type="button" title="切换主题" aria-label="切换主题">
+          <span class="theme-toggle-icon" aria-hidden="true">
+            <svg class="shell-icon theme-toggle-moon" viewBox="0 0 24 24" focusable="false"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></svg>
+            <svg class="shell-icon theme-toggle-sun" viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"/></svg>
+          </span>
+        </button>
       </div>
     </header>
     <main id="content" class="content" tabindex="-1"></main>
