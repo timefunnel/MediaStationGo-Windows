@@ -4668,11 +4668,40 @@
         }
     }
 
-    function applyUiTheme(theme, persist = false) {
-        const selected = validUiTheme(theme) ? theme : 'light';
-        document.documentElement.dataset.uiTheme = selected; document.documentElement.style.colorScheme = selected;
+    function syncUiThemeTitlebar() {
         const titlebarColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
         if (titlebarColor && window.jmpNative?.themeColor) window.jmpNative.themeColor(titlebarColor);
+    }
+
+    function animateUiThemeTitlebar(reveal, from, to, { x, y, width, radius }) {
+        const channels = (color) => [1, 3, 5].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16));
+        const start = channels(from);
+        const end = channels(to);
+        let lastColor = from;
+        let frame = 0;
+        const tick = () => {
+            const progress = reveal.effect.getComputedTiming().progress;
+            if (progress !== null) {
+                // DWM colors the whole titlebar; blend by how much of the top edge the reveal has reached.
+                const reach = Math.sqrt(Math.max(0, (radius * progress) ** 2 - y ** 2));
+                const coverage = (Math.min(width, x + reach) - Math.max(0, x - reach)) / width;
+                const color = `#${start.map((value, index) => Math.round(value + (end[index] - value) * coverage)
+                    .toString(16).padStart(2, '0')).join('')}`;
+                if (color !== lastColor) {
+                    window.jmpNative.themeColor(color);
+                    lastColor = color;
+                }
+            }
+            frame = window.requestAnimationFrame(tick);
+        };
+        frame = window.requestAnimationFrame(tick);
+        return () => window.cancelAnimationFrame(frame);
+    }
+
+    function applyUiTheme(theme, persist = false, syncTitlebar = true) {
+        const selected = validUiTheme(theme) ? theme : 'light';
+        document.documentElement.dataset.uiTheme = selected; document.documentElement.style.colorScheme = selected;
+        if (syncTitlebar) syncUiThemeTitlebar();
         byId('theme-toggle').title = selected === 'dark' ? '切换为浅色主题' : '切换为深色主题';
         byId('theme-toggle').setAttribute('aria-label', byId('theme-toggle').title);
         document.querySelectorAll('[data-ui-theme]').forEach((button) => {
@@ -4707,25 +4736,38 @@
         const radiusPercent = radius / (Math.hypot(width, height) / Math.SQRT2) * 100;
         const collapsed = `circle(0% at ${center})`;
         const expanded = `circle(${radiusPercent}% at ${center})`;
+        const previousColor = getComputedStyle(root).getPropertyValue('--bg').trim();
+        let reveal;
+        let stopTitlebarAnimation;
         button.setAttribute('aria-disabled', 'true');
         root.dataset.uiThemeTransition = 'active';
         root.style.setProperty('--ui-theme-reveal-start', collapsed);
         try {
-            uiThemeTransition = document.startViewTransition(() => applyUiTheme(theme, true));
+            uiThemeTransition = document.startViewTransition(() => applyUiTheme(theme, true, false));
             await Promise.all([
                 uiThemeTransition.finished,
-                uiThemeTransition.ready.then(() => root.animate({ clipPath: [collapsed, expanded] }, {
-                    duration: 600,
-                    easing: 'cubic-bezier(.4,0,.2,1)',
-                    fill: 'both',
-                    pseudoElement: '::view-transition-new(root)',
-                })),
+                uiThemeTransition.ready.then(() => {
+                    reveal = root.animate({ clipPath: [collapsed, expanded] }, {
+                        duration: 600,
+                        easing: 'cubic-bezier(.4,0,.2,1)',
+                        fill: 'both',
+                        pseudoElement: '::view-transition-new(root)',
+                    });
+                    if (window.jmpNative?.themeColor) {
+                        const nextColor = getComputedStyle(root).getPropertyValue('--bg').trim();
+                        stopTitlebarAnimation = animateUiThemeTitlebar(reveal, previousColor, nextColor, { x, y, width, radius });
+                    }
+                    return reveal.finished;
+                }),
             ]);
         } catch (error) {
             uiThemeTransition?.skipTransition();
             console.error(`MediaStation UI theme transition failed: ${error}`);
             showToast('主题切换动效未完成');
         } finally {
+            stopTitlebarAnimation?.();
+            reveal?.cancel();
+            syncUiThemeTitlebar();
             delete root.dataset.uiThemeTransition;
             root.style.removeProperty('--ui-theme-reveal-start');
             button.removeAttribute('aria-disabled');
