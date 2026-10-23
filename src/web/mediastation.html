@@ -386,7 +386,9 @@
   </dialog>
   <dialog id="app-update-dialog" class="app-update-dialog" aria-labelledby="app-update-dialog-title" aria-describedby="app-update-dialog-copy">
     <header><h2 id="app-update-dialog-title">应用更新</h2><button id="app-update-dialog-close" class="icon-button" type="button" aria-label="关闭">&#10005;</button></header>
-    <p id="app-update-dialog-copy">应用更新会关闭当前应用，是否继续？</p>
+    <p id="app-update-dialog-copy" role="status" aria-live="polite" tabindex="-1">应用更新会关闭当前应用，是否继续？</p>
+    <div id="app-update-dialog-progress" class="app-update-progress hidden" role="progressbar" aria-label="正在应用更新"><span></span></div>
+    <p id="app-update-dialog-hint" class="hidden">完成后会自动重新启动，无需重复操作。</p>
     <div class="app-update-dialog-actions"><button id="app-update-dialog-cancel" class="secondary-command" type="button">取消</button><button id="app-update-dialog-confirm" class="danger-command" type="button">确认更新</button></div>
   </dialog>
 

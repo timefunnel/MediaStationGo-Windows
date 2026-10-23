@@ -116,20 +116,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::copy(&icon_source, &icon_out)?;
         std::fs::copy(&manifest_source, &manifest_out)?;
         let icon_path = icon_out.to_string_lossy().replace('\\', "/");
-        let manifest_path = manifest_out.to_string_lossy().replace('\\', "/");
-        let expanded = template
-            .replace("@APP_VERSION_MAJOR@", &major.to_string())
-            .replace("@APP_VERSION_MINOR@", &minor.to_string())
-            .replace("@APP_VERSION_PATCH@", &patch.to_string())
-            .replace("@APP_VERSION_FILEFLAGS@", fileflags)
-            .replace("@APP_VERSION_FULL@", &version_full)
-            .replace("@ICON_PATH@", &icon_path)
-            .replace("@MANIFEST_PATH@", &manifest_path);
+        let expand_resource = |manifest: &std::path::Path| {
+            template
+                .replace("@APP_VERSION_MAJOR@", &major.to_string())
+                .replace("@APP_VERSION_MINOR@", &minor.to_string())
+                .replace("@APP_VERSION_PATCH@", &patch.to_string())
+                .replace("@APP_VERSION_FILEFLAGS@", fileflags)
+                .replace("@APP_VERSION_FULL@", &version_full)
+                .replace("@ICON_PATH@", &icon_path)
+                .replace(
+                    "@MANIFEST_PATH@",
+                    &manifest.to_string_lossy().replace('\\', "/"),
+                )
+        };
 
         let rc_out = out_dir.join("iconres.rc");
-        std::fs::write(&rc_out, expanded)?;
+        std::fs::write(&rc_out, expand_resource(&manifest_out))?;
 
-        embed_resource::compile(&rc_out, embed_resource::NONE).manifest_required()?;
+        embed_resource::compile_for(&rc_out, ["jellium-desktop"], embed_resource::NONE)
+            .manifest_required()?;
+
+        // Only the updater needs common controls v6 for its native marquee bar.
+        // Derive its manifest from the application's DPI/security settings.
+        let updater_manifest_out = out_dir.join("portable-updater.manifest");
+        let updater_manifest = std::fs::read_to_string(&manifest_source)?.replace(
+            "</assembly>",
+            r#"  <dependency><dependentAssembly>
+    <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+      version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+  </dependentAssembly></dependency>
+</assembly>"#,
+        );
+        std::fs::write(&updater_manifest_out, updater_manifest)?;
+        let updater_rc = out_dir.join("portable-updater.rc");
+        std::fs::write(&updater_rc, expand_resource(&updater_manifest_out))?;
+        embed_resource::compile_for(
+            &updater_rc,
+            ["mediastation-portable-updater"],
+            embed_resource::NONE,
+        )
+        .manifest_required()?;
 
         // Hide the console window for GUI launches. `/SUBSYSTEM:WINDOWS`
         // pairs with a `main`-style entrypoint via mainCRTStartup.

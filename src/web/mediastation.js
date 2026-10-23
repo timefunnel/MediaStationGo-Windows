@@ -1706,7 +1706,21 @@
             ? '正在校验...'
             : status === 'installing' ? '正在应用更新...' : `应用 ${displayAppVersion(payload.version)}`;
         installButton.classList.toggle('hidden', status !== 'ready' && !applying);
-        if (status !== 'ready' && dialog.open) closeAppUpdateDialog();
+        dialog.setAttribute('aria-busy', String(applying));
+        byId('app-update-dialog-title').textContent = applying ? '正在应用更新' : status === 'error' ? '更新失败' : '应用更新';
+        byId('app-update-dialog-copy').textContent = applying || status === 'error'
+            ? updateStatusText(status, payload)
+            : '应用更新会关闭当前应用，是否继续？';
+        byId('app-update-dialog-progress').classList.toggle('hidden', !applying);
+        byId('app-update-dialog-hint').classList.toggle('hidden', !applying);
+        byId('app-update-dialog-close').disabled = applying;
+        byId('app-update-dialog-cancel').disabled = applying;
+        byId('app-update-dialog-cancel').textContent = status === 'error' ? '关闭' : '取消';
+        byId('app-update-dialog-confirm').disabled = applying;
+        byId('app-update-dialog-confirm').classList.toggle('hidden', applying || status === 'error');
+        if (applying && !dialog.open) dialog.showModal();
+        if (status !== 'ready' && status !== 'error' && !applying && dialog.open) closeAppUpdateDialog();
+        if (status === 'error' && dialog.open) byId('app-update-dialog-cancel').focus();
     }
 
     function showAppUpdateDialog(trigger) {
@@ -1718,6 +1732,7 @@
     }
 
     function closeAppUpdateDialog() {
+        if (appUpdateState.status === 'verifying' || appUpdateState.status === 'installing') return;
         const dialog = byId('app-update-dialog');
         if (dialog.open) dialog.close();
         if (appUpdateDialogTrigger?.isConnected) appUpdateDialogTrigger.focus();
@@ -1729,10 +1744,14 @@
             closeAppUpdateDialog();
             return;
         }
-        closeAppUpdateDialog();
-        if (!window.jmpNative?.updateInstall) return;
+        if (!window.jmpNative?.updateInstall) {
+            appUpdateState = { status: 'error', payload: { message: '当前版本不支持应用更新' } };
+            refreshUpdateControls();
+            return;
+        }
         appUpdateState = { status: 'verifying', payload: appUpdateState.payload };
         refreshUpdateControls();
+        byId('app-update-dialog-copy').focus();
         window.jmpNative.updateInstall();
     }
 

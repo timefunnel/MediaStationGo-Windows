@@ -4,7 +4,11 @@ fn main() {
 }
 
 #[cfg(windows)]
+mod updater_progress;
+
+#[cfg(windows)]
 mod windows_updater {
+    use super::updater_progress::{self, Progress};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
@@ -85,7 +89,7 @@ mod windows_updater {
         let result = if restart_only {
             parse_restart_args(std::env::args_os().skip(2)).and_then(run_restart)
         } else {
-            run()
+            updater_progress::run(run)
         };
         if let Err(error) = result {
             let title = if restart_only {
@@ -161,7 +165,7 @@ mod windows_updater {
         Ok(())
     }
 
-    fn run() -> Result<(), String> {
+    fn run(progress: Progress) -> Result<(), String> {
         let args = parse_args(std::env::args_os().skip(1))?;
         let logger = Logger {
             path: args.log_file.clone(),
@@ -180,7 +184,7 @@ mod windows_updater {
 
         let archive = fs::canonicalize(&args.archive)
             .map_err(|error| format!("cannot resolve update archive: {error}"))?;
-        verify_archive(&archive, &args.expected_sha256)?;
+        verify_archive(&archive, &args.expected_sha256, &progress)?;
 
         let versions_parent = install_dir
             .parent()
@@ -202,7 +206,8 @@ mod windows_updater {
             .map_err(|error| format!("cannot create update workspace: {error}"))?;
 
         let prepared = (|| {
-            let extracted_files = extract_archive(&archive, &staging_root)?;
+            let extracted_files = extract_archive(&archive, &staging_root, &progress)?;
+            progress.stage("正在检查更新文件…");
             let new_files = read_manifest(&staging_root)?;
             require_package_files(&new_files)?;
             if extracted_files != new_files {
@@ -227,6 +232,7 @@ mod windows_updater {
             }
         };
 
+        progress.stage("正在等待应用关闭…");
         wait_for_parent(args.parent_pid)?;
         logger.line("main application exited; applying files");
         let applied = apply_update(
@@ -235,10 +241,13 @@ mod windows_updater {
             &backup_root,
             &current_files,
             &new_files,
+            &progress,
         )?;
 
+        progress.stage("正在重新启动…");
         let executable = install_dir.join(APP_EXECUTABLE);
         if let Err(error) = Command::new(&executable).current_dir(&install_dir).spawn() {
+            progress.stage("启动失败，正在还原原版本…");
             let rollback = rollback_update(&install_dir, &applied);
             return Err(match rollback {
                 Ok(()) => {
@@ -250,6 +259,7 @@ mod windows_updater {
             });
         }
 
+        progress.stage("正在清理更新文件…");
         if let Err(error) = fs::remove_dir_all(&workspace) {
             logger.line(&format!("warning: cannot remove update workspace: {error}"));
         }
@@ -341,7 +351,8 @@ mod windows_updater {
         Ok(())
     }
 
-    fn verify_archive(path: &Path, expected: &str) -> Result<(), String> {
+    fn verify_archive(path: &Path, expected: &str, progress: &Progress) -> Result<(), String> {
+        progress.stage("正在校验更新包…");
         let metadata = fs::metadata(path)
             .map_err(|error| format!("cannot inspect update archive: {error}"))?;
         if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_ARCHIVE_BYTES {
@@ -351,6 +362,7 @@ mod windows_updater {
             File::open(path).map_err(|error| format!("cannot open update archive: {error}"))?;
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 256 * 1024];
+        let mut verified = 0_u64;
         loop {
             let count = file
                 .read(&mut buffer)
@@ -359,6 +371,8 @@ mod windows_updater {
                 break;
             }
             digest.update(&buffer[..count]);
+            verified += count as u64;
+            progress.fraction("正在校验更新包…", verified, metadata.len());
         }
         let actual = digest
             .finalize()
@@ -371,7 +385,12 @@ mod windows_updater {
         Ok(())
     }
 
-    fn extract_archive(path: &Path, staging_root: &Path) -> Result<BTreeSet<String>, String> {
+    fn extract_archive(
+        path: &Path,
+        staging_root: &Path,
+        progress: &Progress,
+    ) -> Result<BTreeSet<String>, String> {
+        progress.stage("正在解压更新文件…");
         let file =
             File::open(path).map_err(|error| format!("cannot open portable archive: {error}"))?;
         let mut archive = ZipArchive::new(file)
@@ -381,6 +400,17 @@ mod windows_updater {
         }
         let mut extracted = BTreeSet::new();
         let mut total_size = 0_u64;
+        for index in 0..archive.len() {
+            let entry = archive
+                .by_index(index)
+                .map_err(|error| format!("cannot read archive entry {index}: {error}"))?;
+            total_size = total_size
+                .checked_add(entry.size())
+                .filter(|size| *size <= MAX_EXTRACTED_BYTES)
+                .ok_or("portable archive expands beyond the allowed size")?;
+        }
+        let mut extracted_bytes = 0_u64;
+        let mut buffer = vec![0_u8; 256 * 1024];
         for index in 0..archive.len() {
             let mut entry = archive
                 .by_index(index)
@@ -401,12 +431,6 @@ mod windows_updater {
                     return Err(format!("unsupported archive entry type: {relative}"));
                 }
             }
-            total_size = total_size
-                .checked_add(entry.size())
-                .ok_or_else(|| "portable archive size overflow".to_string())?;
-            if total_size > MAX_EXTRACTED_BYTES {
-                return Err("portable archive expands beyond the allowed size".to_string());
-            }
             if !extracted.insert(relative.clone()) {
                 return Err(format!("duplicate archive entry: {relative}"));
             }
@@ -420,8 +444,19 @@ mod windows_updater {
                 .create_new(true)
                 .open(&destination)
                 .map_err(|error| format!("cannot create archive entry {relative}: {error}"))?;
-            std::io::copy(&mut entry, &mut output)
-                .map_err(|error| format!("cannot extract archive entry {relative}: {error}"))?;
+            loop {
+                let count = entry
+                    .read(&mut buffer)
+                    .map_err(|error| format!("cannot read archive entry {relative}: {error}"))?;
+                if count == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..count])
+                    .map_err(|error| format!("cannot extract archive entry {relative}: {error}"))?;
+                extracted_bytes += count as u64;
+                progress.fraction("正在解压更新文件…", extracted_bytes, total_size);
+            }
             output
                 .sync_all()
                 .map_err(|error| format!("cannot flush archive entry {relative}: {error}"))?;
@@ -537,7 +572,9 @@ mod windows_updater {
         backup_root: &Path,
         current_files: &BTreeSet<String>,
         new_files: &BTreeSet<String>,
+        progress: &Progress,
     ) -> Result<AppliedUpdate, String> {
+        progress.stage("正在检查安装目录…");
         preflight_targets(install_dir, current_files, new_files)?;
         fs::create_dir_all(backup_root)
             .map_err(|error| format!("cannot create update backup: {error}"))?;
@@ -551,9 +588,14 @@ mod windows_updater {
                 .union(new_files)
                 .cloned()
                 .collect::<BTreeSet<_>>();
+            let total = (affected.len() + new_files.len()) as u64;
+            let mut completed = 0;
+            progress.fraction("正在备份并替换文件…", completed, total);
             for relative in affected {
                 let target = install_dir.join(relative_path(&relative)?);
+                completed += 1;
                 if !target.exists() {
+                    progress.fraction("正在备份并替换文件…", completed, total);
                     continue;
                 }
                 let backup = backup_root.join(relative_path(&relative)?);
@@ -564,6 +606,7 @@ mod windows_updater {
                 fs::rename(&target, &backup)
                     .map_err(|error| format!("cannot back up {relative}: {error}"))?;
                 state.backed_up.push(relative);
+                progress.fraction("正在备份并替换文件…", completed, total);
             }
             for relative in new_files {
                 let source = staging_root.join(relative_path(relative)?);
@@ -578,10 +621,13 @@ mod windows_updater {
                 fs::rename(&source, &target)
                     .map_err(|error| format!("cannot install {relative}: {error}"))?;
                 state.installed.push(relative.clone());
+                completed += 1;
+                progress.fraction("正在备份并替换文件…", completed, total);
             }
             Ok(())
         })();
         if let Err(error) = result {
+            progress.stage("更新失败，正在还原原版本…");
             let rollback = rollback_update(install_dir, &state);
             return Err(match rollback {
                 Ok(()) => format!("{error}; update rolled back"),
@@ -718,6 +764,41 @@ mod windows_updater {
     mod tests {
         use super::*;
 
+        #[test]
+        fn progress_copy_preserves_large_archive_entries_and_checksum_validation() {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = temp.path().join("update.zip");
+            let payload = (0..800_000)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+            writer
+                .start_file(
+                    "nested/payload.bin",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(&payload).unwrap();
+            writer.finish().unwrap();
+            let digest = Sha256::digest(fs::read(&archive).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let progress = Progress::default();
+            verify_archive(&archive, &digest, &progress).unwrap();
+            assert!(verify_archive(&archive, &"0".repeat(64), &progress).is_err());
+            let staging = temp.path().join("staging");
+            let extracted = extract_archive(&archive, &staging, &progress).unwrap();
+            assert_eq!(
+                extracted,
+                ["nested/payload.bin".to_string()].into_iter().collect()
+            );
+            assert_eq!(
+                fs::read(staging.join("nested/payload.bin")).unwrap(),
+                payload
+            );
+        }
+
         fn restart_args(pid: &str, directory: &Path, extra: &[&str]) -> Vec<OsString> {
             let mut args = vec![
                 "--parent-pid".into(),
@@ -847,7 +928,15 @@ mod windows_updater {
                 .map(str::to_string)
                 .collect();
 
-            let applied = apply_update(&install, &staging, &backup, &current, &next).unwrap();
+            let applied = apply_update(
+                &install,
+                &staging,
+                &backup,
+                &current,
+                &next,
+                &Progress::default(),
+            )
+            .unwrap();
             assert_eq!(fs::read_to_string(install.join("app.exe")).unwrap(), "new");
             assert_eq!(
                 fs::read_to_string(install.join("new.dll")).unwrap(),

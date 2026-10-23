@@ -668,8 +668,13 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .app-update-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .app-update-dialog h2 { margin: 0; font-size: 18px; }
 .app-update-dialog p { margin: 16px 0 24px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.app-update-dialog p:focus { outline: none; }
 .app-update-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .app-update-dialog-actions button { min-width: 88px; }
+.app-update-progress { height: 8px; overflow: hidden; border-radius: 4px; background: var(--line); }
+.app-update-progress span { display: block; width: 40%; height: 100%; border-radius: inherit; background: var(--accent); animation: app-update-progress 1.4s ease-in-out -.35s infinite; }
+@keyframes app-update-progress { from { transform: translateX(-100%); } to { transform: translateX(350%); } }
+@media (prefers-reduced-motion: reduce) { .app-update-progress span { animation: none; transform: translateX(75%); } }
 
 /* 弹层：统一毛玻璃遮罩 + 主题色描边面板（完整简介、选择片源、删除账号）。 */
 .modal-scrim { position: fixed; z-index: 90; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(8, 7, 16, 0.46); backdrop-filter: blur(10px) saturate(125%); animation: scrim-in 180ms ease both; }

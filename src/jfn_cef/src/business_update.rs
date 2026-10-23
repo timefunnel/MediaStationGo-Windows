@@ -1439,9 +1439,9 @@ fn installer_update_command(path: &Path, install_dir: &Path) -> std::process::Co
     let mut directory = std::ffi::OsString::from("/DIR=");
     directory.push(install_dir);
     let mut command = std::process::Command::new(path);
-    // Hide the setup wizard while preserving installation error dialogs.
+    // Skip wizard prompts while keeping the installation progress window visible.
     command
-        .args(["/VERYSILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"])
+        .args(["/SILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"])
         .arg(directory);
     command
 }
@@ -1590,11 +1590,12 @@ mod tests {
         let command = installer_update_command(installer, install_dir);
         assert_eq!(command.get_program(), installer.as_os_str());
         let arguments: Vec<_> = command.get_args().collect();
-        for required in ["/VERYSILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"] {
+        for required in ["/SILENT", "/SP-", "/NORESTART", "/UPDATE=1", "/LOG"] {
             assert!(arguments.contains(&std::ffi::OsStr::new(required)));
         }
         assert!(arguments.contains(&std::ffi::OsStr::new(r"/DIR=D:\应用程序\Media Station Go")));
         assert!(!arguments.contains(&std::ffi::OsStr::new("/SUPPRESSMSGBOXES")));
+        assert!(!arguments.contains(&std::ffi::OsStr::new("/VERYSILENT")));
         assert!(!arguments.contains(&std::ffi::OsStr::new("/FORCECLOSEAPPLICATIONS")));
     }
 
