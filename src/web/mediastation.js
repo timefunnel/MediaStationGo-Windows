@@ -2283,7 +2283,6 @@
             subtitles: 'M3 5h18v14H3ZM6 10h4M14 10h4M6 14h12',
             audio: 'M9 17V5l10-2v12M9 5l10-2M9 17a3 3 0 1 1-3-3h3M19 15a3 3 0 1 1-3-3h3',
             speed: 'M4 18a9 9 0 1 1 16 0ZM12 14l5-5',
-            more: 'M5 12h.01M12 12h.01M19 12h.01',
             eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12ZM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6',
             close: 'm6 6 12 12M6 18 18 6',
             appearance: 'M12 3a9 9 0 1 0 0 18ZM12 3a9 9 0 0 1 0 18V3',
@@ -2296,9 +2295,7 @@
             restore: 'M3 8h5V3M16 3v5h5M21 16h-5v5M8 21v-5H3',
             interpolation: 'M8 4h8v16H8ZM4 7H2v10h2M20 7h2v10h-2',
             sparkles: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5ZM20 2v4M18 4h4',
-            sliders: 'M3 6h8m4 0h6M3 12h2m4 0h12M3 18h12m4 0h2M11 3v6M5 9v6M15 15v6',
             reset: 'M3 10V4m0 6h6M3 10a9 9 0 1 1 1 8',
-            danmaku: 'M3 4h18v13H9l-5 4v-4H3ZM6 8h12M6 12h8',
             info: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM12 11v6M12 7h.01',
         };
         const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -5510,7 +5507,6 @@
         byId('player-loading-meta').textContent = [card.type === 'Episode' ? episodePosition(card) : card.year,
             formatDuration(card.durationMs), card.dynamicRange,
             startMs > 0 ? '从 ' + formatTime(startMs) + ' 继续' : ''].filter(Boolean).join(' · ');
-        closePlayerMore(false);
         setPlayerPoster(card);
         setPlayerLoading(true, '正在准备播放');
         updatePlayerProgress();
@@ -6523,7 +6519,6 @@
         playback.setAttribute('aria-label', playback.title);
         byId('player-seek-back').disabled = !player?.started || exiting || episodeChanging || autoAdvancePending;
         byId('player-seek-forward').disabled = byId('player-seek-back').disabled;
-        byId('player-more').disabled = !info || exiting || episodeChanging || autoAdvancePending;
         const next = byId('player-next'); next.classList.toggle('hidden', player?.card?.type !== 'Episode');
         next.disabled = !info || !player?.started || exiting || episodeChanging || autoAdvancePending || player?.episodesLoading
             || (Array.isArray(player?.episodes) && !nextPlayerEpisode(player));
@@ -7111,8 +7106,6 @@
     }
 
     async function openPlayerPanel(kind, trigger) {
-        const panelTrigger = trigger?.closest('.player-more-menu') ? byId('player-more') : trigger;
-        closePlayerMore(false);
         closeDanmakuPanel();
         const activePlayer = player;
         if (!activePlayer?.loadInfo || activePlayer.trackChanging || activePlayer.exiting) return;
@@ -7125,7 +7118,7 @@
         activePlayer.panelRequest = request;
         activePlayer.panelLoading = ['interpolation', 'audio', 'subtitles', 'info'].includes(kind);
         activePlayer.panelError = '';
-        presentPlayerPanel(activePlayer, kind, panelTrigger);
+        presentPlayerPanel(activePlayer, kind, trigger);
         const current = () => player === activePlayer && !activePlayer.exiting
             && activePlayer.panelRequest === request && activePlayer.panelKind === kind;
         if (kind === 'episodes') {
@@ -7234,7 +7227,6 @@
         byId('player-loading-title').textContent = cardTitle(episode, true);
         byId('player-loading-meta').textContent = [episodePosition(episode),
             activePlayer.positionMs > 0 ? '从 ' + formatTime(activePlayer.positionMs) + ' 继续' : ''].filter(Boolean).join(' · ');
-        closePlayerMore(false);
         setPlayerPoster(episode);
         updatePlayerProgress();
         closePlayerPanel(false);
@@ -7494,7 +7486,7 @@
     }
 
     function hidePlayerControls() {
-        if (player?.panelKind || player?.buffering || !byId('player-more-menu').classList.contains('hidden')
+        if (player?.panelKind || player?.buffering
             || isDanmakuConfigurationActive() || playerControls.querySelector(':focus-visible')) return;
         playerControls.classList.remove('visible');
         playerControls.inert = true;
@@ -7533,7 +7525,7 @@
 
     function scheduleControlsHide() {
         window.clearTimeout(controlsTimer);
-        if (!player?.playing || !player.started || player.panelKind || player.buffering || player.exiting || !byId('player-more-menu').classList.contains('hidden') || isDanmakuConfigurationActive()) return;
+        if (!player?.playing || !player.started || player.panelKind || player.buffering || player.exiting || isDanmakuConfigurationActive()) return;
         controlsTimer = window.setTimeout(hidePlayerControls, 3000);
     }
 
@@ -7568,18 +7560,6 @@
     narrowSidebar.addEventListener('change', updateSidebarToggle);
     updateSidebarToggle();
     byId('theme-toggle').addEventListener('click', () => applyUiTheme(document.documentElement.dataset.uiTheme === 'dark' ? 'light' : 'dark', true));
-    function closePlayerMore(restoreFocus = false) {
-        const menu = byId('player-more-menu'); const wasOpen = !menu.classList.contains('hidden');
-        menu.classList.add('hidden'); byId('player-more').setAttribute('aria-expanded', 'false');
-        if (wasOpen && restoreFocus) byId('player-more').focus(); scheduleControlsHide();
-    }
-    byId('player-more').addEventListener('click', (event) => {
-        if (!player || player.exiting) return;
-        const menu = byId('player-more-menu'); const opening = menu.classList.contains('hidden');
-        closePlayerPanel(false); menu.classList.toggle('hidden', !opening);
-        byId('player-more').setAttribute('aria-expanded', String(opening)); showPlayerControls();
-        if (opening && event.detail === 0) menu.querySelector('button:not(:disabled):not(.hidden)')?.focus();
-    });
     byId('player-seek-back').addEventListener('click', () => { seekBy(-10000); showPlayerFeedback('−10 秒', 750); showPlayerControls(); });
     byId('player-seek-forward').addEventListener('click', () => { seekBy(10000); showPlayerFeedback('+10 秒', 750); showPlayerControls(); });
     byId('player-next').addEventListener('click', async () => {
@@ -7588,7 +7568,6 @@
         const next = nextPlayerEpisode(activePlayer);
         if (next) await switchPlayerEpisode(next); else if (!activePlayer.episodesError) showPlayerFeedback('已到最后一集');
     });
-    playerView.addEventListener('click', (event) => { if (!event.target.closest('.player-more-control')) closePlayerMore(false); });
     playerControls.addEventListener('focusin', () => showPlayerControls());
     playerControls.addEventListener('focusout', () => scheduleControlsHide());
     byId('brand-home').addEventListener('click', goHome);
@@ -7638,13 +7617,12 @@
         ['player-seek-back', 'back', ''], ['player-seek-forward', 'forward', ''],
         ['player-episodes', 'list', '选集'], ['player-speed', 'speed', '倍速'],
         ['player-subtitles', 'subtitles', '字幕'], ['player-audio', 'audio', '音轨'],
-        ['player-more', 'more', ''],
+        ['player-info', 'info', ''],
     ]) {
         const button = byId(id); button.replaceChildren(playerIcon(icon));
         if (label) button.append(element('span', 'player-tool-label', label));
     }
-    [['player-interpolation', 'sparkles'], ['player-danmaku', 'danmaku'], ['player-danmaku-settings', 'sliders'], ['player-danmaku-reset', 'reset']].forEach(([id, icon]) => byId(id).replaceChildren(playerIcon(icon)));
-    byId('player-info').replaceChildren(playerIcon('info'), element('span', 'player-tool-label', '播放信息'));
+    [['player-interpolation', 'sparkles'], ['player-danmaku-reset', 'reset']].forEach(([id, icon]) => byId(id).replaceChildren(playerIcon(icon)));
     byId('topbar-search').addEventListener('submit', (event) => {
         event.preventDefault();
         const query = byId('search-open').value;
@@ -7828,7 +7806,6 @@
     function openDanmakuPanel() {
         if (byId('player-danmaku-settings').disabled) return;
         closePlayerPanel(false);
-        closePlayerMore(false);
         danmakuControl.classList.add('is-open');
         byId('player-danmaku-panel').hidden = false;
         byId('player-danmaku-settings').setAttribute('aria-expanded', 'true');
@@ -8000,8 +7977,7 @@
         if (player) {
             if (event.key === 'Tab') {
                 showPlayerControls();
-                const scope = !playerPanel.classList.contains('hidden') ? playerPanel
-                    : !byId('player-more-menu').classList.contains('hidden') ? byId('player-more-menu') : playerControls;
+                const scope = !playerPanel.classList.contains('hidden') ? playerPanel : playerControls;
                 const focusable = [...scope.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)')]
                     .filter((node) => node.getClientRects().length && !node.closest('[inert]'));
                 if (focusable.length) {
@@ -8023,12 +7999,9 @@
                 togglePlayerDanmaku();
                 return;
             }
-            if ((event.key === 'Escape' || event.key === 'Backspace') && !byId('player-more-menu').classList.contains('hidden')) {
-                event.preventDefault(); closePlayerMore(true); return;
-            }
             const active = document.activeElement;
             if (event.key === 'Escape' && isDanmakuConfigurationActive()) { event.preventDefault(); closeDanmakuPanel(); scheduleControlsHide(); return; }
-            const toolButtons = [byId('player-playback'), byId('player-seek-back'), byId('player-seek-forward'), byId('player-next'), byId('player-more'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-danmaku-settings'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
+            const toolButtons = [byId('player-playback'), byId('player-seek-back'), byId('player-seek-forward'), byId('player-next'), byId('player-volume-toggle'), byId('player-speed'), byId('player-episodes'), byId('player-danmaku'), byId('player-danmaku-settings'), byId('player-subtitles'), byId('player-audio'), byId('player-interpolation'), byId('player-info'), byId('player-fullscreen')]
                 .filter((button) => !button.disabled && button.getClientRects().length > 0);
             if (!playerPanel.classList.contains('hidden')) {
                 if (active?.matches('input, select') && !['Escape', 'Backspace'].includes(event.key)) return;

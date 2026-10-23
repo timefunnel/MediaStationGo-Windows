@@ -18,6 +18,7 @@ const hook = `
         requests.push({operation,args});
         if(operation==='video_components_status') return components;
         if(operation==='frame_interpolation_set_model') return rifeStatus;
+        if(operation==='frame_interpolation_diagnostics') return {active:null,playback:{},status:rifeStatus};
         if(operation==='tracks') return tracks;
         if(operation!=='load') throw new Error('Unexpected fixture IPC: '+operation);
         if(loadOrder==='hold') await new Promise(resolve=>{releaseLoad=resolve;});
@@ -85,8 +86,26 @@ async function main() {
         assert.equal(await nativeCount('toggleFullscreen'), 1);
         await reset(); await page.mouse.click(640, 350); await page.mouse.click(640, bottom.y + 15); await page.waitForTimeout(470);
         assert.equal(await nativeCount('playerPause'), 0, 'entering controls cancels a pending stage click');
-        assert.equal(await page.locator('#player-more-menu button').count(), 1);
-        for (const id of ['player-danmaku', 'player-danmaku-settings', 'player-interpolation']) assert.equal(await page.locator('#' + id).isVisible(), true);
+        for (const id of ['player-danmaku', 'player-danmaku-settings', 'player-interpolation', 'player-info']) assert.equal(await page.locator('#' + id).isVisible(), true);
+        await page.locator('#player-info').click();
+        assert.equal(await page.locator('#player-panel-title').textContent(), '播放信息');
+        assert.equal(await page.evaluate(() => fixture.requests.filter(r => r.operation === 'frame_interpolation_diagnostics').length), 1, 'one click opens playback info');
+        assert.equal(await nativeCount('playerPause'), 0, 'info click never pauses playback');
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('#player-info').evaluate(node => node === document.activeElement), true, 'closing info restores toolbar focus');
+        await page.keyboard.press('Enter');
+        assert.equal(await page.locator('#player-panel').isVisible(), true, 'keyboard opens info directly');
+        await page.keyboard.press('Escape');
+        await page.screenshot({path:path.join(output,'player-toolbar.png')});
+        const danmaku = page.locator('#player-danmaku');
+        const wasEnabled = await danmaku.getAttribute('aria-pressed') === 'true';
+        assert.equal(await danmaku.locator('.player-icon-danmaku-on').isVisible(), wasEnabled);
+        assert.equal(await danmaku.locator('.player-icon-danmaku-off').isVisible(), !wasEnabled);
+        await danmaku.click();
+        assert.equal(await danmaku.locator('.player-icon-danmaku-on').isVisible(), !wasEnabled);
+        assert.equal(await danmaku.locator('.player-icon-danmaku-off').isVisible(), wasEnabled);
+        assert.equal(await nativeCount('playerSetDanmaku'), 1, 'toggle applies once');
+        await danmaku.click();
 
         const popup = page.locator('#player-danmaku-panel');
         await page.locator('#player-danmaku-settings').dispatchEvent('click');

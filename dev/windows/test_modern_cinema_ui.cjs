@@ -61,7 +61,6 @@ for (const name of ['togglePlayback', 'handlePlaybackEvent', 'showPlayerControls
     assert.ok(next >= 0, `missing function boundary after ${name}`);
     vm.runInContext(source.slice(start, start + 1 + next), context);
 }
-element('player-more-menu').classList.add('hidden');
 element('player-feedback').classList.add('hidden');
 function expire(delay) {
     const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
@@ -121,7 +120,7 @@ expire(3000);
 assert.equal(context.playerControls.inert, true);
 
 context.showPlayerControls();
-element('player-more-menu').classList.remove('hidden');
+context.player.panelKind = 'info';
 context.scheduleControlsHide();
 context.hidePlayerControls();
 assert.equal(context.playerControls.classList.contains('visible'), true);
@@ -132,7 +131,7 @@ context.player.seriesPlaybackSetting = { autoNext: true };
 context.handlePlaybackEvent({ kind: 'finished' });
 assert.equal(finishedPlayers, 1);
 assert.equal(episodeAdvances, 0);
-console.log('MODERN_CINEMA_PLAYER_UI_TEST_OK: native pause/play feedback expires; idle controls become inert; buffering, keyboard focus and menus retain controls; confirmed exit does not auto-advance');
+console.log('MODERN_CINEMA_PLAYER_UI_TEST_OK: native pause/play feedback expires; idle controls become inert; buffering, keyboard focus and panels retain controls; confirmed exit does not auto-advance');
 
 // Settings must survive direct loading renders as well as normal navigation.
 function handlerSource(name) {
