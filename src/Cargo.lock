@@ -2231,7 +2231,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jfn-cef"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "base64",
  "cef",
@@ -2260,18 +2260,18 @@ dependencies = [
 
 [[package]]
 name = "jfn-color"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "parking_lot",
 ]
 
 [[package]]
 name = "jfn-compositor-core"
-version = "1.0.9"
+version = "1.1.0"
 
 [[package]]
 name = "jfn-config"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "gethostname",
  "jfn-paths",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-danmaku"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "jfn-mpv",
  "tempfile",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-frame-interpolation"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-gpu-paint"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "ash",
  "nix",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-input"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "jfn-platform-abi",
  "jfn-playback",
@@ -2327,14 +2327,14 @@ dependencies = [
 
 [[package]]
 name = "jfn-jellyfin"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "jfn-linux-util"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "clap",
  "jfn-input",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-logging"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "nix",
  "parking_lot",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-macos"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cef",
  "jfn-cef",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-macos-sink"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "block2",
  "jfn-playback",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-mediastation"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "parking_lot",
  "serde_json",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-menu"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cosmic-text",
  "tiny-skia",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-mpris"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "jfn-mpv",
  "jfn-platform-abi",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-mpv"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "bindgen",
  "jfn-color",
@@ -2440,14 +2440,14 @@ dependencies = [
 
 [[package]]
 name = "jfn-paths"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "jfn-platform-abi"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cef",
  "libc",
@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-playback"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "jfn-mpv",
  "jfn-platform-abi",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-rust"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "clap",
  "embed-resource",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-wake-event"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "nix",
  "windows-sys 0.61.2",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-wayland"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cef",
  "error_reporter",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-windows"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cef",
  "jfn-compositor-core",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-windows-sink"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "jfn-mpv",
  "jfn-playback",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "jfn-x11"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "cef",
  "cursor-icon",
@@ -5343,7 +5343,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cargo-lock",
