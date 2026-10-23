@@ -48,6 +48,10 @@ const hook = `
 `;
 assert.equal(source.split('    initialize();').length, 2, 'one initialization boundary');
 const script = source.replace('    initialize();', hook);
+async function choose(page, key, value) {
+    await page.locator(`[data-enhancement-key="${key}"]`).click();
+    await page.locator(`#player-enhancement-${key}-options [role="option"][value="${value}"]`).click();
+}
 async function main() {
     fs.mkdirSync(output, { recursive: true });
     const browser = await chromium.launch({ executablePath: process.env.VIDEO_UI_CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
@@ -105,19 +109,36 @@ async function main() {
         const apply = page.getByRole('button', { name: '应用', exact: true });
         await apply.waitFor(); assert.equal(await apply.isDisabled(), true);
         await page.locator('[data-enhancement-key=backend][value=nvidia-vfg]').check();
-        await page.locator('[data-enhancement-key=multiplier]').selectOption('3');
+        assert.equal(await page.locator('.enhancement-settings select').count(), 0, 'enhancement choices never enter the native select popup path');
+        const multiplier = page.locator('[data-enhancement-key=multiplier]');
+        assert.equal(await multiplier.textContent(), '刷新率自适应');
+        assert.deepEqual(await page.locator('#player-enhancement-multiplier-options [role=option]').allTextContents(), ['刷新率自适应', '2 倍', '3 倍']);
+        await multiplier.focus(); await page.keyboard.press('ArrowDown');
+        assert.equal(await multiplier.getAttribute('aria-expanded'), 'true');
+        await page.keyboard.press('End'); await page.keyboard.press('Enter');
+        assert.equal(await multiplier.textContent(), '3 倍');
+        await multiplier.click(); await page.keyboard.press('Escape');
+        assert.equal(await multiplier.getAttribute('aria-expanded'), 'false');
+        assert.equal(await page.locator('#player-panel').isVisible(), true, 'first Escape closes the choices only');
+        assert.equal(await multiplier.evaluate(node => document.activeElement === node), true);
+        await multiplier.click(); await page.locator('#player-panel-title').click();
+        assert.equal(await multiplier.getAttribute('aria-expanded'), 'false', 'outside click dismisses choices');
+        await choose(page, 'multiplier', '3');
         await page.locator('[data-enhancement-key=nr]').check();
         await page.locator('[data-enhancement-group=nr] summary').click();
-        await page.locator('[data-enhancement-key=nrStyle]').selectOption('2');
+        await choose(page, 'nrStyle', '2');
         assert.equal(await loadCount(), 0, 'all edits stay in the draft');
         assert.equal(await saved(), null);
         await apply.click();
         await page.waitForFunction(() => fixture.player.enhancementLoadConfirmed);
         assert.equal(await loadCount(), 1, 'one apply makes one reload');
         assert.equal(await saved(), null, 'load acknowledgement alone is insufficient to persist');
+        assert.equal(await page.locator('#player-panel').isVisible(), true, 'panel stays until playback is confirmed');
         await page.evaluate(() => fixture.handlePlaybackEvent({kind:'started'}));
         let setting = JSON.parse(await saved());
         assert.equal(setting.selection.multiplier, 3); assert.equal(setting.selection.nrStyle, 2); assert.equal(setting.selection.nr, true);
+        assert.equal(await page.locator('#player-panel').isVisible(), false, 'successful reload closes the panel');
+        await page.locator('#player-interpolation').click();
         assert.equal(await apply.isDisabled(), true);
         await page.locator('[data-enhancement-key=backend][value=off]').check();
         await page.locator('[data-enhancement-key=nr]').uncheck();
@@ -131,14 +152,14 @@ async function main() {
         assert.equal(await page.locator('[data-enhancement-key=nr]').isChecked(), true, 'switching to another panel discards the draft');
 
         await page.locator('[data-enhancement-key=backend][value=rife]').check();
-        await page.locator('[data-enhancement-key=rifeModel]').selectOption('rife-v4.26-scale0.5');
+        await choose(page, 'rifeModel', 'rife-v4.26-scale0.5');
         await page.evaluate(() => { fixture.order='before'; });
         await apply.click();
         await page.waitForFunction(() => fixture.player.interpolationChanging === false);
         setting = JSON.parse(await saved());
         assert.equal(setting.model, 'rife-v4.26-scale0.5'); assert.equal(setting.selection.vfg, false);
         assert.equal(setting.selection.multiplier, 3, 'disabled VFG retains its parameters');
-        await page.locator('#player-panel-close').click();
+        assert.equal(await page.locator('#player-panel').isVisible(), false, 'playback-before-ack order also closes the panel');
         await page.evaluate(() => fixture.startPlayback({id:'movie-b',type:'Movie',title:'下一部影片',playable:true},12345,'version-b'));
         const start = await page.evaluate(() => fixture.requests.filter(r => r.operation === 'load').at(-1).args);
         assert.equal(start[0], 'movie-b'); assert.equal(start[2], '2x'); assert.equal(start[3], setting.model); assert.equal(start[7], 'version-b');
@@ -162,9 +183,11 @@ async function main() {
 
         for (const failure of ['reject', 'mismatch']) {
             await reset(); const previous = await saved();
+            await page.locator('#player-interpolation').click();
             await page.evaluate(async failure => { fixture.failure=failure; await fixture.setFrameInterpolation(null,fixture.selection({vsr:true})); }, failure);
             assert.equal(await saved(), previous, 'failed application never replaces the last good settings');
             assert.equal(await page.evaluate(() => fixture.player.interpolationChanging), false);
+            assert.equal(await page.locator('#player-panel').isVisible(), true, 'failed reload preserves the panel');
             assert.match(await page.locator('#toast').textContent(), failure === 'reject' ? /native load rejected/ : /参数与请求不一致/);
         }
         await reset();
@@ -173,6 +196,13 @@ async function main() {
         const beforeExit = await saved();
         await page.evaluate(async () => { fixture.discardPlayer(); fixture.release(); await applying; });
         assert.equal(await saved(), beforeExit, 'a late response after exit cannot save settings');
+
+        await page.evaluate(() => localStorage.setItem(fixture.storageKey, JSON.stringify({model:null,selection:fixture.selection({vfg:true,multiplier:8,nrTone:0.4})})));
+        const migrated = await page.evaluate(() => fixture.loadVideoEnhancementSettings());
+        assert.equal(migrated.selection.multiplier, 3);
+        assert.equal(migrated.selection.nrTone, 0.4, 'migration preserves other parameters');
+        assert.deepEqual(JSON.parse(await saved()), migrated);
+        assert.match(await page.locator('#toast').textContent(), /原 8 倍设置调整为 3 倍/);
 
         for (const theme of ['dark', 'light']) {
             await reset();
@@ -186,6 +216,13 @@ async function main() {
                 await page.mouse.move(80,300); await page.waitForTimeout(280);
                 await page.locator('#player-interpolation').click();
                 await apply.waitFor();
+                await page.locator('[data-enhancement-key=backend][value=nvidia-vfg]').check();
+                await multiplier.click();
+                const menu = page.locator('#player-enhancement-multiplier-options');
+                const menuRect = await menu.boundingBox();
+                assert.ok(menuRect.x >= 0 && menuRect.x + menuRect.width <= width && menuRect.y >= 0 && menuRect.y + menuRect.height <= 800, 'choice menu fits viewport');
+                await page.screenshot({path:path.join(output,`enhancement-choices-${theme}-${width}.png`)});
+                await page.keyboard.press('Escape');
                 rect = await page.locator('#player-panel').boundingBox();
                 assert.ok(rect.x >= 0 && rect.x + rect.width <= width && rect.y >= 0, 'enhancement panel fits viewport');
                 await page.screenshot({path:path.join(output,`enhancement-${theme}-${width}.png`)});

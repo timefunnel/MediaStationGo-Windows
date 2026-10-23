@@ -4,6 +4,62 @@
 首页修复、最终 EXE/视频桥校验及回滚位置见 [首页启动修复](windows-home-startup.md)。
 下面的已安装/未安装、回滚描述均为各阶段记录，后续 VFG 修复以本节及对应安装审计为准。
 
+## 2026-10-23 增强参数菜单与应用后收起
+
+同日按用户后续要求，当前产品选项收敛为“刷新率自适应、2 倍、3 倍”，播放信息同步
+使用新名称。原生播放请求仅接受 `0/2/3`；读取旧版保存的 4–8 倍设置时，明确提示
+并保存为 3 倍，其他增强参数保留。现有自适应规划保持不变；以下 SDK/早期阶段中的
+2–8 倍描述是历史能力记录。浏览器校验三项菜单、键盘上限和旧设置迁移，Rust 参数
+边界与回传测试、现有自适应目标/长片时钟检查通过。新版构建结果见
+`build/video-enhancement/vfg-three-times-release-build.log`，当前候选 EXE SHA-256 为
+`cb955aca2382e3978ea531ef33ba7d7f4d898051b304af1263a4e7852f9b845d`。
+本轮修复、回归脚本和记录已纳入本地提交；未替换安装版或推送。
+
+用户复测报告：VFG 播放时倍率下拉框约等一至两秒才打开，原生菜单风格突兀；
+成功应用增强参数并重新播放后，二级面板仍留在画面中。
+
+源码确认原控件是 HTML `select`，CEF `on_popup_show` 需要向 renderer 请求
+`getPopupOptions`，等待选项和尺寸后，再通过 Windows 独立 popup surface 呈现。
+该路径涉及额外 IPC、GPU 复制及共享 compositor 状态，用户报告的完整一至两秒
+尚未通过同场景旧版计时复现，不能据此认定某个锁独占了全部延迟。
+
+此次仅修改画面增强前端：所有增强下拉参数共用同页 HTML popover 菜单，沿用现有
+颜色、圆角、选中标记和深浅主题；菜单在 top layer 中显示，避免滚动容器裁切。
+支持鼠标、方向键/Home/End、Enter、Esc、Tab、点击外部关闭、禁用选项和焦点恢复；
+滚动时重新定位，窗口尺寸变化或面板关闭时收起。
+增强应用沿用原有状态机，只有加载响应校验通过且播放事件确认恢复后才收起增强面板；
+两种事件先后顺序均覆盖，失败保留面板与错误，迟到响应不能保存已退出会话的设置。
+
+验证结果：
+
+- `test_player_panel_async.cjs`、`test_video_components_ui.cjs`、`test_video_components_detection.cjs`、
+  `test_video_settings_browser.cjs`、`test_player_controls_browser.cjs` 通过。
+  浏览器检查使用完整产品 HTML/CSS/JS 与显式离线播放事件夹具；
+  1280/375 px、深浅主题菜单截图人工检查通过。
+- 标准 Release 的实际 CEF 页面源码与当前 JS 逐字一致。使用私有 config/cache 和
+  本地 4K25 合成视频，通过真实 libmpv/VFG 中档滤镜播放，WASAPI 静音、152 Hz。
+  UI 通过显式离线状态夹具打开增强面板，CEF 鼠标输入实际点击产品倍率控件；
+  不访问账号/云盘，不将夹具视为完整服务端重新加载验收。
+- 自动 25 → 50.666667 fps、固定双倍 25 → 50 fps，窗口/全屏各 21 次，共 84 次。
+  点击事件到下一 CEF `requestAnimationFrame` 最长分别为
+  13.8/5.6/5.7/8.4 ms；展开处理器最长 0.6 ms。每组播放诊断前后 VFG 输出帧数
+  均继续增长（208 → 381、205 → 374），无播放错误事件。未复现秒级菜单等待。
+  该计时不覆盖原生输入投递前的等待，也不是光学上屏延迟；CEF 截图只覆盖页面层。
+- 原始 JSON、CEF 截图、native paint 日志及产物指纹保存在
+  `build/vfg-choices-verify/`，构建日志为
+  `build/video-enhancement/vfg-choices-release-build.log`。临时视频、引擎和私有配置已清理，
+  诊断进程已退出。可复现入口：
+
+```powershell
+# 需要 Playwright 可解析、已构建的标准应用以及本地 NVIDIA VFG runtime。
+./dev/windows/test_vfg_parameter_menu.ps1 -ResultDirectory "$PWD/build/vfg-menu-new-report"
+```
+
+菜单修复阶段候选 EXE SHA-256 为
+`89bf054b8b85a923afe29914c1dc6fcf2bd04272e24cf2d66f2041779aba0e05`；
+原始帧回退修复及既有首页/播放修复保留，mpv 和视频桥与下述原始帧修复正式交付一致。
+安装目录仍为 `5c1dc373...` EXE，当前代码已纳入本轮本地提交，未替换安装版、推送或发布。
+
 ## 2026-10-23 VFG 原始帧像素回退修复
 
 用户在真实影片中确认：双倍插帧有整幅画面回退，自动匹配较少，关闭 VFG 后消失；
@@ -194,7 +250,7 @@ RTX Video、NVIDIA VFG 与 DLSSNR 均已接入 mpv 原生播放，核心参数�
 | --- | --- | --- | --- |
 | RIFE | 沿用既有组件，增加本地导入入口 | 原有三档与固定 2 倍插帧 | ABI 8、模型、TensorRT profile 与 HDR 路径保持原合同 |
 | RTX Video | 原版 `nvngx_vsr.dll` 1.6.0.0 | D3D11 RTX Video SDK，质量 1–4 与 2x/QHD/4K–8K 目标尺寸 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
-| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，自动匹配刷新率或手动 2–8 倍，可配置自动切镜检测 | 渐进 SDR / HDR10 / HLG；HDR 使用 RGB10A2/PQ；与 RIFE 互斥 |
+| NVIDIA VFG | Maxine VFX 1.3.0 五个原始 DLL | Low/Medium/High，刷新率自适应或手动 2–3 倍，可配置自动切镜检测 | 渐进 SDR / HDR10 / HLG；HDR 使用 RGB10A2/PQ；与 RIFE 互斥 |
 | DLSSNR | NVIDIA 原版 310.8.0.0，可安装、取消、卸载 | D3D12 Feature 18 实际推理，模型参数与处理尺寸可配置 | 渐进 SDR / HDR10 / HLG；HDR 使用代理推理和原图残差合成 |
 
 ## 使用

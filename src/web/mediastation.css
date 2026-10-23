@@ -1589,7 +1589,6 @@ html[data-ui-theme="light"] .player-panel .player-info-section + .player-info-se
 .enhancement-parameters { margin: 8px 0 18px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
 .enhancement-parameters summary { cursor: pointer; font-size: 13px; }
 .enhancement-parameter { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; font-size: 12px; }
-.enhancement-parameter select { max-width: 60%; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 5px; }
 .enhancement-parameter input[type="range"] { width: 52%; }
 .enhancement-help { color: var(--muted); font-size: 12px; line-height: 1.6; }
 
@@ -1622,13 +1621,23 @@ html[data-ui-theme="light"] .player-panel .player-info-section + .player-info-se
 .enhancement-engine-picker input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
 .enhancement-engine-picker input:disabled { cursor: default; }
 .enhancement-engine-picker input:disabled + span { opacity: .5; }
-.enhancement-parameter select { width: auto; max-width: 62%; min-width: 0; min-height: 30px; padding: 6px 8px; border: 0; border-radius: 5px; color: var(--text); background: color-mix(in srgb, var(--text) 5%, transparent); font: inherit; font-size: 12px; }
-.enhancement-parameter option { color: var(--text); background: var(--player-popover-bg); }
+.enhancement-select { display: flex; align-items: center; gap: 12px; max-width: 62%; min-width: 0; min-height: 30px; padding: 6px 10px; border: 1px solid transparent; border-radius: 6px; color: var(--text); background: color-mix(in srgb, var(--text) 5%, transparent); font: inherit; font-size: 12px; cursor: pointer; }
+.enhancement-select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.enhancement-select::after { content: ""; flex: none; width: 5px; height: 5px; border-right: 1px solid currentColor; border-bottom: 1px solid currentColor; transform: translateY(-2px) rotate(45deg); color: var(--muted); }
+.enhancement-select:hover, .enhancement-select[aria-expanded="true"] { background: var(--surface-hover); border-color: var(--line); }
+.enhancement-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.enhancement-select-menu { position: fixed; inset: auto; width: max-content; min-width: 170px; max-width: calc(100vw - 16px); max-height: 280px; margin: 0; padding: 4px; overflow-y: auto; color: var(--text); background: var(--player-popover-bg); border: 1px solid var(--line); border-radius: 9px; box-shadow: 0 8px 24px #0003; font: inherit; scrollbar-width: thin; }
+.enhancement-select-option { display: flex; align-items: center; justify-content: space-between; gap: 20px; width: 100%; min-height: 32px; padding: 7px 10px; border: 0; border-radius: 5px; color: inherit; background: transparent; text-align: left; font: inherit; font-size: 12px; cursor: pointer; }
+.enhancement-select-option::after { content: "✓"; color: var(--accent); visibility: hidden; }
+.enhancement-select-option[aria-selected="true"] { background: var(--accent-dim); }
+.enhancement-select-option[aria-selected="true"]::after { visibility: visible; }
+.enhancement-select-option:hover, .enhancement-select-option:focus-visible { background: var(--surface-hover); outline: 1px solid var(--line); outline-offset: -1px; }
+.enhancement-select:disabled, .enhancement-select-option:disabled { cursor: default; opacity: .55; }
 .enhancement-parameter input.enhancement-switch { position: relative; flex: none; appearance: none; width: 30px; height: 18px; margin: 0; border: 0; border-radius: 12px; background: var(--player-popover-off); cursor: pointer; }
 .enhancement-switch::before { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--player-popover-thumb); }
 .enhancement-parameter input.enhancement-switch:checked { background: var(--accent); }
 .enhancement-switch:checked::before { transform: translateX(12px); }
-.enhancement-parameter input:disabled, .enhancement-parameter select:disabled { cursor: default; opacity: .55; }
+.enhancement-parameter input:disabled { cursor: default; opacity: .55; }
 .enhancement-group .enhancement-parameters { margin: 4px 0 10px; padding: 0; border: 0; background: none; }
 .enhancement-parameters summary { color: var(--faint); font-size: 11px; }
 .enhancement-parameters fieldset { min-width: 0; margin: 0; padding: 4px 0 0; border: 0; }

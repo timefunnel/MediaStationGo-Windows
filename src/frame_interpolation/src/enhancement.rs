@@ -144,7 +144,7 @@ impl Selection {
         if !(1..=4).contains(&s.vsr_quality)
             || !matches!(s.vsr_target, 0 | 1440 | 2160 | 2880 | 3456 | 4032 | 4320)
             || s.vfg_quality > 2
-            || !(s.multiplier == 0 || (2..=8).contains(&s.multiplier))
+            || !(s.multiplier == 0 || (2..=3).contains(&s.multiplier))
             || !(0..=2).contains(&s.nr_style)
             || !matches!(s.nr_target, 0 | 480 | 720 | 900 | 1080 | 1440)
             || [s.nr_intensity, s.nr_tone, s.nr_structure]
@@ -264,6 +264,8 @@ mod tests {
             "{\"vsrQuality\":0}",
             "{\"vsrTarget\":1080}",
             "{\"vfgQuality\":3}",
+            "{\"multiplier\":4}",
+            "{\"multiplier\":8}",
             "{\"multiplier\":9}",
             "{\"multiplier\":1}",
             "{\"nrStyle\":3}",
@@ -279,6 +281,14 @@ mod tests {
             );
         }
         assert_eq!(Selection::parse("{}").unwrap(), Selection::default());
+        for multiplier in 2..=3 {
+            assert_eq!(
+                Selection::parse(&format!(r#"{{"vfg":true,"multiplier":{multiplier}}}"#))
+                    .unwrap()
+                    .multiplier,
+                multiplier
+            );
+        }
         assert_eq!(
             Selection::parse(r#"{"vfg":true,"multiplier":0}"#)
                 .unwrap()
@@ -311,13 +321,13 @@ mod tests {
     }
     #[test]
     fn all_provider_parameters_round_trip_without_losing_values() {
-        let selection = Selection::parse(r#"{"nr":true,"vsr":true,"vfg":true,"vsrQuality":2,"vsrTarget":2160,"vfgQuality":2,"multiplier":8,"sceneDetection":false,"nrStyle":2,"nrIntensity":0.7,"nrTone":0.6,"nrStructure":0.8,"nrSkin":2,"nrAutoMask":true,"nrUiCorrection":true}"#).unwrap();
+        let selection = Selection::parse(r#"{"nr":true,"vsr":true,"vfg":true,"vsrQuality":2,"vsrTarget":2160,"vfgQuality":2,"multiplier":3,"sceneDetection":false,"nrStyle":2,"nrIntensity":0.7,"nrTone":0.6,"nrStructure":0.8,"nrSkin":2,"nrAutoMask":true,"nrUiCorrection":true}"#).unwrap();
         assert!(selection.enabled());
         assert_eq!(
             Selection::parse(&selection.payload().to_string()).unwrap(),
             selection
         );
-        assert_eq!(selection.multiplier, 8);
+        assert_eq!(selection.multiplier, 3);
         assert_eq!(selection.nr_style, 2);
     }
 }

@@ -18,6 +18,7 @@ static void plan(double source, double display, int divisor, double target)
     assert(p.display_divisor == divisor);
     assert(fabs(p.target_fps - target) < 1e-8);
     assert(p.target_fps > source && p.target_fps <= display);
+    assert(p.target_fps <= 3 * source);
     assert(fabs(p.target_fps * divisor - display) < 1e-8);
 }
 

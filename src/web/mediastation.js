@@ -6023,6 +6023,12 @@
                 || !Object.entries(videoEnhancementDefaults).every(([key, value]) => typeof selection[key] === typeof value
                     && (typeof value !== 'number' || Number.isFinite(selection[key])))
                 || (settings.model !== null && selection.vfg)) throw new Error('配置格式无效');
+            if (Number.isInteger(selection.multiplier) && selection.multiplier >= 4 && selection.multiplier <= 8) {
+                const previous = selection.multiplier;
+                selection.multiplier = 3;
+                window.localStorage.setItem(videoEnhancementSettingKey, JSON.stringify(settings));
+                showToast(`插帧倍率最高支持 3 倍，已将原 ${previous} 倍设置调整为 3 倍`);
+            }
             return settings;
         } catch (error) {
             throw new Error(`无法读取画面增强设置：${error.message}`);
@@ -6062,12 +6068,95 @@
         } catch (error) {
             showToast(`画面增强已生效，但设置保存失败：${error.message}`);
         }
-        refreshVideoEnhancementPanel();
-        const key = activePlayer.enhancementFocusKey;
-        if (activePlayer.panelKind === 'interpolation' && key) {
-            playerPanelContent.querySelector(`[data-enhancement-key="${key}"]:checked, [data-enhancement-key="${key}"]`)?.focus();
-        }
+        if (player === activePlayer && activePlayer.panelKind === 'interpolation') closePlayerPanel(true);
         setPlayerLoading(activePlayer.buffering, activePlayer.buffering ? '正在缓冲' : '');
+    }
+    function closeEnhancementChoices() {
+        playerPanelContent.querySelectorAll('.enhancement-select-menu:popover-open').forEach((menu) => menu.hidePopover());
+    }
+    function positionEnhancementChoices() {
+        playerPanelContent.querySelectorAll('.enhancement-select-menu:popover-open').forEach((menu) => menu._position());
+    }
+    function createEnhancementSelect(key, label, choices, value, onChange, disabled) {
+        const row = element('div', 'enhancement-parameter');
+        const control = element('button', 'enhancement-select');
+        const text = element('span');
+        const menu = element('div', 'enhancement-select-menu');
+        control.type = 'button';
+        control.dataset.enhancementKey = key;
+        control.disabled = disabled;
+        control.value = String(value);
+        control.setAttribute('aria-label', label);
+        control.setAttribute('aria-haspopup', 'listbox');
+        control.setAttribute('aria-expanded', 'false');
+        menu.id = `player-enhancement-${key}-options`;
+        menu.setAttribute('popover', 'auto');
+        menu.setAttribute('role', 'listbox');
+        menu.setAttribute('aria-label', label);
+        control.setAttribute('aria-controls', menu.id);
+        const options = choices.map(([optionValue, title, optionDisabled]) => {
+            const option = element('button', 'enhancement-select-option', title);
+            option.type = 'button';
+            option.value = String(optionValue);
+            option.disabled = Boolean(optionDisabled);
+            option.tabIndex = -1;
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-selected', String(option.value === control.value));
+            if (option.value === control.value) text.textContent = title;
+            option.addEventListener('click', () => {
+                control.value = option.value;
+                text.textContent = title;
+                options.forEach((item) => item.setAttribute('aria-selected', String(item === option)));
+                onChange(option.value);
+                menu.hidePopover();
+                control.focus();
+            });
+            menu.append(option);
+            return option;
+        });
+        menu._position = () => {
+            const rect = control.getBoundingClientRect();
+            const below = innerHeight - rect.bottom - 8, above = rect.top - 8;
+            menu.style.maxHeight = '280px';
+            const up = below < menu.offsetHeight && above > below;
+            menu.style.maxHeight = `${Math.max(0, Math.min(280, up ? above : below))}px`;
+            menu.style.left = `${Math.max(8, Math.min(rect.right - menu.offsetWidth, innerWidth - menu.offsetWidth - 8))}px`;
+            menu.style.top = `${up ? rect.top - menu.offsetHeight - 4 : rect.bottom + 4}px`;
+        };
+        const open = () => {
+            if (control.matches(':disabled')) return;
+            closeEnhancementChoices();
+            // Stay in the same CEF view; native select uses extra renderer /
+            // browser IPC and a separate D3D presentation path.
+            menu.showPopover();
+            menu._position();
+            (options.find((option) => option.value === control.value && !option.disabled)
+                || options.find((option) => !option.disabled))?.focus({ preventScroll: true });
+        };
+        control.addEventListener('click', () => {
+            if (menu.matches(':popover-open')) menu.hidePopover(); else open();
+        });
+        control.addEventListener('keydown', (event) => {
+            if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+            event.preventDefault(); event.stopPropagation(); open();
+        });
+        menu.addEventListener('beforetoggle', (event) => control.setAttribute('aria-expanded', String(event.newState === 'open')));
+        menu.addEventListener('keydown', (event) => {
+            if (['Escape', 'Backspace', 'Tab'].includes(event.key)) {
+                if (event.key !== 'Tab') { event.preventDefault(); event.stopPropagation(); }
+                menu.hidePopover(); control.focus(); return;
+            }
+            if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault(); event.stopPropagation();
+            const enabled = options.filter((option) => !option.disabled);
+            const current = enabled.indexOf(document.activeElement);
+            const index = event.key === 'Home' ? 0 : event.key === 'End' ? enabled.length - 1
+                : (current + (event.key === 'ArrowDown' ? 1 : -1) + enabled.length) % enabled.length;
+            enabled[index]?.focus();
+        });
+        control.append(text);
+        row.append(element('span', '', label), control, menu);
+        return row;
     }
     function sameVideoEnhancement(left, right) {
         const a = videoEnhancementSelection(left), b = videoEnhancementSelection(right);
@@ -6120,14 +6209,9 @@
             return status?.installed ? status.runtime?.failureDetail || '组件已安装，当前运行环境不可用' : '请先在组件管理安装';
         };
         const body = element('div', 'enhancement-settings');
+        body.addEventListener('scroll', positionEnhancementChoices, { passive: true });
         const select = (parent, key, label, choices, value, onChange, disabled = false) => {
-            const row = element('label', 'enhancement-parameter'); row.append(element('span', '', label));
-            const control = element('select'); control.setAttribute('aria-label', label); control.dataset.enhancementKey = key; control.disabled = disabled || busy;
-            for (const [optionValue, text, optionDisabled] of choices) {
-                const option = element('option', '', text); option.value = String(optionValue); option.selected = value === optionValue; option.disabled = Boolean(optionDisabled); control.append(option);
-            }
-            control.value = String(value);
-            control.addEventListener('change', () => { onChange(control.value); updateDraft(); }); row.append(control); parent.append(row); return control;
+            parent.append(createEnhancementSelect(key, label, choices, value, (next) => { onChange(next); updateDraft(); }, disabled || busy));
         };
         const parameterSelect = (parent, key, label, choices) => select(parent, key, label, choices, selection[key], (value) => { selection[key] = Number(value); });
         const toggle = (parent, key, label, disabled = false) => {
@@ -6166,7 +6250,7 @@
             select(interpolation, 'rifeModel', '效果档位', Object.entries(interpolationModels).map(([id, entry]) => [id, entry.name.replace('RIFE ', '')]), model, (value) => { model = value; }, !ready('rife'));
             const row = element('div', 'enhancement-parameter'); row.append(element('span', '', '输出帧率'), element('span', 'enhancement-readonly', '2 倍')); interpolation.append(row);
         } else if (backend === 'nvidia-vfg') {
-            parameterSelect(interpolation, 'multiplier', '输出帧率', [[0, '自动匹配刷新率'], ...[2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} 倍`])]);
+            parameterSelect(interpolation, 'multiplier', '输出帧率', [[0, '刷新率自适应'], ...[2, 3].map((n) => [n, `${n} 倍`])]);
             const fields = parameters(interpolation, 'vfg', !ready('nvidia-vfg'));
             parameterSelect(fields, 'vfgQuality', '插帧质量', [[0, 'Low'], [1, 'Medium'], [2, 'High']]);
             toggle(fields, 'sceneDetection', '检测镜头切换');
@@ -6220,7 +6304,6 @@
         activePlayer.enhancementToRemember = { model: requestedModel, selection: requestedEnhancement };
         activePlayer.enhancementLoadConfirmed = false;
         activePlayer.enhancementPlaybackStarted = false;
-        activePlayer.enhancementFocusKey = document.activeElement?.dataset.enhancementKey;
         if (activePlayer.playing && window.jmpNative) window.jmpNative.playerPause();
         refreshVideoEnhancementPanel();
         setPlayerLoading(true, playerTransitionLoadingLabel(activePlayer));
@@ -6922,7 +7005,7 @@
         }
         const enhancement = videoEnhancementSelection(player.videoEnhancement);
         appendInfoRow(interpolation.list, 'RTX Video 超分', enhancement.vsr ? `已选择 · 质量 ${enhancement.vsrQuality} · ${enhancement.vsrTarget ? `${enhancement.vsrTarget}p` : '2 倍尺寸'}` : '关闭');
-        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', enhancement.vfg ? `已选择 · ${enhancement.multiplier === 0 ? '自动匹配刷新率' : `${enhancement.multiplier} 倍帧率`} · ${['Low', 'Medium', 'High'][enhancement.vfgQuality]}` : '关闭');
+        appendInfoRow(interpolation.list, 'NVIDIA VFG 插帧', enhancement.vfg ? `已选择 · ${enhancement.multiplier === 0 ? '刷新率自适应' : `${enhancement.multiplier} 倍帧率`} · ${['Low', 'Medium', 'High'][enhancement.vfgQuality]}` : '关闭');
         const vfg = diagnostics.vfg;
         if (enhancement.vfg && vfg) {
             const fps = (value) => Number.isFinite(value) && value > 0 ? `${value.toFixed(3)} fps` : '-';
@@ -7088,6 +7171,7 @@
 
     function closePlayerPanel(restoreFocus = true) {
         if (!player?.panelKind && playerPanel.classList.contains('hidden')) return;
+        closeEnhancementChoices();
         playerPanel.classList.add('hidden');
         if (player) { player.panelKind = ''; player.enhancementDraft = null; player.panelRequest = null; player.panelLoading = false; player.panelError = ''; }
         refreshPlayerTools();
@@ -8160,6 +8244,7 @@
     }, { capture: true, passive: true });
 
     window.addEventListener('resize', () => {
+        closeEnhancementChoices();
         refreshHeroArtworkQualification();
         refreshMediaRowCarousels();
         content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());

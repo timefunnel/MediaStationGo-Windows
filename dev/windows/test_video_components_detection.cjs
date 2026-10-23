@@ -21,30 +21,42 @@ function assertGroups() {
     assert.equal(descendants(content).find((n) => n.dataset.enhancementKey === 'nr').disabled, false);
     assert.equal(descendants(content).filter((n) => n.textContent === '应用').length, 1, 'one common apply button');
 }
+function choices(key) { return descendants(content).find((n) => n.id === `player-enhancement-${key}-options`); }
+function choose(key, value) {
+    const menu = choices(key);
+    // This DOM fixture only exercises selection; real popover dispatch is covered
+    // by test_player_controls_browser.cjs and test_vfg_parameter_menu.cjs.
+    menu.hidePopover = () => {};
+    menu.children.find((n) => n.value === value).events.click();
+}
 async function main() {
     backend = async () => payload; await context.showApp({});
     assert.equal(requests.length, 1); assert.equal(byId('player-interpolation').dataset.enhancementReady, 'true');
     player(); context.player.panelKind = 'interpolation'; context.renderPlayerPanel(); assertGroups();
     player(); vm.runInContext('videoComponentStatuses.clear()', context);
     let reply; backend = () => new Promise((resolve) => { reply = resolve; });
-    const opening = context.openPlayerPanel('interpolation'); assert.equal(content.children.length, 0); reply(payload); await opening;
+    const opening = context.openPlayerPanel('interpolation');
+    assert.equal(panel.classList.contains('hidden'), false, 'loading panel appears before component query finishes');
+    assert.equal(content.querySelector('.player-panel-state').textContent, '正在读取…');
+    reply(payload); await opening;
     assert.equal(panel.classList.contains('hidden'), false); assertGroups();
     const calls = [];
     context.setFrameInterpolation = (...args) => calls.push(args);
     const nr = content.querySelector('[data-enhancement-key="nr"]'); nr.checked = true; nr.events.change();
     assert.equal(calls.length, 0, 'editing a toggle never reloads media');
-    const style = content.querySelector('[data-enhancement-key="nrStyle"]'); style.value = '2'; style.events.change();
+    choose('nrStyle', '2');
     const apply = descendants(content).find((n) => n.textContent === '应用'); assert.equal(apply.disabled, false); apply.events.click();
     assert.equal(calls.length, 1); assert.equal(calls[0][1].nr, true); assert.equal(calls[0][1].nrStyle, 2);
     byId('player-interpolation').dataset.componentReady = 'true';
     const engine = descendants(content).find((n) => n.dataset.enhancementKey === 'backend' && n.value === 'rife'); engine.checked = true; engine.events.change();
-    const models = content.querySelector('[data-enhancement-key="rifeModel"]'); assert.equal(models.children.length, 3);
+    assert.equal(choices('rifeModel').children.length, 3);
     assert.equal(context.player.enhancementDraft.selection.vfg, false);
     const vfgEngine = descendants(content).find((n) => n.dataset.enhancementKey === 'backend' && n.value === 'nvidia-vfg'); vfgEngine.checked = true; vfgEngine.events.change();
     const rate = content.querySelector('[data-enhancement-key="multiplier"]');
-    assert.equal(rate.value, '0'); assert.equal(rate.children.length, 8);
-    rate.value = '3'; rate.events.change(); assert.equal(context.player.enhancementDraft.selection.multiplier, 3);
-    rate.value = '0'; rate.events.change(); assert.equal(context.player.enhancementDraft.selection.multiplier, 0);
+    assert.equal(rate.value, '0');
+    assert.deepEqual(choices('multiplier').children.map((n) => n.textContent), ['刷新率自适应', '2 倍', '3 倍']);
+    choose('multiplier', '3'); assert.equal(context.player.enhancementDraft.selection.multiplier, 3);
+    choose('multiplier', '0'); assert.equal(context.player.enhancementDraft.selection.multiplier, 0);
     assert.equal(calls.length, 1, 'automatic/manual rate edits stay in the draft');
     assert.equal(calls.length, 1, 'engine choice and RIFE quality are draft edits');
     context.closePlayerPanel(); assert.equal(context.player.enhancementDraft, null);
@@ -59,9 +71,11 @@ async function main() {
     unavailableNr.checked = false; unavailableNr.events.change();
     assert.equal(content.querySelector('[data-enhancement-key="nr"]').disabled, true, 'unavailable component cannot be enabled again');
     player(); backend = async () => { throw new Error('native IPC unavailable'); }; await context.openPlayerPanel('interpolation');
-    assert.equal(content.children.length, 0); assert.match(toasts.at(-1), /组件状态查询失败/);
+    assert.match(content.querySelector('.player-panel-state').textContent, /组件状态查询失败/);
+    assert.equal(descendants(content).filter((n) => n.dataset.enhancementGroup).length, 0, 'failed query cannot show usable settings');
     player(); backend = () => new Promise((resolve) => { reply = resolve; }); const stale = context.openPlayerPanel('interpolation'); context.player = null; reply(payload); await stale;
-    assert.equal(content.children.length, 0);
+    assert.equal(content.querySelector('.player-panel-state').textContent, '正在读取…');
+    assert.equal(descendants(content).filter((n) => n.dataset.enhancementGroup).length, 0, 'late reply after exit cannot replace loading state with settings');
     console.log('VIDEO_COMPONENT_DETECTION_OK home-first-entry/fresh-panel/group-hierarchy/draft-only/one-apply/RIFE-nested/query-error/exit-race');
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

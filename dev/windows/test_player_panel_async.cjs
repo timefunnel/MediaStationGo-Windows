@@ -5,7 +5,7 @@ const { handler, node } = require('./video_components_test_dom.cjs');
 const panel = node('div', 'hidden');
 let pending = [], applied = [], renders = 0;
 const context = vm.createContext({
-    player: { card: { id: 'media' }, loadInfo: {} }, playerPanel: panel,
+    player: { card: { id: 'media' }, loadInfo: {} }, playerPanel: panel, playerPanelContent: panel,
     playerPanelTrigger: null,
     closePlayerMore() {}, closeDanmakuPanel() {}, refreshPlayerTools() {},
     scheduleControlsHide() {}, positionPlayerPanel() {},
@@ -19,7 +19,7 @@ const context = vm.createContext({
     applyPlaybackMetadataRefresh(player, tracks) { applied.push(tracks); },
     updateFrameInterpolationStatus() {}, friendlyError: error => error.message,
 });
-vm.runInContext(handler('openPlayerPanel') + handler('closePlayerPanel'), context);
+vm.runInContext(handler('closeEnhancementChoices') + handler('openPlayerPanel') + handler('closePlayerPanel'), context);
 async function main() {
     const first = context.openPlayerPanel('audio');
     assert.equal(panel.classList.contains('hidden'), false, 'panel opens before native reply');

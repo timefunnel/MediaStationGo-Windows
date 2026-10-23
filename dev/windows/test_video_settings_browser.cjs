@@ -6,6 +6,10 @@ const { pathToFileURL } = require('node:url');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../..');
 const fixture = path.join(root, 'build/video-parameters-ui');
+async function choose(page, key, value) {
+    await page.locator(`[data-enhancement-key="${key}"]`).click();
+    await page.locator(`#player-enhancement-${key}-options [role="option"][value="${value}"]`).click();
+}
 async function main() {
     const browser = await chromium.launch({ executablePath: process.env.VIDEO_UI_CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
@@ -48,12 +52,12 @@ async function main() {
             assert.equal(await page.getByRole('button', { name: '应用', exact: true }).count(), 1);
             assert.equal(await page.getByRole('button', { name: '应用', exact: true }).isDisabled(), true);
             await page.locator('[data-enhancement-group="nr"] summary').click();
-            await page.locator('[data-enhancement-key="nrStyle"]').selectOption('2');
+            await choose(page, 'nrStyle', '2');
             assert.equal(await page.evaluate(() => fixture.calls.length), 0);
             const footer = await page.locator('.enhancement-footer').boundingBox();
             assert.ok(footer.y + footer.height <= 800, 'common apply stays visible while parameters scroll');
             await page.screenshot({ path: path.join(fixture, `video-parameters-${theme}.png`) });
-            await page.locator('[data-enhancement-key="nrSkin"]').selectOption('1.5');
+            await choose(page, 'nrSkin', '1.5');
             await page.locator('[data-enhancement-key="nrUiCorrection"]').check();
             const scrolledFooter = await page.locator('.enhancement-footer').boundingBox();
             assert.equal(scrolledFooter.y, footer.y, 'scrolling to the last NR control does not move the apply footer');
@@ -63,7 +67,7 @@ async function main() {
             assert.equal(await page.evaluate(() => fixture.calls[0].selection.nrSkin), 1.5);
             assert.equal(await page.evaluate(() => fixture.calls[0].selection.nrUiCorrection), true);
             await page.locator('[data-enhancement-key="backend"][value="rife"]').check();
-            assert.equal(await page.locator('[data-enhancement-key="rifeModel"] option').count(), 3);
+            assert.equal(await page.locator('#player-enhancement-rifeModel-options [role="option"]').count(), 3);
             assert.equal(await page.evaluate(() => fixture.player.enhancementDraft.selection.vfg), false);
             await page.setViewportSize({ width: 480, height: 800 });
             assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);

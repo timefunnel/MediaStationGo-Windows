@@ -56,7 +56,7 @@ async function main() {
     assert.match(label(null, 'rife-v4.26', {}, {}), /正在开启 RIFE 插帧/);
     assert.equal(label('rife-v4.26', null, {}, {}), '正在关闭插帧');
     assert.equal(label(null, null, { nr: true }, { nr: true, nrTone: 0.3 }), '正在应用画面增强参数');
-    assert.equal(label(null, null, { vfg: true }, { vfg: true, multiplier: 4 }), '正在应用插帧参数');
+    assert.equal(label(null, null, { vfg: true }, { vfg: true, multiplier: 3 }), '正在应用插帧参数');
     assert.equal(label(null, null, { vsr: true }, { vsr: true, vsrQuality: 2 }), '正在应用超分参数');
     assert.equal(label('rife-v4.26', null, {}, { vfg: true }), '正在切换插帧');
     assert.equal(label(null, null, {}, { nr: true, vsr: true }), '正在应用画面设置');
@@ -77,7 +77,7 @@ async function main() {
     assert.equal(pauses, 1, 'switching a paused player must not send a pause command');
     assert.equal(toasts.length, 0);
     requests.length = 0;
-    const parameters = { vsr: true, vfg: true, nr: true, vsrQuality: 2, vsrTarget: 2160, vfgQuality: 2, multiplier: 8, sceneDetection: false, nrStyle: 2, nrTarget: 720, nrIntensity: 0.7, nrTone: 0.6, nrStructure: 0.8, nrSkin: 1.5, nrAutoMask: true, nrUiCorrection: true };
+    const parameters = { vsr: true, vfg: true, nr: true, vsrQuality: 2, vsrTarget: 2160, vfgQuality: 2, multiplier: 3, sceneDetection: false, nrStyle: 2, nrTarget: 720, nrIntensity: 0.7, nrTone: 0.6, nrStructure: 0.8, nrSkin: 1.5, nrAutoMask: true, nrUiCorrection: true };
     context.player = makePlayer({ playing: false }); await context.setFrameInterpolation(null, parameters);
     assert.deepEqual(JSON.parse(requests[0].args[8]), parameters, 'all configured values must reach the native load request');
     assert.equal(context.player.videoEnhancement.nrStyle, 2); assert.equal(context.player.interpolationResumePlaying, false);
