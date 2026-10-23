@@ -663,10 +663,13 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .setting-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .setting-actions button { min-height: 34px; }
 .update-settings .setting-actions button[data-busy="true"] { cursor: wait; }
-.update-confirm { display: grid; gap: 12px; padding: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 9px; background: rgba(8,8,12,0.24); }
-.update-confirm p { margin: 0; }
-.update-confirm-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.update-confirm-actions button { width: 100%; }
+.app-update-dialog { width: min(420px, calc(100vw - 32px)); padding: 24px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 48px #0004; }
+.app-update-dialog::backdrop { background: #0006; backdrop-filter: blur(4px); }
+.app-update-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.app-update-dialog h2 { margin: 0; font-size: 18px; }
+.app-update-dialog p { margin: 16px 0 24px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.app-update-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.app-update-dialog-actions button { min-width: 88px; }
 
 /* 弹层：统一毛玻璃遮罩 + 主题色描边面板（完整简介、选择片源、删除账号）。 */
 .modal-scrim { position: fixed; z-index: 90; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(8, 7, 16, 0.46); backdrop-filter: blur(10px) saturate(125%); animation: scrim-in 180ms ease both; }

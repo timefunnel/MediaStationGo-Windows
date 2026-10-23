@@ -7,6 +7,10 @@ const dialog = byId('component-dialog'), label = byId('settings-frame-interpolat
 const render = (component, fields = {}) => context.updateFrameInterpolationStatus({ componentStatus: 'unavailable', component, ...fields });
 render({ installed: false });
 assert.equal(primary.disabled, false); assert.equal(secondary.disabled, true);
+render({ installed: false, restartRequired: true, pendingOperation: 'install', restarting: true });
+assert.equal(primary.disabled, true, 'restart stays blocked while the native helper is active');
+render({ installed: false, restartRequired: true, pendingOperation: 'install', restarting: false });
+assert.equal(primary.disabled, false, 'fresh status clears a stale restart block');
 render({ installed: false, busy: true, progress: { phase: 'downloading', downloadedBytes: 5, totalBytes: 9, source: 'GitHub' } });
 assert.equal(primary.dataset.busy, 'true'); assert.equal(timers.size, 1); assert.match(label.textContent, /5 B \/ 9 B/);
 render({ installed: false, restartRequired: true, pendingOperation: 'install' });

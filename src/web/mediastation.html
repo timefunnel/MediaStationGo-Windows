@@ -245,13 +245,6 @@
           <button id="download-app-update" class="primary-command hidden" type="button">下载更新</button>
           <button id="install-app-update" class="primary-command hidden" type="button">应用更新</button>
         </div>
-        <div id="confirm-app-update" class="update-confirm hidden">
-          <p>应用更新会关闭当前应用，是否继续？</p>
-          <div class="setting-actions">
-            <button id="cancel-app-update" class="secondary-command" type="button">取消</button>
-            <button id="confirm-install-app-update" class="danger-command" type="button">确认更新</button>
-          </div>
-        </div>
       </section>
       <section class="setting-block default-subtitle-settings">
         <h3>默认字幕样式</h3>
@@ -355,13 +348,6 @@
               </div>
               <p id="settings-update-download-sources-status" class="component-status" role="status" aria-live="polite"></p>
             </div>
-            <div id="settings-confirm-app-update" class="update-confirm hidden">
-              <p>应用更新会关闭当前应用，是否继续？</p>
-              <div class="update-confirm-actions">
-                <button id="settings-cancel-app-update" class="secondary-command" type="button">取消</button>
-                <button id="settings-confirm-install-app-update" class="danger-command" type="button">确认更新</button>
-              </div>
-            </div>
           </section>
         </div>
       </div>
@@ -397,6 +383,11 @@
     <header><h2 id="component-dialog-title"></h2><button id="component-dialog-close" class="icon-button" type="button" aria-label="关闭">&#10005;</button></header>
     <p id="component-dialog-copy"></p>
     <div class="component-dialog-actions"><button id="component-dialog-local" class="secondary-command" type="button">从本地安装</button><button id="component-dialog-confirm" class="primary-command" type="button">下载并安装</button><button id="component-dialog-cancel" class="secondary-command" type="button">取消</button></div>
+  </dialog>
+  <dialog id="app-update-dialog" class="app-update-dialog" aria-labelledby="app-update-dialog-title" aria-describedby="app-update-dialog-copy">
+    <header><h2 id="app-update-dialog-title">应用更新</h2><button id="app-update-dialog-close" class="icon-button" type="button" aria-label="关闭">&#10005;</button></header>
+    <p id="app-update-dialog-copy">应用更新会关闭当前应用，是否继续？</p>
+    <div class="app-update-dialog-actions"><button id="app-update-dialog-cancel" class="secondary-command" type="button">取消</button><button id="app-update-dialog-confirm" class="danger-command" type="button">确认更新</button></div>
   </dialog>
 
   <div id="overview-scrim" class="modal-scrim hidden">

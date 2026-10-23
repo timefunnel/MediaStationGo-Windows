@@ -179,6 +179,7 @@
     let uiThemeTransition = null;
     let proxySettingsStatus = { state: '', text: '' };
     let appUpdateState = { status: 'idle', payload: {} };
+    let appUpdateDialogTrigger = null;
     let automaticUpdateTimer = 0;
     let updateNotificationVersion = '';
     const danmakuRenderer = createDanmakuRenderer(playerDanmakuLayer);
@@ -1674,8 +1675,8 @@
         const checkButton = byId('settings-check-app-update');
         const downloadButton = byId('settings-download-app-update');
         const installButton = byId('settings-install-app-update');
-        const confirm = byId('settings-confirm-app-update');
-        if (!versionNode || !statusNode || !checkButton || !downloadButton || !installButton || !confirm) return;
+        const dialog = byId('app-update-dialog');
+        if (!versionNode || !statusNode || !checkButton || !downloadButton || !installButton || !dialog) return;
         const { status, payload } = appUpdateState;
         versionNode.textContent = displayAppVersion(window.jmpInfo?.version);
         statusNode.textContent = updateStatusText(status, payload);
@@ -1705,7 +1706,34 @@
             ? '正在校验...'
             : status === 'installing' ? '正在应用更新...' : `应用 ${displayAppVersion(payload.version)}`;
         installButton.classList.toggle('hidden', status !== 'ready' && !applying);
-        if (status !== 'ready') confirm.classList.add('hidden');
+        if (status !== 'ready' && dialog.open) closeAppUpdateDialog();
+    }
+
+    function showAppUpdateDialog(trigger) {
+        const dialog = byId('app-update-dialog');
+        if (appUpdateState.status !== 'ready') return;
+        appUpdateDialogTrigger = trigger;
+        if (!dialog.open) dialog.showModal();
+        byId('app-update-dialog-confirm').focus();
+    }
+
+    function closeAppUpdateDialog() {
+        const dialog = byId('app-update-dialog');
+        if (dialog.open) dialog.close();
+        if (appUpdateDialogTrigger?.isConnected) appUpdateDialogTrigger.focus();
+        appUpdateDialogTrigger = null;
+    }
+
+    function confirmAppUpdate() {
+        if (appUpdateState.status !== 'ready') {
+            closeAppUpdateDialog();
+            return;
+        }
+        closeAppUpdateDialog();
+        if (!window.jmpNative?.updateInstall) return;
+        appUpdateState = { status: 'verifying', payload: appUpdateState.payload };
+        refreshUpdateControls();
+        window.jmpNative.updateInstall();
     }
 
     function requestUpdateCheck() {
@@ -2170,7 +2198,7 @@
         interpolationEntry.dataset.componentInstalled = String(componentInstalled);
         interpolationEntry.dataset.componentReady = String(componentReady);
         interpolationEntry.classList.toggle('hidden', !componentInstalled);
-        if (component.restarting) interpolationComponentRestarting = true;
+        interpolationComponentRestarting = component.restarting === true;
         videoComponentStatuses.set('rife', { ...component, runtime: { playbackAvailable: componentReady, failureCode: status.failureCode, failureDetail: status.failureDetail } });
         renderComponentActions('rife');
         refreshVideoEnhancementEntry();
@@ -4973,7 +5001,7 @@
         const card = document.querySelector(`[data-component-id="${id}"]`);
         const primary = card.querySelector('[data-component-action="primary"]');
         const secondary = card.querySelector('[data-component-action="secondary"]');
-        const restarting = videoComponentsRestarting || interpolationComponentRestarting || status.restarting;
+        const restarting = videoComponentsRestarting || (id === 'rife' && interpolationComponentRestarting) || status.restarting === true;
         const blocked = restarting || status.busy || status.supported === false || typeof status.installed !== 'boolean';
         const pending = status.pendingOperation === 'install';
         primary.dataset.operation = pending ? 'restart' : 'install';
@@ -5057,7 +5085,7 @@
     async function changeVideoComponent(id, operation) {
         if (!Object.prototype.hasOwnProperty.call(componentNames, id) || !['install', 'import', 'uninstall', 'cancel', 'restart'].includes(operation)) throw new Error('组件操作无效');
         const status = videoComponentStatuses.get(id);
-        if (videoComponentsRestarting || interpolationComponentRestarting || status?.busy || status?.restarting) return;
+        if (videoComponentsRestarting || (id === 'rife' && interpolationComponentRestarting) || status?.busy || status?.restarting === true) return;
         const label = componentStatusLabel(id);
         const isRife = id === 'rife';
         if (operation === 'restart') videoComponentsRestarting = true;
@@ -7791,19 +7819,12 @@
         window.jmpNative.updateDownload();
     });
     byId('settings-install-app-update').addEventListener('click', () => {
-        byId('settings-confirm-app-update').classList.remove('hidden');
-        byId('settings-confirm-install-app-update').focus();
+        showAppUpdateDialog(byId('settings-install-app-update'));
     });
-    byId('settings-cancel-app-update').addEventListener('click', () => {
-        byId('settings-confirm-app-update').classList.add('hidden');
-        byId('settings-install-app-update').focus();
-    });
-    byId('settings-confirm-install-app-update').addEventListener('click', () => {
-        if (!window.jmpNative?.updateInstall) return;
-        appUpdateState = { status: 'verifying', payload: appUpdateState.payload };
-        refreshUpdateControls();
-        window.jmpNative.updateInstall();
-    });
+    byId('app-update-dialog-confirm').addEventListener('click', confirmAppUpdate);
+    byId('app-update-dialog-cancel').addEventListener('click', closeAppUpdateDialog);
+    byId('app-update-dialog-close').addEventListener('click', closeAppUpdateDialog);
+    byId('app-update-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeAppUpdateDialog(); });
     byId('settings-clear-image-cache').addEventListener('click', async (event) => {
         const button = event.currentTarget;
         button.disabled = true;
