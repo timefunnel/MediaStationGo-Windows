@@ -23,7 +23,7 @@ const hook = `
         if(operation!=='load') throw new Error('Unexpected fixture IPC: '+operation);
         if(loadOrder==='hold') await new Promise(resolve=>{releaseLoad=resolve;});
         if(loadFailure==='reject') throw new Error('test native load rejected');
-        if(loadOrder==='before') handlePlaybackEvent({kind:'started'});
+        if(loadOrder==='before') handlePlaybackEvent({kind:'started',mediaId:args[0]});
         const selection=JSON.parse(args[8]);
         if(loadFailure==='mismatch') selection.nrTone=0.17;
         return {...tracks,videoEnhancement:selection,frameInterpolation:args[2]==='2x'?{modelId:args[3]}:null};
@@ -44,7 +44,7 @@ const hook = `
     window.fixture={calls,requests,reset,startPlayback,setFrameInterpolation,handlePlaybackEvent,closePlayerPanel,loadVideoEnhancementSettings,
         selection:videoEnhancementSelection,storageKey:videoEnhancementSettingKey,
         get player(){return player;}, set order(value){loadOrder=value;},set failure(value){loadFailure=value;},release(){releaseLoad();},
-        discardPlayer(){player=null;},showPlayerControls};
+        discardPlayer(){player=null;},showPlayerControls,hidePlayerControls};
     reset(); document.documentElement.dataset.ready='true';
 `;
 assert.equal(source.split('    initialize();').length, 2, 'one initialization boundary');
@@ -70,6 +70,25 @@ async function main() {
     try {
         await page.goto('http://player.test/mediastation.html');
         await page.waitForSelector('html[data-ready="true"]');
+        const controlsVisible = () => page.locator('#player-controls').evaluate(node => node.classList.contains('visible'));
+        await page.mouse.move(640, 350);
+        await page.evaluate(() => fixture.hidePlayerControls());
+        for (const x of [640, 641, 640, 639, 640]) await page.mouse.move(x, 350);
+        assert.equal(await controlsVisible(), false, 'stationary and tiny native pointer moves do not reveal controls');
+        await page.mouse.move(646, 350);
+        assert.equal(await controlsVisible(), true, 'intentional pointer movement reveals controls');
+        await page.waitForFunction(() => !document.getElementById('player-controls').classList.contains('visible'));
+        assert.equal(await page.locator('#player-controls').evaluate(node => node.inert), true);
+        await page.evaluate(() => fixture.handlePlaybackEvent({kind:'started',mediaId:fixture.player.card.id}));
+        assert.equal(await controlsVisible(), false, 'ordinary native Started leaves controls hidden');
+        await page.evaluate(() => {
+            fixture.handlePlaybackEvent({kind:'buffering',mediaId:fixture.player.card.id,buffering:true});
+            fixture.handlePlaybackEvent({kind:'buffering',mediaId:fixture.player.card.id,buffering:false});
+        });
+        assert.equal(await controlsVisible(), false, 'buffering completion leaves controls hidden');
+        await page.keyboard.press('ArrowUp');
+        assert.equal(await controlsVisible(), true, 'keyboard still reveals controls');
+        await reset();
         const bottom = await page.locator('.player-bottom').boundingBox();
         await page.mouse.click(640, bottom.y + 15);
         await page.mouse.dblclick(640, bottom.y + 15);
@@ -153,7 +172,7 @@ async function main() {
         assert.equal(await loadCount(), 1, 'one apply makes one reload');
         assert.equal(await saved(), null, 'load acknowledgement alone is insufficient to persist');
         assert.equal(await page.locator('#player-panel').isVisible(), true, 'panel stays until playback is confirmed');
-        await page.evaluate(() => fixture.handlePlaybackEvent({kind:'started'}));
+        await page.evaluate(() => fixture.handlePlaybackEvent({kind:'started',mediaId:fixture.player.card.id}));
         let setting = JSON.parse(await saved());
         assert.equal(setting.selection.multiplier, 3); assert.equal(setting.selection.nrStyle, 2); assert.equal(setting.selection.nr, true);
         assert.equal(await page.locator('#player-panel').isVisible(), false, 'successful reload closes the panel');

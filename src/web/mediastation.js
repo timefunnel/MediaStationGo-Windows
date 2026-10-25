@@ -5599,6 +5599,7 @@
             panelKind: '',
             trackChanging: false,
             metadataRefreshLoadInfo: null,
+            controlsPointer: null,
             scrubbing: false,
             scrubPositionMs: null,
             interpolationEnabled: enhancementSettings.model !== null,
@@ -5893,7 +5894,8 @@
             }
             return;
         }
-        if (!player) return;
+        // The previous item's events can still be queued while the next resolves.
+        if (!player || event.mediaId !== player.card.id) return;
         if (event.kind === 'canceled' && (player.interpolationChanging || player.episodeChanging) && !player.exiting) return;
         // Only position-bearing events may change the player timeline. Other
         // event snapshots can still contain the load-time or terminal zero.
@@ -5936,8 +5938,8 @@
                     if (firstFrame && !player.panelKind) {
                         hidePlayerFeedback();
                         hidePlayerControls();
-                    } else {
-                        showPlayerControls();
+                    } else if (playerControls.classList.contains('visible')) {
+                        scheduleControlsHide();
                     }
                 }
                 break;
@@ -5969,6 +5971,7 @@
                     );
                 } else {
                     setPlayerLoading(!player.started, '正在准备播放');
+                    if (playerControls.classList.contains('visible')) scheduleControlsHide();
                 }
                 break;
             case 'finished':
@@ -7321,6 +7324,7 @@
             closePlayerPanel(true);
             return false;
         }
+        const startMs = automatic ? 0 : Math.max(0, Math.round(episode.resumePositionMs || 0));
         const previousPlaybackRate = playerPlaybackRate;
         const previous = {
             card: activePlayer.card,
@@ -7347,11 +7351,11 @@
         activePlayer.buffering = false;
         activePlayer.playing = activePlayer.episodeResumePlaying;
         activePlayer.card = episode;
-        activePlayer.positionMs = automatic ? 0 : Math.max(0, Math.round(episode.resumePositionMs || 0));
+        activePlayer.positionMs = startMs;
         activePlayer.durationMs = episode.durationMs || 0;
         activePlayer.episodeSeason = episodeSeasonNumber(episode);
         activePlayer.introSkipHandled = activePlayer.seriesPlaybackSetting.introSkipSeconds === 0
-            || activePlayer.positionMs >= activePlayer.seriesPlaybackSetting.introSkipSeconds * 1000;
+            || startMs >= activePlayer.seriesPlaybackSetting.introSkipSeconds * 1000;
         activePlayer.outroSkipHandled = false;
         activePlayer.playbackFinishedDuringAdvance = false;
         activePlayer.automationDisabled = false;
@@ -7362,7 +7366,7 @@
         byId('player-subtitle').textContent = [episodePosition(episode), episode.title].filter(Boolean).join(' · ');
         byId('player-loading-title').textContent = cardTitle(episode, true);
         byId('player-loading-meta').textContent = [episodePosition(episode),
-            activePlayer.positionMs > 0 ? '从 ' + formatTime(activePlayer.positionMs) + ' 继续' : ''].filter(Boolean).join(' · ');
+            startMs > 0 ? '从 ' + formatTime(startMs) + ' 继续' : ''].filter(Boolean).join(' · ');
         setPlayerPoster(episode);
         updatePlayerProgress();
         closePlayerPanel(false);
@@ -7376,7 +7380,7 @@
                 'load',
                 [
                     episode.id,
-                    activePlayer.positionMs,
+                    startMs,
                     interpolationMode,
                     interpolationModel,
                     playbackPreferenceScope(episode),
@@ -7616,6 +7620,25 @@
         scheduleControlsHide();
     }
 
+    function handlePlayerMouseMove(event) {
+        if (!player || player.exiting) return;
+        const x = event.clientX;
+        const y = event.clientY;
+        const pointer = player.controlsPointer;
+        if (!pointer) {
+            player.controlsPointer = { x, y, anchorX: x, anchorY: y };
+            return;
+        }
+        pointer.x = x;
+        pointer.y = y;
+        // Measure displacement, not total travel, so jitter cannot accumulate
+        // while slow intentional movement can still reveal the controls.
+        if (Math.hypot(x - pointer.anchorX, y - pointer.anchorY) < 6) return;
+        pointer.anchorX = x;
+        pointer.anchorY = y;
+        showPlayerControls();
+    }
+
     function isDanmakuConfigurationActive() {
         const control = byId('player-danmaku-control');
         return control.classList.contains('is-open');
@@ -7627,6 +7650,10 @@
         playerControls.classList.remove('visible');
         playerControls.inert = true;
         if (player) player.exitArmed = false;
+        if (player?.controlsPointer) {
+            player.controlsPointer.anchorX = player.controlsPointer.x;
+            player.controlsPointer.anchorY = player.controlsPointer.y;
+        }
         if (playerControls.contains(document.activeElement)) document.activeElement.blur();
         refreshPlayerCursor();
     }
@@ -8057,7 +8084,8 @@
     byId('player-subtitles').addEventListener('click', (event) => openPlayerPanel('subtitles', event.currentTarget));
     byId('player-audio').addEventListener('click', (event) => openPlayerPanel('audio', event.currentTarget));
     byId('player-info').addEventListener('click', (event) => openPlayerPanel('info', event.currentTarget));
-    playerView.addEventListener('mousemove', () => showPlayerControls(false));
+    playerView.addEventListener('mousemove', handlePlayerMouseMove);
+    playerView.addEventListener('mouseleave', () => { if (player) player.controlsPointer = null; });
     playerView.addEventListener('click', (event) => {
         if (!player || player.exiting) return;
         if (isPlayerInteractiveTarget(event.target)) {

@@ -35,7 +35,7 @@ let finishedPlayers = 0;
 let episodeAdvances = 0;
 const context = vm.createContext({
     byId: element, playerControls: element('player-controls'), playerView: element('player-view'),
-    player: { started: true, playing: true, positionMs: 15000, durationMs: 60000 },
+    player: { card: { id: 'movie' }, started: true, playing: true, positionMs: 15000, durationMs: 60000 },
     controlsTimer: 0, feedbackTimer: 0,
     document: { activeElement: null },
     window: {
@@ -74,7 +74,7 @@ function checkFeedback(icon) {
 context.togglePlayback();
 assert.equal(nativeCalls.at(-1), 'pause');
 checkFeedback('pause');
-context.handlePlaybackEvent({ kind: 'paused' });
+context.handlePlaybackEvent({ kind: 'paused', mediaId: 'movie' });
 checkFeedback('pause');
 expire(750);
 assert.equal(element('player-feedback').classList.contains('hidden'), true);
@@ -84,7 +84,7 @@ assert.equal([...timers.values()].some((timer) => timer.delay === 3000), false);
 
 context.togglePlayback();
 assert.equal(nativeCalls.at(-1), 'play');
-context.handlePlaybackEvent({ kind: 'started' });
+context.handlePlaybackEvent({ kind: 'started', mediaId: 'movie' });
 checkFeedback('play');
 expire(750);
 assert.equal(element('player-feedback').classList.contains('hidden'), true);
@@ -126,9 +126,9 @@ context.hidePlayerControls();
 assert.equal(context.playerControls.classList.contains('visible'), true);
 assert.equal([...timers.values()].some((timer) => timer.delay === 3000), false);
 context.player.exiting = true;
-context.player.card = { type: 'Episode' };
+context.player.card = { id: 'episode', type: 'Episode' };
 context.player.seriesPlaybackSetting = { autoNext: true };
-context.handlePlaybackEvent({ kind: 'finished' });
+context.handlePlaybackEvent({ kind: 'finished', mediaId: 'episode' });
 assert.equal(finishedPlayers, 1);
 assert.equal(episodeAdvances, 0);
 console.log('MODERN_CINEMA_PLAYER_UI_TEST_OK: native pause/play feedback expires; idle controls become inert; buffering, keyboard focus and panels retain controls; confirmed exit does not auto-advance');
@@ -194,7 +194,7 @@ element('player-view').classList.remove('hidden');
 element('player-failure').classList.add('hidden');
 element('player-retry').focus = () => { context.document.activeElement = element('player-retry'); };
 for (const name of ['showPlaybackFailure', 'dismissPlaybackFailure']) vm.runInContext(handlerSource(name), context);
-context.handlePlaybackEvent({ kind: 'error', message: '播放地址不可用' });
+context.handlePlaybackEvent({ kind: 'error', mediaId: failedCard.id, message: '播放地址不可用' });
 assert.equal(context.player, null);
 assert.equal(context.playbackFailure.card.id, failedCard.id);
 assert.equal(context.playbackFailure.positionMs, 23000);

@@ -184,7 +184,8 @@ $PreviewShim = @'
             selectedSeasonId: cached?.seasons?.[0]?.id || '',
         };
     };
-    const playbackEvent = (kind, fields = {}) => respond('', 'playback_event', { kind, ...fields }, true, 0);
+    let playingMediaId = '';
+    const playbackEvent = (kind, fields = {}) => respond('', 'playback_event', { kind, mediaId: playingMediaId, ...fields }, true, 0);
     const respond = (requestId, operation, payload, ok = true, delay = 70) => {
         window.setTimeout(() => window._onMediaStationResponse(requestId, operation, ok, JSON.stringify(payload)), delay);
     };
@@ -245,6 +246,7 @@ $PreviewShim = @'
             if (new URLSearchParams(location.search).get('playback') === 'error') return respond(requestId, 'load', { code: 'preview_error', message: '播放地址获取失败（开发预览模拟）' }, false, 1400);
             const card = previewCards.find((item) => item.id === mediaId) || Object.values(catalog?.details || {}).flatMap((detail) => Object.values(detail.episodesBySeason || {}).flat()).map(adapt).find((item) => item.id === mediaId);
             if (!card) return respond(requestId, 'load', { message: '预览缓存中没有该作品' }, false);
+            playingMediaId = mediaId;
             respond(requestId, 'load', {
                 durationMs: card.durationMs, deliveryMode: 'direct_cdn', probeStatus: 'skipped', acceptsRanges: true,
                 redirectCount: 1, resolveMs: 42, reused: true, targetHost: 'preview.local', container: 'mkv', bitrate: 8000000,
@@ -254,7 +256,7 @@ $PreviewShim = @'
                 audioTrackKey: 'audio-1', subtitleTrackKey: 'subtitle-1', subtitleEnabled: true,
                 frameInterpolation: null, mediaMetadataPending: false,
             });
-            window.setTimeout(() => window._onMediaStationResponse('', 'playback_event', true, JSON.stringify({ kind: 'started' })), 1800);
+            window.setTimeout(() => window._onMediaStationResponse('', 'playback_event', true, JSON.stringify({ kind: 'started', mediaId })), 1800);
         },
         mediaStationTracks(requestId) { respond(requestId, 'tracks', { audioTracks: [{ key: 'audio-1', language: '中文', codec: 'AAC', channels: 2 }], subtitleTracks: [{ key: 'subtitle-1', language: '简体中文', codec: 'SRT', title: '简体中文' }], audioTrackKey: 'audio-1', subtitleTrackKey: 'subtitle-1', subtitleEnabled: true, mediaMetadataPending: false }); },
         mediaStationSelectTrack(requestId, operation) { respond(requestId, operation, { ok: true }); },

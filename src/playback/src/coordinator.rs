@@ -215,6 +215,8 @@ fn worker(shared: Arc<Shared>) {
 
 fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEvent>) {
     let diagnostic = diagnostic_input(&input);
+    // Terminal transitions clear identity before their events are delivered.
+    let previous_item_id = sm.item_id().to_owned();
     let mut emitted = match input {
         Input::FileLoaded => sm.on_file_loaded(),
         Input::LoadStarting(id) => sm.on_load_starting(id),
@@ -283,6 +285,22 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
             snapshot.seeking
         );
     }
+    // Capture identity per input: a later load in this batch must not relabel
+    // an old episode's position or terminal event as belonging to the new one.
+    let terminal = emitted.iter().any(|event| {
+        matches!(
+            event.kind,
+            PlaybackEventKind::Finished | PlaybackEventKind::Canceled | PlaybackEventKind::Error
+        )
+    });
+    let item_id = if terminal {
+        previous_item_id
+    } else {
+        sm.item_id().to_owned()
+    };
+    for event in &mut emitted {
+        event.item_id.clone_from(&item_id);
+    }
     out.append(&mut emitted);
 }
 
@@ -312,6 +330,70 @@ mod tests {
         assert_eq!(s.presence, PlayerPresence::None);
         assert_eq!(s.phase, PlaybackPhase::Stopped);
         assert_eq!(s.rate, 1.0);
+    }
+
+    #[test]
+    fn batched_events_keep_the_episode_that_produced_them() {
+        let mut coord = PlaybackCoordinator::new().unwrap();
+        let (tx, rx) = mpsc::channel();
+        coord.add_event_sink(Box::new(move |event| {
+            tx.send((event.kind, event.item_id.clone())).unwrap();
+        }));
+        // Queue both episodes before starting to force one delivery batch.
+        for (position, item_id) in [(1_000_000, "episode-old"), (2_000_000, "episode-next")] {
+            coord.enqueue(Input::LoadStarting(item_id.to_string()));
+            coord.enqueue(Input::Position(position));
+        }
+        coord.start();
+        let events = (0..4)
+            .map(|_| rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+            .collect::<Vec<_>>();
+        coord.stop();
+        assert_eq!(
+            events,
+            vec![
+                (PlaybackEventKind::TrackLoaded, "episode-old".to_string()),
+                (
+                    PlaybackEventKind::PositionChanged,
+                    "episode-old".to_string()
+                ),
+                (PlaybackEventKind::TrackLoaded, "episode-next".to_string()),
+                (
+                    PlaybackEventKind::PositionChanged,
+                    "episode-next".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_events_keep_identity_after_the_state_clears_it() {
+        for (reason, kind) in [
+            (EndReason::Eof, PlaybackEventKind::Finished),
+            (EndReason::Canceled, PlaybackEventKind::Canceled),
+            (EndReason::Error, PlaybackEventKind::Error),
+        ] {
+            let mut sm = PlaybackStateMachine::new();
+            let mut events = Vec::new();
+            apply(
+                &mut sm,
+                Input::LoadStarting("episode".to_string()),
+                &mut events,
+            );
+            apply(&mut sm, Input::FileLoaded, &mut events);
+            events.clear();
+            apply(
+                &mut sm,
+                Input::EndFile {
+                    reason,
+                    error_message: String::new(),
+                },
+                &mut events,
+            );
+            let terminal = events.iter().find(|event| event.kind == kind).unwrap();
+            assert_eq!(terminal.item_id, "episode");
+            assert_eq!(sm.item_id(), "");
+        }
     }
 
     #[test]

@@ -37,6 +37,10 @@ impl PlaybackStateMachine {
         self.s.clone()
     }
 
+    pub fn item_id(&self) -> &str {
+        &self.last_known_item_id
+    }
+
     pub fn consume_actions(&mut self) -> Vec<PlaybackAction> {
         std::mem::take(&mut self.pending_actions)
     }

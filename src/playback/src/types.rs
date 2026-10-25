@@ -111,6 +111,8 @@ pub enum PlaybackEventKind {
 #[derive(Clone, Debug)]
 pub struct PlaybackEvent {
     pub kind: PlaybackEventKind,
+    /// Item active when this event was produced, before later batched loads.
+    pub item_id: String,
     pub flag: bool,
     pub error_message: String,
     pub snapshot: PlaybackSnapshot,
@@ -124,6 +126,7 @@ impl PlaybackEvent {
     pub(crate) fn new(kind: PlaybackEventKind) -> Self {
         Self {
             kind,
+            item_id: String::new(),
             flag: false,
             error_message: String::new(),
             snapshot: PlaybackSnapshot::default(),

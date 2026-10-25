@@ -330,6 +330,7 @@ fn playback_event_payload(event: &PlaybackEvent) -> Value {
     .then_some(event.error_message.as_str());
     json!({
         "kind": kind,
+        "mediaId": event.item_id,
         "errorCode": error_code,
         "positionMs": event.snapshot.position_us.max(0) / 1_000,
         "durationMs": event.snapshot.duration_us.max(0) / 1_000,
@@ -808,6 +809,15 @@ impl MediaStationRuntime {
         let mut dispatched_event = None;
         let (jobs, reconcile) = {
             let mut state = self.state.lock();
+            // Old queued events must not update the new item's progress report
+            // or filter health after the native load has switched items.
+            if state
+                .active_report
+                .as_ref()
+                .is_some_and(|active| active.source.media_id != event.item_id)
+            {
+                return;
+            }
             let filter_failed = filter_status.as_ref().is_some_and(|status| {
                 state.active_interpolation.as_mut().is_some_and(|active| {
                     interpolation_filter_failed(
@@ -8615,6 +8625,7 @@ mod tests {
     fn playback_event(kind: PlaybackEventKind, position_ms: u64) -> PlaybackEvent {
         PlaybackEvent {
             kind,
+            item_id: String::new(),
             flag: false,
             error_message: String::new(),
             snapshot: PlaybackSnapshot {
@@ -10253,6 +10264,19 @@ mod tests {
             pending_embedded_subtitle_preference(&catalog, &preference),
             None
         );
+    }
+
+    #[test]
+    fn playback_event_payload_keeps_the_source_episode_identity() {
+        for kind in [
+            PlaybackEventKind::PositionChanged,
+            PlaybackEventKind::Started,
+            PlaybackEventKind::Finished,
+        ] {
+            let mut event = playback_event(kind, 42_000);
+            event.item_id = "episode-old".to_string();
+            assert_eq!(playback_event_payload(&event)["mediaId"], "episode-old");
+        }
     }
 
     #[test]
