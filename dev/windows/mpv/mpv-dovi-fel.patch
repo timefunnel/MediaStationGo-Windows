@@ -1,0 +1,1931 @@
+Upstream mpv PR 17932, merge 99b4c12cccb4d8d3f72b41944cb6c640e2156650.
+Adapted to pinned fork; pair before enhancement filters and fail on missing FEL.
+
+diff --git a/DOCS/man/vf.rst b/DOCS/man/vf.rst
+index 3e4d9c7b2ea71df61a71dc3be9b0eeb4cedd8cee..f0620ca905d231dba3689aa854745493a8c78a7b 100644
+--- a/DOCS/man/vf.rst
++++ b/DOCS/man/vf.rst
+@@ -323,6 +323,12 @@ Available mpv-only filters are:
+         Whether or not to include HDR10+ metadata (default: yes). If
+         disabled, any HDR10+ metadata will be stripped from frames.
+ 
++    ``<enhancement-layer=yes|no>``
++        Whether or not to apply the image enhancement layer (default: yes).
++        If disabled, the enhancement-layer frame paired with each base-layer
++        frame is discarded. Currently this controls Dolby Vision Profile 7 FEL
++        application.
++
+     ``<min-luma>``
+         Set the minimum luminance value for the mastering display metadata.
+         This is a float value in nits (cd/m²).
+diff --git a/demux/demux.c b/demux/demux.c
+index 69008829c4c497f7183a1fa71eff4d5407096595..20d2739d97b7bcd29b6660f8b2d5b347a7614b4f 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -4145,11 +4145,11 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
+     struct demux_internal *in = demuxer->in;
+     mp_mutex_lock(&in->lock);
+     bool changed = select_track(in, stream, ref_pts, selected);
+-    if (stream->group) {
++    if (stream->group && !stream->dependent_track) {
+         for (int i = 0; i < stream->group->num_members; i++) {
+             struct sh_stream *m = stream->group->members[i];
+             mp_assert(m);
+-            if (m != stream)
++            if (m != stream && m->dependent_track)
+                 changed |= select_track(in, m, ref_pts, selected);
+         }
+     }
+diff --git a/demux/demux_disc.c b/demux/demux_disc.c
+index 377663c11a2f608f478f383df2a644d70addc57b..87048342edd330915bf0a34859241a79b9fe4b0a 100644
+--- a/demux/demux_disc.c
++++ b/demux/demux_disc.c
+@@ -123,8 +123,9 @@ static void add_dvd_streams(demuxer_t *demuxer)
+ static void add_streams(demuxer_t *demuxer)
+ {
+     struct priv *p = demuxer->priv;
++    int old_num = p->num_streams;
+ 
+-    for (int n = p->num_streams; n < demux_get_num_stream(p->slave); n++) {
++    for (int n = old_num; n < demux_get_num_stream(p->slave); n++) {
+         struct sh_stream *src = demux_get_stream(p->slave, n);
+         if (src->type == STREAM_SUB) {
+             struct sh_stream *sub = NULL;
+@@ -142,6 +143,7 @@ static void add_streams(demuxer_t *demuxer)
+         // Copy all stream fields that might be relevant
+         *sh->codec = *src->codec;
+         sh->demuxer_id = src->demuxer_id;
++        sh->dependent_track = src->dependent_track;
+         if (src->type == STREAM_VIDEO) {
+             double ar;
+             if (stream_control(demuxer->stream, STREAM_CTRL_GET_ASPECT_RATIO, &ar)
+@@ -157,6 +159,31 @@ static void add_streams(demuxer_t *demuxer)
+         get_disc_lang(demuxer->stream, sh, p->is_dvd);
+         demux_add_sh_stream(demuxer, sh);
+     }
++
++    // Mirror slave sh_stream_group onto the disc-level sh_streams. This is needed
++    // for the Dolby Vision BL+EL group, it's detected well by lavf. We could use
++    // the libbluray `dv_streams[]` info, but it's not available yet in release
++    // version, and mapping it through lavf is less code.
++    for (int n = old_num; n < p->num_streams; n++) {
++        struct sh_stream *disc_sh = p->streams[n];
++        if (!disc_sh || disc_sh->group)
++            continue;
++        struct sh_stream *src = demux_get_stream(p->slave, n);
++        if (!src || !src->group)
++            continue;
++        struct sh_stream_group *grp = talloc_zero(disc_sh, struct sh_stream_group);
++        for (int m = 0; m < src->group->num_members; m++) {
++            struct sh_stream *sh = src->group->members[m];
++            if (!sh || sh->index < 0 || sh->index >= p->num_streams)
++                continue;
++            struct sh_stream *disc_member = p->streams[sh->index];
++            if (!disc_member)
++                continue;
++            MP_TARRAY_APPEND(grp, grp->members, grp->num_members, disc_member);
++            disc_member->group = grp;
++        }
++    }
++
+     reselect_streams(demuxer);
+ }
+ 
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index c8f134c47cae14ba64e46718da086a5fd18f6d2b..da884b889e13c4ac25bd5293a7ff8841835ddd86 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -52,6 +52,7 @@
+ #include "stream/stream_curl.h"
+ 
+ #include "demux.h"
++#include "dovi_split.h"
+ #include "stheader.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+@@ -224,6 +225,7 @@ struct stream_info {
+     double last_key_pts;
+     double highest_pts;
+     double ts_offset;
++    struct mp_dovi_split *dovi_split;
+ };
+ 
+ typedef struct lavf_priv {
+@@ -252,6 +254,8 @@ typedef struct lavf_priv {
+ 
+     int retry_counter;
+ 
++    struct demux_packet *pending_pkt;
++
+     AVDictionary *av_opts;
+ 
+     // Proxying nested streams.
+@@ -600,6 +604,12 @@ static void select_tracks(struct demuxer *demuxer, int start)
+         AVStream *st = priv->avfc->streams[n];
+         bool selected = stream && demux_stream_is_selected(stream) &&
+                         !stream->attached_picture;
++        if (!selected && priv->streams[n]->dovi_split) {
++            struct sh_stream *el =
++                mp_dovi_split_el_stream(priv->streams[n]->dovi_split);
++            if (el && demux_stream_is_selected(el))
++                selected = true;
++        }
+         st->discard = selected ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+     }
+ }
+@@ -773,6 +783,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+             sh->codec->dovi = true;
+             sh->codec->dv_profile = cfg->dv_profile;
+             sh->codec->dv_level = cfg->dv_level;
++            sh->codec->dv_el_present = cfg->bl_present_flag && cfg->el_present_flag;
+         }
+ 
+         // This also applies to vfw-muxed mkv, but we can't detect these easily.
+@@ -1266,6 +1277,42 @@ static void handle_lcevc_group(demuxer_t *demuxer, AVStreamGroup *stg)
+ }
+ #endif
+ 
++#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
++// Base layer + Enhancement layer separate track stream group
++static void handle_layered_video_group(demuxer_t *demuxer, AVStreamGroup *stg)
++{
++    lavf_priv_t *priv = demuxer->priv;
++    AVStreamGroupLayeredVideo *layered = stg->params.layered_video;
++
++    if (stg->nb_streams != 2 || layered->el_index >= stg->nb_streams) {
++        MP_WARN(demuxer, "Dolby Vision group %u: expected 2 streams with valid "
++                "el_index, got %u streams and el_index %u\n",
++                stg->index, stg->nb_streams, layered->el_index);
++        return;
++    }
++
++    AVStream *el_st = stg->streams[layered->el_index];
++    AVStream *bl_st = stg->streams[layered->el_index ? 0 : 1];
++
++    if ((size_t)el_st->index >= priv->num_streams || (size_t)bl_st->index >= priv->num_streams)
++        return;
++
++    struct sh_stream *el_sh = priv->streams[el_st->index]->sh;
++    struct sh_stream *bl_sh = priv->streams[bl_st->index]->sh;
++    if (!el_sh || !bl_sh)
++        return;
++
++    // Group storage is attached to the BL so its lifetime tracks the demuxer.
++    struct sh_stream_group *group = talloc_zero(bl_sh, struct sh_stream_group);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, bl_sh);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, el_sh);
++
++    bl_sh->group = group;
++    el_sh->group = group;
++    el_sh->dependent_track = true;
++}
++#endif
++
+ static void handle_stream_groups(demuxer_t *demuxer)
+ {
+     lavf_priv_t *priv = demuxer->priv;
+@@ -1297,6 +1344,11 @@ static void handle_stream_groups(demuxer_t *demuxer)
+         case AV_STREAM_GROUP_PARAMS_LCEVC:
+             handle_lcevc_group(demuxer, stg);
+             break;
++#endif
++#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
++        case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
++            handle_layered_video_group(demuxer, stg);
++            break;
+ #endif
+         default:
+             MP_VERBOSE(demuxer, "Unhandled stream group type %d (index %u)\n",
+@@ -1307,6 +1359,22 @@ static void handle_stream_groups(demuxer_t *demuxer)
+ }
+ #endif
+ 
++static void detect_dovi_split_streams(demuxer_t *demuxer)
++{
++    lavf_priv_t *priv = demuxer->priv;
++    int snapshot_count = priv->num_streams;
++    for (int n = 0; n < snapshot_count; n++) {
++        struct stream_info *info = priv->streams[n];
++        struct sh_stream *sh = info ? info->sh : NULL;
++        if (!sh || sh->type != STREAM_VIDEO || !sh->codec ||
++            !sh->codec->dv_el_present || sh->group)
++        {
++            continue;
++        }
++        info->dovi_split = mp_dovi_split_create(demuxer, sh);
++    }
++}
++
+ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
+ {
+     AVFormatContext *avfc = NULL;
+@@ -1489,6 +1557,7 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
+ #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(60, 19, 100)
+     handle_stream_groups(demuxer);
+ #endif
++    detect_dovi_split_streams(demuxer);
+ 
+     mp_tags_move_from_av_dictionary(demuxer->metadata, &avfc->metadata);
+ 
+@@ -1576,6 +1645,13 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+ {
+     lavf_priv_t *priv = demux->priv;
+ 
++    // Companion EL packet queued by the Dolby Vision splitter on a prior call.
++    if (priv->pending_pkt) {
++        *mp_pkt = priv->pending_pkt;
++        priv->pending_pkt = NULL;
++        return true;
++    }
++
+     AVPacket *pkt = av_packet_alloc();
+     MP_HANDLE_OOM(pkt);
+     int r = av_read_frame(priv->avfc, pkt);
+@@ -1604,7 +1680,14 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+     struct sh_stream *stream = info->sh;
+     AVStream *st = priv->avfc->streams[pkt->stream_index];
+ 
+-    if (!demux_stream_is_selected(stream)) {
++    // Keep BL packets flowing to feed the Dolby Vision splitter when its
++    // virtual EL is selected, even if the BL itself isn't selected. The
++    // unselected BL dp gets discarded by the demuxer queue downstream.
++    struct sh_stream *split_el = info->dovi_split
++                                    ? mp_dovi_split_el_stream(info->dovi_split)
++                                    : NULL;
++    bool need_for_split = split_el && demux_stream_is_selected(split_el);
++    if (!demux_stream_is_selected(stream) && !need_for_split) {
+         av_packet_free(&pkt);
+         return true; // don't signal EOF if skipping a packet
+     }
+@@ -1666,6 +1749,13 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+         }
+     }
+ 
++    // Dispatch the EL view of this packet via the splitter.
++    if (info->dovi_split) {
++        struct sh_stream *el = mp_dovi_split_el_stream(info->dovi_split);
++        if (el && demux_stream_is_selected(el))
++            priv->pending_pkt = mp_dovi_split_dispatch(info->dovi_split, dp);
++    }
++
+     if (st->event_flags & AVSTREAM_EVENT_FLAG_METADATA_UPDATED) {
+         st->event_flags = 0;
+         struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
+@@ -1678,6 +1768,16 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+     return true;
+ }
+ 
++static void reset_dovi_split_state(demuxer_t *demuxer)
++{
++    lavf_priv_t *priv = demuxer->priv;
++    TA_FREEP(&priv->pending_pkt);
++    for (int n = 0; n < priv->num_streams; n++) {
++        if (priv->streams[n] && priv->streams[n]->dovi_split)
++            mp_dovi_split_reset(priv->streams[n]->dovi_split);
++    }
++}
++
+ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
+ {
+     lavf_priv_t *priv = demuxer->priv;
+@@ -1686,6 +1786,7 @@ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
+     stream_drop_buffers(priv->stream);
+     avio_flush(priv->avfc->pb);
+     avformat_flush(priv->avfc);
++    reset_dovi_split_state(demuxer);
+ }
+ 
+ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
+@@ -1769,6 +1870,7 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
+         av_strerror(r, buf, sizeof(buf));
+         MP_VERBOSE(demuxer, "Seek failed (%s)\n", buf);
+     }
++    reset_dovi_split_state(demuxer);
+ 
+     update_read_stats(demuxer);
+ }
+@@ -1802,7 +1904,9 @@ static void demux_close_lavf(demuxer_t *demuxer)
+             struct stream_info *info = priv->streams[n];
+             if (info->sh)
+                 avcodec_parameters_free(&info->sh->codec->lav_codecpar);
++            TA_FREEP(&info->dovi_split);
+         }
++        TA_FREEP(&priv->pending_pkt);
+         if (priv->own_stream)
+             free_stream(priv->stream);
+         if (priv->av_opts)
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index acbd75f6d929f257b67a3ff8e6dfc336dddf1914..0349cb91ac4edbbc6aa22dfe9b46cc08db415598 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -55,6 +55,7 @@
+ #include "video/csputils.h"
+ #include "video/mp_image.h"
+ #include "demux.h"
++#include "dovi_split.h"
+ #include "packet_pool.h"
+ #include "stheader.h"
+ #include "ebml.h"
+@@ -163,6 +164,8 @@ typedef struct mkv_track {
+     size_t last_index_entry;
+ 
+     AVDOVIDecoderConfigurationRecord *dovi_config;
++    bstr hvce;
++    struct mp_dovi_split *dovi_split;
+ } mkv_track_t;
+ 
+ typedef struct mkv_index {
+@@ -837,9 +840,13 @@ static void parse_block_addition_mapping(struct demuxer *demuxer,
+         switch (block_addition_mapping->block_add_id_type) {
+         case MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35:
+         break;
+-        case MKBETAG('a','v','c','E'):
+         case MKBETAG('h','v','c','E'):
+-            MP_WARN(demuxer, "Dolby Vision enhancement-layer playback is not supported.\n");
++            if (block_addition_mapping->n_block_add_id_extra_data)
++                track->hvce = bstrdup(track, block_addition_mapping->block_add_id_extra_data);
++        break;
++        case MKBETAG('a','v','c','E'):
++            MP_WARN(demuxer, "Dolby Vision enhancement-layer playback for AVC "
++                    "is not supported.\n");
+         break;
+         case MKBETAG('d','v','c','C'):
+         case MKBETAG('d','v','v','C'):
+@@ -867,6 +874,7 @@ static void demux_mkv_free_trackentry(mkv_track_t *track)
+ {
+     talloc_free(track->parser_tmp);
+     av_freep(&track->dovi_config);
++    TA_FREEP(&track->dovi_split);
+     talloc_free(track);
+ }
+ 
+@@ -1802,11 +1810,33 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track)
+         sh_v->dovi = true;
+         sh_v->dv_level = track->dovi_config->dv_level;
+         sh_v->dv_profile = track->dovi_config->dv_profile;
++        sh_v->dv_el_present = track->dovi_config->bl_present_flag &&
++                              track->dovi_config->el_present_flag;
+     }
+ 
++#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 35, 100)
++    if (track->hvce.len > 0) {
++        void *data = av_memdup(track->hvce.start, track->hvce.len);
++        MP_HANDLE_OOM(data);
++        if (!av_packet_side_data_add(&sh_v->lav_codecpar->coded_side_data,
++                                     &sh_v->lav_codecpar->nb_coded_side_data,
++                                     AV_PKT_DATA_HEVC_CONF,
++                                     data, track->hvce.len, 0))
++        {
++            MP_ERR(demuxer, "Failed to attach hvcE configuration record to "
++                   "codec parameters for track %d!\n", track->tnum);
++            av_free(data);
++        }
++    }
++#endif
++
+ done:
+     demux_add_sh_stream(demuxer, sh);
+ 
++    // Profile 7 NALU-interleaved
++    if (sh_v->dv_el_present)
++        track->dovi_split = mp_dovi_split_create(demuxer, sh);
++
+     return 0;
+ }
+ 
+@@ -2250,6 +2280,51 @@ static int demux_mkv_open_sub(demuxer_t *demuxer, mkv_track_t *track)
+     return 0;
+ }
+ 
++static void pair_dovi_tracks(demuxer_t *demuxer)
++{
++    mkv_demuxer_t *mkv_d = demuxer->priv;
++    mkv_track_t *bl_track = NULL, *el_track = NULL;
++
++    for (int i = 0; i < mkv_d->num_tracks; i++) {
++        mkv_track_t *track = mkv_d->tracks[i];
++        if (!track->stream || track->stream->type != STREAM_VIDEO ||
++            !track->codec_id || strcmp(track->codec_id, "V_MPEGH/ISO/HEVC"))
++            continue;
++
++        AVDOVIDecoderConfigurationRecord *dovi = track->dovi_config;
++        if (dovi && dovi->dv_profile == 7 && dovi->el_present_flag) {
++            // bl_present_flag is not checked, because the files in the
++            // wild set it to 1 for EL stream, while the expectation, based
++            // on Dolby spec for MPEG-TS would be that it's set to 0.
++            // Ignore this, if we have EL track and single other video track
++            // it's safe to assume it's BL.
++            if (el_track)
++                return;
++            el_track = track;
++            continue;
++        }
++
++        if (bl_track)
++            return;
++        bl_track = track;
++    }
++
++    if (!el_track || !bl_track)
++        return;
++
++    struct sh_stream *bl_sh = bl_track->stream;
++    struct sh_stream *el_sh = el_track->stream;
++
++    // Group storage is attached to the BL so its lifetime tracks the demuxer.
++    struct sh_stream_group *group = talloc_zero(bl_sh, struct sh_stream_group);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, bl_sh);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, el_sh);
++
++    bl_sh->group = group;
++    el_sh->group = group;
++    el_sh->dependent_track = true;
++}
++
+ // Workaround for broken files that don't set attached_picture
+ static void probe_if_image(demuxer_t *demuxer)
+ {
+@@ -2531,6 +2606,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+     MP_VERBOSE(demuxer, "All headers are parsed!\n");
+ 
+     display_create_tracks(demuxer);
++    pair_dovi_tracks(demuxer);
+     add_coverart(demuxer);
+     process_tags(demuxer);
+ 
+@@ -2749,6 +2825,7 @@ static void mkv_seek_reset(demuxer_t *demuxer)
+             av_parser_close(track->av_parser);
+         track->av_parser = NULL;
+         avcodec_free_context(&track->av_parser_codec);
++        mp_dovi_split_reset(track->dovi_split);
+     }
+ 
+     for (int n = 0; n < mkv_d->num_blocks; n++)
+@@ -2896,7 +2973,16 @@ static void mkv_parse_and_add_packet(demuxer_t *demuxer, mkv_track_t *track,
+     }
+ 
+     if (!track->parse || !track->av_parser || !track->av_parser_codec) {
++        struct demux_packet *el_dp = NULL;
++        struct sh_stream *el_sh = NULL;
++        if (track->dovi_split) {
++            el_sh = mp_dovi_split_el_stream(track->dovi_split);
++            if (el_sh && demux_stream_is_selected(el_sh))
++                el_dp = mp_dovi_split_dispatch(track->dovi_split, dp);
++        }
+         add_packet(demuxer, stream, dp);
++        if (el_dp)
++            add_packet(demuxer, el_sh, el_dp);
+         return;
+     }
+ 
+@@ -3034,7 +3120,13 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
+     struct sh_stream *stream = track->stream;
+     bool use_this_block = tc >= mkv_d->skip_to_timecode;
+ 
+-    if (!demux_stream_is_selected(stream))
++    // Keep BL blocks flowing to feed the Dolby Vision splitter when its
++    // virtual EL is selected, even if the BL itself isn't selected.
++    struct sh_stream *split_el = track->dovi_split
++                                    ? mp_dovi_split_el_stream(track->dovi_split)
++                                    : NULL;
++    bool need_for_split = split_el && demux_stream_is_selected(split_el);
++    if (!demux_stream_is_selected(stream) && !need_for_split)
+         return 0;
+ 
+     current_pts = tc / 1e9 - track->codec_delay;
+diff --git a/demux/stheader.h b/demux/stheader.h
+index 6722c07218673a8e0119e7d114e49af88a1543e9..01754746b2372c6fdeeda491d90775a1082cfa13 100644
+--- a/demux/stheader.h
++++ b/demux/stheader.h
+@@ -99,6 +99,23 @@ static inline bool sh_stream_has_program(const struct sh_stream *sh, int program
+     return false;
+ }
+ 
++// Return the dependent twin of the given base track (e.g. a Dolby Vision
++// enhancement-layer stream paired with the base layer), or NULL if none. Only
++// twin-track groups (exactly 2 members) of matching type are supported.
++static inline struct sh_stream *sh_stream_dependent_sibling(struct sh_stream *bl)
++{
++    if (!bl || !bl->group || bl->dependent_track)
++        return NULL;
++    if (bl->group->num_members != 2)
++        return NULL;
++    for (int i = 0; i < bl->group->num_members; i++) {
++        struct sh_stream *m = bl->group->members[i];
++        if (m && m != bl && m->dependent_track && m->type == bl->type)
++            return m;
++    }
++    return NULL;
++}
++
+ struct mp_codec_params {
+     enum stream_type type;
+ 
+@@ -158,6 +175,7 @@ struct mp_codec_params {
+     bool dovi;
+     uint8_t dv_profile;
+     uint8_t dv_level;
++    bool dv_el_present;     // BL and EL interleaved in this stream (Profile 7)
+ 
+     // STREAM_VIDEO + STREAM_AUDIO
+     int bits_per_coded_sample;
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 08978e49f4540eb8ecac4b1a07540efa81dd486e..2137b4b0d2152dc385628bf16867cfb59e203518 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -1406,13 +1406,14 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
+ 
+     decf_reset(p->decf);
+ 
++    struct mp_pin *out_pin;
+     if (p->queue) {
+         struct mp_filter *f_in =
+             mp_async_queue_create_filter(public_f, MP_PIN_OUT, p->queue);
+         struct mp_filter *f_out =
+             mp_async_queue_create_filter(p->decf, MP_PIN_IN, p->queue);
+-        mp_pin_connect(public_f->ppins[0], f_in->pins[0]);
+         mp_pin_connect(f_out->pins[0], p->decf->pins[0]);
++        out_pin = f_in->pins[0];
+ 
+         p->dec_thread_valid = true;
+         if (mp_thread_create(&p->dec_thread, dec_thread, p)) {
+@@ -1420,9 +1421,11 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
+             goto error;
+         }
+     } else {
+-        mp_pin_connect(public_f->ppins[0], p->decf->pins[0]);
++        out_pin = p->decf->pins[0];
+     }
+ 
++    mp_pin_connect(public_f->ppins[0], out_pin);
++
+     public_f_reset(public_f);
+ 
+     return &p->public;
+diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+index 8ded23177da849ea0d1744041832ed40606ccc3f..17cd952cbfb7e45bd9382ec900040eb0912c8961 100644
+--- a/filters/f_output_chain.c
++++ b/filters/f_output_chain.c
+@@ -1,6 +1,7 @@
+ #include "audio/aframe.h"
+ #include "audio/out/ao.h"
+ #include "common/global.h"
++#include "common/msg.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+ #include "video/out/vo.h"
+@@ -9,6 +10,7 @@
+ 
+ #include "f_autoconvert.h"
+ #include "f_auto_filters.h"
++#include "f_enhancement_pair.h"
+ #include "f_lavfi.h"
+ #include "f_output_chain.h"
+ #include "f_utils.h"
+@@ -42,6 +44,11 @@ struct chain {
+     struct mp_user_filter *input, *output, *convert_wrapper;
+     struct mp_autoconvert *convert;
+ 
++    // Enhancement-layer pair filter wrapper (after decoder, before user filters). NULL when
++    // no EL is paired.
++    struct mp_user_filter *el_pair;
++    struct sh_stream *el_sh;
++
+     struct vo *vo;
+     struct ao *ao;
+ 
+@@ -156,7 +163,11 @@ static void user_wrapper_process(struct mp_filter *f)
+     mp_assert(u->name);
+ 
+     if (!u->failed && mp_filter_has_failed(u->f)) {
+-        if (u == p->convert_wrapper) {
++        if (u == p->el_pair || strcmp(u->name, "nvvideo") == 0) {
++            MP_FATAL(p, "Dolby Vision or native enhancement processing failed.\n");
++            p->public.failed_output_conversion = true;
++            mp_filter_wakeup(p->f);
++        } else if (u == p->convert_wrapper) {
+             // This is a fuckup we can't ignore.
+             MP_FATAL(p, "Cannot convert decoder/filter output to any format "
+                      "supported by the output.\n");
+@@ -392,6 +403,47 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
+     update_output_caps(p);
+ }
+ 
++void mp_output_chain_set_el_stream(struct mp_output_chain *c,
++                                   struct sh_stream *el_sh)
++{
++    struct chain *p = c->f->priv;
++
++    mp_assert(p->type == MP_OUTPUT_CHAIN_VIDEO);
++
++    if (p->el_sh == el_sh && (!el_sh || p->el_pair))
++        return;
++
++    if (p->el_pair) {
++        for (int n = 0; n < p->num_pre_filters; n++) {
++            if (p->pre_filters[n] == p->el_pair) {
++                MP_TARRAY_REMOVE_AT(p->pre_filters, p->num_pre_filters, n);
++                break;
++            }
++        }
++        talloc_free(p->el_pair->wrapper);
++        p->el_pair = NULL;
++        p->el_sh = NULL;
++    }
++
++    if (el_sh) {
++        struct mp_user_filter *u = create_wrapper_filter(p);
++        u->name = "el_pair";
++        u->f = mp_enhancement_pair_create(u->wrapper, el_sh);
++        if (!u->f) {
++            MP_FATAL(p, "Failed to set up Dolby Vision enhancement-layer pairing.\n");
++            p->public.failed_output_conversion = true;
++            mp_filter_wakeup(p->f);
++            talloc_free(u->wrapper);
++        } else {
++            MP_TARRAY_APPEND(p, p->pre_filters, p->num_pre_filters, u);
++            p->el_pair = u;
++            p->el_sh = el_sh;
++        }
++    }
++
++    relink_filter_list(p);
++}
++
+ void mp_output_chain_set_ao(struct mp_output_chain *c, struct ao *ao)
+ {
+     struct chain *p = c->f->priv;
+diff --git a/filters/f_output_chain.h b/filters/f_output_chain.h
+index f313f9a65f738c03e2880907e0dce5f5e97bbf2d..932d0d1f7c1d4124094dd9796860f354640bd6d8 100644
+--- a/filters/f_output_chain.h
++++ b/filters/f_output_chain.h
+@@ -88,3 +88,9 @@ double mp_output_get_measured_total_delay(struct mp_output_chain *p);
+ 
+ // Check if deinterlace user filter is inserted
+ bool mp_output_chain_deinterlace_active(struct mp_output_chain *p);
++
++// Pair enhancement-layer frames before user filters.
++// Pass el_sh=NULL to remove. No-op if the same el_sh is already installed.
++struct sh_stream;
++void mp_output_chain_set_el_stream(struct mp_output_chain *p,
++                                   struct sh_stream *el_sh);
+diff --git a/meson.build b/meson.build
+index 218af4f151344fcb785e952e5d8856b1eedad2ce..e64291ad023dbc415553b54a3a001cbfa3d9d2af 100644
+--- a/meson.build
++++ b/meson.build
+@@ -106,6 +106,7 @@ sources = files(
+     'demux/demux_playlist.c',
+     'demux/demux_raw.c',
+     'demux/demux_timeline.c',
++    'demux/dovi_split.c',
+     'demux/ebml.c',
+     'demux/packet.c',
+     'demux/packet_pool.c',
+@@ -117,6 +118,7 @@ sources = files(
+     'filters/f_auto_filters.c',
+     'filters/f_decoder_wrapper.c',
+     'filters/f_demux_in.c',
++    'filters/f_enhancement_pair.c',
+     'filters/f_hwtransfer.c',
+     'filters/f_lavfi.c',
+     'filters/f_output_chain.c',
+diff --git a/player/core.h b/player/core.h
+index f17a8a9a3294f298d3e27b21af87980bc00fa1e0..ec6784411c9699c2db9e03fe929750955b7bf139 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -568,6 +568,7 @@ struct track *select_default_track(struct MPContext *mpctx, int order,
+                                    enum stream_type type);
+ void prefetch_next(struct MPContext *mpctx);
+ void update_lavfi_complex(struct MPContext *mpctx);
++void update_vo_chain_el_pair(struct MPContext *mpctx);
+ 
+ // main.c
+ int mp_initialize(struct MPContext *mpctx, char **argv);
+diff --git a/player/loadfile.c b/player/loadfile.c
+index 0b3e70d550d5917ca93de7b4b129ea43ab10c341..0db9db5fff09ba74500f83bff9c2b969060a31e3 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -1576,8 +1576,12 @@ done:
+     cleanup_deassociated_complex_filters(mpctx);
+ 
+     if (mpctx->playback_initialized) {
+-        for (int n = 0; n < mpctx->num_tracks; n++)
+-            reselect_demux_stream(mpctx, mpctx->tracks[n], false);
++        for (int n = 0; n < mpctx->num_tracks; n++) {
++            struct track *t = mpctx->tracks[n];
++            if (t->stream && t->stream->dependent_track && !t->selected)
++                continue;
++            reselect_demux_stream(mpctx, t, false);
++        }
+     }
+ 
+     mp_notify(mpctx, MP_EVENT_TRACKS_CHANGED, NULL);
+@@ -1585,11 +1589,25 @@ done:
+     return success ? 1 : -1;
+ }
+ 
++// Match the enhancement-layer pairing on the vo_chain to the currently
++// selected video track. Idempotent. Decoupled from lavfi-complex internals.
++void update_vo_chain_el_pair(struct MPContext *mpctx)
++{
++    if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
++        return;
++    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
++    mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
++        track ? sh_stream_dependent_sibling(track->stream) : NULL);
++}
++
+ void update_lavfi_complex(struct MPContext *mpctx)
+ {
+     if (mpctx->playback_initialized) {
+-        if (reinit_complex_filters(mpctx, false) != 0)
++        int r = reinit_complex_filters(mpctx, false);
++        if (r != 0)
+             issue_refresh_seek(mpctx, MPSEEK_EXACT);
++        if (r > 0)
++            update_vo_chain_el_pair(mpctx);
+     }
+ }
+ 
+@@ -1919,10 +1937,18 @@ static void play_current_file(struct MPContext *mpctx)
+     }
+ 
+     process_hooks(mpctx, "on_loaded");
+-    for (int t = 0; t < STREAM_TYPE_COUNT; t++)
+-        for (int n = 0; n < mpctx->num_tracks; n++)
+-            if (mpctx->tracks[n]->type == t)
+-                reselect_demux_stream(mpctx, mpctx->tracks[n], false);
++    for (int t = 0; t < STREAM_TYPE_COUNT; t++) {
++        for (int n = 0; n < mpctx->num_tracks; n++) {
++            struct track *track = mpctx->tracks[n];
++            if (track->type != t)
++                continue;
++            // Only reselect dependent tracks when explicitly selected by user
++            if (track->stream && track->stream->dependent_track &&
++                !track->selected)
++                continue;
++            reselect_demux_stream(mpctx, track, false);
++        }
++    }
+ 
+     update_demuxer_properties(mpctx);
+ 
+@@ -1931,6 +1957,9 @@ static void play_current_file(struct MPContext *mpctx)
+     reinit_video_chain(mpctx);
+     reinit_audio_chain(mpctx);
+     reinit_sub_all(mpctx);
++    // For lavfi-complex mode reinit_video_chain skips chain setup, so set up
++    // the enhancement-layer pairing here. No-op in non-lavfi-complex mode.
++    update_vo_chain_el_pair(mpctx);
+ 
+     if (mpctx->encode_lavc_ctx) {
+         if (mpctx->vo_chain)
+diff --git a/player/video.c b/player/video.c
+index 820bbfbf6c961883201c0adda5af20da26cc048b..e2cc4801f28a059645a66273fbee4e3b415461b9 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -279,6 +279,8 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
+         mp_pin_connect(vo_c->filter->f->pins[0], vo_c->dec_src);
+     }
+ 
++    update_vo_chain_el_pair(mpctx);
++
+     if (!recreate_video_filters(mpctx))
+         goto err_out;
+ 
+diff --git a/video/filter/vf_format.c b/video/filter/vf_format.c
+index 3179d34d0556925b6dfe39cab6723cad75455043..e5a049c42b473970b647ae7488ef6b488d6ae07f 100644
+--- a/video/filter/vf_format.c
++++ b/video/filter/vf_format.c
+@@ -61,6 +61,7 @@ struct vf_format_opts {
+     int force_scaler;
+     bool dovi;
+     bool hdr10plus;
++    bool enhancement_layer;
+     float min_luma;
+     float max_luma;
+     float max_cll;
+@@ -185,6 +186,16 @@ static void vf_format_process(struct mp_filter *f)
+                 .clm = get_side_data(img, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
+                 .dhp = get_side_data(img, AV_FRAME_DATA_DYNAMIC_HDR_PLUS),
+             });
++            // Tell the f_enhancement_pair filter to not inherit DV metadata
++            // from the EL.
++            img->params.no_dovi = true;
++        }
++
++        if (!priv->opts->enhancement_layer) {
++            // This is no-op, but just in case. f_enhancement_pair runs at the
++            // end of chain.
++            mp_image_unrefp(&img->enhancement_layer);
++            img->params.no_enhancement_layer = true;
+         }
+ 
+         if (!priv->opts->hdr10plus) {
+@@ -269,6 +280,7 @@ static const m_option_t vf_opts_fields[] = {
+     {"dar", OPT_DOUBLE(dar)},
+     {"convert", OPT_BOOL(convert)},
+     {"dolbyvision", OPT_BOOL(dovi)},
++    {"enhancement-layer", OPT_BOOL(enhancement_layer)},
+     {"hdr10plus", OPT_BOOL(hdr10plus)},
+     {"min-luma", OPT_FLOAT(min_luma), M_RANGE(0, 10000)},
+     {"max-luma", OPT_FLOAT(max_luma), M_RANGE(0, 10000)},
+@@ -290,6 +302,7 @@ const struct mp_user_filter_entry vf_format = {
+         .priv_defaults = &(const OPT_BASE_STRUCT){
+             .rotate = -1,
+             .dovi = true,
++            .enhancement_layer = true,
+             .hdr10plus = true,
+             .film_grain = true,
+         },
+diff --git a/video/img_format.c b/video/img_format.c
+index 3dbd94fe6251753b70688643b3cc3cbebff7cd7f..8d2b0d058b1e81e6a72103cfff6999ad53e95645 100644
+--- a/video/img_format.c
++++ b/video/img_format.c
+@@ -553,7 +553,7 @@ static bool get_native_desc(int mpfmt, struct mp_imgfmt_desc *desc)
+     return true;
+ }
+ 
+-int mp_imgfmt_desc_get_num_comps(struct mp_imgfmt_desc *desc)
++int mp_imgfmt_desc_get_num_comps(const struct mp_imgfmt_desc *desc)
+ {
+     int flags = desc->flags;
+     if (!(flags & MP_IMGFLAG_COLOR_MASK))
+diff --git a/video/img_format.h b/video/img_format.h
+index 5f2044c944fd6073f589f6ec3d2da3f0cca70e57..8cc7788d76db9b6b5e4c69b509df1d00f3d5b200 100644
+--- a/video/img_format.h
++++ b/video/img_format.h
+@@ -147,7 +147,7 @@ struct mp_imgfmt_desc {
+ struct mp_imgfmt_desc mp_imgfmt_get_desc(int imgfmt);
+ 
+ // Return the number of component types, or 0 if unknown.
+-int mp_imgfmt_desc_get_num_comps(struct mp_imgfmt_desc *desc);
++int mp_imgfmt_desc_get_num_comps(const struct mp_imgfmt_desc *desc);
+ 
+ // For MP_IMGFLAG_PACKED_SS_YUV formats (packed sub-sampled YUV): positions of
+ // further luma samples. luma_offsets must be an array of align_x size, and the
+diff --git a/video/mp_image.c b/video/mp_image.c
+index 0c177d556ee6e8d2223a505af319d384ab04b9e2..1ce05558070a49ddd1061994ca5841a68eab0d9b 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -237,6 +237,7 @@ static void mp_image_destructor(void *ptr)
+     for (int n = 0; n < mpi->num_ff_side_data; n++)
+         av_buffer_unref(&mpi->ff_side_data[n].buf);
+     talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
+ }
+ 
+ int mp_chroma_div_up(int size, int shift)
+@@ -374,6 +375,9 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
+     for (int n = 0; n < new->num_ff_side_data; n++)
+         ref_buffer(&new->ff_side_data[n].buf);
+ 
++    new->enhancement_layer = img->enhancement_layer
++        ? mp_image_new_ref(img->enhancement_layer) : NULL;
++
+     return new;
+ }
+ 
+@@ -407,6 +411,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
+     new->film_grain = NULL;
+     new->num_ff_side_data = 0;
+     new->ff_side_data = NULL;
++    new->enhancement_layer = NULL;
+     return new;
+ }
+ 
+@@ -556,6 +561,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.primaries_orig = src->params.primaries_orig;
+     dst->params.transfer_orig = src->params.transfer_orig;
+     dst->params.sys_orig = src->params.sys_orig;
++    dst->params.no_dovi = src->params.no_dovi;
++    dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+ 
+     // ensure colorspace consistency
+     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
+@@ -587,6 +594,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+         dst->ff_side_data[n].buf = av_buffer_ref(src->ff_side_data[n].buf);
+         MP_HANDLE_OOM(dst->ff_side_data[n].buf);
+     }
++
++    mp_image_setrefp(&dst->enhancement_layer, src->enhancement_layer);
+ }
+ 
+ // Crop the given image to (x0, y0)-(x1, y1) (bottom/right border exclusive)
+@@ -1125,6 +1134,8 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+         dst->params.stereo3d = p->stereo3d;
+         // Might be incorrect if colorspace changes.
+         dst->params.light = p->light;
++        dst->params.no_dovi = p->no_dovi;
++        dst->params.no_enhancement_layer = p->no_enhancement_layer;
+ #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 11, 100)
+         dst->params.repr.alpha = p->repr.alpha;
+ #endif
+@@ -1174,12 +1185,13 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     if (sd) {
+ #ifdef PL_HAVE_LAV_DOLBY_VISION
+         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
+-#if PL_API_VER >= 364
+-        if (pl_avdovi_metadata_supported(metadata)) {
+-#else
++#if PL_API_VER < 364
+         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+-        if (header->disable_residual_flag) {
++        if (header->disable_residual_flag)
++#elif PL_API_VER < 370
++        if (pl_avdovi_metadata_supported(metadata))
+ #endif
++        {
+             dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+             MP_HANDLE_OOM(dovi);
+             pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,
+diff --git a/video/mp_image.h b/video/mp_image.h
+index 5fe523dd64e96f93eea24ba51ecb6d2f052d2309..f5c1562815a2124a1e591dd3f8ab58d7265de203 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -63,6 +63,9 @@ struct mp_image_params {
+     int rotate;
+     enum mp_stereo3d_mode stereo3d; // image is encoded with this mode
+     struct mp_rect crop;        // crop applied on image
++    // Flags for f_enhancement_pair.c to not inherit flags from EL.
++    bool no_dovi;
++    bool no_enhancement_layer;
+ };
+ 
+ /* Memory management:
+@@ -126,6 +129,8 @@ typedef struct mp_image {
+     // Other side data we don't care about.
+     struct mp_ff_side_data *ff_side_data;
+     int num_ff_side_data;
++    // Optional decoded enhancement-layer frame
++    struct mp_image *enhancement_layer;
+ } mp_image_t;
+ 
+ struct mp_ff_side_data {
+diff --git a/video/out/vo.h b/video/out/vo.h
+index a98b0f9496853d3ca417066f5d6f4c259755f5a7..8e397618eb911323286b8f238620a7b683f520f8 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -167,7 +167,7 @@ struct mp_pass_perf {
+ };
+ 
+ #define VO_PASS_PERF_MAX 64
+-#define VO_PASS_DESC_MAX_LEN 128
++#define VO_PASS_DESC_MAX_LEN 256
+ 
+ struct mp_frame_perf {
+     int count;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 451c25e576ce82f6f4e18818fea6871afa502306..e9d1cbfcc866bd0c5029c87533b9cc5f4105cc1b 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -114,6 +114,8 @@ struct priv {
+     struct ra_hwdec_mapper *hwdec_mapper;
+     struct timer_pool *hwdec_timer;
+     struct mp_pass_perf hwdec_perf;
++    struct ra_hwdec_mapper *el_hwdec_mapper;
++    struct timer_pool *el_hwdec_timer;
+     struct timer_pool *sw_upload_timer;
+     struct mp_pass_perf sw_upload_perf;
+ 
+@@ -466,6 +468,10 @@ struct frame_priv {
+     struct osd_state subs;
+     uint64_t osd_sync;
+     struct ra_hwdec *hwdec;
++    // Optional Dolby Vision FEL.
++    struct ra_hwdec *el_hwdec;
++    pl_tex el_tex[4];
++    struct pl_frame el_frame;
+ };
+ 
+ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
+@@ -561,38 +567,39 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
+     return desc.num_planes;
+ }
+ 
+-static bool hwdec_reconfig(struct priv *p, struct ra_hwdec *hwdec,
++static bool hwdec_reconfig(struct priv *p, struct ra_hwdec_mapper **mapper,
++                           struct timer_pool **timer, struct ra_hwdec *hwdec,
+                            const struct mp_image_params *par)
+ {
+-    if (p->hwdec_mapper) {
+-        if (mp_image_params_static_equal(par, &p->hwdec_mapper->src_params)) {
+-            p->hwdec_mapper->src_params.repr.dovi = par->repr.dovi;
+-            p->hwdec_mapper->dst_params.repr.dovi = par->repr.dovi;
+-            p->hwdec_mapper->src_params.color.hdr = par->color.hdr;
+-            p->hwdec_mapper->dst_params.color.hdr = par->color.hdr;
+-            return p->hwdec_mapper;
++    if (*mapper) {
++        if (mp_image_params_static_equal(par, &(*mapper)->src_params)) {
++            (*mapper)->src_params.repr.dovi = par->repr.dovi;
++            (*mapper)->dst_params.repr.dovi = par->repr.dovi;
++            (*mapper)->src_params.color.hdr = par->color.hdr;
++            (*mapper)->dst_params.color.hdr = par->color.hdr;
++            return true;
+         } else {
+-            ra_hwdec_mapper_free(&p->hwdec_mapper);
+-            timer_pool_destroy(p->hwdec_timer);
+-            p->hwdec_timer = NULL;
++            ra_hwdec_mapper_free(mapper);
++            timer_pool_destroy(*timer);
++            *timer = NULL;
+         }
+     }
+ 
+-    p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, par);
+-    if (!p->hwdec_mapper) {
++    *mapper = ra_hwdec_mapper_create(hwdec, par);
++    if (!*mapper) {
+         MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
+-        return NULL;
++        return false;
+     }
+-    p->hwdec_timer = timer_pool_create(p->ra_ctx->ra);
++    *timer = timer_pool_create(p->ra_ctx->ra);
+ 
+-    return p->hwdec_mapper;
++    return true;
+ }
+ 
+-// For RAs not based on ra_pl, this creates a new pl_tex wrapper
+-static pl_tex hwdec_get_tex(struct priv *p, int n)
++// For RAs not based on ra_pl, this creates a new pl_tex wrapper.
++static pl_tex hwdec_get_tex(struct priv *p, struct ra_hwdec_mapper *mapper, int n)
+ {
+-    struct ra_tex *ratex = p->hwdec_mapper->tex[n];
+-    struct ra *ra = p->hwdec_mapper->ra;
++    struct ra_tex *ratex = mapper->tex[n];
++    struct ra *ra = mapper->ra;
+     if (ra_pl_get(ra))
+         return (pl_tex) ratex->priv;
+ 
+@@ -630,12 +637,31 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
+     return false;
+ }
+ 
++static void setup_hwdec_plane_mapping(struct pl_frame *frame,
++                                     const struct mp_imgfmt_desc *desc)
++{
++    frame->num_planes = desc->num_planes;
++    for (int n = 0; n < frame->num_planes; n++) {
++        struct pl_plane *plane = &frame->planes[n];
++        int *map = plane->component_mapping;
++        for (int c = 0; c < mp_imgfmt_desc_get_num_comps(desc); c++) {
++            if (desc->comps[c].plane != n) continue;
++            int index = plane->components++;
++            while (index > 0 && desc->comps[map[index - 1]].offset > desc->comps[c].offset) {
++                map[index] = map[index - 1];
++                index--;
++            }
++            map[index] = c;
++        }
++    }
++}
++
+ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+ {
+     struct mp_image *mpi = frame->user_data;
+     struct frame_priv *fp = mpi->priv;
+     struct priv *p = fp->vo->priv;
+-    if (!hwdec_reconfig(p, fp->hwdec, &mpi->params))
++    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec, &mpi->params))
+         return false;
+ 
+     stats_time_start(p->stats, "hwdec-map");
+@@ -648,7 +674,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+     }
+ 
+     for (int n = 0; n < frame->num_planes; n++) {
+-        if (!(frame->planes[n].texture = hwdec_get_tex(p, n))) {
++        if (!(frame->planes[n].texture = hwdec_get_tex(p, p->hwdec_mapper, n))) {
+             timer_pool_stop(p->hwdec_timer);
+             stats_time_end(p->stats, "hwdec-map");
+             return false;
+@@ -675,6 +701,45 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
+     ra_hwdec_mapper_unmap(p->hwdec_mapper);
+ }
+ 
++#if PL_API_VER >= 367
++static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
++{
++    struct mp_image *bl_mpi = frame->user_data;
++    struct mp_image *el_mpi = bl_mpi->enhancement_layer;
++    struct frame_priv *fp = bl_mpi->priv;
++    struct priv *p = fp->vo->priv;
++    if (!hwdec_reconfig(p, &p->el_hwdec_mapper, &p->el_hwdec_timer,
++                        fp->el_hwdec, &el_mpi->params))
++        return false;
++
++    if (ra_hwdec_mapper_map(p->el_hwdec_mapper, el_mpi) < 0) {
++        MP_ERR(p, "Mapping enhancement-layer hwdec surface failed.\n");
++        return false;
++    }
++
++    for (int n = 0; n < frame->num_planes; n++) {
++        if (!(frame->planes[n].texture =
++                hwdec_get_tex(p, p->el_hwdec_mapper, n)))
++            return false;
++    }
++
++    return true;
++}
++
++static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
++{
++    struct mp_image *bl_mpi = frame->user_data;
++    struct frame_priv *fp = bl_mpi->priv;
++    struct priv *p = fp->vo->priv;
++    if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
++        for (int n = 0; n < frame->num_planes; n++)
++            pl_tex_destroy(p->gpu, &frame->planes[n].texture);
++    }
++
++    ra_hwdec_mapper_unmap(p->el_hwdec_mapper);
++}
++#endif
++
+ static bool format_supported(struct vo *vo, int format, bool use_uint)
+ {
+     struct priv *p = vo->priv;
+@@ -692,10 +757,57 @@ static bool format_supported(struct vo *vo, int format, bool use_uint)
+     return true;
+ }
+ 
++static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
++                             struct pl_frame *frame, pl_tex tex[4])
++{
++    struct priv *p = vo->priv;
++    struct pl_plane_data data[4] = {0};
++    int planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt,
++                                        !format_supported(vo, mpi->imgfmt, false));
++    if (!planes) return false;
++    frame->num_planes = planes;
++    for (int n = 0; n < planes; n++) {
++        struct pl_plane *plane = &frame->planes[n];
++        data[n].width = mp_image_plane_w(mpi, n);
++        data[n].height = mp_image_plane_h(mpi, n);
++        if (mpi->stride[n] < 0) {
++            data[n].pixels = mpi->planes[n] + (data[n].height - 1) * mpi->stride[n];
++            data[n].row_stride = -mpi->stride[n];
++            plane->flipped = true;
++        } else {
++            data[n].pixels = mpi->planes[n];
++            data[n].row_stride = mpi->stride[n];
++        }
++        pl_buf buf = get_dr_buf(p, data[n].pixels);
++        if (buf) {
++            data[n].buf = buf;
++            data[n].buf_offset = (uint8_t *) data[n].pixels - buf->data;
++            data[n].pixels = NULL;
++        }
++        if (gpu->limits.callbacks) {
++            data[n].callback = talloc_free;
++            data[n].priv = mp_image_new_ref(mpi);
++        }
++        if (!pl_upload_plane(gpu, plane, &tex[n], &data[n])) {
++            talloc_free(data[n].priv);
++            return false;
++        }
++        if (!gpu->limits.callbacks && data[n].buf)
++            while (pl_buf_poll(gpu, data[n].buf, UINT64_MAX));
++    }
++    return true;
++}
++
+ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
+                       struct pl_frame *frame)
+ {
+     struct mp_image *mpi = src->frame_data;
++    if (mpi->params.repr.dovi && mpi->params.repr.dovi->nlq_active && !mpi->enhancement_layer) {
++        struct frame_priv *fp = mpi->priv;
++        MP_ERR(fp->vo, "Dolby Vision FEL is missing its decoded enhancement layer.\n");
++        talloc_free(mpi);
++        return false;
++    }
+     struct mp_image_params par = mpi->params;
+     struct frame_priv *fp = mpi->priv;
+     struct vo *vo = fp->vo;
+@@ -707,7 +819,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+         // only reconfig the mapper here (potentially creating it) to access
+         // `dst_params`. In practice, though, this should not matter unless the
+         // image format changes mid-stream.
+-        if (!hwdec_reconfig(p, fp->hwdec, &mpi->params)) {
++        if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
++                            &mpi->params)) {
+             talloc_free(mpi);
+             return false;
+         }
+@@ -745,90 +858,72 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+         struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);
+         frame->acquire = hwdec_acquire;
+         frame->release = hwdec_release;
+-        frame->num_planes = desc.num_planes;
+-        for (int n = 0; n < frame->num_planes; n++) {
+-            struct pl_plane *plane = &frame->planes[n];
+-            int *map = plane->component_mapping;
+-            for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
+-                if (desc.comps[c].plane != n)
+-                    continue;
+-
+-                // Sort by component offset
+-                uint8_t offset = desc.comps[c].offset;
+-                int index = plane->components++;
+-                while (index > 0 && desc.comps[map[index - 1]].offset > offset) {
+-                    map[index] = map[index - 1];
+-                    index--;
+-                }
+-                map[index] = c;
+-            }
+-        }
+-
++        setup_hwdec_plane_mapping(frame, &desc);
+     } else { // swdec
+         p->hwdec_perf.count = 0;
+ 
+         if (!p->sw_upload_timer)
+             p->sw_upload_timer = timer_pool_create(p->ra_ctx->ra);
+ 
+-        struct pl_plane_data data[4] = {0};
+-        bool use_uint = false;
+-
+-        // At this point, we know that the format is supported, query_format()
+-        // makes sure of that. Just check if we should use UINT as a fallback.
+-        if (!format_supported(vo, mpi->imgfmt, false))
+-            use_uint = true;
+-
+-        frame->num_planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt, use_uint);
+         stats_time_start(p->stats, "swdec-upload");
+         timer_pool_start(p->sw_upload_timer);
+-        for (int n = 0; n < frame->num_planes; n++) {
+-            struct pl_plane *plane = &frame->planes[n];
+-            data[n].width = mp_image_plane_w(mpi, n);
+-            data[n].height = mp_image_plane_h(mpi, n);
+-            if (mpi->stride[n] < 0) {
+-                data[n].pixels = mpi->planes[n] + (data[n].height - 1) * mpi->stride[n];
+-                data[n].row_stride = -mpi->stride[n];
+-                plane->flipped = true;
+-            } else {
+-                data[n].pixels = mpi->planes[n];
+-                data[n].row_stride = mpi->stride[n];
+-            }
++        bool ok = upload_planes_sw(vo, gpu, mpi, frame, tex);
++        timer_pool_stop(p->sw_upload_timer);
++        stats_time_end(p->stats, "swdec-upload");
++        if (!ok) {
++            MP_ERR(vo, "Failed uploading frame!\n");
++            talloc_free(mpi);
++            return false;
++        }
++        p->sw_upload_perf = timer_pool_measure(p->sw_upload_timer);
++    }
+ 
+-            pl_buf buf = get_dr_buf(p, data[n].pixels);
+-            if (buf) {
+-                data[n].buf = buf;
+-                data[n].buf_offset = (uint8_t *) data[n].pixels - buf->data;
+-                data[n].pixels = NULL;
+-            }
+-            // Keep the image alive until it's fully read.
+-            if (gpu->limits.callbacks) {
+-                mp_assert(!data[n].callback);
+-                data[n].callback = talloc_free;
+-                mp_assert(!data[n].priv);
+-                data[n].priv = mp_image_new_ref(mpi);
+-            }
++    // Update chroma location, must be done after initializing planes
++    pl_frame_set_chroma_location(frame, par.chroma_location);
+ 
+-            if (!pl_upload_plane(gpu, plane, &tex[n], &data[n])) {
+-                MP_ERR(vo, "Failed uploading frame!\n");
+-                timer_pool_stop(p->sw_upload_timer);
+-                stats_time_end(p->stats, "swdec-upload");
+-                talloc_free(data[n].priv);
+-                talloc_free(mpi);
+-                return false;
++#if PL_API_VER >= 367
++    if (mpi->enhancement_layer) {
++        struct mp_image *el = mpi->enhancement_layer;
++        fp->el_hwdec = ra_hwdec_get(&p->hwdec_ctx, el->imgfmt);
++
++        struct mp_image_params el_par = el->params;
++        bool el_ok = true;
++        if (fp->el_hwdec) {
++            if (hwdec_reconfig(p, &p->el_hwdec_mapper, &p->el_hwdec_timer,
++                               fp->el_hwdec, &el->params)) {
++                el_par = p->el_hwdec_mapper->dst_params;
++            } else {
++                fp->el_hwdec = NULL;
++                el_ok = false;
+             }
++        }
++        mp_image_params_guess_csp(&el_par);
++
++        fp->el_frame = (struct pl_frame) {
++            .color = el_par.color,
++            .repr  = el_par.repr,
++            .user_data = mpi, // BL mpi
++        };
+ 
+-            // Without async callback support, we have to poll...
+-            if (!gpu->limits.callbacks && data[n].buf)
+-                while (pl_buf_poll(gpu, data[n].buf, UINT64_MAX));
++        if (el_ok && fp->el_hwdec) {
++            struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(el_par.imgfmt);
++            fp->el_frame.acquire = hwdec_acquire_el;
++            fp->el_frame.release = hwdec_release_el;
++            setup_hwdec_plane_mapping(&fp->el_frame, &desc);
++        } else if (el_ok) {
++            el_ok = upload_planes_sw(vo, gpu, el, &fp->el_frame, fp->el_tex);
+         }
+-        timer_pool_stop(p->sw_upload_timer);
+-        p->sw_upload_perf = timer_pool_measure(p->sw_upload_timer);
+-        stats_time_end(p->stats, "swdec-upload");
+ 
++        if (el_ok) {
++            pl_frame_set_chroma_location(&fp->el_frame, el_par.chroma_location);
++            frame->enhancement_layer = &fp->el_frame;
++        } else {
++            MP_ERR(vo, "Failed setting up Dolby Vision enhancement layer.\n");
++            talloc_free(mpi);
++            return false;
++        }
+     }
+-
+-    // Update chroma location, must be done after initializing planes
+-    pl_frame_set_chroma_location(frame, par.chroma_location);
++#endif
+ 
+     if (mpi->film_grain)
+         pl_film_grain_from_av(&frame->film_grain, (AVFilmGrainParams *) mpi->film_grain->data);
+@@ -857,6 +952,10 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
+         if (tex)
+             MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
+     }
++    for (int i = 0; i < MP_ARRAY_SIZE(fp->el_tex); i++) {
++        if (fp->el_tex[i])
++            pl_tex_destroy(gpu, &fp->el_tex[i]);
++    }
+     talloc_free(mpi);
+ }
+ 
+@@ -2188,6 +2287,8 @@ static void uninit(struct vo *vo)
+     if (vo->hwdec_devs) {
+         ra_hwdec_mapper_free(&p->hwdec_mapper);
+         timer_pool_destroy(p->hwdec_timer);
++        ra_hwdec_mapper_free(&p->el_hwdec_mapper);
++        timer_pool_destroy(p->el_hwdec_timer);
+         ra_hwdec_ctx_uninit(&p->hwdec_ctx);
+         hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
+         hwdec_devices_destroy(vo->hwdec_devs);
+diff --git a/demux/dovi_split.c b/demux/dovi_split.c
+new file mode 100644
+--- /dev/null
++++ b/demux/dovi_split.c
+@@ -0,0 +1,203 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <string.h>
++
++#include <libavcodec/avcodec.h>
++#include <libavcodec/bsf.h>
++#include <libavutil/dovi_meta.h>
++#include <libavutil/opt.h>
++
++#include "common/av_common.h"
++#include "common/common.h"
++#include "common/msg.h"
++#include "demux.h"
++#include "demux/packet.h"
++#include "demux/packet_pool.h"
++#include "demux/stheader.h"
++#include "dovi_split.h"
++#include "mpv_talloc.h"
++
++struct mp_dovi_split {
++    struct mp_log *log;
++    struct demuxer *demuxer;
++    struct sh_stream *bl;
++    struct sh_stream *el;
++    AVBSFContext *bsf;
++    AVPacket *staging;
++};
++
++static void mp_dovi_split_destructor(void *p)
++{
++    struct mp_dovi_split *s = p;
++    av_packet_free(&s->staging);
++    av_bsf_free(&s->bsf);
++}
++
++struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
++                                           struct sh_stream *bl)
++{
++    if (!bl || bl->type != STREAM_VIDEO || !bl->codec ||
++        !bl->codec->codec || strcmp(bl->codec->codec, "hevc") != 0)
++        return NULL;
++
++    const AVBitStreamFilter *def = av_bsf_get_by_name("dovi_split");
++    if (!def) {
++        MP_WARN(demuxer, "Dolby Vision EL: 'dovi_split' BSF not available in "
++                         "libavcodec; rendering base layer only.\n");
++        return NULL;
++    }
++
++    struct mp_dovi_split *s = talloc_zero(demuxer, struct mp_dovi_split);
++    talloc_set_destructor(s, mp_dovi_split_destructor);
++    s->log = demuxer->log;
++    s->demuxer = demuxer;
++    s->bl = bl;
++
++    s->staging = av_packet_alloc();
++    if (!s->staging)
++        goto fail;
++
++    int ret = av_bsf_alloc(def, &s->bsf);
++    if (ret < 0)
++        goto fail;
++
++    AVCodecParameters *par = mp_codec_params_to_av(bl->codec);
++    if (par) {
++        avcodec_parameters_copy(s->bsf->par_in, par);
++        avcodec_parameters_free(&par);
++    }
++    s->bsf->time_base_in = mp_get_codec_timebase(bl->codec);
++
++    if (av_opt_set(s->bsf, "mode", "el", AV_OPT_SEARCH_CHILDREN) < 0)
++        goto fail;
++    if (av_bsf_init(s->bsf) < 0)
++        goto fail;
++
++    const AVCodecParameters *par_out = s->bsf->par_out;
++
++    // Allocate the virtual EL sh_stream.
++    struct sh_stream *el = demux_alloc_sh_stream(STREAM_VIDEO);
++    el->codec->codec = "hevc";
++    el->codec->native_tb_num = bl->codec->native_tb_num;
++    el->codec->native_tb_den = bl->codec->native_tb_den;
++    el->codec->fps = bl->codec->fps;
++    el->codec->disp_w = par_out->width;
++    el->codec->disp_h = par_out->height;
++    if (par_out->extradata_size > 0) {
++        el->codec->extradata = talloc_memdup(el, par_out->extradata,
++                                             par_out->extradata_size);
++        el->codec->extradata_size = par_out->extradata_size;
++    }
++    for (int i = 0; i < par_out->nb_coded_side_data; i++) {
++        const AVPacketSideData *sd = &par_out->coded_side_data[i];
++        if (sd->type != AV_PKT_DATA_DOVI_CONF)
++            continue;
++        const AVDOVIDecoderConfigurationRecord *cfg = (const void *)sd->data;
++        el->codec->dovi = true;
++        el->codec->dv_profile = cfg->dv_profile;
++        el->codec->dv_level = cfg->dv_level;
++        el->codec->dv_el_present = cfg->el_present_flag;
++        break;
++    }
++    el->title = talloc_strdup(el, "Dolby Vision enhancement layer");
++    el->dependent_track = true;
++
++    demux_add_sh_stream(demuxer, el);
++    s->el = el;
++
++    // Bind BL and EL into a sh_stream_group.
++    struct sh_stream_group *group = talloc_zero(bl, struct sh_stream_group);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, bl);
++    MP_TARRAY_APPEND(group, group->members, group->num_members, el);
++    bl->group = group;
++    el->group = group;
++
++    MP_VERBOSE(demuxer, "Dolby Vision Profile 7 splitter: BL stream %d, "
++               "virtual EL stream %d (dependent_track).\n",
++               bl->index, el->index);
++    return s;
++
++fail:
++    talloc_free(s);
++    return NULL;
++}
++
++void mp_dovi_split_reset(struct mp_dovi_split *s)
++{
++    if (!s || !s->bsf)
++        return;
++    av_bsf_flush(s->bsf);
++}
++
++struct sh_stream *mp_dovi_split_el_stream(struct mp_dovi_split *s)
++{
++    return s ? s->el : NULL;
++}
++
++struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
++                                            struct demux_packet *bl_dp)
++{
++    if (!s || !s->bsf || !bl_dp || !bl_dp->buffer || bl_dp->len <= 0)
++        return NULL;
++
++    // av_bsf_send_packet takes ownership of the packet's buffer, so copy it,
++    // to not steal it from caller.
++    AVPacket *copy = av_packet_alloc();
++    if (!copy)
++        return NULL;
++    int ret = av_new_packet(copy, bl_dp->len);
++    if (ret < 0) {
++        av_packet_free(&copy);
++        return NULL;
++    }
++    memcpy(copy->data, bl_dp->buffer, bl_dp->len);
++    copy->flags = bl_dp->keyframe ? AV_PKT_FLAG_KEY : 0;
++
++    ret = av_bsf_send_packet(s->bsf, copy);
++    av_packet_free(&copy);
++    if (ret < 0) {
++        MP_VERBOSE(s->demuxer, "dovi_split: BSF send failed: %s\n",
++                   mp_strerror(AVUNERROR(ret)));
++        return NULL;
++    }
++
++    ret = av_bsf_receive_packet(s->bsf, s->staging);
++    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++        // No EL NALs in this AU, nothing to emit.
++        return NULL;
++    }
++    if (ret < 0) {
++        MP_VERBOSE(s->demuxer, "dovi_split: BSF receive failed: %s; flushing.\n",
++                   mp_strerror(AVUNERROR(ret)));
++        av_bsf_flush(s->bsf);
++        return NULL;
++    }
++
++    struct demux_packet *dp =
++        new_demux_packet_from_avpacket(s->demuxer->packet_pool, s->staging);
++    if (dp) {
++        // Mirror the BL packet's timing so the pairing filter can match by PTS.
++        dp->pts = bl_dp->pts;
++        dp->dts = bl_dp->dts;
++        dp->duration = bl_dp->duration;
++        dp->keyframe = bl_dp->keyframe;
++        dp->stream = s->el->index;
++    }
++    av_packet_unref(s->staging);
++    return dp;
++}
+
+diff --git a/demux/dovi_split.h b/demux/dovi_split.h
+new file mode 100644
+--- /dev/null
++++ b/demux/dovi_split.h
+@@ -0,0 +1,51 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++struct demuxer;
++struct sh_stream;
++struct demux_packet;
++
++// Dolby Vision Profile 7 enhancement-layer splitter for HEVC streams that
++// carry the EL bitstream interleaved as HEVC_NAL_UNSPEC63.
++//
++// Creates a virtual EL sh_stream and binds it to the BL via sh_stream_group
++// so downstream code can treat same as separate track BL+EL.
++struct mp_dovi_split;
++
++// Create a splitter on `bl`. Adds the virtual EL sh_stream to `demuxer`.
++//
++// Returns NULL if the BSF is unavailable or initialization fails. The
++// returned context is talloc-attached to `demuxer`.
++struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
++                                           struct sh_stream *bl);
++
++void mp_dovi_split_reset(struct mp_dovi_split *s);
++
++// Return the virtual EL sh_stream created by mp_dovi_split_create. The
++// returned pointer remains valid for the lifetime of the splitter.
++struct sh_stream *mp_dovi_split_el_stream(struct mp_dovi_split *s);
++
++// Apply the BSF to `bl_dp` and produce a companion EL demux_packet, if any.
++// Caller owns the returned packet. Returns NULL if the access unit contained
++// no EL NALs or on any non-fatal BSF error.
++//
++// The emitted packet inherits pts/dts/duration/keyframe from `bl_dp` so it
++// lines up with the matching BL packet for PTS-based pairing downstream.
++struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
++                                            struct demux_packet *bl_dp);
+
+diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
+new file mode 100644
+--- /dev/null
++++ b/filters/f_enhancement_pair.c
+@@ -0,0 +1,231 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <libavutil/buffer.h>
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "demux/stheader.h"
++#include "f_decoder_wrapper.h"
++#include "f_enhancement_pair.h"
++#include "filter_internal.h"
++#include "video/mp_image.h"
++
++// PTS-match tolerance, in seconds.
++#define PTS_MATCH_TOLERANCE 1e-6
++
++// Number of frames hold for matching.
++#define QUEUE_MAX 16
++
++struct priv {
++    struct mp_decoder_wrapper *el_dec;
++    struct mp_pin *el_in; // el_dec->f->pins[0]
++
++    // BL/EL frames decoded but not yet emitted as a pair.
++    struct mp_image **bl_pending;
++    int num_bl_pending;
++    struct mp_image **el_pending;
++    int num_el_pending;
++
++    bool bl_eof;
++    bool el_eof;
++};
++
++static int pts_cmp(double a, double b)
++{
++    if (a == MP_NOPTS_VALUE || b == MP_NOPTS_VALUE)
++        return 0;
++    if (a < b - PTS_MATCH_TOLERANCE) return -1;
++    if (a > b + PTS_MATCH_TOLERANCE) return  1;
++    return 0;
++}
++
++// Pull available frames from `pin` into `queue` until either no data is
++// ready or the queue is full. Sets *eof if the upstream signaled EOF.
++static void drain_pin(struct mp_filter *f, struct mp_pin *pin,
++                      struct mp_image ***queue, int *num, bool *eof)
++{
++    while (!*eof && *num < QUEUE_MAX) {
++        if (!mp_pin_out_request_data(pin))
++            return;
++        struct mp_frame fr = mp_pin_out_read(pin);
++        if (fr.type == MP_FRAME_EOF) {
++            *eof = true;
++            return;
++        }
++        if (fr.type != MP_FRAME_VIDEO) {
++            mp_frame_unref(&fr);
++            continue;
++        }
++        MP_TARRAY_APPEND(f->priv, *queue, *num, fr.data);
++    }
++}
++
++static void pop_head(struct mp_image ***queue, int *num)
++{
++    talloc_free((*queue)[0]);
++    int remain = *num - 1;
++    if (remain > 0)
++        memmove(&(*queue)[0], &(*queue)[1], remain * sizeof((*queue)[0]));
++    *num = remain;
++}
++
++static struct mp_image *take_head(struct mp_image ***queue, int *num)
++{
++    struct mp_image *img = (*queue)[0];
++    int remain = *num - 1;
++    if (remain > 0)
++        memmove(&(*queue)[0], &(*queue)[1], remain * sizeof((*queue)[0]));
++    *num = remain;
++    return img;
++}
++
++// Downstream code expects the DV RPU and the related color/repr/HDR fields on
++// the BL frame. In dual-track sources these are carried on the EL stream, so
++// mirror them onto the BL here. This keeps DV bookkeeping local.
++static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
++{
++    if (bl->params.no_dovi || bl->dovi || !el->dovi)
++        return;
++    bl->dovi = av_buffer_ref(el->dovi);
++    if (!bl->dovi)
++        return;
++    bl->params.repr.dovi = (void *)bl->dovi->data;
++    bl->params.repr.sys = el->params.repr.sys;
++    bl->params.color.primaries = el->params.color.primaries;
++    bl->params.color.transfer = el->params.color.transfer;
++    bl->params.color.hdr.min_luma = el->params.color.hdr.min_luma;
++    bl->params.color.hdr.max_luma = el->params.color.hdr.max_luma;
++    bl->params.color.hdr.max_pq_y = el->params.color.hdr.max_pq_y;
++    bl->params.color.hdr.avg_pq_y = el->params.color.hdr.avg_pq_y;
++}
++
++static void pair_process(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    struct mp_pin *in = f->ppins[0];
++    struct mp_pin *out = f->ppins[1];
++
++    drain_pin(f, in, &p->bl_pending, &p->num_bl_pending, &p->bl_eof);
++    drain_pin(f, p->el_in, &p->el_pending, &p->num_el_pending, &p->el_eof);
++
++    while (mp_pin_in_needs_data(out)) {
++        if (p->num_bl_pending == 0) {
++            if (p->bl_eof) {
++                while (p->num_el_pending)
++                    pop_head(&p->el_pending, &p->num_el_pending);
++                mp_pin_in_write(out, MP_EOF_FRAME);
++            }
++            return;
++        }
++
++        struct mp_image *bl = p->bl_pending[0];
++        int cmp = p->num_el_pending > 0
++                ? pts_cmp(p->el_pending[0]->pts, bl->pts) : 0;
++
++        // EL older than BL: its BL partner already left or never arrived.
++        if (p->num_el_pending > 0 && cmp < 0) {
++            pop_head(&p->el_pending, &p->num_el_pending);
++            continue;
++        }
++
++        if (p->num_el_pending > 0 && cmp == 0) {
++            struct mp_image *el = take_head(&p->el_pending, &p->num_el_pending);
++            take_head(&p->bl_pending, &p->num_bl_pending);
++            inherit_dovi_from_el(bl, el);
++            if (bl->params.no_enhancement_layer) {
++                talloc_free(el);
++            } else {
++                bl->enhancement_layer = el;
++            }
++            mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, bl));
++            continue;
++        }
++
++        // No EL match for the oldest BL. Hold BL unless we have affirmative
++        // evidence no EL is coming.
++        bool give_up = p->el_eof ||
++                       (p->num_el_pending > 0 && cmp > 0) ||
++                       p->num_bl_pending >= QUEUE_MAX;
++        if (!give_up)
++            return;
++
++        take_head(&p->bl_pending, &p->num_bl_pending);
++        if (bl->params.repr.dovi && bl->params.repr.dovi->nlq_active) {
++            MP_ERR(f, "Dolby Vision FEL requires a matching enhancement-layer frame (BL PTS %.9f).\n", bl->pts);
++            talloc_free(bl);
++            mp_filter_internal_mark_failed(f);
++            return;
++        }
++        bl->enhancement_layer = NULL;
++        mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, bl));
++    }
++}
++
++static void pair_reset(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    while (p->num_bl_pending)
++        pop_head(&p->bl_pending, &p->num_bl_pending);
++    while (p->num_el_pending)
++        pop_head(&p->el_pending, &p->num_el_pending);
++    p->bl_eof = false;
++    p->el_eof = false;
++}
++
++static void pair_destroy(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    while (p->num_bl_pending)
++        pop_head(&p->bl_pending, &p->num_bl_pending);
++    while (p->num_el_pending)
++        pop_head(&p->el_pending, &p->num_el_pending);
++    // el_dec->f is a child filter, freed by the framework after this returns.
++}
++
++static const struct mp_filter_info pair_filter = {
++    .name = "enhancement_pair",
++    .priv_size = sizeof(struct priv),
++    .process = pair_process,
++    .reset = pair_reset,
++    .destroy = pair_destroy,
++};
++
++struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
++                                             struct sh_stream *el_sh)
++{
++    if (!el_sh)
++        return NULL;
++
++    struct mp_filter *f = mp_filter_create(parent, &pair_filter);
++    if (!f)
++        return NULL;
++    mp_filter_add_pin(f, MP_PIN_IN,  "in");
++    mp_filter_add_pin(f, MP_PIN_OUT, "out");
++
++    struct priv *p = f->priv;
++    p->el_dec = mp_decoder_wrapper_create(f, el_sh);
++    if (!p->el_dec || !mp_decoder_wrapper_reinit(p->el_dec)) {
++        MP_ERR(f, "Failed to set up Dolby Vision enhancement-layer decoder.\n");
++        talloc_free(f);
++        return NULL;
++    }
++    p->el_in = p->el_dec->f->pins[0];
++    mp_pin_set_manual_connection_for(p->el_in, f);
++
++    return f;
++}
+
+diff --git a/filters/f_enhancement_pair.h b/filters/f_enhancement_pair.h
+new file mode 100644
+--- /dev/null
++++ b/filters/f_enhancement_pair.h
+@@ -0,0 +1,37 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include "filter.h"
++
++struct sh_stream;
++
++// Enhancement-layer pairing filter.
++//
++// Reads base-layer (BL) mp_image frames from its input pin, decodes the
++// enhancement-layer (EL) stream `el_sh` via an internal mp_decoder_wrapper,
++// and attaches each decoded EL frame as `mpi->enhancement_layer` of the BL
++// frame with the matching PTS. Missing required FEL is an explicit error.
++//
++// `el_sh` must be a dependent sibling of the BL stream via sh_stream_group,
++// it is auto-selected by the demuxer when the BL is selected.
++//
++// 1 input pin (BL frames), 1 output pin (paired BL frames). Returns NULL
++// on init failure. The caller must fail the output chain.
++struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
++                                             struct sh_stream *el_sh);
+
+diff --git a/DOCS/interface-changes/el.txt b/DOCS/interface-changes/el.txt
+new file mode 100644
+--- /dev/null
++++ b/DOCS/interface-changes/el.txt
+@@ -0,0 +1,1 @@
++add `vf=format=enhancement-layer` option

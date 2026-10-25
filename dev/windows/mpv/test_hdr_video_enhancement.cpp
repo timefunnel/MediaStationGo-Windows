@@ -1,11 +1,14 @@
 // Numeric PQ/HLG acceptance on the real GPU. CPU readback is test-only.
 #define NOMINMAX
 #include "hdr_pipeline.h"
+#include "dovi_pipeline.h"
 #include <dxgi1_2.h>
 #include <vector>
 #include <array>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 using Microsoft::WRL::ComPtr;
 constexpr unsigned W=640,H=360;
 static double pq(double nits) {
@@ -100,6 +103,138 @@ static unsigned gray_error(const std::vector<uint16_t> &a,const std::vector<uint
     }
     return error;
 }
+static nvvideo_dovi test_rpu(unsigned variant) {
+    nvvideo_dovi r{};
+    for(unsigned c=0;c<3;c++) {
+        r.nonlinear[c][c]=1;r.linear[c][c]=1;
+        auto &component=r.comp[c];component.num_pivots=variant==3?9:3;
+        for(unsigned p=0;p<component.num_pivots;p++)component.pivots[p][0]=float(p)/(component.num_pivots-1);
+        for(unsigned p=0;p<component.num_pivots-1;p++) {
+            auto &s=component.segments[p];
+            if((c+p+variant)%2) {
+                unsigned order=1+variant%3;s.polynomial[3]=float(order);
+                s.mmr[0][0][c]=.85f;
+                s.mmr[0][1][0]=.025f;
+                if(order>=2)s.mmr[1][0][c]=.05f;
+                if(order==3)s.mmr[2][1][3]=.01f;
+            } else {s.polynomial[1]=.9f;s.polynomial[2]=.04f;}
+        }
+    }
+    r.nonlinear[0][1]=.03f;r.nonlinear[1][2]=-.02f;
+    r.nonlinear[0][3]=.01f;r.linear[2][1]=.04f;
+    return r;
+}
+static double pq_nits(double signal) {
+    double p=std::pow(std::max(signal,0.0),32.0/2523.0);
+    return 10000*std::pow(std::max(p-3424.0/4096.0,0.0)/std::max(2413.0/128.0-2392.0/128.0*p,1e-6),16384.0/2610.0);
+}
+static std::array<double,3> dovi_reference(const std::vector<uint16_t> &data,int x,int y,const nvvideo_config &c,const nvvideo_dovi &r) {
+    x=std::clamp(x,0,int(W)-1);y=std::clamp(y,0,int(H)-1);
+    double offset_x=c.chroma_location==2||c.chroma_location==3||c.chroma_location==5?.5:1;
+    double offset_y=c.chroma_location==1||c.chroma_location==3?1:c.chroma_location>=4?0:.5;
+    double uv_x=(x+offset_x)/2-.5,uv_y=(y+offset_y)/2-.5;
+    int ix=int(std::floor(uv_x)),iy=int(std::floor(uv_y));double fx=uv_x-ix,fy=uv_y-iy;
+    std::array<double,3> s{double(data[y*W+x]>>6)/1024,0,0};
+    for(int ch=0;ch<2;ch++)for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++)
+        s[ch+1]+=(data[W*H+std::clamp(iy+dy,0,int(H/2)-1)*W+std::clamp(ix+dx,0,int(W/2)-1)*2+ch]>>6)/1024.0*(dx?fx:1-fx)*(dy?fy:1-fy);
+    auto el_codes=s;
+    for(unsigned ch=0;ch<3;ch++)if(r.comp[ch].num_pivots)
+        s[ch]=std::clamp(s[ch],double(r.comp[ch].pivots[0][0]),double(r.comp[ch].pivots[r.comp[ch].num_pivots-1][0]));
+    auto mapped=s;
+    for(unsigned ch=0;ch<3;ch++) {
+        const auto &v=r.comp[ch];if(!v.num_pivots)continue;
+        unsigned i=0;while(i+2<v.num_pivots&&s[ch]>=v.pivots[i+1][0])i++;
+        const auto &p=v.segments[i];double value=p.polynomial[0];
+        if(!p.polynomial[3])value+=p.polynomial[1]*s[ch]+p.polynomial[2]*s[ch]*s[ch];
+        else {
+            std::array<double,7> terms{s[0],s[1],s[2],s[0]*s[1],s[0]*s[2],s[1]*s[2],s[0]*s[1]*s[2]};
+            for(unsigned degree=0;degree<unsigned(p.polynomial[3]);degree++)for(unsigned k=0;k<7;k++)
+                value+=(k<3?p.mmr[degree][0][k]:p.mmr[degree][1][k-3])*std::pow(terms[k],degree+1);
+        }
+        mapped[ch]=std::clamp(value,0.0,1.0);
+    }
+    if(r.nlq_active)for(unsigned ch=0;ch<3;ch++) {
+        double rr=std::nearbyint(el_codes[ch]*1024-r.nlq[ch][0]);
+        double residual=(rr>0?1:rr<0?-1:0)*((std::abs(rr)-.5)*r.nlq[ch][1]+r.nlq[ch][2]);
+        mapped[ch]=std::clamp(mapped[ch]+std::clamp(residual,-double(r.nlq[ch][3]),double(r.nlq[ch][3])),0.0,1.0);
+    }
+    std::array<double,3> lms{},rgb{};
+    for(unsigned i=0;i<3;i++) {
+        double signal=0;for(unsigned k=0;k<3;k++)signal+=r.nonlinear[i][k]*(mapped[k]-r.nonlinear[k][3]);
+        lms[i]=pq_nits(signal);
+    }
+    for(unsigned i=0;i<3;i++) {
+        double nits=0;for(unsigned k=0;k<3;k++)nits+=r.linear[i][k]*lms[k];
+        rgb[i]=pq(std::clamp(nits,0.0,10000.0));
+    }
+    double luma=.2627*rgb[0]+.6780*rgb[1]+.0593*rgb[2];
+    return {luma,(rgb[2]-luma)/1.8814,(rgb[0]-luma)/1.4746};
+}
+static void validate_dovi(nvvideo_config c) {
+    c.mode=2;c.transfer=NVVIDEO_PQ;
+    for(unsigned range=0;range<2;range++)for(unsigned chroma=0;chroma<6;chroma++) {
+        c.full_range=range;c.chroma_location=chroma;
+        HdrPipeline hdr;hdr.initialize(c);DoviPipeline pipeline;pipeline.initialize(hdr);
+        auto data=pixels(range!=0,0,NVVIDEO_PQ);auto input=texture(c.device,W,H,&data),output=texture(c.device,W,H);
+        std::vector<uint16_t> previous;
+        for(unsigned variant=0;variant<6;variant++) {
+            auto r=test_rpu(variant);
+            if(variant>=4) {
+                r.nlq_active=1;r.el_width=W;r.el_height=H;r.el_chroma=chroma;
+                for(unsigned ch=0;ch<3;ch++){r.nlq[ch][0]=512;r.nlq[ch][1]=1.f/4096;r.nlq[ch][2]=variant==5?.0001f:0;r.nlq[ch][3]=.125f;}
+            }
+            pipeline.process(input.Get(),output.Get(),r,variant>=4?input.Get():nullptr);
+            auto result=read(c.device,c.context,output.Get());
+            if(!previous.empty()&&previous==result)throw std::runtime_error("Per-frame RPU update did not change the mapped pixels");
+            previous=result;
+            unsigned max_error=0;
+            for(int y:{0,80,240,358})for(int x:{0,40,78,80,82,120,158,160,200,520,600,638}) {
+                auto expected=dovi_reference(data,x,y,c,r);
+                auto code=[](double value){return int(std::round(std::clamp(value,0.0,1023.0)));};
+                max_error=std::max(max_error,unsigned(std::abs(code(expected[0]*(range?1023:876)+(range?0:64))-int(result[y*W+x]>>6))));
+                bool half_x=chroma==2||chroma==3||chroma==5,half_y=chroma==0||chroma==2;int center_y=chroma>=4?1:0;
+                std::array<double,2> uv{};
+                for(int dy=half_y?0:center_y-1;dy<=(half_y?1:center_y+1);dy++)for(int dx=half_x?0:-1;dx<=1;dx++) {
+                    auto value=dovi_reference(data,x+dx,y+dy,c,r);
+                    double weight=(half_x?.5:dx==0?.5:.25)*(half_y?.5:dy==center_y?.5:.25);
+                    for(unsigned k=0;k<2;k++)uv[k]+=value[k+1]*weight;
+                }
+                for(unsigned k=0;k<2;k++)max_error=std::max(max_error,unsigned(std::abs(code(uv[k]*(range?1023:896)+512)-int(result[W*H+y/2*W+x+k]>>6))));
+            }
+            if(max_error>1||std::any_of(result.begin(),result.end(),[](uint16_t value){return value&63;}))throw std::runtime_error("Dolby Vision GPU mapping differs from scalar RPU reference");
+            std::printf("DOVI_RPU_GPU_REFERENCE_OK full=%u chroma=%u variant=%u fel=%u max-code-error=%u\n",range,chroma,variant,r.nlq_active,max_error);
+        }
+        auto invalid=test_rpu(0);invalid.comp[0].num_pivots=10;bool rejected=false;
+        try{pipeline.process(input.Get(),output.Get(),invalid);}catch(const std::exception &){rejected=true;}
+        if(!rejected)throw std::runtime_error("Invalid RPU was accepted");
+        auto missing_el=test_rpu(0);missing_el.nlq_active=1;
+        missing_el.el_width=W;missing_el.el_height=H;
+        rejected=false;
+        try{pipeline.process(input.Get(),output.Get(),missing_el);}catch(const std::exception &){rejected=true;}
+        if(!rejected)throw std::runtime_error("FEL was silently rendered without its enhancement layer");
+    }
+}
+static void measure_dovi_4k(nvvideo_config c) {
+    c.width=c.out_width=3840;c.height=c.out_height=2160;c.mode=2;c.transfer=NVVIDEO_PQ;
+    HdrPipeline hdr;hdr.initialize(c);DoviPipeline pipeline;pipeline.initialize(hdr);
+    std::vector<uint16_t> pixels4k(size_t(c.width)*c.height*3/2,uint16_t(512<<6));
+    D3D11_TEXTURE2D_DESC d{};d.Width=c.width;d.Height=c.height;d.MipLevels=d.ArraySize=1;d.Format=DXGI_FORMAT_P010;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA data{pixels4k.data(),c.width*2,0};ComPtr<ID3D11Texture2D> input,output;
+    HdrPipeline::hr(c.device->CreateTexture2D(&d,&data,&input),"4K RPU input");
+    HdrPipeline::hr(c.device->CreateTexture2D(&d,nullptr,&output),"4K RPU output");
+    D3D11_QUERY_DESC query{D3D11_QUERY_EVENT,0};ComPtr<ID3D11Query> done;
+    HdrPipeline::hr(c.device->CreateQuery(&query,&done),"4K RPU completion query");
+    auto r=test_rpu(3);double sum=0,maximum=0;
+    for(unsigned i=0;i<7;i++) {
+        auto before=std::chrono::steady_clock::now();
+        pipeline.process(input.Get(),output.Get(),r);c.context->End(done.Get());c.context->Flush();
+        HRESULT status;while((status=c.context->GetData(done.Get(),nullptr,0,0))==S_FALSE)std::this_thread::yield();
+        HdrPipeline::hr(status,"4K RPU completion");
+        double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
+        if(i){sum+=ms;maximum=std::max(maximum,ms);}
+    }
+    std::printf("DOVI_4K_MAP_TIMING width=3840 height=2160 frames=6 avg-ms=%.3f max-ms=%.3f includes=dispatch/copy/GPU-completion excludes=SDK/VO\n",sum/6,maximum);
+}
 int wmain(int argc,wchar_t **argv) {
     if(argc!=5)return 2;
     try {
@@ -109,6 +244,8 @@ int wmain(int argc,wchar_t **argv) {
         ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
         HdrPipeline::hr(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context),"test D3D11");
         nvvideo_config c{NVVIDEO_ABI,2,W,H,W,H,device.Get(),context.Get(),argv[2],argv[3],4,0,2,1,1,0,0,.7f,.6f,.8f,1.f,1080,1,0,0};
+        validate_dovi(c);
+        measure_dovi_4k(c);
         for(unsigned transfer:{NVVIDEO_PQ,NVVIDEO_HLG})for(unsigned range=0;range<2;range++)for(unsigned chroma=0;chroma<6;chroma++) {
             c.transfer=transfer;c.full_range=range;c.chroma_location=chroma;auto data=pixels(range!=0,0,transfer);auto input=texture(device.Get(),W,H,&data);
             for(bool packed:{false,true}) {

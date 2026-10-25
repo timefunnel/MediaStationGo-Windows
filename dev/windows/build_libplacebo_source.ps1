@@ -8,16 +8,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
-$LibplaceboVersion = "7.364.0"
-$LibplaceboDllName = "libplacebo-364.dll"
-$ArchiveSha256 = "eead38de93cee45fa83d82477e2b27dad5015b7ca7ac354c1cbd798064d8282a"
+$LibplaceboCommit = "1532bf6893f7e6dbe1b1943488180d125a421f6f"
+$LibplaceboVersion = "7.387.0"
+$LibplaceboDllName = "libplacebo-387.dll"
+$ArchiveSha256 = "eade56be7214cba317d4ecf0c858adea4deee2d987adcf6fcd039e40c9d649ee"
 $ArchiveUrl = "https://codeload.github.com/haasn/libplacebo/tar.gz/$LibplaceboCommit"
 $HdrPeakPatchCommit = "2d0979fb54e025e904c7372666fffbf5dae40f66"
 $HdrPeakPatch = Join-Path $PSScriptRoot "libplacebo\2d0979f-hdr-peak-source-colorspace.patch"
-$SourcePatches = @(
-    @{ Id = $HdrPeakPatchCommit; Path = $HdrPeakPatch }
-)
+# The HDR peak fix is included upstream, along with FEL reconstruction and the
+# integer-code NLQ/reshaping corrections. Keep the fixed archive as one source.
+$SourcePatches = @()
 
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $ThirdPartyDir = Join-Path $RepoRoot "third_party"

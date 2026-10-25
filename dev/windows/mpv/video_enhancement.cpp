@@ -2,6 +2,7 @@
 #define NVVIDEO_BUILD
 #include "video_enhancement.h"
 #include "hdr_pipeline.h"
+#include "dovi_pipeline.h"
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers_vsr.h>
 #include <wrl/client.h>
@@ -54,6 +55,7 @@ struct nvvideo_session {
     ComPtr<ID3D11Texture2D> vfg_previous, vfg_current;
     void *vfg_resources[3]{};
     std::unique_ptr<HdrPipeline> hdr;
+    std::unique_ptr<DoviPipeline> dovi;
     NVSDK_NGX_Handle *feature = nullptr;
     NVSDK_NGX_Parameter *params = nullptr;
     bool ngx_initialized = false;
@@ -270,6 +272,15 @@ struct nvvideo_session {
 };
 
 uint32_t __cdecl nvvideo_abi() { return NVVIDEO_ABI; }
+int __cdecl nvvideo_map_dovi(nvvideo_session *session, ID3D11Texture2D *input, ID3D11Texture2D *output, ID3D11Texture2D *el, const nvvideo_dovi *metadata, char *error, size_t size) {
+    try {
+        if(!session||!input||!output||!metadata||session->config.transfer!=NVVIDEO_PQ||!session->hdr)throw std::runtime_error("Dolby Vision mapping requires a PQ session and per-frame RPU");
+        ContextGuard guard(session->multithread.Get(),session->context1.Get(),session->isolated.Get());
+        if(!session->dovi){session->dovi=std::make_unique<DoviPipeline>();session->dovi->initialize(*session->hdr);}
+        session->dovi->process(input,output,*metadata,el);
+        return 1;
+    } catch(const std::exception &exception) { report(error,size,exception.what());return 0; }
+}
 nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *error, size_t size) {
     try {
         if (!config || config->abi != NVVIDEO_ABI || config->mode < 1 || config->mode > 3 || !config->device || !config->context || !config->runtime_directory || !config->cache_directory || !config->width || !config->height || !config->out_width || !config->out_height || config->out_width > 16384 || config->out_height > 16384 || (config->mode != 1 && (config->width != config->out_width || config->height != config->out_height)) || config->vsr_quality < 1 || config->vsr_quality > 4 || config->vfg_quality > 2 || config->multiplier == 1 || config->multiplier > 8 || config->scene_detection > 1)

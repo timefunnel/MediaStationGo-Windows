@@ -6902,27 +6902,22 @@ fn valid_identifier(value: &str, maximum_len: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum_len && !value.chars().any(char::is_control)
 }
 
-fn enhancement_color_mode(range: &str, transfer: &str, dolby: bool) -> Result<bool, LoadFailure> {
+fn enhancement_color_mode(range: &str, transfer: &str, dolby: bool) -> bool {
     let range = range.trim().to_ascii_lowercase();
     let transfer = transfer.trim().to_ascii_lowercase();
-    if dolby
+    dolby
         || range.contains("dolby")
+        || range.contains("dovi")
         || range == "dv"
         || range.contains("hdr10+")
         || range.contains("hdr10plus")
         || range.contains("hdr10 plus")
-    {
-        return Err(LoadFailure::new(
-            "video_enhancement_format_unsupported",
-            "Native enhancement supports SDR, HDR10 and HLG; HDR10+ and Dolby Vision are unsupported",
-        ));
-    }
-    Ok(range.starts_with("hdr")
+        || range.starts_with("hdr")
         || range.contains("hlg")
         || matches!(
             transfer.as_str(),
             "pq" | "smpte2084" | "hlg" | "arib-std-b67"
-        ))
+        )
 }
 
 fn execute_load(
@@ -7006,7 +7001,7 @@ fn execute_load(
         let transfer = inputs.color_transfer.unwrap_or_default();
         let dolby = video.dolby_vision_profile.is_some()
             || runtime_video.is_some_and(|video| video.dolby_vision_profile.is_some());
-        enhancement_hdr = enhancement_color_mode(&range, &transfer, dolby)?;
+        enhancement_hdr = enhancement_color_mode(&range, &transfer, dolby);
     }
     let interpolation = frame_interpolation_plan(
         &source,
@@ -8942,7 +8937,7 @@ mod tests {
     }
 
     #[test]
-    fn enhancement_accepts_pq_and_hlg_but_rejects_unvalidated_dynamic_hdr() {
+    fn enhancement_plans_dynamic_hdr_without_discarding_its_metadata() {
         for (range, transfer) in [
             ("HDR10", "smpte2084"),
             ("HDR", "pq"),
@@ -8953,24 +8948,20 @@ mod tests {
             ("", "hlg"),
             ("HDR", "arib-std-b67"),
         ] {
-            assert!(enhancement_color_mode(range, transfer, false).unwrap());
+            assert!(enhancement_color_mode(range, transfer, false));
         }
         for (range, transfer) in [("SDR", "bt709"), ("", "")] {
-            assert!(!enhancement_color_mode(range, transfer, false).unwrap());
+            assert!(!enhancement_color_mode(range, transfer, false));
         }
         for (range, transfer, dolby) in [
             ("HDR10+", "pq", false),
             ("HDR10Plus", "pq", false),
             ("Dolby Vision", "pq", false),
             ("DV", "", false),
+            ("DoVi", "", false),
             ("HDR10", "pq", true),
         ] {
-            assert_eq!(
-                enhancement_color_mode(range, transfer, dolby)
-                    .unwrap_err()
-                    .code,
-                "video_enhancement_format_unsupported"
-            );
+            assert!(enhancement_color_mode(range, transfer, dolby));
         }
     }
 

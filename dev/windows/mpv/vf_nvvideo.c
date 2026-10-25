@@ -33,6 +33,7 @@ struct priv {
     struct nvvideo_session *(__cdecl *create)(const struct nvvideo_config *, char *, size_t);
     int (__cdecl *process)(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, char *, size_t);
     int (__cdecl *process_timestep)(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, float, char *, size_t);
+    int (__cdecl *map_dovi)(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, const struct nvvideo_dovi *, char *, size_t);
     void (__cdecl *destroy_session)(struct nvvideo_session *);
     ID3D11Device *device;
     ID3D11DeviceContext *context;
@@ -49,9 +50,13 @@ struct priv {
     uint64_t output_frames;
     bool draining;
     uint64_t sdk_frames, input_frames, resets;
+    uint64_t dovi_frames, fel_frames, hdr10plus_frames;
+    uint64_t rpu_output_frames, hdr10plus_output_frames, metadata_copy_errors, metadata_interval_errors;
+    double metadata_source_pts;
     uint64_t session_frames;
     double process_ms, max_process_ms;
     bool failed;
+    bool dolby_vision, hdr10plus;
 };
 
 static wchar_t *utf8_to_wide(void *parent, const char *value) {
@@ -109,7 +114,19 @@ static struct mp_image *output_frame(struct mp_filter *f, struct mp_image *input
     if (!frame) return NULL;
     if (av_hwframe_get_buffer(p->hw_pool, frame, 0) < 0) { av_frame_free(&frame); return NULL; }
     struct mp_image *output = mp_image_from_av_frame(frame); av_frame_free(&frame);
-    if (output) { mp_image_copy_attributes(output, input); output->params.crop = (struct mp_rect){0, 0, p->out_width, p->out_height}; }
+    if (output) {
+        mp_image_copy_attributes(output, input);
+        output->params.crop = (struct mp_rect){0, 0, p->out_width, p->out_height};
+        p->metadata_source_pts = input->pts;
+        // These counters inspect the actual output, including refcounted raw
+        // metadata. Keep the original RPU even after its color map was consumed.
+        if (memcmp(&output->params.color.hdr, &input->params.color.hdr, sizeof(input->params.color.hdr)) || output->num_ff_side_data != input->num_ff_side_data) p->metadata_copy_errors++;
+        for (int i = 0; i < output->num_ff_side_data; i++) {
+            if (i >= input->num_ff_side_data || output->ff_side_data[i].type != input->ff_side_data[i].type || output->ff_side_data[i].buf->data != input->ff_side_data[i].buf->data) p->metadata_copy_errors++;
+            if (output->ff_side_data[i].type == AV_FRAME_DATA_DOVI_RPU_BUFFER) p->rpu_output_frames++;
+            if (output->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) p->hdr10plus_output_frames++;
+        }
+    }
     return output;
 }
 static struct mp_image *copy_original(struct mp_filter *f, struct mp_image *input,
@@ -138,8 +155,9 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
         p->create = (void *)GetProcAddress(p->module, "nvvideo_create");
         p->process = (void *)GetProcAddress(p->module, "nvvideo_process");
         p->process_timestep = (void *)GetProcAddress(p->module, "nvvideo_process_timestep");
+        p->map_dovi = (void *)GetProcAddress(p->module, "nvvideo_map_dovi");
         p->destroy_session = (void *)GetProcAddress(p->module, "nvvideo_destroy");
-        if (!abi || !p->create || !p->process || !p->process_timestep || !p->destroy_session) { MP_ERR(f, "Native video bridge is missing required exports\n"); return false; }
+        if (!abi || !p->create || !p->process || !p->process_timestep || !p->map_dovi || !p->destroy_session) { MP_ERR(f, "Native video bridge is missing required exports\n"); return false; }
         uint32_t version = abi();
         if (version != NVVIDEO_ABI) { MP_ERR(f, "Native video bridge ABI mismatch: expected=%d actual=%u\n", NVVIDEO_ABI, version); return false; }
     }
@@ -177,12 +195,92 @@ static bool initialize(struct mp_filter *f, struct mp_image *input) {
     return p->session != NULL;
 }
 static bool valid_input(struct mp_image *input) {
-    if (input->imgfmt != IMGFMT_D3D11 || !input->hwctx || (input->fields & MP_IMGFIELD_INTERLACED) || input->dovi || input->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || input->params.color.hdr.scene_avg > 0 || input->params.color.hdr.ootf.num_anchors > 0) return false;
-    for (int i = 0; i < input->num_ff_side_data; i++) if (input->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) return false;
+    if (input->imgfmt != IMGFMT_D3D11 || !input->hwctx || (input->fields & MP_IMGFIELD_INTERLACED)) return false;
+    // A raw RPU without a supported parsed mapping must never silently become
+    // HDR10. FEL additionally requires its decoded, PTS-matched layer below.
+    for (int i = 0; i < input->num_ff_side_data; i++)
+        if ((input->ff_side_data[i].type == AV_FRAME_DATA_DOVI_METADATA || input->ff_side_data[i].type == AV_FRAME_DATA_DOVI_RPU_BUFFER) && !input->dovi) return false;
+    if (input->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && (!input->dovi || !input->params.repr.dovi)) return false;
     if (input->params.color.transfer == PL_COLOR_TRC_PQ || input->params.color.transfer == PL_COLOR_TRC_HLG) {
-        return input->params.hw_subfmt == IMGFMT_P010 && input->params.color.primaries == PL_COLOR_PRIM_BT_2020 && input->params.repr.sys == PL_COLOR_SYSTEM_BT_2020_NC && (input->params.repr.levels == PL_COLOR_LEVELS_FULL || input->params.repr.levels == PL_COLOR_LEVELS_LIMITED) && (input->params.chroma_location == PL_CHROMA_LEFT || input->params.chroma_location == PL_CHROMA_TOP_LEFT || input->params.chroma_location == PL_CHROMA_CENTER || input->params.chroma_location == PL_CHROMA_TOP_CENTER || input->params.chroma_location == PL_CHROMA_BOTTOM_LEFT || input->params.chroma_location == PL_CHROMA_BOTTOM_CENTER);
+        return input->params.hw_subfmt == IMGFMT_P010 && input->params.color.primaries == PL_COLOR_PRIM_BT_2020 && (input->params.repr.sys == PL_COLOR_SYSTEM_BT_2020_NC || (input->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && input->params.color.transfer == PL_COLOR_TRC_PQ)) && (input->params.repr.levels == PL_COLOR_LEVELS_FULL || input->params.repr.levels == PL_COLOR_LEVELS_LIMITED) && (input->params.chroma_location == PL_CHROMA_LEFT || input->params.chroma_location == PL_CHROMA_TOP_LEFT || input->params.chroma_location == PL_CHROMA_CENTER || input->params.chroma_location == PL_CHROMA_TOP_CENTER || input->params.chroma_location == PL_CHROMA_BOTTOM_LEFT || input->params.chroma_location == PL_CHROMA_BOTTOM_CENTER);
     }
     return input->params.hw_subfmt == IMGFMT_BGRA && input->params.color.transfer != PL_COLOR_TRC_HLG;
+}
+static bool map_dovi(struct mp_filter *f, struct mp_image *input) {
+    struct priv *p = f->priv;
+    if (input->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION) return true;
+    const struct pl_dovi_metadata *src = input->params.repr.dovi;
+    struct nvvideo_dovi metadata = {0};
+    ID3D11Texture2D *el = NULL;
+    if (src->nlq_active) {
+        struct mp_image *layer = input->enhancement_layer;
+        if (!layer || layer->imgfmt != IMGFMT_D3D11 || layer->params.hw_subfmt != IMGFMT_P010 ||
+            !isfinite(layer->pts) || layer->pts == MP_NOPTS_VALUE || fabs(layer->pts - input->pts) > 1e-6) {
+            MP_ERR(f, "Dolby Vision FEL requires a P010 decoded enhancement layer at the same PTS\n");
+            return false;
+        }
+        metadata.nlq_active = 1;
+        metadata.el_width = layer->w; metadata.el_height = layer->h;
+        metadata.el_chroma = layer->params.chroma_location == PL_CHROMA_TOP_LEFT ? 1 : layer->params.chroma_location == PL_CHROMA_CENTER ? 2 : layer->params.chroma_location == PL_CHROMA_TOP_CENTER ? 3 : layer->params.chroma_location == PL_CHROMA_BOTTOM_LEFT ? 4 : layer->params.chroma_location == PL_CHROMA_BOTTOM_CENTER ? 5 : 0;
+    }
+    const float lms_to_rgb[3][3] = {
+        {3.06441879f, -2.16597676f, .10155818f},
+        {-.65612108f, 1.78554118f, -.12943749f},
+        {.01736321f, -.04725154f, 1.03004253f},
+    };
+    for (int row = 0; row < 3; row++) {
+        if (src->nlq_active) {
+            metadata.nlq[row][0] = src->nlq[row].offset;
+            metadata.nlq[row][1] = src->nlq[row].deadzone_slope;
+            metadata.nlq[row][2] = src->nlq[row].deadzone_threshold;
+            metadata.nlq[row][3] = src->nlq[row].hdr_in_max;
+        }
+        metadata.nonlinear[row][3] = src->nonlinear_offset[row];
+        for (int col = 0; col < 3; col++) {
+            metadata.nonlinear[row][col] = src->nonlinear.m[row][col];
+            for (int k = 0; k < 3; k++) metadata.linear[row][col] += lms_to_rgb[row][k] * src->linear.m[k][col];
+        }
+        const struct pl_reshape_data *comp = &src->comp[row];
+        if (comp->num_pivots > 9 || comp->num_pivots == 1) return false;
+        metadata.comp[row].num_pivots = comp->num_pivots;
+        for (int i = 0; i < comp->num_pivots; i++) metadata.comp[row].pivots[i][0] = comp->pivots[i];
+        for (int i = 0; i + 1 < comp->num_pivots; i++) {
+            struct nvvideo_dovi_segment *dst = &metadata.comp[row].segments[i];
+            if (comp->method[i] == 0) {
+                for (int k = 0; k < 3; k++) dst->polynomial[k] = comp->poly_coeffs[i][k];
+            } else if (comp->method[i] == 1 && comp->mmr_order[i] >= 1 && comp->mmr_order[i] <= 3) {
+                dst->polynomial[0] = comp->mmr_constant[i]; dst->polynomial[3] = comp->mmr_order[i];
+                for (int n = 0; n < comp->mmr_order[i]; n++) {
+                    for (int k = 0; k < 3; k++) dst->mmr[n][0][k] = comp->mmr_coeffs[i][n][k];
+                    for (int k = 0; k < 4; k++) dst->mmr[n][1][k] = comp->mmr_coeffs[i][n][k + 3];
+                }
+            } else return false;
+        }
+    }
+    // Keep source dimensions even if this provider later upscales. Work on a
+    // retained single-slice texture, never on the decoder's reusable surface.
+    ID3D11Texture2D *mapped = single_texture(f, input);
+    if (!mapped) return false;
+    if (metadata.nlq_active) {
+        el = single_texture(f, input->enhancement_layer);
+        if (!el) { ID3D11Texture2D_Release(mapped); return false; }
+    }
+    char detail[512] = {0};
+    bool ok = p->map_dovi(p->session, p->current, mapped, el, &metadata, detail, sizeof(detail));
+    if (el) ID3D11Texture2D_Release(el);
+    if (!ok) { ID3D11Texture2D_Release(mapped); MP_ERR(f, "Dolby Vision RPU mapping failed: %s\n", detail); return false; }
+    ID3D11Texture2D_Release(p->current); p->current = mapped;
+    // RPU reshaping is now in the pixels. Preserve its refcounted side data and
+    // every dynamic HDR field, but do not ask VO or later providers to reshape twice.
+    input->params.repr.sys = input->params.sys_orig = PL_COLOR_SYSTEM_BT_2020_NC;
+    input->params.repr.dovi = NULL;
+    input->params.color.primaries = input->params.primaries_orig = PL_COLOR_PRIM_BT_2020;
+    input->params.color.transfer = input->params.transfer_orig = PL_COLOR_TRC_PQ;
+    if (metadata.nlq_active) p->fel_frames++;
+    mp_image_unrefp(&input->enhancement_layer);
+    input->params.no_enhancement_layer = true;
+    p->dovi_frames++;
+    return true;
 }
 static bool update_timing(struct mp_filter *f, struct mp_image *input) {
     struct priv *p = f->priv;
@@ -220,6 +318,7 @@ static bool update_timing(struct mp_filter *f, struct mp_image *input) {
 static void write_output(struct mp_filter *f, struct mp_image *output,
                          double pts, double duration) {
     struct priv *p = f->priv;
+    if (p->metadata_source_pts > pts + 1e-7) p->metadata_interval_errors++;
     output->pts = pts;
     output->dts = MP_NOPTS_VALUE;
     output->pkt_duration = duration;
@@ -236,7 +335,9 @@ static void write_output(struct mp_filter *f, struct mp_image *output,
 
 static struct mp_image *generate_frame(struct mp_filter *f, float timestep) {
     struct priv *p = f->priv;
-    struct mp_image *output = output_frame(f, p->current_image);
+    // Generated timestamps precede the current endpoint. Hold the preceding
+    // source frame's scene metadata until that endpoint, including at cuts.
+    struct mp_image *output = output_frame(f, p->opts->mode == 2 ? p->previous_image : p->current_image);
     if (!output) { fail(f, "Cannot allocate a native output frame"); return NULL; }
     if (!p->result) {
         D3D11_TEXTURE2D_DESC desc; ID3D11Texture2D_GetDesc(p->current, &desc);
@@ -337,8 +438,12 @@ static void process(struct mp_filter *f) {
     struct mp_image *input = frame.data;
     if (!valid_input(input)) {
         MP_ERR(f, "Unsupported enhancement input: %s\n", mp_image_params_to_str(&input->params));
-        mp_frame_unref(&frame); fail(f, "Requires progressive SDR BGRA8 or P010 BT.2020 NCL with PQ/HLG, explicit range and chroma; HDR10+ and Dolby Vision are unsupported"); return;
+        mp_frame_unref(&frame); fail(f, "Requires progressive SDR BGRA8 or HDR P010 with explicit range/chroma; Dolby Vision requires parsed per-frame RPU and matching FEL when present"); return;
     }
+    p->dolby_vision = input->dovi != NULL;
+    p->hdr10plus = false;
+    for (int i = 0; i < input->num_ff_side_data; i++)
+        if (input->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) p->hdr10plus = true;
     if (p->session && !mp_image_params_static_equal(&p->params, &input->params)) reset(f);
     if (!p->session && !initialize(f, input)) { mp_frame_unref(&frame); fail(f, "Cannot initialize installed native provider; see preceding SDK error"); return; }
     if (p->opts->mode == 2) {
@@ -356,6 +461,9 @@ static void process(struct mp_filter *f) {
     p->input_frames++;
     p->current = single_texture(f, input);
     if (!p->current) { mp_frame_unref(&frame); fail(f, "Cannot allocate an input texture"); return; }
+    if (!map_dovi(f, input)) { mp_frame_unref(&frame); fail(f, "Cannot apply Dolby Vision per-frame color mapping"); return; }
+    for (int i = 0; i < input->num_ff_side_data; i++)
+        if (input->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) p->hdr10plus_frames++;
     p->current_image = input;
     p->next_index = 1;
     if (p->opts->mode != 2) {
@@ -383,7 +491,8 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd) {
     mp_tags_set_str(tags, "status", p->failed ? "failed" : p->session_frames ? "active" : "initializing");
     mp_tags_set_str(tags, "backend", p->opts->mode == 1 ? "rtx-video" : p->opts->mode == 2 ? "nvidia-vfg" : "dlssnr");
     bool hdr = p->params.color.transfer == PL_COLOR_TRC_PQ || p->params.color.transfer == PL_COLOR_TRC_HLG;
-    mp_tags_set_str(tags, "dynamic-range", p->params.color.transfer == PL_COLOR_TRC_HLG ? "hlg" : hdr ? "hdr10" : "sdr");
+    mp_tags_set_str(tags, "dynamic-range", p->dolby_vision ? "dolbyvision" : p->hdr10plus ? "hdr10plus" : p->params.color.transfer == PL_COLOR_TRC_HLG ? "hlg" : hdr ? "hdr10" : "sdr");
+    mp_tags_set_str(tags, "fel-reconstructed-frames", mp_tprintf(30, "%llu", (unsigned long long)p->fel_frames));
     mp_tags_set_str(tags, "sdk-encoding", hdr && p->opts->mode == 2 ? "rgb10a2-pq" : "bgra8");
     mp_tags_set_str(tags, "hdr-processing", !hdr ? "none" : p->opts->mode == 2 ? "native-10bit" : "proxy-residual");
     if (p->params.color.transfer == PL_COLOR_TRC_HLG) mp_tags_set_str(tags, "hlg-reference", "1000-nits-gamma-1.2");
@@ -401,6 +510,14 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd) {
     mp_tags_set_str(tags, "avg-process-ms", mp_tprintf(40, "%.3f", p->sdk_frames ? p->process_ms / p->sdk_frames : 0));
     mp_tags_set_str(tags, "max-process-ms", mp_tprintf(40, "%.3f", p->max_process_ms));
     mp_tags_set_str(tags, "sdk-frames", mp_tprintf(80, "%llu", (unsigned long long)p->sdk_frames));
+    mp_tags_set_str(tags, "dovi-mapped-frames", mp_tprintf(80, "%llu", (unsigned long long)p->dovi_frames));
+    mp_tags_set_str(tags, "hdr10plus-frames", mp_tprintf(80, "%llu", (unsigned long long)p->hdr10plus_frames));
+    mp_tags_set_str(tags, "rpu-output-frames", mp_tprintf(80, "%llu", (unsigned long long)p->rpu_output_frames));
+    mp_tags_set_str(tags, "hdr10plus-output-frames", mp_tprintf(80, "%llu", (unsigned long long)p->hdr10plus_output_frames));
+    mp_tags_set_str(tags, "metadata-copy-errors", mp_tprintf(80, "%llu", (unsigned long long)p->metadata_copy_errors));
+    mp_tags_set_str(tags, "metadata-interval-errors", mp_tprintf(80, "%llu", (unsigned long long)p->metadata_interval_errors));
+    mp_tags_set_str(tags, "metadata-source-pts", mp_tprintf(80, "%.9f", p->metadata_source_pts));
+    mp_tags_set_str(tags, "dynamic-metadata", "preserved; generated frames use preceding source interval");
     mp_tags_set_str(tags, "resets", mp_tprintf(80, "%llu", (unsigned long long)p->resets));
     *(struct mp_tags **)cmd->res = tags; return true;
 }

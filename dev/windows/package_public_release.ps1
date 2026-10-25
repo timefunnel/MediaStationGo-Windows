@@ -103,7 +103,7 @@ if ($Forbidden) {
 }
 foreach ($RequiredRuntime in @(
     'jellium-desktop.exe', 'mediastation-portable-updater.exe',
-    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-364.dll',
+    'libmpv-2.dll', 'avcodec-62.dll', 'libplacebo-387.dll',
     'video_enhancement.dll', 'nvngx.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $RequiredRuntime) -PathType Leaf)) {
@@ -187,7 +187,7 @@ try {
     }
 
     $FfmpegSource = Join-Path $RepoRoot "third_party\ffmpeg-38b88335f99e76ed89ff3c93f877fdefce736c13"
-    $FfmpegFiles = & git -C $FfmpegSource ls-files
+    $FfmpegFiles = & git -C $FfmpegSource ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to enumerate FFmpeg source"
     }
@@ -196,7 +196,7 @@ try {
             "$ArchiveRoot/third_party/ffmpeg/$RelativePath"
     }
 
-    $LibplaceboSource = Join-Path $RepoRoot "third_party\libplacebo-1733c8601edec161b714e4a799c72a9f5e5aa2f0"
+    $LibplaceboSource = Join-Path $RepoRoot "third_party\libplacebo-1532bf6893f7e6dbe1b1943488180d125a421f6f"
     Get-ChildItem -LiteralPath $LibplaceboSource -Recurse -File |
         Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } |
         ForEach-Object {
@@ -221,7 +221,7 @@ applicationCommit=$Commit
 applicationWorkingTreeDirty=$($Dirty.ToString().ToLowerInvariant())
 mpvCommit=$MpvCommit
 ffmpegCommit=$FfmpegCommit
-libplaceboCommit=1733c8601edec161b714e4a799c72a9f5e5aa2f0
+libplaceboCommit=1532bf6893f7e6dbe1b1943488180d125a421f6f
 "@
     $StateEntry = $SourceZip.CreateEntry("$ArchiveRoot/SOURCE-STATE.txt")
     $StateWriter = [System.IO.StreamWriter]::new($StateEntry.Open(), $Utf8NoBom)

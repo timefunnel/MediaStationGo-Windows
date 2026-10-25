@@ -14,7 +14,7 @@ $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 $OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
 $LicenseDir = Join-Path $OutputDir "licenses"
 $FfmpegCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
-$LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
+$LibplaceboCommit = "1532bf6893f7e6dbe1b1943488180d125a421f6f"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Copy-RequiredFile {
@@ -84,7 +84,7 @@ if (-not (Test-Path -LiteralPath $Pacman -PathType Leaf)) {
 $PinnedRuntimeNames = @(
     'avcodec-62.dll', 'avdevice-62.dll', 'avfilter-11.dll', 'avformat-62.dll',
     'avutil-60.dll', 'swresample-6.dll', 'swscale-9.dll', 'libmpv-2.dll',
-    'libplacebo-364.dll', 'rife_runtime.dll', 'cudart64_12.dll',
+    'libplacebo-387.dll', 'rife_runtime.dll', 'cudart64_12.dll',
     'tensorrt_rtx_1_4.dll', 'tensorrt_onnxparser_rtx_1_4.dll'
     'video_enhancement.dll'
 )
@@ -204,7 +204,7 @@ Public source repository:
 https://github.com/timefunnel/MediaStationGo-Windows
 
 The source archive contains the application source, the pinned mpv submodule,
-the pinned FFmpeg 8.1.2 source, the patched libplacebo 7.364.0 source, and the
+the pinned FFmpeg 8.1.2 source, the libplacebo 7.387.0 source, and the
 build scripts needed to reproduce the native libraries. Build-time and
 proprietary SDK archives are not relicensed by this offer.
 "@

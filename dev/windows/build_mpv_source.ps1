@@ -29,9 +29,9 @@ $FfmpegCommit = "38b88335f99e76ed89ff3c93f877fdefce736c13"
 $FfmpegInstallDir = Join-Path $RepoRoot "third_party\ffmpeg-install-$FfmpegCommit"
 $LibplaceboBuildScript = Join-Path $PSScriptRoot "build_libplacebo_source.ps1"
 $LibplaceboHdrPeakPatch = Join-Path $PSScriptRoot "libplacebo\2d0979f-hdr-peak-source-colorspace.patch"
-$LibplaceboCommit = "1733c8601edec161b714e4a799c72a9f5e5aa2f0"
-$LibplaceboVersion = "7.364.0"
-$LibplaceboDllName = "libplacebo-364.dll"
+$LibplaceboCommit = "1532bf6893f7e6dbe1b1943488180d125a421f6f"
+$LibplaceboVersion = "7.387.0"
+$LibplaceboDllName = "libplacebo-387.dll"
 $LibplaceboInstallDir = Join-Path $RepoRoot "third_party\libplacebo-install-$LibplaceboCommit"
 $RifeRuntimeHeaderDestination = Join-Path $MpvSourceDir "video\filter\rife_runtime.h"
 $FrameInterpolationRuntimeDir = Join-Path $RepoRoot "third_party\frame-interpolation-runtime"
@@ -43,6 +43,8 @@ $NvofMemcSourceCreated = $false
 $NvVideoCreated = @()
 $NvVideoPatch = Join-Path $PSScriptRoot 'mpv\mpv-nvvideo.patch'
 $NvVideoPatchApplied = $false
+$DoviFelPatch = Join-Path $PSScriptRoot 'mpv\mpv-dovi-fel.patch'
+$DoviFelPatchApplied = $false
 $RifeRuntimeHeaderCreated = $false
 
 function Get-MpvSourceContractHash {
@@ -53,6 +55,7 @@ function Get-MpvSourceContractHash {
         (Join-Path $PSScriptRoot "mpv\video_enhancement.h"),
         (Join-Path $PSScriptRoot "mpv\vfg_timing.h"),
         $NvVideoPatch,
+        $DoviFelPatch,
         $NvofMemcPatch,
         $RifeRuntimeHeader,
         $FfmpegBuildScript,
@@ -253,7 +256,7 @@ function Assert-MpvUsesPinnedLibplacebo {
     if ($Imports -notmatch "(?im)DLL Name:\s+$([regex]::Escape($LibplaceboDllName))\s*$") {
         throw "libmpv does not import the pinned $LibplaceboDllName"
     }
-    if ($Imports -match "(?im)DLL Name:\s+libplacebo-(?!364\.dll)\d+\.dll\s*$") {
+    if ($Imports -match "(?im)DLL Name:\s+(?!$([regex]::Escape($LibplaceboDllName))\s*$)libplacebo-\d+\.dll\s*$") {
         throw "libmpv imports an unpinned libplacebo runtime"
     }
 
@@ -304,6 +307,13 @@ if ((Test-Path $OutputLib) -and -not $Force) {
 }
 
 try {
+    if (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $DoviFelPatch) {
+        & git -C $MpvSourceDir apply $DoviFelPatch
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to apply Dolby Vision FEL backport' }
+        $DoviFelPatchApplied = $true
+    } elseif (-not (Test-GitPatchApplies -SourceDirectory $MpvSourceDir -PatchPath $DoviFelPatch -Reverse)) {
+        throw 'The mpv source does not match the Dolby Vision FEL backport'
+    }
     foreach ($Name in @('vf_nvvideo.c', 'video_enhancement.h', 'vfg_timing.h')) {
         $Source = Join-Path $PSScriptRoot "mpv\$Name"
         $Destination = Join-Path $MpvSourceDir "video\filter\$Name"
@@ -703,5 +713,9 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to restore the mpv source after the NVOF MEMC build"
         }
+    }
+    if ($DoviFelPatchApplied) {
+        & git -C $MpvSourceDir apply --reverse $DoviFelPatch
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Dolby Vision FEL source patch' }
     }
 }

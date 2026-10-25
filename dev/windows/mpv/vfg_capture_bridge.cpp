@@ -36,6 +36,7 @@ struct RealBridge {
     decltype(&nvvideo_create) create = nullptr;
     decltype(&nvvideo_process) process = nullptr;
     decltype(&nvvideo_process_timestep) timestep = nullptr;
+    decltype(&nvvideo_map_dovi) map_dovi = nullptr;
     decltype(&nvvideo_destroy) destroy = nullptr;
     RealBridge() {
         module = LoadLibraryExW(environment(L"VFG_CAPTURE_BRIDGE").c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -44,8 +45,9 @@ struct RealBridge {
         create = reinterpret_cast<decltype(create)>(GetProcAddress(module, "nvvideo_create"));
         process = reinterpret_cast<decltype(process)>(GetProcAddress(module, "nvvideo_process"));
         timestep = reinterpret_cast<decltype(timestep)>(GetProcAddress(module, "nvvideo_process_timestep"));
+        map_dovi = reinterpret_cast<decltype(map_dovi)>(GetProcAddress(module, "nvvideo_map_dovi"));
         destroy = reinterpret_cast<decltype(destroy)>(GetProcAddress(module, "nvvideo_destroy"));
-        if (!abi || abi() != NVVIDEO_ABI || !create || !process || !timestep || !destroy) throw std::runtime_error("Original capture bridge ABI mismatch");
+        if (!abi || abi() != NVVIDEO_ABI || !create || !process || !timestep || !map_dovi || !destroy) throw std::runtime_error("Original capture bridge ABI mismatch");
     }
     ~RealBridge() { if (module) FreeLibrary(module); }
 };
@@ -241,6 +243,10 @@ struct nvvideo_session {
     std::unique_ptr<Capture> capture;
 };
 extern "C" uint32_t __cdecl nvvideo_abi() { return NVVIDEO_ABI; }
+extern "C" int __cdecl nvvideo_map_dovi(nvvideo_session *session, ID3D11Texture2D *input, ID3D11Texture2D *output, ID3D11Texture2D *el, const nvvideo_dovi *metadata, char *error, size_t size) {
+    if (!session) { report(error, size, "Missing capture session"); return 0; }
+    return bridge().map_dovi(session->real, input, output, el, metadata, error, size);
+}
 extern "C" nvvideo_session *__cdecl nvvideo_create(const nvvideo_config *config, char *error, size_t size) {
     try {
         if (!config) throw std::runtime_error("Missing capture config");

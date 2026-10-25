@@ -21,6 +21,7 @@ $InstallDir = Join-Path $ThirdPartyDir "ffmpeg-install-$FfmpegCommit"
 $BuildStamp = Join-Path $InstallDir "lib\mediastation-ffmpeg-source.sha256"
 $CachedConfigHeader = Join-Path $InstallDir "lib\mediastation-ffmpeg-config.h"
 $TrueHdPatch = Join-Path $PSScriptRoot "ffmpeg\truehd-single-substream-layout.patch"
+$DoviSplitPatch = Join-Path $PSScriptRoot "ffmpeg\dovi-split.patch"
 $TrueHdTest = Join-Path $PSScriptRoot "test_ffmpeg_truehd.ps1"
 $TrueHdFixture = Join-Path $PSScriptRoot "ffmpeg\single-substream-5point1.thd.hex"
 
@@ -96,25 +97,37 @@ function Initialize-PinnedFfmpegSource {
     if ($LASTEXITCODE -ne 0 -or $ActualCommit -ne $FfmpegCommit) {
         throw "Pinned FFmpeg commit mismatch: expected=$FfmpegCommit actual=$ActualCommit"
     }
-    $Untracked = (& git -C $SourceDir ls-files --others --exclude-standard) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $Untracked) {
-        throw "Unexpected untracked files in pinned FFmpeg source: $SourceDir"
+    $Patches = @($TrueHdPatch, $DoviSplitPatch)
+    foreach ($Patch in $Patches) {
+        & git -C $SourceDir apply --reverse --check $Patch 2>$null
+        if ($LASTEXITCODE -eq 0) { continue }
+        & git -C $SourceDir apply --check $Patch
+        if ($LASTEXITCODE -ne 0) { throw "Pinned FFmpeg patch does not apply: $Patch" }
+        & git -C $SourceDir apply $Patch
+        if ($LASTEXITCODE -ne 0) { throw "Failed to apply pinned FFmpeg patch: $Patch" }
     }
-    $Diff = (& git -C $SourceDir diff --no-ext-diff --no-color --full-index HEAD --) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to inspect pinned FFmpeg source"
-    }
-    $ExpectedDiff = (Get-Content -LiteralPath $TrueHdPatch -Raw).Replace("`r`n", "`n").TrimEnd("`n")
-    if (-not $Diff) {
-        & git -C $SourceDir apply --check $TrueHdPatch
-        if ($LASTEXITCODE -ne 0) { throw "The TrueHD layout patch does not apply to pinned FFmpeg" }
-        & git -C $SourceDir apply $TrueHdPatch
-        if ($LASTEXITCODE -ne 0) { throw "Failed to apply the TrueHD layout patch" }
-        $Diff = (& git -C $SourceDir diff --no-ext-diff --no-color --full-index HEAD --) -join "`n"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to verify the patched FFmpeg source" }
-    }
-    if ($Diff -ne $ExpectedDiff) {
-        throw "Pinned FFmpeg source differs from the tracked TrueHD layout patch: $SourceDir"
+    # Compare complete trees, including the BSF's new file, without changing the
+    # checkout's index. Reverse-apply checks alone miss unrelated source edits.
+    $PreviousIndex = $env:GIT_INDEX_FILE
+    $CheckIndex = Join-Path $ThirdPartyDir ("ffmpeg-verify-" + [guid]::NewGuid().ToString('N') + '.index')
+    try {
+        $env:GIT_INDEX_FILE = $CheckIndex
+        & git -C $SourceDir read-tree HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot initialize FFmpeg verification index' }
+        foreach ($Patch in $Patches) {
+            & git -C $SourceDir apply --cached $Patch
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot derive expected FFmpeg source tree' }
+        }
+        $ExpectedTree = (& git -C $SourceDir write-tree).Trim()
+        & git -C $SourceDir add -A -- .
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect actual FFmpeg source tree' }
+        $ActualTree = (& git -C $SourceDir write-tree).Trim()
+        if ($LASTEXITCODE -ne 0 -or $ActualTree -ne $ExpectedTree) {
+            throw 'Pinned FFmpeg source differs from the tracked TrueHD and Dolby Vision patches'
+        }
+    } finally {
+        $env:GIT_INDEX_FILE = $PreviousIndex
+        Remove-Item -LiteralPath $CheckIndex -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -179,6 +192,7 @@ $ContractMaterial = @(
     $FfmpegCommit,
     (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(),
     (Get-FileHash -LiteralPath $TrueHdPatch -Algorithm SHA256).Hash.ToLowerInvariant(),
+    (Get-FileHash -LiteralPath $DoviSplitPatch -Algorithm SHA256).Hash.ToLowerInvariant(),
     (Get-FileHash -LiteralPath $TrueHdTest -Algorithm SHA256).Hash.ToLowerInvariant(),
     (Get-FileHash -LiteralPath $TrueHdFixture -Algorithm SHA256).Hash.ToLowerInvariant()
 ) -join "`n"

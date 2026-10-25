@@ -4,6 +4,79 @@
 首页修复、最终 EXE/视频桥校验及回滚位置见 [首页启动修复](windows-home-startup.md)。
 下面的已安装/未安装、回滚描述均为各阶段记录，后续 VFG 修复以本节及对应安装审计为准。
 
+## 2026-10-25 HDR10+ 与 Dolby Vision 画面增强
+
+《死侍与金刚狼》的当前条目为 3840×2160 HEVC Main10 / Dolby Vision。
+服务端未返回 Profile；只读首帧核对确认是 Profile 7 / FEL：
+`disable_residual_flag=0`，三个分量的 NLQ offset=512、slope=2048、
+vdr_in_max=1048576，coef_log2_denom=23，属于非平凡残差。
+旧代码在加载前按名称拒绝，原生 `nvvideo` 也拒绝动态 HDR，固定依赖缺少
+完整 FEL 链路。本轮同时处理格式限制、双层解码和增强链，不修改 RIFE。
+
+- HDR10+ 保留每帧原始 side data、场景亮度和 OOTF；沿用 P010 HDR 增强链。
+- Dolby Vision 使用解码器/libplacebo 已解析的逐帧 RPU，在 GPU 上执行多项式/
+  MMR 重整形；Profile 7 从 HEVC UNSPEC63 拆出增强层，独立解码并按 PTS
+  配对，在整数 EL 码值上完成 LINEAR_DZ NLQ 残差重建。随后执行非线性矩阵、
+  PQ 和 LMS→BT.2020 转换，再交给 NR、VSR、VFG。
+  结果标记为已完成色彩映射的 BT.2020 NCL/PQ，避免后续组件或 VO 重复重整形。
+  原始 RPU、解析后的动态亮度与其他 side data 继续随输出帧保留。
+- 生成帧使用其时间所在的前一源帧区间的元数据，原始端点使用自身元数据；
+  不把后一帧的动态元数据提前套到生成帧，也不数值插值 RPU/Bezier 参数。
+- 增强层在用户滤镜前配对；缺少必要增强层或解码/配对失败会显式失败，不能
+  继续只渲染基础层。重建后的输出沿用增强组件的 P010/PQ 合同，动态元数据仍
+  用于当前 mpv/gpu-next 渲染。这不新增电视端 Dolby Vision HDMI 位流直通，
+  也不宣称输出为 12 位或渲染器处理所有 Dolby 元数据级别。
+
+主程序视频桥 ABI 升至 7，增加显式逐帧 RPU/FEL 映射入口；配套 mpv、视频桥和
+诊断采集代理须同步更新。NR 适配器合同和三个已安装组件包的合同保持原样。
+能力 IPC 增加 `hdr10plus`/`dolbyvision`，并返回支持增强层重建。
+mpv 回移上游 PR 17932（merge `99b4c12cccb4d8d3f72b41944cb6c640e2156650`）；
+FFmpeg 保留 8.1.2 和既有 TrueHD 修复，仅回移 `dovi_split`；libplacebo 固定至
+`1532bf6893f7e6dbe1b1943488180d125a421f6f` / 7.387.0，包含 FEL、
+整数 NLQ 及 2^bit_depth 重整形单位修复。源码归档和运行库检查同步更新。
+
+验证：48 组 GPU RPU 映射及 24 组 FEL 重建（多项式/MMR 1–3 阶、2–9 个
+pivots、逐帧更新、Limited/Full × 六种色度位置）与独立标量参考的误差至多
+1 个 10 位码值。
+原 48 组 PQ/HLG 往返检查与 SDR/PQ/HLG 真实 provider 检查通过。
+4K RPU 映射 6 帧平均 1.061 ms、最大 1.082 ms，包含 GPU 完成和复制，排除 EL/SDK/VO；
+这不是整条 4K 增强链或影片的实时性能验收。
+
+本机生成 4 秒/24 fps 视频，注入固定提交的 dovi_tool/hdr10plus_tool 测试元数据；
+ffprobe 确认实际 RPU/HDR10+ side data 后，在真实 d3d11va/gpu-next 下检查
+Profile 5、Profile 8、HDR10+ × VSR、VFG、NR、VSR→VFG、NR→VSR→VFG、
+自适应 VFG，共 18 条链路。Profile 5 在中途切换 RPU；所有链路实际 SDK 调用、
+精确 seek 目标、EOF、P010/PQ、原始元数据引用和动态 HDR 字段复制均通过；
+组合增强未重复应用 RPU，VFG 所有输出的元数据区间错误数为零。
+
+147 项常规 Rust 单测、三个既有 JS 组件/播放器回归、格式检查通过。scoped Clippy
+通过；严格 Clippy 被既有 `mediastation_runtime.rs:1854` 的 `collapsible_if` 阻挡，
+未修改该无关代码。临时媒体、元数据、探针和引擎缓存由脚本清理。日志位于
+`build/video-enhancement/dynamic-hdr-{fel-gpu,playback-final,rust-final,clippy-scoped}.log`。
+复现入口为 `build_video_enhancement.ps1 -TestGpu` 和
+`test_dynamic_hdr_enhancement.ps1`（后者下载固定提交的上游测试夹具）。
+
+实片只读验证：同一《死侍与金刚狼》来源的六种增强组合均完成首段播放、精确
+跳转到 15 秒和跳转后处理，实际 FEL 重建计数分别为 33/35/33/35/35/17。
+RPU/动态 HDR 字段未丢失、组合链未重复映射、VFG 元数据区间错误为零。
+最终实片检查加载标准 `build` 中的 DLL，并使用当前已安装的 VFG 运行库；
+VSR/NR 使用本机开发运行库，两者当前未在应用组件管理中安装。六种组合的
+跳转读数为 15.015 秒（自适应为 15.008421 秒）。探针显式禁用本机配置和
+续播状态，并等待 SEEK 事件后的 PLAYBACK_RESTART，避免受独立 mpv 状态影响。
+入口 `test_dynamic_hdr_live.ps1 -MediaId <条目ID>` 从当前凭据会话取得同源播放信息，签名 URL
+只经内存/stdin 传入探针；缓冲上限 32 MiB，不上报播放进度，不保存影片。
+首帧与脱敏结果见 `dynamic-hdr-real-source-metadata.json`、
+`dynamic-hdr-real-playback.log`。这些短时检查不替代 HDR 显示器观感、长片或
+实体声音验收；音频为 null 输出。
+
+标准 Release 已于 2026-10-26 构建并恢复正常运行，实际加载 libmpv 和
+libplacebo-387.dll；临时调试端口已关闭。实际 CEF/native IPC 能力验证通过，
+审计为 `build/video-enhancement/dynamic-hdr-normal-app.json` 和
+`dynamic-hdr-app-ipc.json`，EXE SHA-256 为
+`56a50e50ce8727c97a03e5923638131411af5dc036316033c6e22842f1546c71`。
+一次独立 GPU 验收进程在 VFG 检查后提前退出，未记录 SDK 错误码；单独复跑
+通过，原因尚未定位。因此不将这些短时结果视为长时间稳定性验收。
+
 ## 2026-10-23 增强参数菜单与应用后收起
 
 同日按用户后续要求，当前产品选项收敛为“刷新率自适应、2 倍、3 倍”，播放信息同步

@@ -5,7 +5,7 @@ if (-not $SdkDirectory) { $SdkDirectory = Join-Path $RepoRoot 'third_party\video
 $SdkDirectory = (Resolve-Path -LiteralPath $SdkDirectory).Path
 if (-not [IO.Path]::IsPathRooted($OutputDir)) { $OutputDir = Join-Path $RepoRoot $OutputDir }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
-if (-not $OutputDir.StartsWith($RepoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Native bridge output must be inside this workspace' }
+if (-not $OutputDir.StartsWith($RepoRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Native bridge output must be inside this workspace' }
 . (Join-Path $PSScriptRoot 'env.ps1')
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 & cl.exe /nologo /LD /MD /std:c++17 /EHsc /W4 /WX /external:W0 "/external:I$SdkDirectory\include" (Join-Path $PSScriptRoot 'mpv\video_enhancement.cpp') "/Fo$OutputDir\video_enhancement.obj" "/Fe$OutputDir\video_enhancement.dll" /link "$SdkDirectory\lib\Windows\x64\nvsdk_ngx_d.lib" d3d11.lib d3dcompiler.lib dxgi.lib advapi32.lib user32.lib

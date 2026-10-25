@@ -1275,7 +1275,7 @@
             frame_interpolation_state_mismatch: '播放器返回的 RTX 插帧状态与请求不一致',
             frame_interpolation_filter_inactive: 'RIFE 原生滤镜未生效',
             video_enhancement_filter_inactive: '画面增强原生滤镜未生效，播放已停止；请检查组件、GPU 和媒体格式',
-            video_enhancement_format_unsupported: '画面增强支持 SDR、HDR10 和 HLG，暂不支持 HDR10+ 和 Dolby Vision',
+            video_enhancement_format_unsupported: '当前片源的像素格式或杜比增强层无法用于画面增强，请查看播放诊断',
         };
         return codes[error.code] || error.message || '请求失败';
     }

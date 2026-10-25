@@ -48,7 +48,9 @@ pub fn status(kind: ComponentKind) -> Value {
     match runtime(kind) {
         Ok(runtime) => {
             json!({"runtimeVerified": runtime.installed, "playbackAvailable": runtime.installed && bridge_path().is_ok(),
-            "experimental": false, "supportedDynamicRanges": ["sdr", "hdr10", "hlg"], "failureDetail": null, "defaults": Selection::default().payload()})
+            "experimental": false, "supportedDynamicRanges": ["sdr", "hdr10", "hlg", "hdr10plus", "dolbyvision"],
+            "dolbyVisionProcessing": "fel-reconstruction-rpu-color-mapping-and-scene-metadata", "dolbyVisionEnhancementLayer": true,
+            "failureDetail": null, "defaults": Selection::default().payload()})
         }
         Err(error) => {
             json!({"runtimeVerified": false, "playbackAvailable": false, "failureCode": error.code, "failureDetail": error.detail})

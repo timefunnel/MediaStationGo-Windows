@@ -1,13 +1,31 @@
-/* MediaStationGo optional video providers, ABI 5. Host owns PTS and presentation. */
+/* MediaStationGo optional video providers, ABI 7. Host owns PTS and presentation. */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 #include <d3d11.h>
-#define NVVIDEO_ABI 5
+#define NVVIDEO_ABI 7
 #ifdef __cplusplus
 extern "C" {
 #endif
 struct nvvideo_session;
+/* Per-frame RPU mapping, already parsed by mpv/libplacebo. GPU constants are
+ * float4-aligned; no third-party structs cross the DLL boundary. */
+struct nvvideo_dovi_segment {
+    float polynomial[4]; /* xyz coefficients; w: 0 polynomial, 1..3 MMR order */
+    float mmr[3][2][4]; /* xyz, xy/xz/yz/xyz for each order */
+};
+struct nvvideo_dovi_component {
+    float pivots[9][4];
+    struct nvvideo_dovi_segment segments[8];
+    uint32_t num_pivots, padding[3];
+};
+struct nvvideo_dovi {
+    float nonlinear[3][4]; /* xyz matrix row, w input offset */
+    float linear[3][4]; /* BT.2020 HPE LMS -> linear BT.2020 RGB */
+    struct nvvideo_dovi_component comp[3];
+    float nlq[3][4]; /* integer EL offset, slope, threshold, residual bound */
+    uint32_t el_width, el_height, el_chroma, nlq_active;
+};
 enum nvvideo_transfer { NVVIDEO_SDR = 0, NVVIDEO_PQ = 1, NVVIDEO_HLG = 2 };
 struct nvvideo_config {
     uint32_t abi;
@@ -30,6 +48,10 @@ struct nvvideo_config {
 #endif
 NVVIDEO_API uint32_t __cdecl nvvideo_abi(void);
 NVVIDEO_API struct nvvideo_session *__cdecl nvvideo_create(const struct nvvideo_config *, char *, size_t);
+/* Apply the current frame's RPU exactly once, before enhancement. Both textures
+ * are source-sized P010. Host retains scene metadata and raw RPU side data,
+ * and marks the resulting pixels BT.2020 NCL/PQ to prevent double reshaping. */
+NVVIDEO_API int __cdecl nvvideo_map_dovi(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, const struct nvvideo_dovi *, char *, size_t);
 /* Single-slice BGRA8 (SDR) or P010 (PQ/HLG). Host retains source color metadata. */
 NVVIDEO_API int __cdecl nvvideo_process(struct nvvideo_session *, ID3D11Texture2D *, ID3D11Texture2D *, ID3D11Texture2D *, uint32_t, char *, size_t);
 /* multiplier=0: index starts at 1 for each new source pair; 0 < timestep < 1. */

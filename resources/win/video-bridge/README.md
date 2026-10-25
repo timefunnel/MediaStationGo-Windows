@@ -15,13 +15,15 @@ instead of being rebuilt in CI.
 
 | Item | Value |
 | --- | --- |
-| Build date | 2026-10-22 |
+| Build date | 2026-10-25 |
 | SDK | `third_party/video-enhancement-deps/RTX-Video-SDK-1.1.0` |
-| Sources | `dev/windows/mpv/video_enhancement.cpp`, `dev/windows/mpv/nr_adapter.cpp` |
-| Video bridge source | Git blob `4af3bb9024abe32cdc278c7c4a5c116d9c96d845` (`dev/windows/mpv/video_enhancement.cpp`) |
+| Sources | `dev/windows/mpv/video_enhancement.cpp`, `hdr_pipeline.h`, `dovi_pipeline.h`, `video_enhancement.h`, `nr_adapter.cpp` |
+| Video bridge source | Git blob `7682cb73c1b902a3d93fffb17c2cbe7628139fc2` (`dev/windows/mpv/video_enhancement.cpp`) |
+| HDR/Dolby mapping sources | Git blobs `10cf6cf3e32799b317f5b0715171a0727f2a0f65` / `7bb2bcd31f26e6d007a49c3799c2674e552e6ed5` |
+| Video bridge ABI | 7; per-frame RPU mapping and FEL NLQ reconstruction, paired with the updated mpv `nvvideo` filter |
 | NR adapter source | `364e5ca` (unchanged since) |
-| `video_enhancement.dll` SHA-256 | `97ffb5fe4d9d8a61ddc28cb0cfe411234fc6bc0661bee54a9b4bfdec41a9808a` |
-| `nvngx.dll` SHA-256 | `817b413833e96994e7152b0277ab63344ae4a7fc73453c3d04180cf0b8291673` |
+| `video_enhancement.dll` SHA-256 | `3ef769cc4c6a5c1fa96c80a9b5ebfde73341b3d1060d800927b65068ca98a6f2` |
+| `nvngx.dll` SHA-256 | `fe7fe1093b1ae899d56e37935a24823926faad868089e99b38746288b396b6f0` |
 
 `NVIDIA_RTX_Video_SDK_License.pdf` is the SDK notice shipped in the release
 `licenses/` directory; its SHA-256 is
