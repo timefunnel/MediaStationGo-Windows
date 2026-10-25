@@ -382,6 +382,10 @@ pub fn jfn_mpv_toggle_pause() {
 pub fn jfn_mpv_stop() {
     cmd(&[c"stop"]);
 }
+
+pub fn jfn_mpv_stop_checked() -> crate::Result<()> {
+    named_command_async("stop", &[])
+}
 pub fn jfn_mpv_seek_absolute(secs: f64) {
     let s = CString::new(format!("{}", secs)).unwrap_or_default();
     cmd(&[c"seek", &s, c"absolute"]);
@@ -412,8 +416,8 @@ pub fn jfn_mpv_set_start_position(s: f64) {
 }
 
 /// Track id sentinel: 0 = disabled. >=1 = explicit mpv track id.
-/// Mpv's auto-track-selection is globally disabled (boot applies
-/// `track-auto-selection=no`); jellyfin-web is the authority.
+/// Jellyfin is authoritative. Startup validates these ids before enabling
+/// native selection; only unprobed audio explicitly delegates to mpv.
 const TRACK_DISABLE: i64 = 0;
 
 fn track_to_mpv_str(id: i64) -> CString {
@@ -642,12 +646,14 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 struct PendingTrack {
+    path: String,
     vid: i64,
     aid: i64,
     sid: i64,
     external_audio_url: String,
     external_sub_url: String,
     defer_audio_to_mpv: bool,
+    prepared: bool,
     valid: bool,
 }
 
@@ -656,12 +662,14 @@ fn pending_slot() -> &'static Mutex<PendingTrack> {
     static SLOT: OnceLock<Mutex<PendingTrack>> = OnceLock::new();
     SLOT.get_or_init(|| {
         Mutex::new(PendingTrack {
+            path: String::new(),
             vid: 1,
             aid: TRACK_DISABLE,
             sid: TRACK_DISABLE,
             external_audio_url: String::new(),
             external_sub_url: String::new(),
             defer_audio_to_mpv: false,
+            prepared: false,
             valid: false,
         })
     })
@@ -689,9 +697,30 @@ fn media_station_subtitle_options(font_size: f64, subtitle_position: f64) -> Vec
     ]
 }
 
+fn startup_position_option(seconds: f64) -> String {
+    if seconds == 0.0 {
+        "none".to_string()
+    } else {
+        seconds.to_string()
+    }
+}
+
 pub unsafe fn jfn_mpv_load_file(
     path: *const c_char,
     opts: *const JfnMpvLoadOptions,
+) -> Result<(), LoadError> {
+    unsafe { jfn_mpv_load_file_with_initial_head(path, opts, std::sync::Arc::from([])) }
+}
+
+/// Load with a validated prefix from this URL's CDN validation response.
+/// The prefix is copied by Arc into the queued stream, never into its URI.
+///
+/// # Safety
+/// `path` and `opts` follow the same lifetime requirements as `jfn_mpv_load_file`.
+pub unsafe fn jfn_mpv_load_file_with_initial_head(
+    path: *const c_char,
+    opts: *const JfnMpvLoadOptions,
+    initial_head: std::sync::Arc<[u8]>,
 ) -> Result<(), LoadError> {
     let Some(path_c) = (unsafe { cstr(path) }) else {
         return Err(LoadError::InvalidArgument("path"));
@@ -710,20 +739,20 @@ pub unsafe fn jfn_mpv_load_file(
         should_defer_audio_to_mpv(o.defer_audio_to_mpv, o.audio_track, !ext_audio.is_empty());
 
     let mut load_options = vec![
-        ("start".to_string(), o.start_secs.to_string()),
+        ("start".to_string(), startup_position_option(o.start_secs)),
         ("pause".to_string(), "yes".to_string()),
+        // The on_preloaded hook supplies the final selectors before mpv
+        // initializes decoders and executes the initial resume seek.
+        ("track-auto-selection".to_string(), "yes".to_string()),
+        ("vid".to_string(), "no".to_string()),
+        ("aid".to_string(), "no".to_string()),
+        ("sid".to_string(), "no".to_string()),
     ];
     if o.subtitle_style_override {
         load_options.extend(media_station_subtitle_options(
             o.subtitle_font_size,
             o.subtitle_position,
         ));
-    }
-    if defer_audio {
-        // Per-file enable so mpv's demuxer picks the format-correct
-        // audio track (HLS DEFAULT=YES, MPEG-TS first PMT, etc.). We
-        // explicitly write `sid=no` after FILE_LOADED to keep subs off.
-        load_options.push(("track-auto-selection".to_string(), "yes".to_string()));
     }
     if !http_header_fields.is_empty() {
         load_options.push(("http-header-fields".to_string(), http_header_fields));
@@ -748,26 +777,27 @@ pub unsafe fn jfn_mpv_load_file(
         return Err(LoadError::HandleUnavailable);
     }
 
-    // Track selection is owned by Jellyfin. With track-auto-selection=no,
-    // mpv silently drops aid/vid/sid in loadfile options (loadfile.c
-    // skips select_default_track entirely). Load the file *paused* with
-    // no selectors, stash the intended ids, and apply them via property
-    // writes after FILE_LOADED. The async writes + final pause=false are
-    // FIFO-ordered on mpv's core thread, so playback only begins after
-    // track-switch reinits land.
+    crate::stream_cb::prepare_initial_head(&path_c.to_string_lossy(), initial_head)
+        .map_err(LoadError::InvalidArgument)?;
+
+    // Keep a single authoritative selection, including the subtitle resolved
+    // from the parsed local catalog by the preloaded action sink.
     {
         let mut s = pending_slot().lock();
+        s.path = path_c.to_string_lossy().into_owned();
         s.vid = o.video_track;
         s.aid = o.audio_track;
         s.sid = o.sub_track;
         s.external_audio_url = ext_audio;
         s.external_sub_url = ext_sub;
         s.defer_audio_to_mpv = defer_audio;
+        s.prepared = false;
         s.valid = true;
     }
     let result = unsafe { sys::mpv_command_node_async(handle, 0, command.as_mut_ptr()) };
     if let Err(error) = crate::error::check(result) {
         pending_slot().lock().valid = false;
+        crate::stream_cb::discard_initial_head(&path_c.to_string_lossy());
         return Err(LoadError::Command(error));
     }
     Ok(())
@@ -785,57 +815,146 @@ fn set_pending_embedded_subtitle(track: &mut PendingTrack, id: i64) -> bool {
     true
 }
 
-/// Resolve a container subtitle after FILE_LOADED, before the coordinator
-/// applies the queued selectors and unpauses. External subtitles retain the
-/// per-load path that was already prepared by the caller.
+/// Resolve a container subtitle in on_preloaded, before native track init.
+/// External subtitles retain the per-load path prepared by the caller.
 pub fn jfn_mpv_set_pending_embedded_subtitle(id: i64) -> bool {
     set_pending_embedded_subtitle(&mut pending_slot().lock(), id)
 }
 
-pub fn jfn_mpv_apply_pending_track_selection_and_play() {
-    let snapshot = {
-        let mut s = pending_slot().lock();
-        if !s.valid {
-            return;
-        }
-        let snap = (
-            s.vid,
-            s.aid,
-            s.sid,
-            std::mem::take(&mut s.external_audio_url),
-            std::mem::take(&mut s.external_sub_url),
-            s.defer_audio_to_mpv,
-        );
-        s.valid = false;
-        s.defer_audio_to_mpv = false;
-        snap
-    };
-    let (vid, aid, sid, ext_audio, ext_sub, defer_audio) = snapshot;
+fn current_path_matches(handle: *mut sys::mpv_handle, pending: &PendingTrack) -> bool {
+    if !pending.valid {
+        return false;
+    }
+    let path = unsafe { sys::mpv_get_property_string(handle, c"path".as_ptr()) };
+    if path.is_null() {
+        return false;
+    }
+    let matches = unsafe { CStr::from_ptr(path) }.to_bytes() == pending.path.as_bytes();
+    unsafe { sys::mpv_free(path.cast()) };
+    matches
+}
 
-    let vid_s = track_to_mpv_str(vid);
-    unsafe { set_str(c"vid", &vid_s) };
-    if !defer_audio {
-        // Normal path: the server catalog is authoritative. Skipped only
-        // when an unprobed source explicitly delegates the initial audio
-        // choice to mpv's demuxer for this file.
-        let aid_s = track_to_mpv_str(aid);
-        unsafe { set_str(c"aid", &aid_s) };
+pub fn jfn_mpv_pending_tracks_match_current_file() -> bool {
+    let Ok(handle) = checked_raw() else {
+        return false;
+    };
+    current_path_matches(handle, &pending_slot().lock())
+}
+
+fn startup_selector(catalog: &crate::Node, kind: &str, id: i64) -> Result<String, String> {
+    if id == TRACK_DISABLE {
+        return Ok("no".to_string());
     }
-    let sid_s = track_to_mpv_str(sid);
-    unsafe { set_str(c"sid", &sid_s) };
-    if !ext_audio.is_empty() {
-        match CString::new(ext_audio) {
-            Ok(u) => cmd(&[c"audio-add", &u, c"select"]),
-            Err(e) => tracing::warn!("ext audio path has interior NUL: {e}"),
+    let tracks = catalog
+        .as_array()
+        .ok_or("native track catalog is unavailable")?;
+    let mut has_kind = false;
+    for track in tracks {
+        if track.get("type").and_then(crate::Node::as_str) == Some(kind) {
+            has_kind = true;
+            if track.get("id").and_then(crate::Node::as_int) == Some(id) {
+                return Ok(id.to_string());
+            }
         }
     }
-    if !ext_sub.is_empty() {
-        match CString::new(ext_sub) {
-            Ok(u) => cmd(&[c"sub-add", &u, c"select"]),
-            Err(e) => tracing::warn!("ext sub path has interior NUL: {e}"),
+    // An audio-only file has no video; a video-only file has no audio.
+    if !has_kind {
+        return Ok("no".to_string());
+    }
+    Err(format!("requested {kind} track {id} is unavailable"))
+}
+
+fn prepare_tracks(handle: *mut sys::mpv_handle, pending: &PendingTrack) -> Result<bool, String> {
+    let mut node: sys::mpv_node = unsafe { std::mem::zeroed() };
+    crate::error::check(unsafe {
+        sys::mpv_get_property(
+            handle,
+            c"track-list".as_ptr(),
+            sys::mpv_format::MPV_FORMAT_NODE,
+            (&mut node as *mut sys::mpv_node).cast(),
+        )
+    })
+    .map_err(|e| format!("read startup track catalog: {e}"))?;
+    let catalog = unsafe { crate::Node::from_raw(&node) };
+    unsafe { sys::mpv_free_node_contents(&mut node) };
+    let video = startup_selector(&catalog, "video", pending.vid)?;
+    let has_video = video != "no";
+    let audio = if !pending.external_audio_url.is_empty() {
+        "no".to_string()
+    } else if pending.defer_audio_to_mpv {
+        "auto".to_string()
+    } else {
+        startup_selector(&catalog, "audio", pending.aid)?
+    };
+    let sub = if pending.external_sub_url.is_empty() {
+        startup_selector(&catalog, "sub", pending.sid)?
+    } else {
+        "no".to_string()
+    };
+    for (name, value) in [
+        (c"file-local-options/vid", video),
+        (c"file-local-options/aid", audio),
+        (c"file-local-options/sid", sub),
+    ] {
+        let value = CString::new(value).map_err(|e| e.to_string())?;
+        crate::error::check(unsafe {
+            sys::mpv_set_property_string(handle, name.as_ptr(), value.as_ptr())
+        })
+        .map_err(|e| format!("set startup {}: {e}", name.to_string_lossy()))?;
+    }
+    // Before playback_initialized, mpv adds external tracks and marks the
+    // selector without switching/reinitializing an already running chain.
+    for (command, path) in [
+        ("audio-add", &pending.external_audio_url),
+        ("sub-add", &pending.external_sub_url),
+    ] {
+        if !path.is_empty() {
+            let args = crate::Command::new([command, path, "select"])
+                .map_err(|_| format!("invalid startup {command} path"))?;
+            crate::error::check(unsafe { sys::mpv_command(handle, args.as_ptr()) })
+                .map_err(|e| format!("startup {command} failed: {e}"))?;
         }
     }
-    unsafe { set_flag(c"pause", false) };
+    Ok(has_video)
+}
+
+/// Called on the coordinator worker while on_preloaded suspends native load.
+/// Never call this from a stream callback or the mpv wakeup callback.
+pub fn jfn_mpv_prepare_pending_tracks() -> Result<Option<bool>, String> {
+    let handle = checked_raw().map_err(|e| e.to_string())?;
+    let mut pending = pending_slot().lock();
+    if !current_path_matches(handle, &pending) {
+        return Ok(None); // An old hook may arrive while a replacement load is queued.
+    }
+    let started = std::time::Instant::now();
+    match prepare_tracks(handle, &pending) {
+        Ok(has_video) => {
+            pending.prepared = true;
+            tracing::info!(target: "mpv", "startup tracks prepared before decoder init: elapsed_ms={}", started.elapsed().as_millis());
+            Ok(Some(has_video))
+        }
+        Err(error) => {
+            pending.valid = false;
+            Err(error)
+        }
+    }
+}
+
+pub fn jfn_mpv_continue_preloaded(hook_id: u64) -> crate::Result<()> {
+    crate::error::check(unsafe { sys::mpv_hook_continue(checked_raw()?, hook_id) })
+}
+
+pub fn jfn_mpv_apply_pending_track_selection_and_play() -> Result<(), String> {
+    let handle = checked_raw().map_err(|e| e.to_string())?;
+    let mut pending = pending_slot().lock();
+    if !current_path_matches(handle, &pending) {
+        return Ok(());
+    }
+    if !pending.prepared {
+        return Err("startup tracks were not prepared before file-loaded".to_string());
+    }
+    pending.valid = false;
+    set_str_checked(c"pause", c"no").map_err(|e| e.to_string())
 }
 
 // =============================================================================
@@ -916,12 +1035,14 @@ mod tests {
     #[test]
     fn loaded_subtitle_updates_the_pending_selector_before_playback() {
         let mut pending = PendingTrack {
+            path: "fixture.mkv".to_string(),
             vid: 1,
             aid: 2,
             sid: 0,
             external_audio_url: String::new(),
             external_sub_url: String::new(),
             defer_audio_to_mpv: false,
+            prepared: false,
             valid: true,
         };
         assert!(set_pending_embedded_subtitle(&mut pending, 7));
@@ -951,5 +1072,193 @@ mod tests {
         assert!(!should_defer_audio_to_mpv(false, 0, false));
         assert!(!should_defer_audio_to_mpv(true, 1, false));
         assert!(!should_defer_audio_to_mpv(true, 0, true));
+    }
+
+    #[test]
+    fn startup_selection_keeps_explicit_ids_and_never_falls_back_to_another_track() {
+        use crate::Node;
+        let catalog = Node::Array(vec![Node::Map(vec![
+            ("type".into(), Node::String("audio".into())),
+            ("id".into(), Node::Int(2)),
+        ])]);
+        assert_eq!(super::startup_selector(&catalog, "audio", 2).unwrap(), "2");
+        assert_eq!(super::startup_selector(&catalog, "audio", 0).unwrap(), "no");
+        assert!(super::startup_selector(&catalog, "audio", 1).is_err());
+        assert_eq!(super::startup_selector(&catalog, "video", 1).unwrap(), "no");
+    }
+
+    #[test]
+    #[ignore = "requires installed libmpv and MPV_STREAM_TEST_FIXTURE local video"]
+    fn native_preloaded_selection_avoids_post_load_switch_and_preserves_resume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{Command, Event, Handle, LogLevel, PropertyValue};
+        use std::ffi::CString;
+        use std::time::{Duration, Instant};
+
+        let fixture = std::env::var("MPV_STREAM_TEST_FIXTURE")?;
+        let path = CString::new(fixture.clone())?;
+        struct TestSubtitle(std::path::PathBuf);
+        impl Drop for TestSubtitle {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_file(&self.0) {
+                    eprintln!("test subtitle cleanup failed: {error}");
+                }
+            }
+        }
+        let subtitle_path =
+            std::env::temp_dir().join(format!("jellium-startup-sub-{}.srt", std::process::id()));
+        let mut subtitle_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&subtitle_path)?;
+        let subtitle = TestSubtitle(subtitle_path);
+        std::io::Write::write_all(
+            &mut subtitle_file,
+            b"1\n00:00:00,000 --> 00:00:00,900\nStartup subtitle\n",
+        )?;
+        drop(subtitle_file);
+        for (preloaded, start, external_sub) in [
+            (false, 0.4, false),
+            (true, 0.4, false),
+            (true, 0.0, false),
+            (true, 0.4, true),
+        ] {
+            let handle = Handle::create()?;
+            for (name, value) in [
+                ("config", "no"),
+                ("vo", "null"),
+                ("ao", "null"),
+                ("terminal", "no"),
+                ("hwdec", "no"),
+                ("track-auto-selection", "no"),
+                ("cache", "no"),
+                ("demuxer-readahead-secs", "0"),
+            ] {
+                handle.set_option_string(name, value)?;
+            }
+            handle.initialize()?;
+            handle.request_log_messages(LogLevel::Info)?;
+            handle.observe_property_node(1, "video-frame-info")?;
+            if preloaded {
+                crate::error::check(unsafe {
+                    crate::sys::mpv_hook_add(handle.raw(), 0, c"on_preloaded".as_ptr(), 0)
+                })?;
+            }
+            let mut options = vec![
+                (
+                    "start".to_string(),
+                    if preloaded {
+                        super::startup_position_option(start)
+                    } else {
+                        start.to_string()
+                    },
+                ),
+                ("pause".to_string(), "yes".to_string()),
+            ];
+            if preloaded {
+                options.extend([
+                    ("track-auto-selection".to_string(), "yes".to_string()),
+                    ("vid".to_string(), "no".to_string()),
+                    ("aid".to_string(), "no".to_string()),
+                    ("sid".to_string(), "no".to_string()),
+                ]);
+            }
+            let mut load = super::LoadFileCommand::new(&path, &options)?;
+            let started = Instant::now();
+            crate::error::check(unsafe {
+                crate::sys::mpv_command_node_async(handle.raw(), 0, load.as_mut_ptr())
+            })?;
+            let mut switches = 0;
+            let mut seeks = 0;
+            let mut first_frame = false;
+            let mut native_started = false;
+            let mut loaded = false;
+            let mut prepared = false;
+            while started.elapsed() < Duration::from_secs(5) {
+                match handle.wait_event(0.01) {
+                    Event::Hook { reply, name } if name == "on_preloaded" => {
+                        let pending = PendingTrack {
+                            path: fixture.clone(),
+                            vid: 1,
+                            aid: 0,
+                            sid: 0,
+                            external_audio_url: String::new(),
+                            external_sub_url: if external_sub {
+                                subtitle
+                                    .0
+                                    .to_str()
+                                    .ok_or("invalid local subtitle path")?
+                                    .to_string()
+                            } else {
+                                String::new()
+                            },
+                            defer_audio_to_mpv: false,
+                            prepared: false,
+                            valid: true,
+                        };
+                        assert!(super::current_path_matches(handle.raw(), &pending));
+                        assert!(super::prepare_tracks(handle.raw(), &pending)?);
+                        prepared = true;
+                        crate::error::check(unsafe {
+                            crate::sys::mpv_hook_continue(handle.raw(), reply)
+                        })?;
+                    }
+                    Event::FileLoaded => {
+                        loaded = true;
+                        if preloaded {
+                            assert!(prepared);
+                            assert_eq!(handle.get_property::<i64>("vid")?, 1);
+                            if external_sub {
+                                assert_eq!(handle.get_property::<i64>("sid")?, 1);
+                            } else {
+                                assert_eq!(handle.get_property_string("sid")?, "no");
+                            }
+                        } else {
+                            assert!(handle.get_property_string("vid")? == "no");
+                            handle.set_property_string_async(0, "vid", "1")?;
+                            handle.set_property_string_async(0, "aid", "no")?;
+                            handle.set_property_string_async(0, "sid", "no")?;
+                        }
+                        handle.set_property_flag_async(0, "pause", false)?;
+                    }
+                    Event::Seek => seeks += 1,
+                    Event::PlaybackRestart => native_started = true,
+                    Event::PropertyChange { id: 1, value, .. } if value != PropertyValue::None => {
+                        first_frame = true
+                    }
+                    Event::LogMessage(message) if message.text.contains("Track switched:") => {
+                        switches += 1
+                    }
+                    Event::EndFile(reason) => {
+                        return Err(format!("fixture ended before readiness: {reason:?}").into());
+                    }
+                    _ => {}
+                }
+                if first_frame && native_started {
+                    break;
+                }
+            }
+            assert!(
+                loaded && first_frame && native_started,
+                "local video never reached readiness"
+            );
+            let position = handle.get_property::<f64>("time-pos")?;
+            eprintln!(
+                "preloaded={preloaded} start={start}: switches={switches} seeks={seeks} video_ready={:?} position={position}",
+                started.elapsed()
+            );
+            if preloaded {
+                assert!(
+                    (position - start).abs() < 0.2,
+                    "resume position {position}, expected {start}"
+                );
+                assert_eq!(switches, 0);
+                assert_eq!(seeks, usize::from(start != 0.0));
+            } else {
+                assert!(switches >= 1);
+            }
+            handle.command(&Command::new(["stop"])?)?;
+        }
+        Ok(())
     }
 }

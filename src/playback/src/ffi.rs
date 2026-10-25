@@ -56,6 +56,7 @@ pub fn jfn_playback_init() {
         c.start();
         *guard = Some(c);
     }
+    jfn_mpv::stream_cb::set_failure_handler(Some(|failure| post(Input::StreamFailed(failure))));
     // The immediate reconcile is load-bearing: mode posts made before the
     // coordinator existed were dropped by `post`, and no wakeup replays them.
     jfn_platform_abi::subscribe_window_changed(
@@ -67,7 +68,24 @@ pub fn jfn_playback_init() {
 fn register_builtin_sinks(c: &PlaybackCoordinator) {
     c.add_builtin_action_sink(Box::new(|a: &PlaybackAction| match a.kind {
         PlaybackActionKind::ApplyPendingTrackSelectionAndPlay => {
-            jfn_mpv::api::jfn_mpv_apply_pending_track_selection_and_play();
+            if let Err(error) = jfn_mpv::api::jfn_mpv_apply_pending_track_selection_and_play() {
+                fail_startup(error);
+            }
+        }
+        PlaybackActionKind::PreparePendingTracks => {
+            match jfn_mpv::api::jfn_mpv_prepare_pending_tracks() {
+                Ok(Some(has_video)) => post(Input::MediaType(if has_video {
+                    MediaType::Video
+                } else {
+                    MediaType::Audio
+                })),
+                Ok(None) => {}
+                Err(error) => fail_startup(error),
+            }
+            // Never strand mpv in a hook, including after a preparation error.
+            if let Err(error) = jfn_mpv::api::jfn_mpv_continue_preloaded(a.hook_id) {
+                fail_startup(format!("continue startup track hook: {error}"));
+            }
         }
     }));
 
@@ -84,7 +102,19 @@ fn register_builtin_sinks(c: &PlaybackCoordinator) {
     }));
 }
 
+fn fail_startup(error: String) {
+    tracing::error!(target: "Playback", "native startup failed: {error}");
+    post(Input::EndFile {
+        reason: EndReason::Error,
+        error_message: error,
+    });
+    if let Err(error) = jfn_mpv::api::jfn_mpv_stop_checked() {
+        tracing::error!(target: "Playback", "stop after startup failure: {error}");
+    }
+}
+
 pub fn jfn_playback_shutdown() {
+    jfn_mpv::stream_cb::set_failure_handler(None);
     // stop() joins the worker, whose sinks call post() → coord_slot;
     // holding the guard across stop() deadlocks.
     let coord = coord_slot().lock().take();

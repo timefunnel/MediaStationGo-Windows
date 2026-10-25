@@ -138,6 +138,9 @@ pub(crate) fn ingest<C: IngestCtx>(event: &Event, state: &IngestState, ctx: &C) 
     match event {
         Event::Shutdown => vec![IngestOut::Shutdown],
         Event::FileLoaded => vec![IngestOut::Input(Input::FileLoaded)],
+        Event::Hook { reply, name } if name == "on_preloaded" => {
+            vec![IngestOut::Input(Input::TracksPreloaded(*reply))]
+        }
         Event::PlaybackRestart => vec![IngestOut::Input(Input::PlaybackRestart)],
         Event::EndFile(reason) => Some(end_file_input(reason))
             .into_iter()
@@ -385,6 +388,23 @@ mod tests {
         assert!(matches!(
             out.as_slice(),
             [IngestOut::Input(Input::PlaybackRestart)]
+        ));
+    }
+
+    #[test]
+    fn preloaded_hook_preserves_the_native_continuation_id() {
+        let state = IngestState::new();
+        let out = ingest(
+            &Event::Hook {
+                reply: 42,
+                name: "on_preloaded".into(),
+            },
+            &state,
+            &ctx(1.0),
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [IngestOut::Input(Input::TracksPreloaded(42))]
         ));
     }
 

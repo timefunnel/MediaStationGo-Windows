@@ -273,7 +273,13 @@ pub unsafe fn jfn_mpv_handle_init(boot: *const JfnMpvBoot) -> *mut sys::mpv_hand
     }
 
     let raw = handle.raw();
-    crate::stream_cb::register_protocol(raw);
+    if let Err(error) =
+        crate::error::check(unsafe { sys::mpv_hook_add(raw, 0, c"on_preloaded".as_ptr(), 0) })
+    {
+        tracing::error!(target: "mpv", "register startup track hook failed: {error}");
+        return ptr::null_mut();
+    }
+    unsafe { crate::stream_cb::register_protocol(raw) };
     *handle_slot().lock() = Some(handle);
     raw
 }

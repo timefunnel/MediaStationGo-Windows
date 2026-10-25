@@ -17,7 +17,7 @@ use jfn_mediastation::{
 use jfn_mpv::api::{
     JfnMpvLoadOptions, LoadError, jfn_mpv_free_string, jfn_mpv_get_property_double,
     jfn_mpv_get_property_int, jfn_mpv_get_property_node, jfn_mpv_get_property_string,
-    jfn_mpv_load_file, jfn_mpv_set_audio_track_checked, jfn_mpv_set_pending_embedded_subtitle,
+    jfn_mpv_set_audio_track_checked, jfn_mpv_set_pending_embedded_subtitle,
     jfn_mpv_set_subtitle_track_checked, jfn_mpv_stop, jfn_mpv_sub_add_checked,
     jfn_mpv_sub_remove_current_checked,
 };
@@ -331,7 +331,9 @@ fn playback_event_payload(event: &PlaybackEvent) -> Value {
     json!({
         "kind": kind,
         "mediaId": event.item_id,
-        "errorCode": error_code,
+        "errorCode": if event.stream_failure.is_some() { Some("media_stream_failed") } else { error_code },
+        "httpStatus": event.stream_failure.as_ref().and_then(|failure| failure.http_status()),
+        "errorMessage": event.stream_failure.as_ref().map(|failure| failure.user_message()),
         "positionMs": event.snapshot.position_us.max(0) / 1_000,
         "durationMs": event.snapshot.duration_us.max(0) / 1_000,
         "buffering": event.snapshot.buffering,
@@ -462,6 +464,13 @@ struct RuntimeState {
     active_enhancements: Vec<ActiveEnhancement>,
     active_report: Option<ActivePlaybackReport>,
     active_danmaku: Option<ActiveDanmaku>,
+    active_stream_session: Option<u64>,
+    startup_timing: Option<PlaybackStartupTiming>,
+}
+
+struct PlaybackStartupTiming {
+    load_started: Instant,
+    native_started: Instant,
 }
 
 struct ActiveInterpolation {
@@ -515,6 +524,7 @@ struct SessionSnapshot {
 }
 
 struct NativeLoadRequest<'a> {
+    load_started: Instant,
     snapshot: &'a SessionSnapshot,
     source: &'a PlaybackSource,
     preference: &'a PlaybackTrackPreference,
@@ -524,6 +534,7 @@ struct NativeLoadRequest<'a> {
     start_ms: u64,
     url: &'a CString,
     options: &'a JfnMpvLoadOptions,
+    initial_head: Arc<[u8]>,
     subtitle: Option<PreparedExternalSubtitle>,
     interpolation: Option<InterpolationPlan>,
     enhancement: jfn_frame_interpolation::enhancement::Selection,
@@ -721,6 +732,8 @@ impl MediaStationRuntime {
                 active_enhancements: Vec::new(),
                 active_report: None,
                 active_danmaku: None,
+                active_stream_session: None,
+                startup_timing: None,
             }),
         })
     }
@@ -785,6 +798,21 @@ impl MediaStationRuntime {
     }
 
     fn handle_playback_event(self: &Arc<Self>, event: &PlaybackEvent) {
+        if let Some(failure) = &event.stream_failure {
+            // Serialize stop with load_if_current: an old failure must not stop
+            // a newer load, including a replay of the same cached link.
+            let mut state = self.state.lock();
+            if state.active_stream_session != Some(failure.session_id) {
+                return;
+            }
+            if let Err(error) = jfn_mpv::api::jfn_mpv_stop_checked() {
+                log_error(&format!(
+                    "MediaStation failed stream stop rejected: mpv_code={}",
+                    error.code
+                ));
+            }
+            state.active_stream_session = None;
+        }
         if !matches!(
             event.kind,
             PlaybackEventKind::PositionChanged
@@ -848,12 +876,31 @@ impl MediaStationRuntime {
                 dispatched_event = Some(failure);
             }
             let effective_event = dispatched_event.as_ref().unwrap_or(event);
+            if effective_event.kind == PlaybackEventKind::Started
+                && let Some(timing) = state.startup_timing.take()
+            {
+                log_info(&format!(
+                    "mediastation playback startup ready: media_id={:?} session_id={:?} prepare_ms={} native_to_started_ms={} total_ms={}",
+                    state
+                        .active_report
+                        .as_ref()
+                        .map(|active| active.source.media_id.as_str()),
+                    state.active_stream_session,
+                    timing
+                        .native_started
+                        .duration_since(timing.load_started)
+                        .as_millis(),
+                    timing.native_started.elapsed().as_millis(),
+                    timing.load_started.elapsed().as_millis(),
+                ));
+            }
             if matches!(
                 effective_event.kind,
                 PlaybackEventKind::Finished
                     | PlaybackEventKind::Canceled
                     | PlaybackEventKind::Error
             ) {
+                state.startup_timing = None;
                 state.active_subtitle = None;
                 state.active_interpolation = None;
                 state.active_enhancements.clear();
@@ -931,9 +978,9 @@ impl MediaStationRuntime {
     }
 
     fn prepare_loaded_subtitle(&self) -> Result<(), LoadFailure> {
-        // Runs on the coordinator worker, before its builtin FILE_LOADED
-        // action. Only read the local mpv catalog here: network metadata and
-        // preference writes must never delay the first frame.
+        // Runs on the coordinator worker in on_preloaded, before native track
+        // selection and decoder init. Only read the local mpv catalog here:
+        // network metadata and preference writes must never delay the first frame.
         let state = self.state.lock();
         let Some(active) = state.active_report.as_ref() else {
             return Ok(());
@@ -1681,7 +1728,24 @@ impl MediaStationRuntime {
             ));
         }
 
-        pb_post(PbInput::LoadStarting(load.media_id.to_string()));
+        let stream_session = load
+            .url
+            .to_str()
+            .ok()
+            .and_then(jfn_mpv::stream_cb::session_id);
+        state.active_stream_session = stream_session;
+        state.startup_timing = Some(PlaybackStartupTiming {
+            load_started: load.load_started,
+            native_started: Instant::now(),
+        });
+        if let Some(session_id) = stream_session {
+            pb_post(PbInput::StreamLoadStarting {
+                item_id: load.media_id.to_string(),
+                session_id,
+            });
+        } else {
+            pb_post(PbInput::LoadStarting(load.media_id.to_string()));
+        }
         pb_post(PbInput::MediaType(if load.source.video.is_some() {
             PbMediaType::Video
         } else {
@@ -1690,7 +1754,13 @@ impl MediaStationRuntime {
         pb_post(PbInput::Position(
             i64::try_from(load.start_ms.saturating_mul(1000)).unwrap_or(i64::MAX),
         ));
-        if let Err(error) = unsafe { jfn_mpv_load_file(load.url.as_ptr(), load.options) } {
+        if let Err(error) = unsafe {
+            jfn_mpv::api::jfn_mpv_load_file_with_initial_head(
+                load.url.as_ptr(),
+                load.options,
+                load.initial_head,
+            )
+        } {
             log_mpv_error(&error);
             pb_post(PbInput::EndFile {
                 reason: EndReason::Error,
@@ -2391,7 +2461,8 @@ fn install_playback_cleanup(runtime: Weak<MediaStationRuntime>) {
         return;
     }
     jfn_playback::register_action_sink(Box::new(move |action| {
-        if action.kind == jfn_playback::PlaybackActionKind::ApplyPendingTrackSelectionAndPlay
+        if action.kind == jfn_playback::PlaybackActionKind::PreparePendingTracks
+            && jfn_mpv::api::jfn_mpv_pending_tracks_match_current_file()
             && let Some(runtime) = track_runtime.upgrade()
             && let Err(failure) = runtime.prepare_loaded_subtitle()
         {
@@ -6859,6 +6930,11 @@ fn execute_load(
     snapshot: &SessionSnapshot,
     request: &LoadRequest,
 ) -> Result<Value, LoadFailure> {
+    let load_started = Instant::now();
+    log_info(&format!(
+        "mediastation playback load started: media_id={:?}",
+        request.media_id
+    ));
     runtime.ensure_generation(snapshot.generation)?;
     let active_media_id_before = runtime.active_playback_media_id(snapshot)?;
     let runtime_metadata =
@@ -6879,6 +6955,11 @@ fn execute_load(
             request.media_source_id.as_deref(),
         )
         .map_err(|error| api_failure("playback_info_failed", &error))?;
+    log_info(&format!(
+        "mediastation playback info ready: media_id={:?} elapsed_ms={}",
+        request.media_id,
+        load_started.elapsed().as_millis(),
+    ));
     let active_media_id_after = runtime.active_playback_media_id(snapshot)?;
     let runtime_video = runtime_metadata_for_media(
         active_media_id_after.as_deref(),
@@ -6978,6 +7059,7 @@ fn execute_load(
         &source,
         &request.preference_scope_id,
     );
+    let preference_started = Instant::now();
     let preference_state = match reload_preference {
         Some(preference) => preference,
         None => runtime
@@ -6985,6 +7067,12 @@ fn execute_load(
             .load_playback_preference(&snapshot.session, &request.preference_scope_id, &source)
             .map_err(|error| api_failure("preference_load_failed", &error))?,
     };
+    log_info(&format!(
+        "mediastation playback preference ready: media_id={:?} elapsed_ms={} load_elapsed_ms={}",
+        request.media_id,
+        preference_started.elapsed().as_millis(),
+        load_started.elapsed().as_millis(),
+    ));
     let preference = preference_state.preference;
     let preference_persistence = preference_state.persistence;
     log_debug(&format!(
@@ -7017,10 +7105,50 @@ fn execute_load(
                 .user_agent(&runtime.user_agent),
         )
         .map_err(|error| playback_session_failure("resolve_input_failed", &error))?;
-    let playback = runtime
-        .resolver
-        .resolve(&resolve_input)
-        .map_err(|error| playback_session_failure("playback_resolve_failed", &error))?;
+    let resolve_started = Instant::now();
+    log_info(&format!(
+        "mediastation playback resolve started: media_id={:?} source_host={} proxy_mode={:?} requested_user_agent={:?}",
+        request.media_id,
+        resolve_input.source_url.host_str().unwrap_or_default(),
+        resolve_input.proxy_mode,
+        resolve_input.user_agent,
+    ));
+    let playback = if source.standard_emby_stream {
+        runtime.resolver.resolve(&resolve_input)
+    } else {
+        runtime.resolver.resolve_with_initial_head(&resolve_input)
+    }
+    .map_err(|error| {
+        log_warn(&format!(
+            "mediastation playback resolve failed: media_id={:?} elapsed_ms={}",
+            request.media_id,
+            resolve_started.elapsed().as_millis(),
+        ));
+        playback_session_failure("playback_resolve_failed", &error)
+    })?;
+    let media_user_agent = playback.request_headers.get("user-agent");
+    let link_id = jfn_mpv::stream_cb::diagnostic_link_id(playback.resolved_url.as_str());
+    log_info(&format!(
+        "mediastation playback resolved: media_id={:?} link_id={:016x} reused={} resolve_ms={} elapsed_ms={} redirects={} status={} host={} expires_in_ms={} expiry_source={:?} requested_user_agent={:?} playback_user_agent={:?} ua_matches={} transport={}",
+        request.media_id,
+        link_id,
+        playback.metrics.reused,
+        playback.metrics.resolve_ms,
+        resolve_started.elapsed().as_millis(),
+        playback.metrics.redirect_count,
+        playback.metrics.status_code,
+        playback.metrics.target_host,
+        playback.expires_at_epoch_ms.saturating_sub(unix_time_ms()),
+        playback.metrics.expiry_source,
+        resolve_input.user_agent,
+        media_user_agent,
+        media_user_agent == Some(resolve_input.user_agent.as_str()),
+        if source.standard_emby_stream {
+            "mpv_http"
+        } else {
+            "ureq_stream"
+        },
+    ));
 
     runtime.ensure_generation(snapshot.generation)?;
     let prepared_subtitle = prepare_external_subtitle(runtime, snapshot, &source, &plan)?;
@@ -7134,7 +7262,15 @@ fn execute_load(
         subtitle_position: request.subtitle_position,
         defer_audio_to_mpv: source.audio_tracks.is_empty(),
     };
+    let native_load_started = Instant::now();
+    log_info(&format!(
+        "mediastation playback native load requested: media_id={:?} link_id={:016x} load_elapsed_ms={}",
+        request.media_id,
+        link_id,
+        load_started.elapsed().as_millis(),
+    ));
     runtime.load_if_current(NativeLoadRequest {
+        load_started,
         snapshot,
         source: &source,
         preference: &preference,
@@ -7144,10 +7280,22 @@ fn execute_load(
         start_ms: request.start_ms,
         url: &playback_url,
         options: &options,
+        initial_head: if use_mpv_http {
+            Arc::from([])
+        } else {
+            playback.initial_head.clone()
+        },
         subtitle: prepared_subtitle,
         interpolation: interpolation.clone(),
         enhancement: request.enhancement,
     })?;
+    log_info(&format!(
+        "mediastation playback native load queued: media_id={:?} link_id={:016x} native_call_ms={} load_elapsed_ms={}",
+        request.media_id,
+        link_id,
+        native_load_started.elapsed().as_millis(),
+        load_started.elapsed().as_millis(),
+    ));
 
     Ok(json!({
         "state": "queued",
@@ -8237,6 +8385,10 @@ fn log_warn(message: &str) {
     jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_WARN, message);
 }
 
+fn log_info(message: &str) {
+    jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_INFO, message);
+}
+
 fn log_debug(message: &str) {
     jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG, message);
 }
@@ -8244,6 +8396,7 @@ fn log_debug(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jfn_mpv::api::jfn_mpv_load_file;
     use jfn_playback::{MediaMetadata, PlaybackSnapshot};
     use std::io::Read as _;
     use std::net::TcpListener;
@@ -8495,14 +8648,22 @@ mod tests {
             let mut playing = false;
             while Instant::now() < deadline && !playing {
                 match wait_event_owned(0.1) {
-                    WaitEvent::Event(Event::FileLoaded) => {
-                        assert_eq!(mpv_property_string(c"pause").as_deref(), Some("yes"));
-                        loaded_at = Some(Instant::now());
+                    WaitEvent::Event(Event::Hook { reply, name }) if name == "on_preloaded" => {
+                        let prepared_at = Instant::now();
                         runtime
                             .prepare_loaded_subtitle()
                             .expect("subtitle should prepare locally");
-                        preparation = loaded_at.expect("load time recorded").elapsed();
-                        jfn_mpv_apply_pending_track_selection_and_play();
+                        jfn_mpv::api::jfn_mpv_prepare_pending_tracks()
+                            .expect("startup tracks should prepare");
+                        preparation = prepared_at.elapsed();
+                        jfn_mpv::api::jfn_mpv_continue_preloaded(reply)
+                            .expect("startup hook should continue");
+                    }
+                    WaitEvent::Event(Event::FileLoaded) => {
+                        assert_eq!(mpv_property_string(c"pause").as_deref(), Some("yes"));
+                        loaded_at = Some(Instant::now());
+                        jfn_mpv_apply_pending_track_selection_and_play()
+                            .expect("prepared playback should start");
                     }
                     WaitEvent::Event(Event::PropertyChange {
                         id: PAUSE_OBSERVER,
@@ -8547,6 +8708,7 @@ mod tests {
             media_id: "media-1".to_string(),
             source_url: base_url.clone(),
             resolved_url: base_url,
+            initial_head: Arc::from([]),
             request_headers,
             content_length: Some(42),
             content_version: None,
@@ -8593,10 +8755,14 @@ mod tests {
             Url::parse("https://cdn.example/video.mkv?sig=redacted").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
 
+        let native_url = native_playback_url(&playback, false, MediaStationProxyMode::Direct);
         assert_eq!(
-            native_playback_url(&playback, false, MediaStationProxyMode::Direct),
-            "mediastation://https://cdn.example/video.mkv?sig=redacted|MediaStationWindows/test|42|direct"
+            native_url.rsplit_once('|').map(|(prefix, _)| prefix),
+            Some(
+                "mediastation://https://cdn.example/video.mkv?sig=redacted|MediaStationWindows/test|42|direct"
+            )
         );
+        assert!(jfn_mpv::stream_cb::session_id(&native_url).is_some());
     }
 
     #[test]
@@ -8616,10 +8782,9 @@ mod tests {
         let url = Url::parse("https://cdn.example/video.mkv").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
 
-        assert!(
-            native_playback_url(&playback, false, MediaStationProxyMode::System)
-                .ends_with("|system")
-        );
+        let native_url = native_playback_url(&playback, false, MediaStationProxyMode::System);
+        assert_eq!(native_url.split('|').nth(3), Some("system"));
+        assert!(jfn_mpv::stream_cb::session_id(&native_url).is_some());
     }
 
     fn playback_event(kind: PlaybackEventKind, position_ms: u64) -> PlaybackEvent {
@@ -8628,6 +8793,7 @@ mod tests {
             item_id: String::new(),
             flag: false,
             error_message: String::new(),
+            stream_failure: None,
             snapshot: PlaybackSnapshot {
                 position_us: i64::try_from(position_ms.saturating_mul(1000)).unwrap_or(i64::MAX),
                 ..Default::default()
@@ -10299,6 +10465,32 @@ mod tests {
     }
 
     #[test]
+    fn playback_event_payload_keeps_stream_http_status_and_safe_message() {
+        let mut event = playback_event(PlaybackEventKind::Error, 0);
+        event.stream_failure = Some(jfn_mpv::stream_cb::StreamFailure {
+            session_id: 1,
+            phase: "seek",
+            offset: 1000,
+            error: jfn_mpv::stream_cb::StreamError::Http {
+                status: 403,
+                message: "115 pmt 3-2 https://cdn.example/video?token=secret Cookie=private"
+                    .to_string(),
+            },
+        });
+        let payload = playback_event_payload(&event);
+        assert_eq!(payload["errorCode"], "media_stream_failed");
+        assert_eq!(payload["httpStatus"], 403);
+        assert!(
+            payload["errorMessage"]
+                .as_str()
+                .is_some_and(|message| message.contains("115 pmt 3-2"))
+        );
+        for secret in ["cdn.example", "secret", "private", "Cookie="] {
+            assert!(!payload.to_string().contains(secret));
+        }
+    }
+
+    #[test]
     fn playback_event_payload_exposes_only_known_interpolation_failure_code() {
         let mut event = playback_event(PlaybackEventKind::Error, 42_000);
         event.error_message = RIFE_FILTER_INACTIVE.to_string();
@@ -10422,6 +10614,8 @@ mod tests {
             active_enhancements: Vec::new(),
             active_report: None,
             active_danmaku: None,
+            active_stream_session: None,
+            startup_timing: None,
         };
         let preference = PlaybackTrackPreference {
             configured: false,

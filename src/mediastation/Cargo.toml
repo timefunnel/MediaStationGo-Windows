@@ -13,6 +13,7 @@ parking_lot.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
 ureq.workspace = true
 url.workspace = true
 

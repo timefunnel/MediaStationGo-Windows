@@ -5990,7 +5990,9 @@
                 break;
             case 'error':
                 if (player.exiting) { finishPlayer(); break; }
-                showPlaybackFailure(event.errorCode
+                showPlaybackFailure(event.errorCode === 'media_stream_failed' && event.errorMessage
+                    ? event.errorMessage
+                    : event.errorCode
                     ? friendlyError({ code: event.errorCode })
                     : (player.interpolationChanging
                         ? 'RTX 插帧切换失败'

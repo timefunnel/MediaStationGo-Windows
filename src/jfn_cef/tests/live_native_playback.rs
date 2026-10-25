@@ -314,9 +314,18 @@ fn decodes_first_live_video_frame_through_native_load_path() {
     let mut first_frame = false;
     while Instant::now() < deadline && !first_frame {
         match wait_event_owned(0.5) {
+            jfn_mpv::api::WaitEvent::Event(Event::Hook { reply, name })
+                if name == "on_preloaded" =>
+            {
+                jfn_mpv::api::jfn_mpv_prepare_pending_tracks()
+                    .expect("startup tracks should prepare");
+                jfn_mpv::api::jfn_mpv_continue_preloaded(reply)
+                    .expect("startup hook should continue");
+            }
             jfn_mpv::api::WaitEvent::Event(Event::FileLoaded) => {
                 file_loaded = true;
-                jfn_mpv_apply_pending_track_selection_and_play();
+                jfn_mpv_apply_pending_track_selection_and_play()
+                    .expect("prepared playback should start");
             }
             jfn_mpv::api::WaitEvent::Event(Event::PropertyChange {
                 id: VIDEO_FRAME_INFO_OBSERVER,

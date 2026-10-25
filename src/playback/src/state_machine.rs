@@ -11,6 +11,8 @@ pub struct PlaybackStateMachine {
     frame_available: bool,
     last_known_item_id: String,
     pending_actions: Vec<PlaybackAction>,
+    stream_session: Option<u64>,
+    load_failed: bool,
 }
 
 impl Default for PlaybackStateMachine {
@@ -30,6 +32,8 @@ impl PlaybackStateMachine {
             frame_available: false,
             last_known_item_id: String::new(),
             pending_actions: Vec::new(),
+            stream_session: None,
+            load_failed: false,
         }
     }
 
@@ -45,7 +49,19 @@ impl PlaybackStateMachine {
         std::mem::take(&mut self.pending_actions)
     }
 
+    pub fn on_tracks_preloaded(&mut self, hook_id: u64) -> Vec<PlaybackEvent> {
+        // A native hook must always be released, including during cancellation.
+        self.pending_actions.push(PlaybackAction {
+            kind: PlaybackActionKind::PreparePendingTracks,
+            hook_id,
+        });
+        vec![]
+    }
+
     pub fn on_file_loaded(&mut self) -> Vec<PlaybackEvent> {
+        if self.load_failed {
+            return vec![];
+        }
         self.s.presence = PlayerPresence::Present;
         self.s.phase = PlaybackPhase::Starting;
         self.s.seeking = false;
@@ -58,11 +74,14 @@ impl PlaybackStateMachine {
         self.frame_available = false;
         self.pending_actions.push(PlaybackAction {
             kind: PlaybackActionKind::ApplyPendingTrackSelectionAndPlay,
+            hook_id: 0,
         });
         vec![PlaybackEvent::new(PlaybackEventKind::TrackLoaded)]
     }
 
     pub fn on_load_starting(&mut self, item_id: String) -> Vec<PlaybackEvent> {
+        self.stream_session = None;
+        self.load_failed = false;
         self.pending_load = true;
         self.s.presence = PlayerPresence::Present;
         self.s.phase = PlaybackPhase::Starting;
@@ -75,6 +94,36 @@ impl PlaybackStateMachine {
         self.pause_requested = false;
         self.frame_available = false;
         vec![PlaybackEvent::new(PlaybackEventKind::TrackLoaded)]
+    }
+
+    pub fn on_stream_load_starting(
+        &mut self,
+        item_id: String,
+        session_id: u64,
+    ) -> Vec<PlaybackEvent> {
+        let events = self.on_load_starting(item_id);
+        self.stream_session = Some(session_id);
+        events
+    }
+
+    pub fn on_stream_failed(
+        &mut self,
+        failure: jfn_mpv::stream_cb::StreamFailure,
+    ) -> Vec<PlaybackEvent> {
+        if self.load_failed || self.stream_session != Some(failure.session_id) {
+            return vec![];
+        }
+        let mut events = self.on_end_file(EndReason::Error, failure.user_message());
+        for event in &mut events {
+            if event.kind == PlaybackEventKind::Error {
+                event.stream_failure = Some(failure.clone());
+            }
+        }
+        // mpv can report EOF or FILE_LOADED after a callback has already failed.
+        // Keep the terminal error until the next explicit load starts.
+        self.load_failed = true;
+        self.pending_actions.clear();
+        events
     }
 
     pub fn on_pause_changed(&mut self, paused: bool) -> Vec<PlaybackEvent> {
@@ -106,6 +155,12 @@ impl PlaybackStateMachine {
             return vec![];
         }
         if self.s.phase == PlaybackPhase::Paused {
+            // The initial native pause can arrive after FILE_LOADED. Resuming
+            // that pause still needs a first video frame, just like Starting.
+            if !ready_to_play(self.s.media_type, self.frame_available) {
+                self.s.phase = PlaybackPhase::Starting;
+                return vec![];
+            }
             let mut out = vec![];
             transition_to_playing(&mut self.s, &mut out);
             return out;
@@ -125,6 +180,9 @@ impl PlaybackStateMachine {
     }
 
     pub fn on_end_file(&mut self, reason: EndReason, error_message: String) -> Vec<PlaybackEvent> {
+        if self.load_failed {
+            return vec![];
+        }
         let mut out = vec![];
 
         if self.s.seeking {
@@ -153,6 +211,7 @@ impl PlaybackStateMachine {
 
         self.pending_load = false;
         self.pause_requested = false;
+        self.stream_session = None;
         self.s.presence = PlayerPresence::None;
         self.s.phase = PlaybackPhase::Stopped;
         self.s.position_us = 0;
@@ -166,6 +225,9 @@ impl PlaybackStateMachine {
         };
         if reason == EndReason::Error {
             terminal.error_message = error_message;
+            // A startup failure followed by stop must remain Error; late
+            // native FILE_LOADED/EOF/cancel cannot revive or finish that load.
+            self.load_failed = true;
         }
         out.push(terminal);
         out
@@ -281,12 +343,13 @@ impl PlaybackStateMachine {
     }
 
     pub fn on_playback_restart(&mut self) -> Vec<PlaybackEvent> {
-        self.frame_available = true;
         if self.s.phase != PlaybackPhase::Starting {
             return vec![];
         }
         self.pause_requested = true;
-        if self.s.buffering {
+        // A trackless/old-frame restart is possible before the selected video
+        // has reached VO. Only video-frame-info establishes video readiness.
+        if self.s.buffering || !ready_to_play(self.s.media_type, self.frame_available) {
             return vec![];
         }
         let mut out = vec![];
@@ -344,7 +407,7 @@ fn is_active_phase(p: PlaybackPhase) -> bool {
 }
 
 fn ready_to_play(ty: MediaType, frame_available: bool) -> bool {
-    ty != MediaType::Video || frame_available
+    ty == MediaType::Audio || frame_available
 }
 
 fn transition_to_playing(s: &mut PlaybackSnapshot, out: &mut Vec<PlaybackEvent>) {
@@ -413,15 +476,17 @@ mod tests {
     }
 
     #[test]
-    fn playback_restart_promotes_starting_video_without_pause_property_edge() {
+    fn playback_restart_waits_for_video_frame_without_pause_property_edge() {
         let mut sm = PlaybackStateMachine::new();
         sm.on_load_starting("item-A".into());
         sm.on_media_type(MediaType::Video);
         sm.on_file_loaded();
 
         let out = sm.on_playback_restart();
-
-        assert!(has(&out, PlaybackEventKind::Started));
+        assert!(!has(&out, PlaybackEventKind::Started));
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Starting);
+        let frame = sm.on_video_frame_available(true);
+        assert!(has(&frame, PlaybackEventKind::Started));
         assert_eq!(sm.snapshot().phase, PlaybackPhase::Playing);
     }
 
@@ -435,6 +500,7 @@ mod tests {
 
         let restart = sm.on_playback_restart();
         assert!(!has(&restart, PlaybackEventKind::Started));
+        assert!(sm.on_video_frame_available(true).is_empty());
 
         let ready = sm.on_core_idle(false);
         assert!(has(&ready, PlaybackEventKind::Started));
@@ -451,6 +517,49 @@ mod tests {
 
         assert!(!has(&out, PlaybackEventKind::Started));
         assert_eq!(sm.snapshot().phase, PlaybackPhase::Paused);
+    }
+
+    #[test]
+    fn initial_pause_resume_does_not_skip_video_frame_gate() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("movie".into());
+        sm.on_media_type(MediaType::Video);
+        sm.on_file_loaded();
+        sm.on_pause_changed(true);
+        assert!(!has(
+            &sm.on_pause_changed(false),
+            PlaybackEventKind::Started
+        ));
+        assert!(!has(&sm.on_playback_restart(), PlaybackEventKind::Started));
+        assert!(has(
+            &sm.on_video_frame_available(true),
+            PlaybackEventKind::Started
+        ));
+    }
+
+    #[test]
+    fn unknown_metadata_cannot_bypass_first_frame_gate() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("unprobed-movie".into());
+        sm.on_file_loaded();
+        assert!(!has(
+            &sm.on_pause_changed(false),
+            PlaybackEventKind::Started
+        ));
+        assert!(!has(&sm.on_playback_restart(), PlaybackEventKind::Started));
+        assert!(has(
+            &sm.on_video_frame_available(true),
+            PlaybackEventKind::Started
+        ));
+    }
+
+    #[test]
+    fn parsed_audio_source_does_not_need_video_frame() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("audio".into());
+        sm.on_media_type(MediaType::Audio);
+        sm.on_file_loaded();
+        assert!(has(&sm.on_playback_restart(), PlaybackEventKind::Started));
     }
 
     #[test]
@@ -493,6 +602,7 @@ mod tests {
     #[test]
     fn variant_switch_first_load_then_same_id_reload() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_load_starting("item-A".into());
         assert!(!sm.snapshot().variant_switch_pending);
         sm.on_file_loaded();
@@ -512,6 +622,7 @@ mod tests {
     #[test]
     fn variant_switch_cleared_by_started_from_buffering_clear() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_load_starting("item-A".into());
         sm.on_file_loaded();
         sm.on_pause_changed(false);
@@ -571,6 +682,7 @@ mod tests {
     #[test]
     fn pending_load_swallows_eof() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_file_loaded();
         sm.on_pause_changed(false);
         assert_eq!(sm.snapshot().phase, PlaybackPhase::Playing);
@@ -633,6 +745,7 @@ mod tests {
     #[test]
     fn started_waits_for_core_idle_clear() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_core_idle(true);
         sm.on_file_loaded();
         assert!(sm.snapshot().buffering);
@@ -670,6 +783,7 @@ mod tests {
     #[test]
     fn pause_toggles_edge_triggered() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_file_loaded();
         sm.on_pause_changed(false);
         let p1 = sm.on_pause_changed(true);
@@ -756,6 +870,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_error_cannot_be_replaced_by_late_native_events() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_load_starting("movie".into());
+        assert!(has(
+            &sm.on_end_file(EndReason::Error, "startup failed".into()),
+            PlaybackEventKind::Error
+        ));
+        assert!(sm.on_file_loaded().is_empty());
+        assert!(
+            sm.on_end_file(EndReason::Canceled, String::new())
+                .is_empty()
+        );
+        assert!(sm.on_end_file(EndReason::Eof, String::new()).is_empty());
+        sm.on_load_starting("retry".into());
+        assert!(has(&sm.on_file_loaded(), PlaybackEventKind::TrackLoaded));
+    }
+
+    #[test]
     fn cancel_end_file_emits_canceled() {
         let mut sm = PlaybackStateMachine::new();
         sm.on_file_loaded();
@@ -778,6 +910,7 @@ mod tests {
     #[test]
     fn buffering_during_starting_holds_back_started() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_file_loaded();
         sm.on_paused_for_cache(true);
         let u = sm.on_pause_changed(false);
@@ -791,6 +924,7 @@ mod tests {
     #[test]
     fn resume_from_paused_immediate() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_file_loaded();
         sm.on_pause_changed(false);
         sm.on_pause_changed(true);
@@ -803,6 +937,7 @@ mod tests {
     #[test]
     fn core_idle_gates_started_pre_roll() {
         let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
         sm.on_file_loaded();
         sm.on_core_idle(true);
         let u = sm.on_pause_changed(false);
@@ -870,5 +1005,78 @@ mod tests {
         assert!(b.is_empty());
         let c = sm.on_media_type(MediaType::Audio);
         assert_eq!(c.len(), 1);
+    }
+
+    fn stream_failure(session_id: u64) -> jfn_mpv::stream_cb::StreamFailure {
+        jfn_mpv::stream_cb::StreamFailure {
+            session_id,
+            phase: "seek",
+            offset: 1000,
+            error: jfn_mpv::stream_cb::StreamError::Http {
+                status: 403,
+                message: "115 pmt 3-2".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn stream_failure_before_file_loaded_is_error_and_late_eof_cannot_finish() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_stream_load_starting("movie".to_string(), 1);
+        let events = sm.on_stream_failed(stream_failure(1));
+        let error = events
+            .iter()
+            .find(|e| e.kind == PlaybackEventKind::Error)
+            .expect("error event");
+        assert_eq!(
+            error.stream_failure.as_ref().and_then(|f| f.http_status()),
+            Some(403)
+        );
+        assert!(error.error_message.contains("115 pmt 3-2"));
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Stopped);
+        assert!(sm.on_file_loaded().is_empty());
+        assert!(sm.on_playback_restart().is_empty());
+        assert!(sm.on_end_file(EndReason::Eof, String::new()).is_empty());
+        assert!(
+            sm.on_end_file(EndReason::Canceled, String::new())
+                .is_empty()
+        );
+        assert!(sm.on_stream_failed(stream_failure(1)).is_empty());
+        assert!(sm.consume_actions().is_empty());
+    }
+
+    #[test]
+    fn stream_failure_stops_playback_and_clears_seeking_and_buffering() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_stream_load_starting("movie".to_string(), 1);
+        sm.on_file_loaded();
+        sm.on_pause_changed(false);
+        sm.on_playback_restart();
+        sm.on_seeking_changed(true);
+        sm.on_paused_for_cache(true);
+        let events = sm.on_stream_failed(stream_failure(1));
+        assert!(has(&events, PlaybackEventKind::Error));
+        assert!(!has(&events, PlaybackEventKind::Finished));
+        assert!(!sm.snapshot().seeking);
+        assert!(!sm.snapshot().buffering);
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Stopped);
+        assert!(sm.consume_actions().is_empty());
+    }
+
+    #[test]
+    fn replay_ignores_old_stream_failure_and_can_start_again() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.on_media_type(MediaType::Audio);
+        sm.on_stream_load_starting("movie".to_string(), 1);
+        sm.on_stream_failed(stream_failure(1));
+        sm.on_stream_load_starting("movie".to_string(), 2);
+        assert!(sm.on_stream_failed(stream_failure(1)).is_empty());
+        sm.on_file_loaded();
+        sm.on_pause_changed(false);
+        sm.on_playback_restart();
+        assert_eq!(sm.snapshot().phase, PlaybackPhase::Playing);
+        let events = sm.on_end_file(EndReason::Eof, String::new());
+        assert!(has(&events, PlaybackEventKind::Finished));
+        assert!(sm.on_stream_failed(stream_failure(2)).is_empty());
     }
 }

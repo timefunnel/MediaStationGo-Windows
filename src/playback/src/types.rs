@@ -115,6 +115,7 @@ pub struct PlaybackEvent {
     pub item_id: String,
     pub flag: bool,
     pub error_message: String,
+    pub stream_failure: Option<jfn_mpv::stream_cb::StreamFailure>,
     pub snapshot: PlaybackSnapshot,
     pub metadata: MediaMetadata,
     pub artwork_uri: String,
@@ -129,6 +130,7 @@ impl PlaybackEvent {
             item_id: String::new(),
             flag: false,
             error_message: String::new(),
+            stream_failure: None,
             snapshot: PlaybackSnapshot::default(),
             metadata: MediaMetadata::default(),
             artwork_uri: String::new(),
@@ -142,9 +144,11 @@ impl PlaybackEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackActionKind {
     ApplyPendingTrackSelectionAndPlay = 0,
+    PreparePendingTracks = 1,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlaybackAction {
     pub kind: PlaybackActionKind,
+    pub hook_id: u64,
 }

@@ -18,7 +18,13 @@ use crate::types::*;
 #[derive(Debug)]
 pub enum Input {
     FileLoaded,
+    TracksPreloaded(u64),
     LoadStarting(String),
+    StreamLoadStarting {
+        item_id: String,
+        session_id: u64,
+    },
+    StreamFailed(jfn_mpv::stream_cb::StreamFailure),
     PauseChanged(bool),
     EndFile {
         reason: EndReason,
@@ -171,7 +177,10 @@ fn worker(shared: Arc<Shared>) {
         let mut events: Vec<PlaybackEvent> = Vec::new();
         let mut actions: Vec<PlaybackAction> = Vec::new();
         for input in work {
-            apply(&mut sm, input, &mut events);
+            if apply(&mut sm, input, &mut events) {
+                // Drop queued play, but always release an outstanding hook.
+                actions.retain(|a| a.kind == PlaybackActionKind::PreparePendingTracks);
+            }
             actions.extend(sm.consume_actions());
         }
 
@@ -213,13 +222,19 @@ fn worker(shared: Arc<Shared>) {
     }
 }
 
-fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEvent>) {
+fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEvent>) -> bool {
     let diagnostic = diagnostic_input(&input);
     // Terminal transitions clear identity before their events are delivered.
     let previous_item_id = sm.item_id().to_owned();
     let mut emitted = match input {
         Input::FileLoaded => sm.on_file_loaded(),
+        Input::TracksPreloaded(id) => sm.on_tracks_preloaded(id),
         Input::LoadStarting(id) => sm.on_load_starting(id),
+        Input::StreamLoadStarting {
+            item_id,
+            session_id,
+        } => sm.on_stream_load_starting(item_id, session_id),
+        Input::StreamFailed(failure) => sm.on_stream_failed(failure),
         Input::PauseChanged(paused) => sm.on_pause_changed(paused),
         Input::EndFile {
             reason,
@@ -285,6 +300,9 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
             snapshot.seeking
         );
     }
+    let load_failed = emitted
+        .iter()
+        .any(|event| event.kind == PlaybackEventKind::Error);
     // Capture identity per input: a later load in this batch must not relabel
     // an old episode's position or terminal event as belonging to the new one.
     let terminal = emitted.iter().any(|event| {
@@ -302,12 +320,21 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
         event.item_id.clone_from(&item_id);
     }
     out.append(&mut emitted);
+    load_failed
 }
 
 fn diagnostic_input(input: &Input) -> Option<String> {
     match input {
         Input::FileLoaded => Some("file-loaded".to_string()),
+        Input::TracksPreloaded(_) => Some("tracks-preloaded".to_string()),
         Input::LoadStarting(_) => Some("load-starting".to_string()),
+        Input::StreamLoadStarting { session_id, .. } => {
+            Some(format!("stream-load-starting session_id={session_id}"))
+        }
+        Input::StreamFailed(failure) => Some(format!(
+            "stream-failed session_id={} cause={}",
+            failure.session_id, failure.error
+        )),
         Input::PauseChanged(paused) => Some(format!("pause={paused}")),
         Input::EndFile { reason, .. } => Some(format!("end-file={reason:?}")),
         Input::PausedForCache(paused) => Some(format!("paused-for-cache={paused}")),
@@ -397,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn file_loaded_prepares_tracks_before_builtin_selection_and_play() {
+    fn preloaded_prepares_subtitle_before_builtin_track_selection_and_hook_release() {
         let mut coord = PlaybackCoordinator::new().unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let prepared = Arc::clone(&order);
@@ -406,16 +433,62 @@ mod tests {
         }));
         let selected = Arc::clone(&order);
         let (tx, rx) = mpsc::sync_channel(1);
-        coord.add_builtin_action_sink(Box::new(move |_action| {
+        coord.add_builtin_action_sink(Box::new(move |action| {
+            assert_eq!(action.kind, PlaybackActionKind::PreparePendingTracks);
+            assert_eq!(action.hook_id, 42);
             selected.lock().push("select-and-play");
             tx.send(()).expect("test receiver should be alive");
         }));
         coord.start();
-        coord.enqueue(Input::FileLoaded);
+        coord.enqueue(Input::TracksPreloaded(42));
         rx.recv_timeout(std::time::Duration::from_secs(2))
-            .expect("file-loaded action should complete");
+            .expect("preloaded action should complete");
         assert_eq!(*order.lock(), vec!["prepare-subtitle", "select-and-play"]);
         coord.stop();
+    }
+
+    #[test]
+    fn stream_failure_discards_batched_play_actions_only_for_the_active_session() {
+        for (failed_session, expected_actions) in [(1, 2), (2, 1)] {
+            let mut coord = PlaybackCoordinator::new().unwrap();
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            let recorded_actions = Arc::clone(&actions);
+            coord.add_builtin_action_sink(Box::new(move |action| {
+                recorded_actions.lock().push(action.kind);
+            }));
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let recorded_errors = Arc::clone(&errors);
+            let (tx, rx) = mpsc::channel();
+            coord.add_event_sink(Box::new(move |event| {
+                if let Some(failure) = &event.stream_failure {
+                    recorded_errors.lock().push(failure.session_id);
+                }
+                tx.send(()).expect("test receiver should be alive");
+            }));
+            // Queue before starting so FILE_LOADED and the error share a batch.
+            coord.enqueue(Input::StreamLoadStarting {
+                item_id: "movie".to_string(),
+                session_id: 2,
+            });
+            coord.enqueue(Input::TracksPreloaded(42));
+            coord.enqueue(Input::FileLoaded);
+            coord.enqueue(Input::StreamFailed(jfn_mpv::stream_cb::StreamFailure {
+                session_id: failed_session,
+                phase: "seek",
+                offset: 1000,
+                error: jfn_mpv::stream_cb::StreamError::Http {
+                    status: 403,
+                    message: "115 pmt 3-2".to_string(),
+                },
+            }));
+            coord.start();
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("batch should complete");
+            coord.stop();
+            assert_eq!(actions.lock().len(), expected_actions);
+            assert_eq!(actions.lock()[0], PlaybackActionKind::PreparePendingTracks);
+            assert_eq!(errors.lock().len(), usize::from(failed_session == 2));
+        }
     }
 
     #[test]

@@ -12,6 +12,8 @@ const MAX_REDIRECTS: usize = 6;
 const DEFAULT_SESSION_TTL_MS: u64 = 120_000;
 const EXPIRY_SAFETY_MS: u64 = 60_000;
 const CACHE_REUSE_SAFETY_MS: u64 = 10_000;
+const INITIAL_HEAD_LIMIT: usize = 64 * 1024;
+const INITIAL_HEAD_RANGE: &str = "bytes=0-65535";
 
 const HEADER_ACCEPT_RANGES: &str = "accept-ranges";
 const HEADER_CONTENT_LENGTH: &str = "content-length";
@@ -214,6 +216,8 @@ pub struct PlaybackSession {
     pub request_headers: HeaderMap,
     pub content_length: Option<u64>,
     pub content_version: Option<String>,
+    /// Validated bytes from the same CDN response, starting at offset zero.
+    pub initial_head: Arc<[u8]>,
     pub expires_at_epoch_ms: u64,
     pub metrics: PlaybackSessionMetrics,
 }
@@ -244,6 +248,7 @@ impl fmt::Debug for PlaybackSession {
             .field("request_headers", &self.request_headers)
             .field("content_length", &self.content_length)
             .field("content_version", &self.content_version)
+            .field("initial_head_bytes", &self.initial_head.len())
             .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
             .field("metrics", &self.metrics)
             .finish()
@@ -268,10 +273,22 @@ impl fmt::Debug for ProbeRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProbeResponse {
     pub status_code: u16,
     pub headers: HeaderMap,
+    pub initial_head: Arc<[u8]>,
+}
+
+impl fmt::Debug for ProbeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProbeResponse")
+            .field("status_code", &self.status_code)
+            .field("headers", &self.headers)
+            .field("initial_head_bytes", &self.initial_head.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +382,7 @@ impl Default for UreqTransport {
 
 impl ProbeTransport for UreqTransport {
     fn probe(&self, request: &ProbeRequest) -> Result<ProbeResponse, TransportError> {
+        let started = Instant::now();
         let agent = self.agent_for_mode(request.proxy_mode)?;
         let mut builder = agent.get(request.url.as_str());
         for (name, value) in request.headers.iter() {
@@ -372,8 +390,21 @@ impl ProbeTransport for UreqTransport {
         }
         let mut response = builder
             .call()
-            .map_err(|error| TransportError::new(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "mpv",
+                    "mediastation resolve probe transport failed: host={} elapsed_ms={} proxy_mode={:?}",
+                    request.url.host_str().unwrap_or_default(), started.elapsed().as_millis(), request.proxy_mode,
+                );
+                TransportError::new(error.to_string())
+            })?;
         let status_code = response.status().as_u16();
+        tracing::info!(
+            target: "mpv",
+            "mediastation resolve probe HTTP response: host={} status={} header_ms={} proxy_configured={} user_agent={:?}",
+            request.url.host_str().unwrap_or_default(), status_code, started.elapsed().as_millis(),
+            agent.config().proxy().is_some(), request.headers.get(HEADER_USER_AGENT),
+        );
         let mut headers = HeaderMap::default();
         for name in [
             HEADER_ACCEPT_RANGES,
@@ -391,17 +422,60 @@ impl ProbeTransport for UreqTransport {
             }
         }
 
-        if !is_redirect(status_code) {
-            let mut probe_byte = [0_u8; 1];
+        let mut initial_head = Vec::new();
+        if status_code == 206 && request.headers.get(HEADER_RANGE) == Some(INITIAL_HEAD_RANGE) {
+            // Validate the offset and exact body size before these bytes can
+            // become mpv's file header. Never cache an error or encoded body.
+            let length = initial_head_length(&headers).map_err(TransportError::new)?;
+            if response
+                .headers()
+                .get("content-encoding")
+                .is_some_and(|value| value.as_bytes() != b"identity")
+            {
+                return Err(TransportError::new(
+                    "initial head has unsupported content encoding",
+                ));
+            }
+            initial_head.resize(length, 0);
+            let body_started = Instant::now();
             response
                 .body_mut()
                 .as_reader()
+                .read_exact(&mut initial_head)
+                .map_err(|error| {
+                    TransportError::new(format!("initial head read failed: {error}"))
+                })?;
+            tracing::info!(target: "mpv",
+                "mediastation resolve initial head read: host={} bytes={} body_ms={} elapsed_ms={}",
+                request.url.host_str().unwrap_or_default(), initial_head.len(),
+                body_started.elapsed().as_millis(), started.elapsed().as_millis());
+        } else if !is_redirect(status_code) {
+            let mut probe_byte = [0_u8; 1];
+            let body_started = Instant::now();
+            let bytes = response
+                .body_mut()
+                .as_reader()
                 .read(&mut probe_byte)
-                .map_err(|error| TransportError::new(format!("probe body read failed: {error}")))?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "mpv",
+                        "mediastation resolve probe body failed: host={} status={} body_ms={} elapsed_ms={} io_kind={:?}",
+                        request.url.host_str().unwrap_or_default(), status_code, body_started.elapsed().as_millis(),
+                        started.elapsed().as_millis(), error.kind(),
+                    );
+                    TransportError::new(format!("probe body read failed: {error}"))
+                })?;
+            tracing::info!(
+                target: "mpv",
+                "mediastation resolve probe body read: host={} status={} bytes={} body_ms={} elapsed_ms={}",
+                request.url.host_str().unwrap_or_default(), status_code, bytes,
+                body_started.elapsed().as_millis(), started.elapsed().as_millis(),
+            );
         }
         Ok(ProbeResponse {
             status_code,
             headers,
+            initial_head: initial_head.into(),
         })
     }
 }
@@ -558,10 +632,28 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         self.resolve_at(input, unix_epoch_ms())
     }
 
+    /// Read a bounded CDN header in the existing validation request for the
+    /// custom native stream. Standard mpv HTTP playback keeps its byte probe.
+    pub fn resolve_with_initial_head(
+        &self,
+        input: &ResolveInput,
+    ) -> Result<PlaybackSession, PlaybackSessionError> {
+        self.resolve_at_inner(input, unix_epoch_ms(), true)
+    }
+
     pub fn resolve_at(
         &self,
         input: &ResolveInput,
         now_epoch_ms: u64,
+    ) -> Result<PlaybackSession, PlaybackSessionError> {
+        self.resolve_at_inner(input, now_epoch_ms, false)
+    }
+
+    fn resolve_at_inner(
+        &self,
+        input: &ResolveInput,
+        now_epoch_ms: u64,
+        read_initial_head: bool,
     ) -> Result<PlaybackSession, PlaybackSessionError> {
         input.validate()?;
         let key = SessionKey {
@@ -582,13 +674,23 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
             && cached.server_base_url == input.server_base_url
             && cached.auth == input.auth
             && cached.proxy_mode == input.proxy_mode
+            && cached.session.request_headers.get(HEADER_USER_AGENT)
+                == Some(input.user_agent.as_str())
             && cached.session.is_reusable_at(now_epoch_ms)
         {
             return Ok(cached.session.as_reused());
         }
 
-        let session = self.resolve_network(input, now_epoch_ms)?;
-        self.sessions.lock().insert(
+        let session = self.resolve_network(input, now_epoch_ms, read_initial_head)?;
+        let mut sessions = self.sessions.lock();
+        // Keep a header only for the latest newly resolved item. Expired link
+        // entries may remain in this map, but must not retain media buffers.
+        if !session.initial_head.is_empty() {
+            for cached in sessions.values_mut() {
+                cached.session.initial_head = Arc::from([]);
+            }
+        }
+        sessions.insert(
             key,
             CachedSession {
                 session: session.clone(),
@@ -613,6 +715,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         &self,
         input: &ResolveInput,
         now_epoch_ms: u64,
+        read_initial_head: bool,
     ) -> Result<PlaybackSession, PlaybackSessionError> {
         let started = Instant::now();
         let mut current = input.source_url.clone();
@@ -621,10 +724,21 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         loop {
             let mut headers = HeaderMap::default();
             headers.insert(HEADER_USER_AGENT, input.user_agent.clone());
-            headers.insert(HEADER_RANGE, "bytes=0-0");
+            let range = if read_initial_head && !same_origin(&current, &input.server_base_url) {
+                INITIAL_HEAD_RANGE
+            } else {
+                "bytes=0-0"
+            };
+            headers.insert(HEADER_RANGE, range);
             if same_origin(&current, &input.server_base_url) {
                 input.auth.apply(&mut headers);
             }
+            let probe_started = Instant::now();
+            tracing::info!(
+                target: "mpv",
+                "mediastation resolve probe request: media_id={:?} hop={} host={} range={} proxy_mode={:?} user_agent={:?}",
+                input.media_id, redirect_count, current.host_str().unwrap_or_default(), range, input.proxy_mode, input.user_agent,
+            );
             let response = self
                 .transport
                 .probe(&ProbeRequest {
@@ -632,10 +746,23 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
                     headers,
                     proxy_mode: input.proxy_mode,
                 })
-                .map_err(|error| PlaybackSessionError::Transport {
-                    url: redacted_url(&current),
-                    message: error.to_string(),
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "mpv",
+                        "mediastation resolve probe failed: media_id={:?} hop={} host={} elapsed_ms={}",
+                        input.media_id, redirect_count, current.host_str().unwrap_or_default(), probe_started.elapsed().as_millis(),
+                    );
+                    PlaybackSessionError::Transport {
+                        url: redacted_url(&current),
+                        message: error.to_string(),
+                    }
                 })?;
+            tracing::info!(
+                target: "mpv",
+                "mediastation resolve probe completed: media_id={:?} hop={} host={} status={} elapsed_ms={} resolve_elapsed_ms={}",
+                input.media_id, redirect_count, current.host_str().unwrap_or_default(), response.status_code,
+                probe_started.elapsed().as_millis(), started.elapsed().as_millis(),
+            );
 
             if is_redirect(response.status_code) {
                 if redirect_count == MAX_REDIRECTS {
@@ -719,6 +846,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
                 request_headers,
                 content_length,
                 content_version,
+                initial_head: response.initial_head,
                 expires_at_epoch_ms,
                 metrics: PlaybackSessionMetrics {
                     redirect_count,
@@ -854,6 +982,42 @@ fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, PlaybackSess
         .transpose()
 }
 
+fn initial_head_length(headers: &HeaderMap) -> Result<usize, &'static str> {
+    let range = headers
+        .get(HEADER_CONTENT_RANGE)
+        .and_then(|value| value.strip_prefix("bytes "))
+        .ok_or("initial head content-range missing or invalid")?;
+    let (bounds, total) = range
+        .split_once('/')
+        .ok_or("initial head content-range invalid")?;
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or("initial head content-range invalid")?;
+    let start: u64 = start.parse().map_err(|_| "initial head offset invalid")?;
+    let end: u64 = end.parse().map_err(|_| "initial head end invalid")?;
+    if start != 0 || end >= INITIAL_HEAD_LIMIT as u64 {
+        return Err("initial head range outside requested prefix");
+    }
+    if total != "*"
+        && total
+            .parse::<u64>()
+            .map_err(|_| "initial head total invalid")?
+            <= end
+    {
+        return Err("initial head range exceeds total");
+    }
+    let length = end as usize + 1;
+    if let Some(declared) = headers.get(HEADER_CONTENT_LENGTH)
+        && declared
+            .parse::<usize>()
+            .map_err(|_| "initial head content-length invalid")?
+            != length
+    {
+        return Err("initial head content-length mismatch");
+    }
+    Ok(length)
+}
+
 fn direct_link_expiry(url: &Url, now_epoch_ms: u64) -> (u64, SessionExpirySource) {
     if let Some(raw) = url
         .query_pairs()
@@ -946,6 +1110,7 @@ mod tests {
         ProbeResponse {
             status_code,
             headers: headers(values),
+            initial_head: Arc::from([]),
         }
     }
 
@@ -1086,6 +1251,153 @@ mod tests {
             Some("secret-token")
         );
         assert_eq!(session.metrics.delivery_mode, DeliveryMode::Server);
+    }
+
+    #[test]
+    fn initial_head_is_read_in_the_existing_cdn_probe_and_has_no_server_credentials() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("server bind");
+        let cdn = TcpListener::bind("127.0.0.1:0").expect("CDN bind");
+        let source_url = format!(
+            "http://{}/stream",
+            server.local_addr().expect("server address")
+        );
+        let cdn_address = cdn.local_addr().expect("CDN address");
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{cdn_address}/file\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let server_thread = thread::spawn(move || accept_request(server, redirect));
+        let body = "h".repeat(INITIAL_HEAD_LIMIT);
+        let reply = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-65535/131072\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n{body}"
+        );
+        let cdn_thread = thread::spawn(move || accept_request(cdn, reply));
+        let mut request = input(&source_url);
+        request.server_base_url = Url::parse(&source_url).expect("source URL");
+        let resolver = PlaybackSessionResolver::new(UreqTransport::new());
+        let session = resolver
+            .resolve_with_initial_head(&request)
+            .expect("head resolve");
+        let reused = resolver
+            .resolve_with_initial_head(&request)
+            .expect("cached resolve");
+        assert_eq!(session.initial_head.as_ref(), body.as_bytes());
+        assert!(Arc::ptr_eq(&session.initial_head, &reused.initial_head));
+        assert!(reused.metrics.reused);
+        assert_eq!(session.content_length, Some(131072));
+        let server_request = server_thread
+            .join()
+            .expect("server joined")
+            .to_ascii_lowercase();
+        let cdn_request = cdn_thread.join().expect("CDN joined").to_ascii_lowercase();
+        assert!(server_request.contains("range: bytes=0-0"));
+        assert!(cdn_request.contains("range: bytes=0-65535"));
+        assert!(!cdn_request.contains("secret-token"));
+        assert!(!format!("{session:?}").contains(&body));
+    }
+
+    #[test]
+    fn truncated_initial_head_is_an_explicit_transport_failure() {
+        let cdn = TcpListener::bind("127.0.0.1:0").expect("CDN bind");
+        let url = format!("http://{}/file", cdn.local_addr().expect("CDN address"));
+        let reply = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/100\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab".to_string();
+        let server = thread::spawn(move || accept_request(cdn, reply));
+        let error = UreqTransport::new()
+            .probe(&ProbeRequest {
+                url: Url::parse(&url).expect("CDN URL"),
+                headers: headers(&[(HEADER_RANGE, INITIAL_HEAD_RANGE)]),
+                proxy_mode: MediaStationProxyMode::Direct,
+            })
+            .expect_err("short body must fail");
+        assert!(error.message.contains("initial head read failed"));
+        server.join().expect("server joined");
+    }
+
+    #[test]
+    fn initial_head_rejects_wrong_offset_oversize_and_inconsistent_lengths() {
+        for (range, declared) in [
+            ("bytes 1-3/100", "3"),
+            ("bytes 0-65536/100000", "65537"),
+            ("bytes 0-99/99", "100"),
+            ("bytes 0-3/100", "3"),
+            ("garbage", "3"),
+        ] {
+            assert!(
+                initial_head_length(&headers(&[
+                    (HEADER_CONTENT_RANGE, range),
+                    (HEADER_CONTENT_LENGTH, declared)
+                ]))
+                .is_err(),
+                "accepted {range}"
+            );
+        }
+        assert_eq!(
+            initial_head_length(&headers(&[
+                (HEADER_CONTENT_RANGE, "bytes 0-2/3"),
+                (HEADER_CONTENT_LENGTH, "3")
+            ])),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn only_the_latest_resolved_item_retains_a_cached_head() {
+        let mut first = response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-2/100")]);
+        first.initial_head = Arc::from(*b"abc");
+        let mut second = first.clone();
+        second.initial_head = Arc::from(*b"xyz");
+        let transport = FakeTransport::with_responses(vec![
+            response(302, &[(HEADER_LOCATION, "https://cdn.example/one")]),
+            first,
+            response(302, &[(HEADER_LOCATION, "https://cdn.example/two")]),
+            second,
+        ]);
+        let resolver = PlaybackSessionResolver::new(transport);
+        let request = input("https://media.example/one");
+        let active = resolver
+            .resolve_at_inner(&request, NOW_MS, true)
+            .expect("first head");
+        let mut next = request.clone();
+        next.media_id = "media-2".into();
+        next.source_url = Url::parse("https://media.example/two").expect("second URL");
+        resolver
+            .resolve_at_inner(&next, NOW_MS, true)
+            .expect("second head");
+        let cached = resolver
+            .resolve_at_inner(&request, NOW_MS + 1, true)
+            .expect("cached first link");
+        assert!(cached.metrics.reused);
+        assert!(cached.initial_head.is_empty());
+        assert_eq!(active.initial_head.as_ref(), b"abc");
+        assert_eq!(
+            resolver
+                .sessions
+                .lock()
+                .values()
+                .map(|value| value.session.initial_head.len())
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn cached_link_and_head_are_not_reused_with_a_different_user_agent() {
+        let transport = FakeTransport::with_responses(vec![
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-0/123")]),
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-0/123")]),
+        ]);
+        let resolver = PlaybackSessionResolver::new(transport.clone());
+        let mut request = input("https://media.example/file");
+        resolver.resolve_at(&request, NOW_MS).expect("first link");
+        request.user_agent = "different-UA".into();
+        let session = resolver
+            .resolve_at(&request, NOW_MS + 1)
+            .expect("new UA link");
+        assert!(!session.metrics.reused);
+        assert_eq!(
+            session.request_headers.get(HEADER_USER_AGENT),
+            Some("different-UA")
+        );
+        assert_eq!(transport.requests().len(), 2);
     }
 
     #[test]
