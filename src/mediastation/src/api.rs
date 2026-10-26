@@ -1072,6 +1072,7 @@ impl MediaStationApiClient {
         let mut episodes = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
         let mut expected_total = None;
+        let fields = format!("{BROWSE_FIELDS},MediaSources");
 
         loop {
             let start_index = episodes.len();
@@ -1084,7 +1085,7 @@ impl MediaStationApiClient {
                 .append_pair("Limit", &limit.to_string())
                 .append_pair("SortBy", "ParentIndexNumber,IndexNumber,SortName")
                 .append_pair("SortOrder", "Ascending")
-                .append_pair("Fields", BROWSE_FIELDS);
+                .append_pair("Fields", &fields);
             if let Some(season_id) = season_id {
                 episodes_query.append_pair("SeasonId", season_id);
             }
@@ -3803,7 +3804,12 @@ mod tests {
         let first = response(json!({
             "StartIndex": 0,
             "TotalRecordCount": 1,
-            "Items": [{ "Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "ParentIndexNumber": 1, "IndexNumber": 1 }]
+            "Items": [{
+                "Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "ParentIndexNumber": 1, "IndexNumber": 1,
+                "MediaSources": [{ "MediaStreams": [{
+                    "Type": "Video", "Codec": "hevc", "Width": 3840, "Height": 2160, "VideoRange": "SDR"
+                }] }]
+            }]
         }));
         let second = response(json!({
             "StartIndex": 0,
@@ -3827,6 +3833,10 @@ mod tests {
         let requests = server.join().expect("server thread should finish");
 
         assert_eq!(season.len(), 1);
+        assert_eq!(season[0].video_width, Some(3840));
+        assert_eq!(season[0].video_height, Some(2160));
+        assert_eq!(season[0].video_codec.as_deref(), Some("hevc"));
+        assert_eq!(season[0].dynamic_range.as_deref(), Some("SDR"));
         assert_eq!(all.len(), 2);
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("SeasonId=season-1"));
@@ -3835,7 +3845,7 @@ mod tests {
             assert!(request.contains("StartIndex=0"));
             assert!(request.contains("Limit=100"));
             assert!(request.contains("Fields="));
-            assert!(!request.contains("MediaSources"));
+            assert!(request.contains("MediaSources"));
         }
     }
 

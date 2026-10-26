@@ -154,7 +154,8 @@ $PreviewShim = @'
         id: item.id, title: item.title, type: item.type, year: item.year,
         playable: ['Movie', 'Episode', 'Video'].includes(item.type),
         overview: item.description || '', durationMs: item.durationMs || 0,
-        resumePositionMs: item.positionMs || 0, communityRating: item.rating || 0,
+        resumePositionMs: item.positionMs || 0, played: item.played === true, communityRating: item.rating || 0,
+        seasonId: catalog?.details[item.seriesId]?.seasons?.find((season) => season.indexNumber === item.seasonNumber)?.id,
         genres: item.genres || [], seriesId: item.seriesId, seriesName: item.seriesName,
         parentIndexNumber: item.seasonNumber, indexNumber: item.episodeNumber,
         primaryImage: artwork(item.poster, 'primary'),
@@ -181,7 +182,6 @@ $PreviewShim = @'
         const bySeason = Object.fromEntries(Object.entries(cached?.episodesBySeason || {}).map(([key, items]) => [key, items.map(adapt)]));
         return { item, seasons: cached?.seasons || [], seasonCount: cached?.seasons?.length || 0,
             episodesBySeason: bySeason, episodes: Object.values(bySeason).flat(), people: [],
-            selectedSeasonId: cached?.seasons?.[0]?.id || '',
         };
     };
     let playingMediaId = '';
@@ -195,7 +195,7 @@ $PreviewShim = @'
         if (operation === 'favorites' || operation === 'set_favorite') return respond(requestId, operation, { code: 'preview_unavailable', message: '缓存没有收藏状态；此预览不连接服务器，不模拟收藏结果。' }, false);
         if (operation === 'home') return respond(requestId, operation, previewHome);
         if (operation === 'detail') return respond(requestId, operation, previewDetail(input.mediaId));
-        if (operation === 'series_episodes') return respond(requestId, operation, { episodes: catalog ? previewDetail(input.seriesId).episodes : episodes });
+        if (operation === 'series_episodes') return respond(requestId, operation, { episodes: catalog ? (input.seasonId ? previewDetail(input.seriesId).episodesBySeason[input.seasonId] || [] : previewDetail(input.seriesId).episodes) : episodes });
         if (operation === 'cache_stats') return respond(requestId, operation, { imageBytes: imageMap.size * 42000, imageCount: imageMap.size });
         if (operation === 'clear_image_cache') return respond(requestId, operation, { imageBytes: 0, imageCount: 0 });
         const currentLibrary = catalog?.libraries.find((library) => library.id === input.parentId);

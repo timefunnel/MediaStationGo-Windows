@@ -2440,6 +2440,8 @@
         img.alt = '';
         img.decoding = 'async';
         art.append(fallback, img);
+        const quality = !isLibrary && createQualityBadge(cardVideoInfo(card));
+        if (quality) art.append(quality);
         const ref = rowKey === 'resume' && card.type === 'Episode'
             ? (card.primaryImage || card.landscapeImage)
             : options.landscape
@@ -3709,6 +3711,7 @@
         replaceContent();
         const view = element('article', 'detail-view');
         view.dataset.seriesId = card.type === 'Series' ? card.id : '';
+        view.dataset.detailKind = card.type === 'Series' ? 'series' : 'movie';
         const backdrop = element('div', 'detail-backdrop');
         const backdropImage = element('span', 'detail-backdrop-image');
         backdrop.append(backdropImage);
@@ -3726,6 +3729,8 @@
         posterImage.alt = '';
         posterImage.decoding = 'async';
         poster.append(posterFallback, posterImage);
+        const quality = createQualityBadge(detailDisplaySource(detail));
+        if (quality) poster.append(quality);
         const posterRef = card.primaryImage || card.landscapeImage;
         observeImage(posterImage, posterRef, imageWidthFor(posterRef, false));
         const copy = element('div', 'detail-copy');
@@ -3756,21 +3761,20 @@
             });
         }
         copy.append(createDetailMeta(detail));
+        if (card.genres?.length) copy.append(createDetailGenres(detail));
         if (card.overview) {
             copy.append(createDetailOverview(detail));
         }
         const actions = element('div', 'detail-actions');
         if (card.type === 'Series') actions.dataset.seriesId = card.id;
-        const playTarget = card.playable ? card : (pickContinueEpisode(detail.episodes) || detail.episodes?.[0]);
+        const playTarget = detailPlayTarget(detail);
         if (playTarget?.playable) appendDetailPlayAction(actions, playTarget, detail);
         actions.append(createFavoriteButton(card));
         if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
-        if (card.genres?.length) {
-            copy.append(createDetailGenres(detail));
-        }
+        copy.append(createDetailPlaybackContext(playTarget), createDetailMediaInfo(detail));
         layout.append(poster, copy);
         const flowing = element('div', 'detail-flow');
-        [...copy.children].filter((node) => node.matches('.detail-overview, .detail-actions, .tag-list')).forEach((node) => flowing.append(node));
+        [...copy.children].filter((node) => node.matches('.detail-overview, .detail-actions, .tag-list, .detail-playback-context, .detail-media-info')).forEach((node) => flowing.append(node));
         copy.append(flowing);
         body.append(back, layout);
         view.append(backdrop, body);
@@ -3792,9 +3796,9 @@
         }).catch((error) => console.error(`详情背景加载失败：${friendlyError(error)}`));
     }
 
-    function replaceDetailField(detail, field, replacement) {
+    function replaceDetailField(detail, field, replacement, root = content) {
         const selector = `[data-detail-field="${field}"]`;
-        const existing = content.querySelector(selector);
+        const existing = root.querySelector(selector);
         if (!existing) return false;
         existing.replaceWith(replacement);
         return true;
@@ -3810,21 +3814,155 @@
                 Number.isFinite(detail.episodeCount) && detail.episodeCount > 0 ? `${detail.episodeCount} 集` : '',
             ]
             : [];
-        // 片源类型跟随所选版本，切换片源后这里显示的就是即将播放的版本。
-        const { options, selected } = detailSourceState(detail);
-        const dynamicRange = selected?.dynamicRange || card.dynamicRange;
-        [card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.year, ...seriesMeta, formatDuration(card.durationMs), mediaTypeLabel(card.type), card.officialRating, dynamicRange]
+        [card.communityRating ? `★ ${card.communityRating.toFixed(1)}` : '', card.year, ...seriesMeta, formatDuration(card.durationMs), mediaTypeLabel(card.type), card.officialRating]
             .filter(Boolean).forEach((value) => meta.append(element('span', value.toString().startsWith('★') ? 'rating' : '', value)));
+        return meta;
+    }
+
+    function cardVideoInfo(card) {
+        return { width: card.videoWidth, height: card.videoHeight, videoCodec: card.videoCodec, dynamicRange: card.dynamicRange };
+    }
+
+    function detailPlayTarget(detail, episodes = detail.episodes) {
+        if (detail.item.playable) return detail.item;
+        const resumable = homeData?.resume?.find((episode) => (
+            episode?.seriesId === detail.item.id && episode.resumePositionMs > 0
+        ));
+        return pickContinueEpisode(episodes)
+            || episodes?.find((episode) => episode.id === resumable?.id)
+            || episodes?.[0];
+    }
+
+    function detailDisplaySource(detail) {
+        if (detail.item.type === 'Series') {
+            const episode = detailPlayTarget(detail);
+            return episode?.type === 'Episode' ? cardVideoInfo(episode) : {};
+        }
+        const versions = detailVersionOptions(detail, detail.item);
+        const { selected } = detailSourceState(detail);
+        // 已选版本的缺失字段保持缺失，不能借用其他版本的参数。
+        if (versions.length) return selected || (versions.length === 1 ? versions[0] : {});
+        return cardVideoInfo(detail.item);
+    }
+
+    function createQualityBadge(video) {
+        const label = versionResolutionLabel(video);
+        if (!label) return null;
+        const badge = element('span', 'media-quality-badge', label);
+        badge.title = `视频清晰度：${label}`;
+        return badge;
+    }
+
+    function refreshDetailSource(detail, root = content) {
+        replaceDetailField(detail, 'source', createDetailMediaInfo(detail), root);
+        const poster = root.querySelector('.detail-poster');
+        if (!poster) return;
+        poster.querySelector('.media-quality-badge')?.remove();
+        const quality = createQualityBadge(detailDisplaySource(detail));
+        if (quality) poster.append(quality);
+    }
+
+    function createDetailMediaInfo(detail) {
+        const source = detailDisplaySource(detail);
+        const { options } = detailSourceState(detail);
+        const episode = detail.item.type === 'Series' ? detailPlayTarget(detail) : null;
+        const section = element('section', 'detail-media-info');
+        section.dataset.detailField = 'source';
+        if (episode) section.dataset.mediaId = episode.id;
+        section.setAttribute('aria-label', '片源信息');
+        const specs = element('dl', 'detail-media-specs');
+        const bitrate = Number(source.bitrate);
+        [
+            ['分辨率', source.width > 0 && source.height > 0 ? `${source.width} × ${source.height}` : ''],
+            ['容器', source.container?.toUpperCase()],
+            ['位深', source.bitDepth > 0 ? `${source.bitDepth}-bit` : ''],
+            ['码率', bitrate > 0 ? (bitrate >= 1000000 ? `${(bitrate / 1000000).toFixed(1)} Mbps` : `${Math.round(bitrate / 1000)} kbps`) : ''],
+            ['文件大小', versionSizeLabel(source.sizeBytes)],
+        ].filter(([, value]) => value).forEach(([label, value]) => {
+            const spec = element('div');
+            spec.append(element('dt', '', label), element('dd', '', value));
+            specs.append(spec);
+        });
+        const disclosure = element(specs.childElementCount ? 'details' : 'div', 'detail-media-disclosure');
+        const heading = element(specs.childElementCount ? 'summary' : 'div', 'detail-media-heading');
+        heading.append(element('span', 'detail-media-label', episode ? '本集片源' : '片源'));
+        if (episode) {
+            const position = element('span', 'detail-media-episode', episodePosition(episode));
+            position.title = episode.title;
+            heading.append(position);
+        }
+        const badges = element('span', 'detail-media-badges');
+        [versionResolutionLabel(source), source.dynamicRange, versionCodecLabel(source.videoCodec)]
+            .filter(Boolean).forEach((value) => badges.append(element('span', 'detail-media-badge', value)));
+        heading.append(badges);
+        if (specs.childElementCount) {
+            const hint = element('span', 'detail-parameters-hint');
+            hint.append(element('span', 'detail-parameters-expand', '查看参数'), element('span', 'detail-parameters-collapse', '收起'));
+            heading.append(hint);
+            heading.dataset.focusKey = `parameters:${detail.item.id}`;
+            disclosure.open = detail.mediaInfoExpanded === true;
+            disclosure.addEventListener('toggle', () => { detail.mediaInfoExpanded = disclosure.open; });
+        }
+        disclosure.append(heading, specs);
+        section.append(disclosure);
         if (options.length > 1) {
             const switchButton = element('button', 'meta-switch', '切换片源');
             switchButton.type = 'button';
             switchButton.title = '选择片源版本';
-            switchButton.dataset.focusKey = `sources:${card.id}`;
+            switchButton.dataset.focusKey = `sources:${detail.item.id}`;
             switchButton.setAttribute('aria-haspopup', 'dialog');
             switchButton.addEventListener('click', () => openSourcePicker(detail, switchButton));
-            meta.append(switchButton);
+            section.append(switchButton);
         }
-        return meta;
+        section.hidden = !badges.childElementCount && !specs.childElementCount && options.length < 2;
+        return section;
+    }
+
+    function createDetailPlaybackContext(target) {
+        const context = element('div', 'detail-playback-context');
+        context.dataset.detailField = 'playback';
+        context.hidden = !target?.playable || (target.type !== 'Episode' && !target.resumePositionMs && !target.played);
+        if (context.hidden) return context;
+        const inProgress = target.resumePositionMs > 0 && !target.played;
+        const copy = element('div', 'detail-playback-copy');
+        const position = target.type === 'Episode' ? episodePosition(target) : '';
+        const title = [position, target.type === 'Episode' ? target.title : '观看进度'].filter(Boolean).join(' · ');
+        copy.append(element('span', 'detail-playback-title', title));
+        const status = target.played ? '已看完'
+            : inProgress ? `已看 ${formatTime(target.resumePositionMs)}${target.durationMs > target.resumePositionMs ? ` · 剩余 ${formatDuration(target.durationMs - target.resumePositionMs)}` : ''}`
+            : formatDuration(target.durationMs);
+        copy.append(element('span', 'detail-playback-status', status));
+        context.append(copy);
+        if (inProgress && target.durationMs > 0) {
+            const track = element('div', 'detail-playback-progress');
+            const value = element('span');
+            value.style.width = `${progressPercent(target)}%`;
+            track.append(value);
+            context.append(track);
+        }
+        return context;
+    }
+
+    function createDetailCredits(detail) {
+        const credits = element('dl', 'detail-credits');
+        credits.dataset.detailField = 'credits';
+        for (const [type, label, limit] of [['director', '导演', 2], ['actor', '主演', 3]]) {
+            const people = [...new Map((detail.people || []).filter((person) => person?.id && person?.name && person.type?.toLowerCase() === type).map((person) => [person.id, person])).values()].slice(0, limit);
+            if (!people.length) continue;
+            const names = element('dd');
+            people.forEach((person) => {
+                const link = element('button', 'detail-person-link', person.name);
+                link.type = 'button';
+                link.dataset.focusKey = `credit:${type}:${person.id}`;
+                link.addEventListener('click', () => openPerson(person));
+                names.append(link);
+            });
+            const row = element('div');
+            row.append(element('dt', '', label), names);
+            credits.append(row);
+        }
+        credits.hidden = !credits.childElementCount;
+        return credits;
     }
 
     function createDetailOverview(detail) {
@@ -3840,7 +3978,8 @@
     function createDetailGenres(detail) {
         const tags = element('div', 'tag-list');
         tags.dataset.detailField = 'genres';
-        detail.item.genres?.slice(0, 8).forEach((genre) => tags.append(element('span', 'tag', genre)));
+        tags.title = (detail.item.genres || []).join(' / ');
+        tags.append(element('span', 'detail-genres', detail.item.genres?.slice(0, 4).join(' / ')));
         return tags;
     }
 
@@ -3853,8 +3992,8 @@
             durationMs: previousItem?.durationMs,
             officialRating: previousItem?.officialRating,
             communityRating: previousItem?.communityRating,
-            dynamicRange: previousItem?.dynamicRange,
         });
+        const previousSource = JSON.stringify([detailDisplaySource(detail), detail.sources]);
         const previousPeople = JSON.stringify(detail.people || []);
         const previousGenres = JSON.stringify(previousItem?.genres || []);
         const previousOverview = previousItem?.overview || '';
@@ -3878,9 +4017,9 @@
             durationMs: detail.item.durationMs,
             officialRating: detail.item.officialRating,
             communityRating: detail.item.communityRating,
-            dynamicRange: detail.item.dynamicRange,
         });
         if (previousMeta !== nextMeta) replaceDetailField(detail, 'meta', createDetailMeta(detail));
+        if (previousSource !== JSON.stringify([detailDisplaySource(detail), detail.sources])) refreshDetailSource(detail);
         const existingOverview = view.querySelector('[data-detail-field="overview"]');
         if (detail.item.overview) {
             if (existingOverview && previousOverview !== detail.item.overview) {
@@ -3897,7 +4036,7 @@
             if (existingGenres && previousGenres !== nextGenres) {
                 replaceDetailField(detail, 'genres', createDetailGenres(detail));
             } else if (!existingGenres) {
-                view.querySelector('.detail-actions')?.after(createDetailGenres(detail));
+                view.querySelector('.detail-flow')?.prepend(createDetailGenres(detail));
             }
         } else {
             existingGenres?.remove();
@@ -3905,27 +4044,41 @@
 
         const peopleHost = view.querySelector('[data-detail-field="people"]');
         if (peopleHost && previousPeople !== JSON.stringify(detail.people || [])) {
-            peopleHost.replaceChildren(...(detail.people?.length ? [createPeopleSection(detail.people)] : []));
+            const expanded = peopleHost.querySelector('details')?.open ?? true;
+            peopleHost.replaceChildren(...(detail.people?.length ? [createPeopleSection(detail.people, { expanded })] : []));
         }
         const episodesRoot = view.querySelector('[data-detail-field="episodes"]');
         if (episodesRoot) {
             episodesRoot._refreshEpisodes?.(detail);
         } else if (detail.seasons?.length) {
-            view.append(createEpisodes(detail));
+            peopleHost.before(createEpisodes(detail, view.querySelector('.detail-actions')));
         }
     }
 
-    function createPeopleSection(people) {
+    function createPeopleSection(people, { expanded = true } = {}) {
         const uniquePeople = [...new Map(people.filter((person) => person?.id && person?.name).map((person) => [person.id, person])).values()];
-        const section = element('section', 'people-section');
-        const heading = element('div', 'people-heading');
-        heading.append(element('h2', '', '演职员'));
-        const controls = element('div', 'people-heading-controls');
-        heading.append(controls);
+        const section = element('details', 'people-section');
+        section.open = expanded;
+        const heading = element('summary', 'people-heading');
+        heading.append(element('h2', '', '演职员'), element('span', 'people-count', `${uniquePeople.length} 人`));
+        const more = element('span', 'people-disclosure');
+        more.append(element('span', 'people-expand-label', '查看全部'), element('span', 'people-collapse-label', '收起'));
+        heading.append(more);
+        heading.dataset.focusKey = 'detail:people';
+        section.append(heading);
+        section.addEventListener('toggle', () => {
+            if (!section.open) return;
+            if (!section.querySelector('.people-row')) section.append(createDetailCredits({ people: uniquePeople }), createPeopleRow(uniquePeople));
+            section.querySelector('.people-row')._refreshCarousel?.();
+        });
+        return section;
+    }
+
+    function createPeopleRow(people) {
         const row = element('div', 'media-row people-row');
         row.dataset.rowKey = 'people';
         row.dataset.rowIndex = '0';
-        uniquePeople.forEach((person, index) => {
+        people.forEach((person, index) => {
             const button = element('button', 'media-card person-card');
             button.type = 'button';
             button.dataset.cardIndex = String(index);
@@ -3936,20 +4089,18 @@
             image.alt = '';
             image.decoding = 'async';
             portrait.append(fallback, image);
-            observeImage(image, person.primaryImage, 260);
+            observeImage(image, person.primaryImage, 160);
+            const type = ({ Actor: '演员', Director: '导演', Writer: '编剧', Producer: '制片人' })[person.type] || person.type;
             button.append(
                 portrait,
                 element('span', 'card-title', person.name),
-                element('span', 'card-subtitle', [person.role, person.type].filter(Boolean).join(' · ')),
+                element('span', 'card-subtitle', person.role || type || ''),
             );
-            button.addEventListener('focus', () => {
-                if (person.primaryImage) updateBackdropForCard({ primaryImage: person.primaryImage });
-            });
+            button.title = [person.name, person.role || type].filter(Boolean).join(' · ');
             button.addEventListener('click', () => openPerson(person));
             row.append(button);
         });
-        section.append(heading, createRowCarousel(row, '演职员', controls));
-        return section;
+        return createRowCarousel(row, '演职员');
     }
 
     async function openPerson(person) {
@@ -4087,7 +4238,10 @@
                 ? resumableEpisode.seasonId
             : seasons.find((season) => season.indexNumber > 0)?.id || seasons[0].id;
         const heading = element('div', 'episodes-heading');
-        heading.append(element('h2', '', '选集'));
+        const headingCopy = element('div', 'episodes-heading-copy');
+        const episodeSummary = element('p', 'episodes-summary');
+        headingCopy.append(element('h2', '', '选集'), episodeSummary);
+        heading.append(headingCopy);
         const headingControls = element('div', 'episodes-heading-controls');
         const pagingControls = element('div', 'episodes-paging-controls');
         const seasonPicker = element('div', 'season-picker');
@@ -4102,11 +4256,36 @@
         seasonMenu.setAttribute('aria-hidden', 'true');
         seasonPicker.append(seasonMenuButton, seasonMenu);
         const stage = element('div', 'episode-stage');
+        const ranges = element('div', 'episode-ranges');
+        ranges.setAttribute('role', 'group');
+        ranges.setAttribute('aria-label', '集数范围');
+        const viewSwitch = element('div', 'episode-view-switch');
+        viewSwitch.setAttribute('role', 'group');
+        viewSwitch.setAttribute('aria-label', '选集显示方式');
         const seasonOptions = new Map();
         const loadingSeasonIds = new Set();
         const refreshingSeasonIds = new Set();
         let renderedSeasonId = null;
         let renderedEpisodes = [];
+        let seasonCards = [];
+        let episodePage = 0;
+        let episodeView = ['cards', 'numbers'].includes(detail.episodeView) ? detail.episodeView : '';
+        const pageSize = () => episodeView === 'numbers' ? 50 : 4;
+        for (const [value, label] of [['cards', '缩略图'], ['numbers', '集数']]) {
+            const button = element('button', '', label);
+            button.type = 'button';
+            button.dataset.episodeView = value;
+            button.dataset.focusKey = `episode-view:${detail.item.id}:${value}`;
+            button.addEventListener('click', () => {
+                if (episodeView === value) return;
+                const anchor = episodePage * pageSize();
+                episodeView = value;
+                detail.episodeView = value;
+                episodePage = Math.floor(anchor / pageSize());
+                renderEpisodePage();
+            });
+            viewSwitch.append(button);
+        }
 
         const seasonLabel = (season) => {
             const count = Number.isFinite(season.episodeCount) && season.episodeCount > 0
@@ -4163,6 +4342,13 @@
         const openSeasonMenu = () => {
             if (seasonPicker.classList.contains('is-open')) return;
             syncSeasonPicker();
+            const bounds = content.getBoundingClientRect();
+            const anchor = seasonPicker.getBoundingClientRect();
+            seasonMenu.style.maxWidth = `${Math.max(0, content.clientWidth - 32)}px`;
+            const menuWidth = seasonMenu.offsetWidth;
+            const menuLeft = clamp(anchor.right - menuWidth, bounds.left + 16, bounds.right - menuWidth - 16);
+            seasonMenu.style.left = `${menuLeft - anchor.left}px`;
+            seasonMenu.style.right = 'auto';
             const selected = seasonMenu.querySelector('.season-picker-option.selected')
                 || seasonMenu.querySelector('.season-picker-option');
             selected?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -4182,7 +4368,7 @@
             option.append(element('span', 'season-picker-option-label', episodeSeasonLabel(season.indexNumber)));
             option.addEventListener('click', () => {
                 selectSeasonOption(option);
-                closeSeasonMenu();
+                closeSeasonMenu(true);
                 ensureSelectedSeasonLoaded();
             });
             return option;
@@ -4222,35 +4408,119 @@
         syncSeasonDirectory(seasons);
         syncSeasonPicker();
 
+        const renderEpisodePage = () => {
+            const pages = Math.max(1, Math.ceil(seasonCards.length / pageSize()));
+            episodePage = clamp(episodePage, 0, pages - 1);
+            viewSwitch.querySelectorAll('button').forEach((button) => {
+                button.disabled = !seasonCards.length;
+                button.setAttribute('aria-pressed', String(button.dataset.episodeView === episodeView));
+            });
+            const first = episodePage * pageSize();
+            const grid = element('div', episodeView === 'numbers' ? 'episode-number-grid' : 'grid-view episodes-grid');
+            seasonCards.slice(first, first + pageSize()).forEach((card, index) => {
+                if (episodeView === 'cards') {
+                    const button = createMediaCard(card, {
+                        landscape: true, episodePicker: true, omitSeriesName: true, index: first + index,
+                        onClick: (item) => startPlayback(item, item.resumePositionMs),
+                    });
+                    if (card.played) button.querySelector('.card-art').append(element('span', 'episode-watched-label', '已看'));
+                    grid.append(button);
+                } else {
+                    const inProgress = card.resumePositionMs > 0 && !card.played;
+                    const state = card.played ? '已看完' : inProgress ? `已看 ${formatTime(card.resumePositionMs)}` : '未观看';
+                    const button = element('button', `episode-number-button${card.played ? ' is-watched' : inProgress ? ' is-in-progress' : ''}`);
+                    button.type = 'button';
+                    button.dataset.mediaId = card.id;
+                    button.dataset.focusKey = `media:${card.id}`;
+                    button.title = [episodePosition(card), card.title, state].filter(Boolean).join(' · ');
+                    button.setAttribute('aria-label', button.title);
+                    button.append(element('span', '', Number.isFinite(card.indexNumber) ? card.indexNumber : card.title));
+                    if (card.played) button.append(element('span', 'episode-number-state', '✓'));
+                    if (inProgress) {
+                        const progress = element('span', 'episode-number-progress');
+                        progress.style.width = `${progressPercent(card)}%`;
+                        button.append(progress);
+                    }
+                    button.addEventListener('click', () => startPlayback(card, card.resumePositionMs));
+                    grid.append(button);
+                }
+            });
+            pagingControls.replaceChildren();
+            ranges.replaceChildren();
+            if (pages > 1 && episodeView === 'cards') {
+                for (const [direction, label] of [[-1, '上一页'], [1, '下一页']]) {
+                    const button = element('button', `icon-button hero-carousel-button hero-carousel-${direction < 0 ? 'previous' : 'next'} episode-page-button`);
+                    button.type = 'button';
+                    button.setAttribute('aria-label', label);
+                    button.title = label;
+                    button.disabled = direction < 0 ? episodePage === 0 : episodePage === pages - 1;
+                    button.append(element('span', 'hero-carousel-chevron'));
+                    button.addEventListener('click', () => {
+                        episodePage += direction;
+                        renderEpisodePage();
+                        focusElement(pagingControls.querySelector(`[aria-label="${label}"]:not(:disabled)`) || pagingControls.querySelector('button:not(:disabled)'));
+                    });
+                    if (direction > 0) pagingControls.append(element('span', 'episode-page-label', `${episodePage + 1} / ${pages}`));
+                    pagingControls.append(button);
+                }
+            }
+            if (pages > 1 && episodeView === 'numbers') {
+                for (let page = 0; page < pages; page += 1) {
+                    const start = seasonCards[page * pageSize()], end = seasonCards[Math.min(seasonCards.length, (page + 1) * pageSize()) - 1];
+                    const label = Number.isFinite(start.indexNumber) && Number.isFinite(end.indexNumber) ? `${start.indexNumber}–${end.indexNumber}` : `第 ${page + 1} 组`;
+                    const button = element('button', 'episode-range-button', label);
+                    button.type = 'button';
+                    button.setAttribute('aria-pressed', String(page === episodePage));
+                    button.addEventListener('click', () => {
+                        episodePage = page;
+                        renderEpisodePage();
+                        focusElement(ranges.querySelector('[aria-pressed="true"]'));
+                    });
+                    ranges.append(button);
+                }
+            }
+            stage.replaceChildren(grid.childElementCount ? grid : element('div', 'episode-stage-state', '这一季暂无剧集'));
+            stage.scrollTop = 0;
+        };
+
         const renderSeason = (seasonId, episodes) => {
+            const changedSeason = renderedSeasonId !== seasonId;
             renderedSeasonId = seasonId;
             renderedEpisodes = episodes;
+            seasonCards = episodes.slice().sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
+            if (!detail.episodeView) episodeView = seasonCards.length > 36 ? 'numbers' : 'cards';
+            if (changedSeason) {
+                const target = pickContinueEpisode(seasonCards);
+                episodePage = Math.floor(Math.max(0, seasonCards.findIndex((card) => card.id === target?.id)) / pageSize());
+            }
             syncSeasonPicker();
-            const cards = episodes.slice().sort((left, right) => (left.indexNumber || 0) - (right.indexNumber || 0));
-            const grid = element('div', 'grid-view episodes-grid');
-            cards.forEach((card, index) => grid.append(createMediaCard(card, {
-                landscape: true, episodePicker: true, omitSeriesName: true, index,
-                onClick: (item) => startPlayback(item, item.resumePositionMs),
-            })));
-            pagingControls.replaceChildren();
-            stage.replaceChildren(grid.childElementCount ? grid : element('div', 'episode-stage-state', '这一季暂无剧集'));
+            const season = seasons.find((entry) => entry.id === seasonId);
+            episodeSummary.textContent = [season ? episodeSeasonLabel(season.indexNumber) : '', `本季 ${seasonCards.length} 集`, `已看 ${seasonCards.filter((card) => card.played).length} 集`].filter(Boolean).join(' · ');
+            renderEpisodePage();
         };
 
         const setDetailPlayAction = (episodes) => {
             // 与标准 Emby NextUp 一致：最近在看优先；首页“继续观看”列表
             // 只是次要回退（条目被移出最近观看时不能影响剧集页定位）。
-            const target = pickContinueEpisode(episodes)
-                || episodes.find((episode) => episode.id === resumableEpisode?.id)
-                || episodes[0];
-            if (!target?.playable) return;
+            detail.episodes = episodes;
+            const target = detailPlayTarget(detail);
             detailActions.querySelector('.primary-command')?.remove();
+            detailActions.parentElement?.querySelector('[data-detail-field="playback"]')?.replaceWith(createDetailPlaybackContext(target));
+            refreshDetailSource(detail, detailActions.closest('.detail-view'));
+            if (!target?.playable) return;
             appendDetailPlayAction(detailActions, target, detail);
         };
 
         const renderLoading = () => {
+            setDetailPlayAction([]);
+            pagingControls.replaceChildren();
+            ranges.replaceChildren();
+            episodeSummary.textContent = '正在读取本季剧集';
+            viewSwitch.querySelectorAll('button').forEach((button) => { button.disabled = true; });
             stage.replaceChildren(element('div', 'episode-stage-state', '正在读取剧集...'));
         };
         const renderError = (error) => {
+            episodeSummary.textContent = '本季剧集读取失败';
             const retry = element('button', 'secondary-command', '重试');
             retry.type = 'button';
             retry.addEventListener('click', () => loadSeason(selectedSeasonId));
@@ -4324,10 +4594,47 @@
                 ensureSelectedSeasonLoaded();
             }
         });
+        seasonPicker.addEventListener('keydown', (event) => {
+            if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Escape'].includes(event.key)) return;
+            if (event.key === 'Escape') {
+                if (!seasonPicker.classList.contains('is-open')) return;
+                event.preventDefault();
+                event.stopPropagation();
+                closeSeasonMenu(true);
+                ensureSelectedSeasonLoaded();
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            if (!seasonPicker.classList.contains('is-open')) {
+                openSeasonMenu();
+                focusElement(seasonMenu.querySelector('.selected'));
+                return;
+            }
+            const options = [...seasonMenu.querySelectorAll('button')];
+            const index = options.indexOf(document.activeElement);
+            const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowDown' ? 4 : -4;
+            focusAndReveal(options[clamp(index + step, 0, options.length - 1)], 'nearest', 'nearest');
+        });
+        root.addEventListener('keydown', (event) => {
+            const controls = event.target.closest('.episode-view-switch, .episode-ranges, .episodes-paging-controls');
+            if (!controls || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.key === 'ArrowDown') {
+                focusAndReveal(stage.querySelector('.episode-number-button.is-in-progress, .episode-number-button, .media-card'), 'nearest', 'nearest');
+            } else if (event.key === 'ArrowUp') {
+                focusElement(detailActions.querySelector('.primary-command'));
+            } else {
+                const buttons = [...controls.querySelectorAll('button:not(:disabled)')];
+                const index = buttons.indexOf(document.activeElement);
+                focusAndReveal(buttons[clamp(index + (event.key === 'ArrowRight' ? 1 : -1), 0, buttons.length - 1)], 'nearest', 'nearest');
+            }
+        });
         if (seasons.length > 1) headingControls.append(seasonPicker);
-        headingControls.append(pagingControls);
+        headingControls.append(viewSwitch, pagingControls);
         heading.append(headingControls);
-        root.append(heading, stage);
+        root.append(heading, ranges, stage);
         loadSeason(selectedSeasonId);
         root._refreshEpisodes = (refreshedDetail) => {
             const previousSelectedSeasonId = selectedSeasonId;
@@ -4371,6 +4678,7 @@
     function versionResolutionLabel(source) {
         const height = Number(source?.height) || 0;
         const width = Number(source?.width) || 0;
+        if (height >= 4000 || width >= 7600) return '8K';
         if (height >= 2000 || width >= 3800) return '4K';
         if (height >= 1000 || width >= 1800) return '1080p';
         if (height >= 700 || width >= 1200) return '720p';
@@ -4467,9 +4775,8 @@
         if (changed) detail.selectedSourceId = sourceId;
         closeSourcePicker();
         if (!changed) return;
-        const meta = createDetailMeta(detail);
-        if (!replaceDetailField(detail, 'meta', meta)) content.querySelector('.detail-copy')?.append(meta);
-        focusElement(content.querySelector('[data-detail-field="meta"] .meta-switch'));
+        refreshDetailSource(detail);
+        focusElement(content.querySelector('[data-detail-field="source"] .meta-switch'));
     }
 
     function openSourcePicker(detail, trigger) {
@@ -4495,10 +4802,9 @@
         const play = element('button', 'primary-command');
         play.type = 'button';
         play.dataset.focusKey = `play:${target.id}`;
-        const position = target.resumePositionMs ? ` ${formatTime(target.resumePositionMs)}` : '';
         const label = target.type === 'Episode'
-            ? `播放 ${episodePosition(target).replace(' · ', '')}${position}`
-            : (target.resumePositionMs ? `继续播放${position}` : '开始播放');
+            ? (target.resumePositionMs && !target.played ? '继续观看' : target.played ? '重新观看' : '开始观看')
+            : (target.resumePositionMs && !target.played ? '继续播放' : '开始播放');
         play.append(strokeIcon('play'), element('span', '', label));
         play.addEventListener('click', () => startPlayback(target, target.resumePositionMs, detail?.selectedSourceId || ''));
         actions.prepend(play);
@@ -8264,7 +8570,7 @@
             } else if (event.key === 'ArrowDown') {
                 const scopedRow = heroControls.classList.contains('row-carousel-controls')
                     ? heroControls.closest('section')?.querySelector('.media-row .media-card')
-                    : content.querySelector('.media-row .media-card');
+                    : content.querySelector('.episodes-grid .media-card, .episode-number-grid .episode-number-button, .media-row .media-card');
                 focusAndReveal(scopedRow, 'center', 'center');
             }
             return;
@@ -8302,12 +8608,12 @@
             }
             return;
         }
-        const card = document.activeElement?.closest?.('.media-card');
+        const card = document.activeElement?.closest?.('.media-card, .episode-number-button');
         if (!card) return;
-        const grid = card.closest('.grid-view');
+        const grid = card.closest('.grid-view, .episode-number-grid');
         if (grid) {
             event.preventDefault();
-            const cards = [...grid.querySelectorAll('.media-card')];
+            const cards = [...grid.querySelectorAll('.media-card, .episode-number-button')];
             const index = cards.indexOf(card);
             const firstTop = cards[0]?.offsetTop;
             const wrapIndex = cards.findIndex((candidate) => Math.abs(candidate.offsetTop - firstTop) > 2);
@@ -8318,7 +8624,8 @@
             if (event.key === 'ArrowUp') nextIndex -= columnCount;
             if (event.key === 'ArrowDown') nextIndex += columnCount;
             if (event.key === 'ArrowUp' && nextIndex < 0) {
-                const target = content.querySelector('.search-field input, .library-filter-button[aria-pressed="true"], .back-button');
+                const target = grid.closest('.episodes')?.querySelector('.episode-range-button[aria-pressed="true"], .episode-view-switch [aria-pressed="true"]')
+                    || content.querySelector('.search-field input, .library-filter-button[aria-pressed="true"], .back-button');
                 focusAndReveal(target, 'nearest', 'nearest');
                 return;
             }
@@ -8340,7 +8647,7 @@
             if (!targetRow) {
                 if (event.key === 'ArrowUp') {
                     const target = row.classList.contains('episode-row')
-                        ? content.querySelector('.episode-ranges [aria-selected="true"], .season-tabs [aria-selected="true"], .season-picker-button')
+                        ? content.querySelector('.episode-ranges [aria-pressed="true"], .season-tabs [aria-selected="true"], .season-picker-button')
                         : row.classList.contains('people-row')
                             ? content.querySelector('.detail-actions button, .detail-overview, .detail-back')
                             : content.querySelector('.hero-actions button');
