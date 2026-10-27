@@ -11,7 +11,7 @@ use std::io::Read;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ureq::ResponseExt;
@@ -32,6 +32,8 @@ const READ_RECOVERY_ATTEMPTS: usize = 2;
 const RETRY_BASE_DELAY_MS: u64 = 150;
 const ERROR_BODY_LIMIT: u64 = 4096;
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(100);
+const IO_CANCEL_POLL: Duration = Duration::from_millis(100);
+const MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const INITIAL_HEAD_LIMIT: usize = 64 * 1024;
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -135,13 +137,49 @@ pub fn diagnostic_link_id(url: &str) -> u64 {
 }
 
 // ureq's request body timeout would also limit successful, long-lived media reads.
-// Apply a deadline only while collecting an HTTP error body instead. Keep the
-// default connector (including its TLS/proxy behavior); no background requests.
+// Bound each wait for new data, not the lifetime of a successful media body.
+// Keep the default connector (including TLS/proxy behavior); polling happens
+// inside the same read and never issues another request.
 #[derive(Clone, Debug, Default)]
 struct ErrorBodyDeadline(Arc<Mutex<Option<Instant>>>);
 
 #[derive(Debug)]
-struct DiagnosticConnector(ErrorBodyDeadline);
+struct StreamIo {
+    cancelled: AtomicBool,
+    idle_timeout: Duration,
+}
+
+impl Default for StreamIo {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            idle_timeout: MEDIA_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl StreamIo {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check_cancelled(&self) -> Result<(), ureq::Error> {
+        if self.is_cancelled() {
+            Err(
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "stream cancelled")
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiagnosticConnector {
+    deadline: ErrorBodyDeadline,
+    io: Arc<StreamIo>,
+}
 
 impl<T: Transport> Connector<T> for DiagnosticConnector {
     type Out = DiagnosticTransport<T>;
@@ -153,7 +191,8 @@ impl<T: Transport> Connector<T> for DiagnosticConnector {
     ) -> Result<Option<Self::Out>, ureq::Error> {
         Ok(chained.map(|inner| DiagnosticTransport {
             inner,
-            deadline: self.0.clone(),
+            deadline: self.deadline.clone(),
+            io: self.io.clone(),
         }))
     }
 }
@@ -162,6 +201,7 @@ impl<T: Transport> Connector<T> for DiagnosticConnector {
 struct DiagnosticTransport<T> {
     inner: T,
     deadline: ErrorBodyDeadline,
+    io: Arc<StreamIo>,
 }
 
 impl<T: Transport> Transport for DiagnosticTransport<T> {
@@ -170,27 +210,44 @@ impl<T: Transport> Transport for DiagnosticTransport<T> {
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.io.check_cancelled()?;
         self.inner.transmit_output(amount, timeout)
     }
 
-    fn await_input(&mut self, mut timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        if let Some(deadline) = *self.deadline.0.lock() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ureq::Error::Timeout(ureq::Timeout::RecvBody));
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let started = Instant::now();
+        loop {
+            self.io.check_cancelled()?;
+            let elapsed = started.elapsed();
+            let mut remaining = self.io.idle_timeout.saturating_sub(elapsed);
+            let mut reason = ureq::Timeout::RecvBody;
+            let original_remaining = (*timeout.after).saturating_sub(elapsed);
+            if original_remaining <= remaining {
+                remaining = original_remaining;
+                reason = timeout.reason;
             }
-            if remaining < *timeout.after {
-                timeout = NextTimeout {
-                    after: remaining.into(),
-                    reason: ureq::Timeout::RecvBody,
-                };
+            if let Some(deadline) = *self.deadline.0.lock() {
+                remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
+            }
+            if remaining.is_zero() {
+                return Err(ureq::Error::Timeout(reason));
+            }
+            let result = self.inner.await_input(NextTimeout {
+                after: remaining.min(IO_CANCEL_POLL).into(),
+                reason,
+            });
+            self.io.check_cancelled()?;
+            match result {
+                // Only the short I/O polling timeout is consumed here. EOF and
+                // real transport errors return to the existing recovery path.
+                Err(ureq::Error::Timeout(_)) => {}
+                result => return result,
             }
         }
-        self.inner.await_input(timeout)
     }
 
     fn is_open(&mut self) -> bool {
-        self.inner.is_open()
+        !self.io.is_cancelled() && self.inner.is_open()
     }
 
     fn is_tls(&self) -> bool {
@@ -221,7 +278,11 @@ impl StreamProxyMode {
     }
 }
 
-fn stream_agent(proxy_mode: StreamProxyMode, deadline: ErrorBodyDeadline) -> Option<ureq::Agent> {
+fn stream_agent(
+    proxy_mode: StreamProxyMode,
+    deadline: ErrorBodyDeadline,
+    io: Arc<StreamIo>,
+) -> Option<ureq::Agent> {
     let proxy = match proxy_mode {
         StreamProxyMode::Direct => None,
         StreamProxyMode::System => Some(ureq::Proxy::try_from_env()?),
@@ -231,16 +292,23 @@ fn stream_agent(proxy_mode: StreamProxyMode, deadline: ErrorBodyDeadline) -> Opt
             .proxy(proxy)
             // Inspect error responses before preserving the existing failure/retry path.
             .http_status_as_error(false)
+            // These stages precede body polling, including TLS establishment
+            // during the initial send. Never put a lifetime limit on the body.
+            .timeout_resolve(Some(Duration::from_secs(5)))
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_send_request(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(15)))
             .build(),
-        DefaultConnector::default().chain(DiagnosticConnector(deadline)),
+        DefaultConnector::default().chain(DiagnosticConnector { deadline, io }),
         DefaultResolver::default(),
     ))
 }
 
-/// A single open media stream. Guarded by a mutex because mpv may call the
-/// cancel callback from a different thread than read/seek.
+/// Serializes read/seek state. Cancellation uses the independent atomic control
+/// so it never waits for this mutex while a read owns it.
 struct Stream {
     agent: ureq::Agent,
+    io: Arc<StreamIo>,
     url: String,
     user_agent: String,
     content_length: Option<u64>,
@@ -271,9 +339,11 @@ impl Stream {
         session_id: u64,
     ) -> Option<Self> {
         let error_body_deadline = ErrorBodyDeadline::default();
-        let agent = stream_agent(proxy_mode, error_body_deadline.clone())?;
+        let io = Arc::new(StreamIo::default());
+        let agent = stream_agent(proxy_mode, error_body_deadline.clone(), io.clone())?;
         let stream = Self {
             agent,
+            io,
             url: url.to_string(),
             user_agent: user_agent.to_string(),
             content_length,
@@ -311,7 +381,7 @@ impl Stream {
     }
 
     fn fail(&mut self, phase: &'static str, offset: u64, error: StreamError) {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.cancelled() {
             return;
         }
         self.reader = None;
@@ -329,10 +399,20 @@ impl Stream {
             handler(failure);
         }
     }
+
+    fn cancelled(&mut self) -> bool {
+        if self.io.is_cancelled() {
+            self.reader = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct StreamCookie {
     inner: Mutex<Stream>,
+    io: Arc<StreamIo>,
 }
 
 fn stream_from_cookie<'a>(cookie: *mut c_void) -> &'a StreamCookie {
@@ -347,6 +427,14 @@ enum ReadAttempt {
 }
 
 fn io_error_kind(error: &std::io::Error) -> &'static str {
+    if matches!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<ureq::Error>()),
+        Some(ureq::Error::Timeout(_))
+    ) {
+        return "timeout";
+    }
     match error.kind() {
         std::io::ErrorKind::ConnectionAborted => "connection_aborted",
         std::io::ErrorKind::ConnectionReset => "connection_reset",
@@ -532,6 +620,9 @@ fn open_reader_at(
     phase: &str,
     attempt: usize,
 ) -> Result<(), StreamError> {
+    if stream.cancelled() {
+        return Err(StreamError::Transport("cancelled".to_string()));
+    }
     if let Some(failure) = &stream.failure {
         return Err(failure.error.clone());
     }
@@ -555,6 +646,9 @@ fn open_reader_at(
         .header("Range", range.as_str())
         .call()
         .map_err(|error| {
+            if stream.io.is_cancelled() {
+                return StreamError::Transport("cancelled".to_string());
+            }
             let cause = ureq_error_kind(&error);
             tracing::warn!(
                 target: "mpv",
@@ -563,6 +657,9 @@ fn open_reader_at(
             );
             StreamError::Transport(cause)
         })?;
+    if stream.cancelled() {
+        return Err(StreamError::Transport("cancelled".to_string()));
+    }
     let status = response.status().as_u16();
     let header_ms = started.elapsed().as_millis();
     let content_range = response
@@ -615,13 +712,20 @@ fn open_reader_at(
 }
 
 fn read_once(stream: &mut Stream, out: &mut [u8]) -> ReadAttempt {
+    if stream.cancelled() {
+        return ReadAttempt::Recoverable("cancelled");
+    }
     if out.is_empty() {
         return ReadAttempt::Eof;
     }
     let Some(reader) = stream.reader.as_mut() else {
         return ReadAttempt::Recoverable("reader_missing");
     };
-    match reader.read(out) {
+    let result = reader.read(out);
+    if stream.cancelled() {
+        return ReadAttempt::Recoverable("cancelled");
+    }
+    match result {
         Ok(0)
             if stream
                 .content_length
@@ -648,7 +752,7 @@ fn read_once(stream: &mut Stream, out: &mut [u8]) -> ReadAttempt {
 }
 
 fn read_with_recovery(stream: &mut Stream, out: &mut [u8]) -> i64 {
-    if stream.failure.is_some() {
+    if stream.failure.is_some() || stream.cancelled() {
         return -1;
     }
     if out.is_empty() {
@@ -691,6 +795,9 @@ fn read_with_recovery(stream: &mut Stream, out: &mut [u8]) -> i64 {
     let offset = stream.position;
 
     for attempt in 1..=READ_RECOVERY_ATTEMPTS {
+        if stream.cancelled() {
+            return -1;
+        }
         tracing::warn!(
             target: "mpv",
             "mediastation stream read interrupted; retrying range: {} offset={} attempt={}/{} cause={}",
@@ -703,6 +810,9 @@ fn read_with_recovery(stream: &mut Stream, out: &mut [u8]) -> i64 {
         std::thread::sleep(std::time::Duration::from_millis(
             RETRY_BASE_DELAY_MS * attempt as u64,
         ));
+        if stream.cancelled() {
+            return -1;
+        }
         match open_reader_at(stream, offset, "read_recovery", attempt) {
             Ok(()) => match read_once(stream, out) {
                 ReadAttempt::Bytes(n) => {
@@ -724,6 +834,9 @@ fn read_with_recovery(stream: &mut Stream, out: &mut [u8]) -> i64 {
         }
     }
 
+    if stream.cancelled() {
+        return -1;
+    }
     tracing::warn!(
         target: "mpv",
         "mediastation stream read failed after bounded recovery: {} offset={} attempts={} cause={}",
@@ -750,7 +863,7 @@ unsafe extern "C" fn seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
 }
 
 fn seek_to(inner: &mut Stream, offset: i64) -> i64 {
-    if inner.failure.is_some() {
+    if inner.failure.is_some() || inner.cancelled() {
         return MPV_ERROR_GENERIC;
     }
     if offset < 0 {
@@ -780,6 +893,9 @@ fn open_seek_reader(inner: &mut Stream) -> i64 {
     let offset = inner.position;
     let mut last_error = None;
     for attempt in 0..RANGE_OPEN_ATTEMPTS {
+        if inner.cancelled() {
+            return MPV_ERROR_GENERIC;
+        }
         match open_reader_at(inner, offset, "seek", attempt + 1) {
             Ok(()) => return offset as i64,
             Err(error) => {
@@ -791,6 +907,9 @@ fn open_seek_reader(inner: &mut Stream) -> i64 {
                 }
             }
         }
+    }
+    if inner.cancelled() {
+        return MPV_ERROR_GENERIC;
     }
     tracing::warn!(
         target: "mpv",
@@ -824,15 +943,19 @@ unsafe extern "C" fn close_cb(cookie: *mut c_void) {
     let inner = cookie.inner.lock();
     tracing::info!(
         target: "mpv",
-        "mediastation stream closed: {} position={} reader_open={} lifetime_ms={} initial_head_bytes={} cached_bytes_read={}",
+        "mediastation stream closed: {} position={} reader_open={} lifetime_ms={} initial_head_bytes={} cached_bytes_read={} cancelled={}",
         inner.diagnostic_context(), inner.position, inner.reader.is_some(), inner.created_at.elapsed().as_millis(),
-        inner.initial_head.len(), inner.cached_bytes_read,
+        inner.initial_head.len(), inner.cached_bytes_read, inner.io.is_cancelled(),
     );
 }
 
-unsafe extern "C" fn cancel_cb(_cookie: *mut c_void) {
-    // Interrupt in-flight reads. We don't drive a background worker, so
-    // nothing to cancel; the next read/seek returns promptly.
+unsafe extern "C" fn cancel_cb(cookie: *mut c_void) {
+    // mpv calls this on a different thread while read_cb may own inner.
+    // Never acquire that mutex or call back into libmpv from here.
+    stream_from_cookie(cookie)
+        .io
+        .cancelled
+        .store(true, Ordering::Release);
 }
 
 unsafe extern "C" fn open_cb(
@@ -879,6 +1002,7 @@ unsafe extern "C" fn open_cb(
     }
     stream.initial_head = initial_head;
     let cookie = StreamCookie {
+        io: stream.io.clone(),
         inner: Mutex::new(stream),
     };
     let cookie_ptr = Box::into_raw(Box::new(cookie)) as *mut c_void;
@@ -1114,6 +1238,396 @@ mod tests {
         handle
             .join()
             .map_err(|_| std::io::Error::other("delayed server thread panicked"))?
+    }
+
+    // The peer stays connected until explicitly released, reproducing a stalled
+    // CDN without relying on EOF to unblock the client's read.
+    fn stalled_peer_cancellation(send_body: bool) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let url = format!("http://{}/video", listener.local_addr()?);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut socket, _) = listener.accept()?;
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let mut request = BufReader::new(socket.try_clone()?);
+            loop {
+                let mut line = String::new();
+                if request.read_line(&mut line)? == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            if send_body {
+                socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1/2\r\nContent-Length: 2\r\nConnection: close\r\n\r\na")?;
+                socket.flush()?;
+            }
+            ready_tx.send(()).map_err(std::io::Error::other)?;
+            release_rx
+                .recv_timeout(Duration::from_secs(4))
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        });
+        let stream = test_stream(&url, 2)?;
+        let cookie = Arc::new(StreamCookie {
+            io: stream.io.clone(),
+            inner: Mutex::new(stream),
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader_cookie = cookie.clone();
+        let worker = std::thread::spawn(move || {
+            let cookie_ptr = Arc::as_ptr(&reader_cookie) as *mut c_void;
+            let mut byte = [0_u8];
+            if send_body {
+                assert_eq!(
+                    unsafe { read_cb(cookie_ptr, byte.as_mut_ptr().cast(), 1) },
+                    1
+                );
+                assert_eq!(byte, *b"a");
+            }
+            let result = unsafe { read_cb(cookie_ptr, byte.as_mut_ptr().cast(), 1) };
+            done_tx.send(result).unwrap();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(std::io::Error::other)?;
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            cookie.inner.is_locked(),
+            "read must be in flight while canceled"
+        );
+        let started = Instant::now();
+        unsafe { cancel_cb(Arc::as_ptr(&cookie) as *mut c_void) };
+        let completed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = started.elapsed();
+        // Release and join even when the old implementation fails the deadline.
+        release_tx.send(()).map_err(std::io::Error::other)?;
+        server
+            .join()
+            .map_err(|_| std::io::Error::other("stalled peer panicked"))??;
+        worker
+            .join()
+            .map_err(|_| std::io::Error::other("read worker panicked"))?;
+        assert_eq!(
+            completed,
+            Ok(-1),
+            "cancellation did not unblock read: {elapsed:?}"
+        );
+        let mut stream = cookie.inner.lock();
+        assert!(
+            stream.failure.is_none(),
+            "user cancellation is not a stream failure"
+        );
+        assert_eq!(
+            stream.request_seq, 1,
+            "cancellation must not retry the Range"
+        );
+        let mut byte = [0_u8];
+        assert_eq!(read_with_recovery(&mut stream, &mut byte), -1);
+        assert_eq!(seek_to(&mut stream, 0), MPV_ERROR_GENERIC);
+        assert_eq!(stream.request_seq, 1);
+        eprintln!("stalled peer canceled: body={send_body} elapsed={elapsed:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_stalled_media_body_without_recovery() -> std::io::Result<()> {
+        stalled_peer_cancellation(true)
+    }
+
+    #[test]
+    fn cancellation_interrupts_waiting_for_range_headers_without_recovery() -> std::io::Result<()> {
+        stalled_peer_cancellation(false)
+    }
+
+    fn test_stream_with_idle_timeout(
+        url: &str,
+        length: u64,
+        idle: Duration,
+    ) -> std::io::Result<Stream> {
+        let mut stream = test_stream(url, length)?;
+        stream.io = Arc::new(StreamIo {
+            cancelled: AtomicBool::new(false),
+            idle_timeout: idle,
+        });
+        stream.agent = stream_agent(
+            StreamProxyMode::Direct,
+            stream.error_body_deadline.clone(),
+            stream.io.clone(),
+        )
+        .ok_or_else(|| std::io::Error::other("direct stream agent unavailable"))?;
+        Ok(stream)
+    }
+
+    #[test]
+    fn stalled_successful_body_returns_an_explicit_idle_timeout() -> std::io::Result<()> {
+        let (url, server) = spawn_delayed_body_server(206, Duration::from_millis(500))?;
+        let mut stream = test_stream_with_idle_timeout(&url, 2, Duration::from_millis(150))?;
+        open_reader_at(&mut stream, 0, "seek", 1).map_err(std::io::Error::other)?;
+        let mut bytes = [0_u8; 2];
+        let result = read_once(&mut stream, &mut bytes);
+        join_delayed_server(server)?;
+        assert_eq!(result, ReadAttempt::Recoverable("timeout"));
+        assert_eq!(stream.position, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_timeouts_exhaust_existing_recovery_and_remain_a_terminal_error() -> std::io::Result<()>
+    {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let url = format!("http://{}/video", listener.local_addr()?);
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            for _ in 0..=READ_RECOVERY_ATTEMPTS {
+                let (mut socket, _) = listener.accept()?;
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = BufReader::new(socket.try_clone()?);
+                loop {
+                    let mut line = String::new();
+                    if request.read_line(&mut line)? == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1/2\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")?;
+                socket.flush()?;
+                let mut byte = [0_u8];
+                // The client must time out and close; the peer never sends EOF.
+                assert_eq!(socket.read(&mut byte)?, 0);
+            }
+            Ok(())
+        });
+        let mut stream = test_stream_with_idle_timeout(&url, 2, Duration::from_millis(150))?;
+        assert_eq!(seek_to(&mut stream, 0), 0);
+        let mut byte = [0_u8];
+        assert_eq!(read_with_recovery(&mut stream, &mut byte), -1);
+        join_delayed_server(server)?;
+        let failure = stream
+            .failure
+            .clone()
+            .expect("idle timeout must be reported");
+        assert_eq!(failure.error, StreamError::Transport("timeout".to_string()));
+        assert_eq!(failure.phase, "read_recovery");
+        assert_eq!(stream.request_seq, (READ_RECOVERY_ATTEMPTS + 1) as u64);
+        assert_eq!(read_with_recovery(&mut stream, &mut byte), -1);
+        assert_eq!(seek_to(&mut stream, 0), MPV_ERROR_GENERIC);
+        assert_eq!(stream.failure, Some(failure));
+        assert_eq!(stream.request_seq, (READ_RECOVERY_ATTEMPTS + 1) as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_body_can_outlive_the_idle_timeout_while_data_keeps_arriving()
+    -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let url = format!("http://{}/video", listener.local_addr()?);
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut socket, _) = listener.accept()?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.set_nodelay(true)?;
+            let mut request = BufReader::new(socket.try_clone()?);
+            loop {
+                let mut line = String::new();
+                if request.read_line(&mut line)? == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-5/6\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")?;
+            for byte in b"abcdef" {
+                std::thread::sleep(Duration::from_millis(150));
+                socket.write_all(&[*byte])?;
+            }
+            Ok(())
+        });
+        let idle = Duration::from_millis(400);
+        let mut stream = test_stream_with_idle_timeout(&url, 6, idle)?;
+        let started = Instant::now();
+        let mut actual = Vec::new();
+        assert_eq!(seek_to(&mut stream, 0), 0);
+        loop {
+            let mut byte = [0_u8];
+            let count = read_with_recovery(&mut stream, &mut byte);
+            if count <= 0 {
+                assert_eq!(count, 0, "progressing body failed: {:?}", stream.failure);
+                break;
+            }
+            actual.push(byte[0]);
+        }
+        join_delayed_server(server)?;
+        assert_eq!(actual, b"abcdef");
+        assert!(started.elapsed() > idle);
+        assert_eq!(stream.request_seq, 1, "polling must not reopen the Range");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_prevents_reading_the_cached_head_or_starting_a_new_range() -> std::io::Result<()>
+    {
+        let mut stream = test_stream("http://127.0.0.1:1/unused", 6)?;
+        stream.initial_head = Arc::from(b"abcdef".as_slice());
+        assert_eq!(seek_to(&mut stream, 0), 0);
+        let cookie = Box::new(StreamCookie {
+            io: stream.io.clone(),
+            inner: Mutex::new(stream),
+        });
+        unsafe { cancel_cb((&*cookie as *const StreamCookie).cast_mut().cast()) };
+        let mut stream = cookie.inner.lock();
+        let mut bytes = [0_u8; 2];
+        assert_eq!(read_with_recovery(&mut stream, &mut bytes), -1);
+        assert_eq!(seek_to(&mut stream, 0), MPV_ERROR_GENERIC);
+        assert_eq!(stream.cached_bytes_read, 0);
+        assert_eq!(stream.request_seq, 0);
+        assert!(stream.failure.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn local_https_polling_keeps_tls_usable_and_interrupts_a_stalled_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // Public test-only identity, trusted only by this loopback client.
+        let pem = include_bytes!("../tests/fixtures/loopback-cert.pem");
+        let cert = ureq::tls::Certificate::from_pem(pem)?;
+        let key =
+            ureq::tls::PrivateKey::from_pem(include_bytes!("../tests/fixtures/loopback-key.pem"))?;
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                key.der().to_vec(),
+            )),
+        )?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let base = format!("https://{}", listener.local_addr()?);
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            for path in ["/progress", "/stall"] {
+                let (socket, _) = listener.accept()?;
+                socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+                socket.set_nodelay(true)?;
+                let connection = rustls::ServerConnection::new(Arc::new(server_config.clone()))
+                    .map_err(std::io::Error::other)?;
+                let mut peer = rustls::StreamOwned::new(connection, socket);
+                let mut request = BufReader::new(&mut peer);
+                let mut first_line = String::new();
+                request.read_line(&mut first_line)?;
+                assert!(first_line.starts_with(&format!("GET {path} ")));
+                loop {
+                    let mut line = String::new();
+                    if request.read_line(&mut line)? == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                peer.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-5/6\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")?;
+                peer.flush()?;
+                if path == "/progress" {
+                    for byte in b"abcdef" {
+                        std::thread::sleep(Duration::from_millis(180));
+                        peer.write_all(&[*byte])?;
+                        peer.flush()?;
+                    }
+                    peer.conn.send_close_notify();
+                    peer.flush()?;
+                } else {
+                    peer.write_all(b"a")?;
+                    peer.flush()?;
+                    let mut byte = [0_u8];
+                    match peer.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) => {}
+                        result => {
+                            return Err(std::io::Error::other(format!(
+                                "TLS client did not close canceled stream: {result:?}"
+                            )));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        let tls = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::Specific(Arc::new(vec![cert])))
+            .build();
+        let make_stream = |path: &str| -> std::io::Result<Stream> {
+            let mut stream = test_stream_with_idle_timeout(
+                &format!("{base}/{path}"),
+                6,
+                Duration::from_millis(600),
+            )?;
+            stream.agent = ureq::Agent::with_parts(
+                ureq::Agent::config_builder()
+                    .proxy(None)
+                    .tls_config(tls.clone())
+                    .build(),
+                DefaultConnector::default().chain(DiagnosticConnector {
+                    deadline: stream.error_body_deadline.clone(),
+                    io: stream.io.clone(),
+                }),
+                DefaultResolver::default(),
+            );
+            Ok(stream)
+        };
+        let mut progress = make_stream("progress")?;
+        let started = Instant::now();
+        assert_eq!(seek_to(&mut progress, 0), 0);
+        let mut actual = Vec::new();
+        loop {
+            let mut byte = [0_u8];
+            let n = read_with_recovery(&mut progress, &mut byte);
+            if n <= 0 {
+                assert_eq!(n, 0, "TLS body failed: {:?}", progress.failure);
+                break;
+            }
+            actual.push(byte[0]);
+        }
+        assert_eq!(actual, b"abcdef");
+        assert!(started.elapsed() > progress.io.idle_timeout);
+        assert_eq!(progress.request_seq, 1);
+
+        let mut stalled = make_stream("stall")?;
+        assert_eq!(seek_to(&mut stalled, 0), 0);
+        let mut byte = [0_u8];
+        assert_eq!(read_with_recovery(&mut stalled, &mut byte), 1);
+        let io = stalled.io.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let n = read_with_recovery(&mut stalled, &mut byte);
+            tx.send((n, stalled.failure.is_none(), stalled.request_seq))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let started = Instant::now();
+        io.cancelled.store(true, Ordering::Release);
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        worker.join().map_err(|_| "TLS read worker panicked")?;
+        join_delayed_server(server)?;
+        assert_eq!(result?, (-1, true, 1));
+        eprintln!(
+            "TLS polling: progressing body intact; stalled body canceled in {:?}",
+            started.elapsed()
+        );
+        Ok(())
     }
 
     #[test]

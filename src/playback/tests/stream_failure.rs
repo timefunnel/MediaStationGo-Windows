@@ -3,7 +3,7 @@
 //! cargo test -p jfn-playback --test stream_failure -- --ignored --nocapture.
 
 use std::error::Error;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -26,6 +26,8 @@ struct LoopbackCdn {
     url: String,
     reject: Arc<AtomicBool>,
     rejected: Arc<AtomicUsize>,
+    stall: Arc<AtomicBool>,
+    stalled: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<std::io::Result<()>>>,
 }
@@ -37,9 +39,12 @@ impl LoopbackCdn {
         let url = format!("http://{}/fixture", listener.local_addr()?);
         let reject = Arc::new(AtomicBool::new(false));
         let rejected = Arc::new(AtomicUsize::new(0));
+        let stall = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (reject_worker, rejected_worker, stop_worker) =
             (reject.clone(), rejected.clone(), stop.clone());
+        let (stall_worker, stalled_worker) = (stall.clone(), stalled.clone());
         let bytes = Arc::new(bytes);
         let join = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -55,8 +60,9 @@ impl LoopbackCdn {
                             reject_worker.clone(),
                             rejected_worker.clone(),
                         );
+                        let (stall, stalled) = (stall_worker.clone(), stalled_worker.clone());
                         workers.push(thread::spawn(move || {
-                            serve_range(socket, &bytes, &reject, &rejected)
+                            serve_range(socket, &bytes, &reject, &rejected, &stall, &stalled)
                         }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -76,6 +82,8 @@ impl LoopbackCdn {
             url,
             reject,
             rejected,
+            stall,
+            stalled,
             stop,
             join: Some(join),
         })
@@ -106,6 +114,8 @@ fn serve_range(
     bytes: &[u8],
     reject: &AtomicBool,
     rejected: &AtomicUsize,
+    stall: &AtomicBool,
+    stalled: &AtomicUsize,
 ) -> std::io::Result<()> {
     // The listener polls; each bounded response worker uses blocking I/O.
     socket.set_nonblocking(false)?;
@@ -155,6 +165,29 @@ fn serve_range(
         bytes.len(),
         bytes.len() - offset
     )?;
+    if stall.load(Ordering::Acquire) {
+        socket.write_all(&bytes[offset..offset + 1])?;
+        socket.flush()?;
+        stalled.fetch_add(1, Ordering::AcqRel);
+        // Keep the response incomplete until the client cancels and closes it.
+        // A timeout is a failed regression, never a successful peer close.
+        let mut byte = [0_u8];
+        return match socket.read(&mut byte) {
+            Ok(0) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(std::io::Error::other(
+                "unexpected bytes after stalled Range",
+            )),
+            Err(error) => Err(error),
+        };
+    }
     match socket.write_all(&bytes[offset..]) {
         Ok(()) => Ok(()),
         // Seeking deliberately abandons the previous response.
@@ -170,6 +203,116 @@ fn serve_range(
         }
         Err(e) => Err(e),
     }
+}
+
+#[test]
+#[ignore = "requires installed libmpv and an existing seekable local video fixture"]
+fn stalled_stream_can_stop_switch_files_and_destroy_mpv() -> Result<(), Box<dyn Error>> {
+    let fixture = std::env::var("MPV_STREAM_TEST_FIXTURE")?;
+    let bytes = std::fs::read(&fixture)?;
+    assert!(bytes.len() < 32 * 1024 * 1024);
+    for operation in ["stop", "switch", "destroy"] {
+        let mut cdn = LoopbackCdn::spawn(bytes.clone())?;
+        let handle = Handle::create()?;
+        for (name, value) in [
+            ("config", "no"),
+            ("vo", "null"),
+            ("ao", "null"),
+            ("terminal", "no"),
+            ("hwdec", "no"),
+            ("audio", "no"),
+            ("pause", "yes"),
+            ("cache", "no"),
+            ("stream-buffer-size", "4096"),
+            ("demuxer-readahead-secs", "0"),
+            ("demuxer-max-back-bytes", "0"),
+        ] {
+            handle.set_option_string(name, value)?;
+        }
+        handle.initialize()?;
+        unsafe { stream_cb::register_protocol(handle.raw()) };
+        let uri = stream_cb::build_uri(
+            &cdn.url,
+            "MediaStationGoWindows/test",
+            None,
+            StreamProxyMode::Direct,
+        );
+        handle.command(&Command::new(["loadfile", &uri])?)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loaded = false;
+        while Instant::now() < deadline {
+            if matches!(handle.wait_event(0.01), Event::FileLoaded) {
+                loaded = true;
+                break;
+            }
+        }
+        assert!(loaded, "fixture never loaded");
+        let target = (handle.get_property::<f64>("duration")? * 0.8).to_string();
+        cdn.stall.store(true, Ordering::Release);
+        handle.command_async(0, &Command::new(["seek", &target, "absolute+exact"])?)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cdn.stalled.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            cdn.stalled.load(Ordering::Acquire),
+            1,
+            "seek never reached the stalled response"
+        );
+        thread::sleep(Duration::from_millis(120));
+        let (tx, rx) = mpsc::channel();
+        let next_file = fixture.clone();
+        let worker = thread::spawn(move || -> Result<Duration, String> {
+            let started = Instant::now();
+            if operation != "destroy" {
+                let args = if operation == "stop" {
+                    vec!["stop"]
+                } else {
+                    vec!["loadfile", &next_file]
+                };
+                handle
+                    .command_async(0, &Command::new(args).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut completed = false;
+                while Instant::now() < deadline {
+                    match handle.wait_event(0.01) {
+                        Event::EndFile(_) if operation == "stop" => {
+                            completed = true;
+                            break;
+                        }
+                        Event::FileLoaded if operation == "switch" => {
+                            completed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !completed {
+                    return Err(format!("{operation} did not complete"));
+                }
+            }
+            drop(handle);
+            let elapsed = started.elapsed();
+            tx.send(elapsed).map_err(|e| e.to_string())?;
+            Ok(elapsed)
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(2));
+        let server_result = cdn.finish();
+        let worker_result = worker
+            .join()
+            .map_err(|_| "native cancellation worker panicked")?;
+        server_result?;
+        worker_result?;
+        let elapsed = completed?;
+        assert_eq!(
+            cdn.stalled.load(Ordering::Acquire),
+            1,
+            "canceled stream reopened a Range"
+        );
+        eprintln!("native stalled response: {operation} including mpv destroy = {elapsed:?}");
+    }
+    Ok(())
 }
 
 #[test]

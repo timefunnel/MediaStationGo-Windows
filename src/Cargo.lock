@@ -2435,6 +2435,7 @@ dependencies = [
  "jfn-color",
  "parking_lot",
  "pkg-config",
+ "rustls",
  "serde_json",
  "tracing",
  "ureq",

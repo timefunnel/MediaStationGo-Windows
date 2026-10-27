@@ -20,5 +20,8 @@ ureq.workspace = true
 bindgen = "0.72"
 pkg-config = "0.3"
 
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
 [lints]
 workspace = true
