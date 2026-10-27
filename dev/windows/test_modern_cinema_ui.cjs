@@ -174,10 +174,15 @@ const heroContext = vm.createContext({ content: { clientWidth: 1064 }, window: {
 vm.runInContext(handlerSource('heroArtworkFits'), heroContext);
 const heroFrame = { clientWidth: 1000, clientHeight: 300 };
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1920, height: 1080 }), true);
+assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1200, height: 675 }), true, 'artwork can use its full native width without stretching at the current pixel density');
+assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1280, height: 720 }), true);
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 640, height: 360 }), false);
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1200, height: 1800 }), false);
 heroContext.window.devicePixelRatio = 3;
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1280, height: 720 }), false);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 440 }, { width: 1280, height: 720 }), false, 'insufficient vertical resolution still excludes artwork');
+heroContext.window.devicePixelRatio = 1.25;
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 440 }, { width: 1280, height: 720 }), true, 'wide windows retain sharp artwork at its native pixel width');
 heroContext.content.clientWidth = 375; heroContext.window.devicePixelRatio = 2;
 assert.equal(heroContext.heroArtworkFits({ clientWidth: 343 }, { width: 1280, height: 720 }), true);
 console.log('MODERN_CINEMA_LAYOUT_TEST_OK: settings survive direct loading navigation without duplicate controls; artwork checks actual footprint, density and aspect ratio');

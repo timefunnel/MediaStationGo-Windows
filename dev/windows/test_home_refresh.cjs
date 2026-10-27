@@ -53,7 +53,7 @@ async function main() {
     const render = vm.createContext({
         imageWidthFor() { events.push('measure');return 1440; },
         stopHeroCarousel() {}, replaceContent() { events.push('replace'); }, heroRevision: 1,
-        maximumContinueWatchingItems:20, element:node, createSection:() => null, content:node(), heroCandidates:() => [],
+        maximumContinueWatchingItems:20, element:node, createSection:() => null, createHomeHeroSkeleton:node, content:node(), heroCandidates:() => [],
         resumePlayback() {}, openDetail() {},
         loadHeroCandidates(hero, candidates, revision, width) { assert.equal(width,1440);events.push('artwork'); },
     });
