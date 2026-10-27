@@ -3771,7 +3771,8 @@
         if (playTarget?.playable) appendDetailPlayAction(actions, playTarget, detail);
         actions.append(createFavoriteButton(card));
         if (card.type === 'Series' || playTarget?.playable) copy.append(actions);
-        copy.append(createDetailPlaybackContext(playTarget), createDetailMediaInfo(detail));
+        copy.append(createDetailPlaybackContext(playTarget));
+        if (card.type !== 'Series') copy.append(createDetailMediaInfo(detail));
         layout.append(poster, copy);
         const flowing = element('div', 'detail-flow');
         [...copy.children].filter((node) => node.matches('.detail-overview, .detail-actions, .tag-list, .detail-playback-context, .detail-media-info')).forEach((node) => flowing.append(node));
@@ -3854,7 +3855,7 @@
     }
 
     function refreshDetailSource(detail, root = content) {
-        replaceDetailField(detail, 'source', createDetailMediaInfo(detail), root);
+        if (detail.item.type !== 'Series') replaceDetailField(detail, 'source', createDetailMediaInfo(detail), root);
         const poster = root.querySelector('.detail-poster');
         if (!poster) return;
         poster.querySelector('.media-quality-badge')?.remove();
@@ -3865,10 +3866,8 @@
     function createDetailMediaInfo(detail) {
         const source = detailDisplaySource(detail);
         const { options } = detailSourceState(detail);
-        const episode = detail.item.type === 'Series' ? detailPlayTarget(detail) : null;
         const section = element('section', 'detail-media-info');
         section.dataset.detailField = 'source';
-        if (episode) section.dataset.mediaId = episode.id;
         section.setAttribute('aria-label', '片源信息');
         const specs = element('dl', 'detail-media-specs');
         const bitrate = Number(source.bitrate);
@@ -3885,12 +3884,7 @@
         });
         const disclosure = element(specs.childElementCount ? 'details' : 'div', 'detail-media-disclosure');
         const heading = element(specs.childElementCount ? 'summary' : 'div', 'detail-media-heading');
-        heading.append(element('span', 'detail-media-label', episode ? '本集片源' : '片源'));
-        if (episode) {
-            const position = element('span', 'detail-media-episode', episodePosition(episode));
-            position.title = episode.title;
-            heading.append(position);
-        }
+        heading.append(element('span', 'detail-media-label', '片源'));
         const badges = element('span', 'detail-media-badges');
         [versionResolutionLabel(source), source.dynamicRange, versionCodecLabel(source.videoCodec)]
             .filter(Boolean).forEach((value) => badges.append(element('span', 'detail-media-badge', value)));
@@ -4270,6 +4264,17 @@
         let seasonCards = [];
         let episodePage = 0;
         let episodeView = ['cards', 'numbers'].includes(detail.episodeView) ? detail.episodeView : '';
+        let episodeTransition = null;
+        let pendingPageDirection = 0;
+        const cancelEpisodeTransition = () => {
+            pendingPageDirection = 0;
+            if (!episodeTransition) return;
+            const { animations, outgoing } = episodeTransition;
+            episodeTransition = null;
+            animations.forEach((animation) => animation.cancel());
+            outgoing.remove();
+            stage.classList.remove('is-sliding');
+        };
         const pageSize = () => episodeView === 'numbers' ? 50 : 4;
         for (const [value, label] of [['cards', '缩略图'], ['numbers', '集数']]) {
             const button = element('button', '', label);
@@ -4408,7 +4413,8 @@
         syncSeasonDirectory(seasons);
         syncSeasonPicker();
 
-        const renderEpisodePage = () => {
+        const renderEpisodePage = (direction = 0) => {
+            cancelEpisodeTransition();
             const pages = Math.max(1, Math.ceil(seasonCards.length / pageSize()));
             episodePage = clamp(episodePage, 0, pages - 1);
             viewSwitch.querySelectorAll('button').forEach((button) => {
@@ -4416,7 +4422,7 @@
                 button.setAttribute('aria-pressed', String(button.dataset.episodeView === episodeView));
             });
             const first = episodePage * pageSize();
-            const grid = element('div', episodeView === 'numbers' ? 'episode-number-grid' : 'grid-view episodes-grid');
+            const grid = element('div', episodeView === 'numbers' ? 'episode-number-grid' : 'grid-view episodes-grid episode-thumbnail-page');
             seasonCards.slice(first, first + pageSize()).forEach((card, index) => {
                 if (episodeView === 'cards') {
                     const button = createMediaCard(card, {
@@ -4455,11 +4461,7 @@
                     button.title = label;
                     button.disabled = direction < 0 ? episodePage === 0 : episodePage === pages - 1;
                     button.append(element('span', 'hero-carousel-chevron'));
-                    button.addEventListener('click', () => {
-                        episodePage += direction;
-                        renderEpisodePage();
-                        focusElement(pagingControls.querySelector(`[aria-label="${label}"]:not(:disabled)`) || pagingControls.querySelector('button:not(:disabled)'));
-                    });
+                    button.addEventListener('click', () => moveEpisodePage(direction));
                     if (direction > 0) pagingControls.append(element('span', 'episode-page-label', `${episodePage + 1} / ${pages}`));
                     pagingControls.append(button);
                 }
@@ -4479,8 +4481,48 @@
                     ranges.append(button);
                 }
             }
-            stage.replaceChildren(grid.childElementCount ? grid : element('div', 'episode-stage-state', '这一季暂无剧集'));
+            const outgoing = stage.querySelector(':scope > .episodes-grid');
+            if (direction && outgoing && grid.childElementCount && !prefersReducedMotion()) {
+                outgoing.classList.remove('grid-view', 'episodes-grid');
+                outgoing.classList.add('episode-page-outgoing');
+                outgoing.inert = true;
+                outgoing.setAttribute('aria-hidden', 'true');
+                stage.classList.add('is-sliding');
+                stage.append(grid);
+                const timing = { duration: horizontalScrollDurationMs, easing: 'cubic-bezier(0.2, 0, 0, 1)' };
+                const incomingAnimation = grid.animate([
+                    { transform: `translateX(calc(${direction * 100}% + ${direction * 16}px))` },
+                    { transform: 'translateX(0)' },
+                ], timing);
+                const outgoingAnimation = outgoing.animate([
+                    { transform: 'translateX(0)' },
+                    { transform: `translateX(calc(${-direction * 100}% - ${direction * 16}px))` },
+                ], timing);
+                const transition = { outgoing, animations: [incomingAnimation, outgoingAnimation] };
+                episodeTransition = transition;
+                incomingAnimation.onfinish = () => {
+                    if (episodeTransition !== transition) return;
+                    const queuedDirection = pendingPageDirection;
+                    cancelEpisodeTransition();
+                    if (queuedDirection && root.isConnected) moveEpisodePage(queuedDirection);
+                };
+            } else {
+                stage.replaceChildren(grid.childElementCount ? grid : element('div', 'episode-stage-state', '这一季暂无剧集'));
+            }
             stage.scrollTop = 0;
+        };
+
+        const moveEpisodePage = (direction) => {
+            if (episodeTransition) {
+                pendingPageDirection = direction;
+                return;
+            }
+            const targetPage = clamp(episodePage + direction, 0, Math.ceil(seasonCards.length / pageSize()) - 1);
+            if (targetPage === episodePage) return;
+            episodePage = targetPage;
+            renderEpisodePage(direction);
+            const label = direction < 0 ? '上一页' : '下一页';
+            focusElement(pagingControls.querySelector(`[aria-label="${label}"]:not(:disabled)`) || pagingControls.querySelector('button:not(:disabled)'));
         };
 
         const renderSeason = (seasonId, episodes) => {
@@ -4512,6 +4554,7 @@
         };
 
         const renderLoading = () => {
+            cancelEpisodeTransition();
             setDetailPlayAction([]);
             pagingControls.replaceChildren();
             ranges.replaceChildren();

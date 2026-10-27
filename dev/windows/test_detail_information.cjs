@@ -74,7 +74,8 @@ function configureFixture() {
             const episodes = episodeSets[input.seasonId] || [];
             payload = { episodes: window.detailFixture.unwatched ? episodes.map((episode) => ({ ...episode, played: false, resumePositionMs: 0, lastPlayedAt: null })) : episodes };
         } else return original(requestId, operation, raw);
-        window.setTimeout(() => window._onMediaStationResponse(requestId, operation, true, JSON.stringify(payload)), 0);
+        const delay = operation === 'series_episodes' && new URLSearchParams(location.search).has('delayed-episodes') ? 400 : 0;
+        window.setTimeout(() => window._onMediaStationResponse(requestId, operation, true, JSON.stringify(payload)), delay);
     };
 }
 
@@ -130,6 +131,73 @@ async function assertEpisodeWheelScrolling(page, label) {
         assert.fail(`${label}: wheel over the episode area must scroll the detail page at the upper boundary`);
     });
     await page.waitForTimeout(200);
+    await page.locator('#content').evaluate((node) => { node.scrollTop = 0; });
+}
+
+async function assertThumbnailSliding(page, width, theme) {
+    await page.evaluate((value) => { document.documentElement.dataset.uiTheme = value; }, theme);
+    await page.getByRole('button', { name: '上一页', exact: true }).click();
+    assert.equal(await page.locator('.episode-page-label').innerText(), '1 / 3');
+    assert.equal(await page.locator('.episode-stage.is-sliding').count(), 0, 'reduced motion changes pages directly');
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.locator('.episode-stage').scrollIntoViewIfNeeded();
+    const backdrop = await backdropMetrics(page);
+    const requestCount = await page.evaluate(() => window.detailFixture.catalogRequests.filter(({ operation }) => operation !== 'cache_stats').length);
+    const finishSlide = async () => {
+        await page.locator('.episode-stage').evaluate((node) => node.getAnimations({ subtree: true }).forEach((animation) => animation.finish()));
+        await page.waitForFunction(() => !document.querySelector('.episode-stage').classList.contains('is-sliding'));
+    };
+    for (const [label, direction, expectedPage] of [['下一页', 1, '2 / 3'], ['上一页', -1, '1 / 3']]) {
+        await page.getByRole('button', { name: label, exact: true }).click();
+        const motion = await page.locator('.episode-stage').evaluate((node) => {
+            const animations = node.getAnimations({ subtree: true }).filter((animation) => animation.effect.target.classList.contains('episode-thumbnail-page'));
+            animations.forEach((animation) => { animation.pause(); animation.currentTime = 160; });
+            const incoming = node.querySelector('.episodes-grid'), outgoing = node.querySelector('.episode-page-outgoing');
+            return {
+                animationCount: animations.length,
+                incomingX: new DOMMatrix(getComputedStyle(incoming).transform).m41,
+                outgoingX: new DOMMatrix(getComputedStyle(outgoing).transform).m41,
+                outgoingInert: outgoing.inert,
+                hidden: outgoing.getAttribute('aria-hidden'),
+                overflow: document.getElementById('content').scrollWidth - document.getElementById('content').clientWidth,
+            };
+        });
+        assert.equal(motion.animationCount, 2);
+        assert.ok(motion.incomingX * direction > 0 && motion.outgoingX * direction < 0, `pages slide in opposite directions: ${JSON.stringify(motion)}`);
+        assert.ok(motion.outgoingInert && motion.hidden === 'true', 'outgoing page must not be interactive or exposed to screen readers');
+        assert.ok(motion.overflow <= 1, 'sliding pages must not widen the detail canvas');
+        assert.equal(await page.locator('.episodes-grid .media-card').count(), 4);
+        assert.deepEqual(await backdropMetrics(page), backdrop, 'paging keeps the artwork framing stable');
+        if (process.argv[2] && label === '下一页') await page.screenshot({ path: path.join(process.argv[2], `detail-thumbnail-slide-${theme}-${width}.png`) });
+        await finishSlide();
+        assert.equal(await page.locator('.episode-page-label').innerText(), expectedPage);
+        assert.equal(await page.locator('.episode-page-outgoing').count(), 0);
+        assert.equal(await page.locator(':focus').getAttribute('aria-label'), direction < 0 ? '下一页' : label);
+    }
+    await page.evaluate(() => {
+        document.querySelector('.episode-page-button[aria-label="下一页"]').click();
+        document.querySelector('.episode-page-button[aria-label="下一页"]').click();
+    });
+    await page.waitForFunction(() => document.querySelector('.episode-page-label').textContent === '3 / 3' && !document.querySelector('.episode-stage').classList.contains('is-sliding'));
+    assert.equal(await page.getByRole('button', { name: '下一页', exact: true }).isDisabled(), true);
+    assert.equal(await page.locator('.episode-page-outgoing').count(), 0);
+    await page.getByRole('button', { name: '上一页', exact: true }).click();
+    await page.locator('[data-episode-view="numbers"]').click();
+    assert.equal(await page.locator('.episode-page-outgoing').count(), 0, 'view changes cancel the in-flight slide');
+    assert.equal(await page.locator('.episode-stage.is-sliding').count(), 0);
+    await page.locator('[data-episode-view="cards"]').click();
+    const requests = await page.evaluate(() => window.detailFixture.catalogRequests.filter(({ operation }) => operation !== 'cache_stats'));
+    assert.equal(requests.length, requestCount, `thumbnail paging does not fetch media: ${JSON.stringify(requests.slice(requestCount))}`);
+    await page.getByRole('button', { name: '下一页', exact: true }).click();
+    await page.locator('.season-picker-button').click();
+    await page.locator('[data-season-id="detail-series-season-0"]').click();
+    await page.waitForFunction(() => document.querySelectorAll('.episodes-grid .media-card').length === 2);
+    assert.equal(await page.locator('.episode-page-outgoing').count(), 0, 'season changes cancel the in-flight slide');
+    assert.equal(await page.locator('.episode-stage.is-sliding').count(), 0);
+    await page.locator('.season-picker-button').click();
+    await page.locator('[data-season-id="detail-series-season-2"]').click();
+    await page.waitForFunction(() => document.querySelector('.episode-page-label').textContent === '2 / 3');
+    await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.locator('#content').evaluate((node) => { node.scrollTop = 0; });
 }
 
@@ -233,13 +301,9 @@ async function main() {
                 await openFixture(page, 'detail-series');
                 assert.match(await page.locator('.detail-copy > .hero-meta').innerText(), /2 季[\s\S]*24 集/);
                 await page.waitForSelector('.episodes-grid .media-card');
-                assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-series-s2-e8');
-                assert.match(await page.locator('.detail-media-info').innerText(), /本集片源[\s\S]*第 2 季 · 第 8 集[\s\S]*1080p[\s\S]*SDR[\s\S]*H\.264/);
+                assert.equal(await page.locator('.detail-media-info').count(), 0, 'series must not render a source parameter section');
                 assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '1080p');
-                await page.locator('summary.detail-media-heading').click();
-                assert.match(await page.locator('.detail-media-info').innerText(), /1920 × 1080/);
-                assert.doesNotMatch(await page.locator('.detail-media-info').innerText(), /8K|HDR10|3840|码率|位深|文件大小/);
-                await page.locator('summary.detail-media-heading').click();
+                assert.deepEqual(await page.locator('.episodes-grid .media-quality-badge').allInnerTexts(), Array(4).fill('1080p'));
                 assert.equal(await page.locator('.people-section').getAttribute('open'), '', 'series cast is expanded by default');
                 assert.equal(await page.locator('.episodes-grid .media-card').count(), 4, 'thumbnail view is bounded to one page');
                 assert.equal(await page.locator('.episodes-grid [data-media-id="detail-series-s2-e8"]').count(), 1, 'the first page contains the resume episode');
@@ -247,6 +311,9 @@ async function main() {
                 assert.equal(await page.locator('.detail-actions .primary-command').innerText(), '继续观看');
                 const seriesGeometry = await page.locator('.episodes').boundingBox();
                 if (width === 1280) assert.ok(seriesGeometry.y + seriesGeometry.height < 760, 'episode selection fits the desktop first viewport');
+                if (scale === 1 && [375, 1280].includes(width)) {
+                    for (const theme of ['light', 'dark']) await assertThumbnailSliding(page, width, theme);
+                }
                 if (process.argv[2] && scale === 1 && [375, 1280].includes(width)) await page.screenshot({ path: path.join(process.argv[2], `detail-series-dark-${width}.png`) });
                 const requestCount = await page.evaluate(() => window.detailFixture.catalogRequests.length);
                 const seriesBackdrop = await backdropMetrics(page);
@@ -276,24 +343,23 @@ async function main() {
                 await page.getByText('本季剧集读取失败', { exact: true }).waitFor();
                 assert.equal(await page.locator('.detail-actions .primary-command').count(), 0, 'failed season loading must not retain a previous season playback target');
                 assert.equal(await page.locator('.detail-playback-context').isVisible(), false);
-                assert.equal(await page.locator('.detail-media-info').isVisible(), false, 'failed season loading must clear the previous episode parameters');
+                assert.equal(await page.locator('.detail-media-info').count(), 0);
                 assert.equal(await page.locator('.detail-poster .media-quality-badge').count(), 0);
                 await page.locator('.episode-stage').getByRole('button', { name: '重试', exact: true }).click();
                 await page.waitForSelector('.episode-number-button');
                 assert.equal(await page.locator('.episode-number-button').count(), 12);
                 assert.match(await page.locator('.detail-playback-context').innerText(), /第 1 季 · 第 10 集/);
-                assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-series-s1-e10');
-                assert.match(await page.locator('.detail-media-info').innerText(), /第 1 季 · 第 10 集[\s\S]*4K[\s\S]*HDR10[\s\S]*HEVC/);
+                assert.equal(await page.locator('.detail-media-info').count(), 0, 'season loading must not insert source parameters');
                 assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '4K');
                 await page.locator('.season-picker-button').click();
                 await page.locator('[data-season-id="detail-series-season-2"]').click();
-                assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-series-s2-e8', 'cached season uses the same episode as the playback action');
+                assert.equal(await page.locator('.detail-media-info').count(), 0, 'cached seasons must not insert source parameters');
                 assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '1080p');
                 await page.locator('.season-picker-button').click();
                 await page.locator('[data-season-id="detail-series-season-0"]').click();
                 await page.waitForFunction(() => document.querySelectorAll('.episode-number-button').length === 2);
                 assert.match(await page.locator('.season-picker-label').innerText(), /特别篇/);
-                assert.equal(await page.locator('.detail-media-info').isVisible(), false, 'missing episode parameters must not borrow series or other season data');
+                assert.equal(await page.locator('.detail-media-info').count(), 0);
                 assert.equal(await page.locator('.detail-poster .media-quality-badge').count(), 0);
                 await openFixture(page, 'detail-anime');
                 await page.waitForSelector('.episode-number-button');
@@ -303,8 +369,8 @@ async function main() {
                 assert.equal(await page.locator('.episode-range-button[aria-pressed="true"]').innerText(), '101–150');
                 assert.equal(await page.locator('.episode-number-button.is-in-progress').innerText(), '121');
                 assert.match(await page.locator('.detail-playback-context').innerText(), /第 121 集/);
-                assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-anime-s1-e121');
-                assert.match(await page.locator('.detail-media-info').innerText(), /第 121 集[\s\S]*720p[\s\S]*SDR[\s\S]*AV1/);
+                assert.equal(await page.locator('.detail-media-info').count(), 0, 'anime must not render a source parameter section');
+                assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '720p');
                 const animeBackdrop = await backdropMetrics(page);
                 if (scale === 1 && [375, 1280].includes(width)) await assertEpisodeWheelScrolling(page, 'anime');
                 if (process.argv[2] && scale === 1 && [375, 1280].includes(width)) await page.screenshot({ path: path.join(process.argv[2], `detail-anime-dark-${width}.png`) });
@@ -314,6 +380,7 @@ async function main() {
                 assert.equal(await page.locator(':focus').innerText(), '151–181', 'range changes preserve keyboard focus');
                 await page.locator('[data-episode-view="cards"]').click();
                 assert.equal(await page.locator('.episodes-grid .media-card').count(), 4);
+                assert.deepEqual(await page.locator('.episodes-grid .media-quality-badge').allInnerTexts(), Array(4).fill('720p'));
                 assert.deepEqual(await backdropMetrics(page), animeBackdrop, 'anime view switching preserves backdrop framing');
                 if (scale === 1 && [375, 1280].includes(width)) await assertEpisodeWheelScrolling(page, 'thumbnails');
                 if (width === 1280 && scale === 1) {
@@ -323,21 +390,24 @@ async function main() {
                     await page.setViewportSize({ width: 1280, height: 800 });
                     await page.waitForFunction(() => document.querySelector('.detail-backdrop-image').offsetHeight === 736);
                     assert.deepEqual(await backdropMetrics(page), animeBackdrop, 'restoring window size restores the artwork framing');
-                    await openFixture(page, 'detail-series', '?unwatched');
+                    await openFixture(page, 'detail-series', '?unwatched&delayed-episodes');
+                    assert.equal(await page.locator('.detail-media-info').count(), 0, 'no parameter section while waiting for episodes');
                     await page.waitForSelector('.episodes-grid .media-card');
                     assert.equal(await page.locator('.detail-actions .primary-command').innerText(), '开始观看');
                     assert.match(await page.locator('.detail-playback-context').innerText(), /第 1 季 · 第 1 集/);
-                    assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-series-s1-e1', 'a series with no viewing history shows the first regular season episode parameters');
+                    assert.equal(await page.locator('.detail-media-info').count(), 0, 'late episode metadata must not insert source parameters');
+                    assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '4K');
                     await page.locator('.detail-back').click();
                     await page.locator('.media-card[data-media-id="detail-series"]').first().click();
                     await page.waitForSelector('.episodes-grid .media-card');
-                    assert.equal(await page.locator('.detail-media-info').getAttribute('data-media-id'), 'detail-series-s1-e1', 'cached detail rendering keeps episode parameters in sync before attachment');
+                    assert.equal(await page.locator('.detail-media-info').count(), 0);
+                    assert.equal(await page.locator('.detail-poster .media-quality-badge').innerText(), '4K', 'cached detail keeps the first episode resolution badge');
                 }
                 assert.deepEqual(errors, []);
                 await page.close();
             }
         }
-        console.log(JSON.stringify({ result: 'DETAIL_INFORMATION_OK', scenarios, sourceSwitch: true, missingMetadata: true, episodeParameters: true, unwatchedFirstEpisode: true, defaultExpandedCast: true, keyboardDisclosure: true, stableBackdrop: true, nativeEpisodeScrolling: true }));
+        console.log(JSON.stringify({ result: 'DETAIL_INFORMATION_OK', scenarios, thumbnailSliding: true, sourceSwitch: true, missingMetadata: true, episodeResolutionBadgesOnly: true, delayedEpisodeMetadata: true, unwatchedFirstEpisode: true, defaultExpandedCast: true, keyboardDisclosure: true, stableBackdrop: true, nativeEpisodeScrolling: true }));
     } finally { await browser.close(); }
 }
 
