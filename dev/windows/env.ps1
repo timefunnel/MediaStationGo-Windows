@@ -5,6 +5,15 @@
 $ErrorActionPreference = "Stop"
 $RepoRootEnv = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 
+# Preserve the CMake selected before vcvars adds its bundled (possibly older)
+# CMake to PATH. An explicit CMAKE setting remains authoritative.
+if (-not $env:CMAKE) {
+    $CmakeCommand = Get-Command cmake -CommandType Application -ErrorAction SilentlyContinue
+    if ($CmakeCommand) {
+        $env:CMAKE = $CmakeCommand.Source
+    }
+}
+
 if (-not $env:VSINSTALLDIR) {
     Write-Host "MSVC environment not detected." -ForegroundColor Yellow
     Write-Host "Attempting to load vcvars64.bat..."

@@ -1,5 +1,5 @@
 # Setup Windows development environment for jellium-desktop
-# Prerequisites: Visual Studio 2022, Python 3, 7-Zip, CMake (needed by
+# Prerequisites: Visual Studio 2022, Python 3, 7-Zip, CMake 4.2+ (needed by
 # cef-dll-sys to build libcef_dll_wrapper), Ninja, meson, Rust.
 
 param(

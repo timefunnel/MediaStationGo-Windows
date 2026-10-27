@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --manifest-path src/xtask/Cargo.toml --"
+
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "dev/windows/cef-toolchain.cmake", relative = true }
+CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc = { value = "dev/windows/cef-toolchain.cmake", relative = true }

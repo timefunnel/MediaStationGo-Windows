@@ -206,8 +206,8 @@ UA、代理、取链缓存和取链策略未改变。原有 seek 最多 3 次、
 本地原生回归需要显式提供已有测试素材，不会取链或下载：
 
 ```powershell
-# 先按 windows-build-paths.md 核对 V: 并加载构建环境。
-$env:CEF_PATH = 'V:\.cache\cef'
+# 先按 windows-build-paths.md 从仓库真实路径加载构建环境。
+$env:CEF_PATH = Join-Path (Get-Location).Path '.cache\cef'
 $env:MPV_STREAM_TEST_FIXTURE = '<已有的本地可跳转视频文件>'
 cargo test --manifest-path src/Cargo.toml -p jfn-playback --test stream_failure -- --ignored --nocapture
 ```
