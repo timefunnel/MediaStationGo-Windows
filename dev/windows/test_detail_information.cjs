@@ -50,7 +50,7 @@ function configureFixture() {
         ...Array.from({ length: 18 }, (_, index) => ({ id: 'person-' + index, name: ['陈星', '周宁', '叶舟'][index % 3] + (index > 2 ? ' ' + index : ''), role: '角色 ' + (index + 1), type: 'Actor', primaryImage: image('portrait-' + index) }))];
     const original = window.jmpNative.mediaStationCatalog;
     const originalImage = window.jmpNative.mediaStationImage;
-    window.detailFixture = { imageRequests: [], catalogRequests: [], failSeasonOnce: false, unwatched: new URLSearchParams(location.search).has('unwatched') };
+    window.detailFixture = { imageRequests: [], catalogRequests: [], completedCatalogRequests: [], failSeasonOnce: false, unwatched: new URLSearchParams(location.search).has('unwatched') };
     window.jmpNative.mediaStationImage = (requestId, raw) => {
         window.detailFixture.imageRequests.push(JSON.parse(raw).key);
         return originalImage(requestId, raw);
@@ -75,7 +75,10 @@ function configureFixture() {
             payload = { episodes: window.detailFixture.unwatched ? episodes.map((episode) => ({ ...episode, played: false, resumePositionMs: 0, lastPlayedAt: null })) : episodes };
         } else return original(requestId, operation, raw);
         const delay = operation === 'series_episodes' && new URLSearchParams(location.search).has('delayed-episodes') ? 400 : 0;
-        window.setTimeout(() => window._onMediaStationResponse(requestId, operation, true, JSON.stringify(payload)), delay);
+        window.setTimeout(() => {
+            window._onMediaStationResponse(requestId, operation, true, JSON.stringify(payload));
+            window.detailFixture.completedCatalogRequests.push({ operation, ...input });
+        }, delay);
     };
 }
 
@@ -194,9 +197,13 @@ async function assertThumbnailSliding(page, width, theme) {
     await page.waitForFunction(() => document.querySelectorAll('.episodes-grid .media-card').length === 2);
     assert.equal(await page.locator('.episode-page-outgoing').count(), 0, 'season changes cancel the in-flight slide');
     assert.equal(await page.locator('.episode-stage.is-sliding').count(), 0);
+    const refreshCount = await page.evaluate(() => window.detailFixture.completedCatalogRequests.filter(({ operation, seasonId, refresh }) => operation === 'series_episodes' && seasonId === 'detail-series-season-2' && refresh).length);
     await page.locator('.season-picker-button').click();
     await page.locator('[data-season-id="detail-series-season-2"]').click();
     await page.waitForFunction(() => document.querySelector('.episode-page-label').textContent === '2 / 3');
+    // Returning to a cached season schedules an intentional background refresh.
+    // Finish that scenario before asserting that local view changes fetch nothing.
+    await page.waitForFunction((count) => window.detailFixture.completedCatalogRequests.filter(({ operation, seasonId, refresh }) => operation === 'series_episodes' && seasonId === 'detail-series-season-2' && refresh).length > count, refreshCount);
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.locator('#content').evaluate((node) => { node.scrollTop = 0; });
 }
@@ -315,7 +322,7 @@ async function main() {
                     for (const theme of ['light', 'dark']) await assertThumbnailSliding(page, width, theme);
                 }
                 if (process.argv[2] && scale === 1 && [375, 1280].includes(width)) await page.screenshot({ path: path.join(process.argv[2], `detail-series-dark-${width}.png`) });
-                const requestCount = await page.evaluate(() => window.detailFixture.catalogRequests.length);
+                const requestCount = await page.evaluate(() => window.detailFixture.catalogRequests.filter(({ operation }) => operation !== 'cache_stats').length);
                 const seriesBackdrop = await backdropMetrics(page);
                 await page.locator('[data-episode-view="numbers"]').click();
                 assert.deepEqual(await backdropMetrics(page), seriesBackdrop, `view switching must preserve backdrop framing (${width}px, scale ${scale})`);
@@ -324,7 +331,8 @@ async function main() {
                 await page.locator('[data-episode-view="numbers"]').click();
                 assert.equal(await page.locator('.episode-number-button').count(), 12);
                 assert.equal(await page.locator('.episode-number-button.is-in-progress').innerText(), '8');
-                assert.equal(await page.evaluate(() => window.detailFixture.catalogRequests.length), requestCount, 'local view changes must not fetch or resolve media');
+                assert.equal(await page.evaluate(() => window.detailFixture.catalogRequests.filter(({ operation }) => operation !== 'cache_stats').length), requestCount,
+                    `local view changes must not fetch or resolve media: ${JSON.stringify({ width, scale, requests: await page.evaluate(() => window.detailFixture.catalogRequests) })}`);
                 if (scale === 1 && [375, 1280].includes(width)) await assertEpisodeWheelScrolling(page, 'series');
                 await page.locator('.episode-number-button').first().focus();
                 await page.keyboard.press('ArrowRight');
