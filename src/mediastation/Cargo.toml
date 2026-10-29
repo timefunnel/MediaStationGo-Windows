@@ -9,6 +9,7 @@ name = "jfn_mediastation"
 crate-type = ["rlib"]
 
 [dependencies]
+fastrand = "2"
 parking_lot.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -2399,6 +2399,7 @@ dependencies = [
 name = "jfn-mediastation"
 version = "1.2.0"
 dependencies = [
+ "fastrand",
  "parking_lot",
  "serde_json",
  "sha2",

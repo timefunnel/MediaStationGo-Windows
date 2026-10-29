@@ -46,7 +46,8 @@ use crate::APP_VERSION;
 use crate::client::{Inner, RendererValue, post_renderer_message};
 use crate::ipc::list_string;
 use crate::mediastation_cache::{
-    HomeSnapshotCache, ImageDiskCache, SeriesDetailSnapshotCache, image_cache_key,
+    HOME_RECOMMENDATION_TTL_MS, HomeRecommendationCache, HomeSnapshotCache, ImageDiskCache,
+    SeriesDetailSnapshotCache, image_cache_key,
 };
 use crate::mediastation_credentials::{
     CredentialError, SavedAccount, StoredSession, WindowsCredentialStore, account_credential_id,
@@ -512,6 +513,8 @@ struct MediaStationRuntime {
     user_agent: String,
     reporter: PlaybackReportDispatcher,
     home_cache: HomeSnapshotCache,
+    recommendation_cache: Mutex<HomeRecommendationCache>,
+    recommendation_refresh: Mutex<()>,
     series_detail_cache: Mutex<SeriesDetailSnapshotCache>,
     image_cache: Mutex<ImageDiskCache>,
     state: Mutex<RuntimeState>,
@@ -712,6 +715,10 @@ impl MediaStationRuntime {
             user_agent,
             reporter,
             home_cache: HomeSnapshotCache::new(cache_root.join(HOME_CACHE_DIRECTORY)),
+            recommendation_cache: Mutex::new(HomeRecommendationCache::new(
+                cache_root.join("mediastation-recommendations-v1"),
+            )),
+            recommendation_refresh: Mutex::new(()),
             series_detail_cache: Mutex::new(SeriesDetailSnapshotCache::new(
                 cache_root.join(SERIES_DETAIL_CACHE_DIRECTORY),
             )),
@@ -3494,6 +3501,7 @@ pub(crate) fn handle_image_message(layer: Option<Arc<Inner>>, args: Option<&List
 #[derive(Clone, Copy)]
 enum CatalogOperation {
     Home,
+    Recommendations,
     Items,
     Filters,
     Detail,
@@ -3510,6 +3518,7 @@ impl CatalogOperation {
     const fn label(self) -> &'static str {
         match self {
             Self::Home => "home",
+            Self::Recommendations => "recommendations",
             Self::Items => "items",
             Self::Filters => "filters",
             Self::Detail => "detail",
@@ -3561,6 +3570,7 @@ fn parse_catalog_request(
     let raw_operation = list_string(args, 1);
     let operation = match raw_operation.as_str() {
         "home" => CatalogOperation::Home,
+        "recommendations" => CatalogOperation::Recommendations,
         "items" => CatalogOperation::Items,
         "filters" => CatalogOperation::Filters,
         "detail" => CatalogOperation::Detail,
@@ -3766,6 +3776,39 @@ fn execute_catalog_request(
                 None,
                 cache_write_failed,
             )
+        }
+        CatalogOperation::Recommendations => {
+            let refresh = bool_param(&request.params, "refresh", false)?;
+            if let Some(cached) = cached_recommendations(runtime, snapshot, !refresh)? {
+                return Ok(cached);
+            }
+            // Only network refreshes serialize. Cached artwork stays readable during a slow refresh.
+            let _refresh = runtime.recommendation_refresh.lock();
+            if let Some(cached) = cached_recommendations(runtime, snapshot, false)? {
+                return Ok(cached);
+            }
+            let items = runtime
+                .api
+                .load_home_recommendations(&snapshot.session)
+                .map_err(|error| catalog_failure(request.operation, &error))?;
+            runtime.ensure_generation(snapshot.generation)?;
+            let payload =
+                json!({ "items": items.iter().map(media_card_payload).collect::<Vec<_>>() });
+            let saved_at_ms = unix_time_ms();
+            let write_failed = if let Err(error) =
+                runtime
+                    .recommendation_cache
+                    .lock()
+                    .store(&snapshot.session, &payload, saved_at_ms)
+            {
+                log_error(&format!(
+                    "MediaStation recommendation cache write failed: {error}"
+                ));
+                true
+            } else {
+                false
+            };
+            recommendation_payload(payload, saved_at_ms, "miss", write_failed)
         }
         CatalogOperation::Items => {
             let parent_id = required_param(&request.params, "parentId")?;
@@ -3996,6 +4039,16 @@ fn execute_catalog_request(
                 ));
                 cache_warning = true;
             }
+            if let Err(error) = runtime.recommendation_cache.lock().update_favorite(
+                &snapshot.session,
+                &media_id,
+                actual,
+            ) {
+                log_error(&format!(
+                    "MediaStation recommendation favorite cache update failed: {error}"
+                ));
+                cache_warning = true;
+            }
             json!({ "mediaId": media_id, "isFavorite": actual, "cacheWarning": cache_warning })
         }
         CatalogOperation::Search => {
@@ -4028,6 +4081,61 @@ fn execute_catalog_request(
     };
     runtime.ensure_generation(snapshot.generation)?;
     Ok(payload)
+}
+
+fn cached_recommendations(
+    runtime: &MediaStationRuntime,
+    snapshot: &SessionSnapshot,
+    allow_stale: bool,
+) -> Result<Option<Value>, LoadFailure> {
+    let cache = runtime.recommendation_cache.lock();
+    let at_ms = unix_time_ms();
+    let loaded = if allow_stale {
+        cache.load_for_display(&snapshot.session, at_ms)
+    } else {
+        cache.load(&snapshot.session, at_ms)
+    };
+    match loaded {
+        Ok(Some(cached)) => {
+            runtime.ensure_generation(snapshot.generation)?;
+            let status = if at_ms - cached.saved_at_ms >= HOME_RECOMMENDATION_TTL_MS {
+                "stale"
+            } else {
+                "hit"
+            };
+            Ok(Some(recommendation_payload(
+                cached.payload,
+                cached.saved_at_ms,
+                status,
+                false,
+            )))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            log_error(&format!(
+                "MediaStation recommendation cache read failed: {error}"
+            ));
+            cache
+                .remove(&snapshot.session)
+                .map_err(|error| cache_failure("recommendation_cache_remove_failed", &error))?;
+            Ok(None)
+        }
+    }
+}
+
+fn recommendation_payload(
+    mut payload: Value,
+    saved_at_ms: u64,
+    status: &str,
+    write_failed: bool,
+) -> Value {
+    payload["cache"] = json!({
+        "status": status,
+        "savedAtMs": saved_at_ms,
+        "expiresAtMs": saved_at_ms.saturating_add(HOME_RECOMMENDATION_TTL_MS),
+        "writeFailed": write_failed,
+    });
+    payload
 }
 
 fn execute_image_request(
@@ -9314,6 +9422,52 @@ mod tests {
             &base_url,
             MediaStationClientProfile::SenPlayer,
         ));
+    }
+
+    #[test]
+    fn expired_recommendations_remain_readable_during_network_refresh() {
+        let root = tempfile::tempdir().expect("cache directory should be created");
+        let mut runtime = MediaStationRuntime::new().expect("runtime should initialize");
+        runtime.recommendation_cache =
+            Mutex::new(HomeRecommendationCache::new(root.path().to_path_buf()));
+        let runtime = Arc::new(runtime);
+        runtime.configure_session(session("user-1"));
+        let (snapshot, _request_guard) = runtime
+            .begin_catalog_request("cached-recommendations")
+            .unwrap();
+        let saved_at_ms = unix_time_ms() - HOME_RECOMMENDATION_TTL_MS - 1;
+        runtime
+            .recommendation_cache
+            .lock()
+            .store(
+                &snapshot.session,
+                &json!({"items": [{"id": "cached-banner"}]}),
+                saved_at_ms,
+            )
+            .unwrap();
+
+        // A slow request may hold this lock. Display reads must never acquire it.
+        let _refresh_guard = runtime.recommendation_refresh.lock();
+        let payload = execute_catalog_request(
+            &runtime,
+            &snapshot,
+            &CatalogRequest {
+                request_id: "cached-recommendations".to_string(),
+                operation: CatalogOperation::Recommendations,
+                params: json!({}),
+            },
+        )
+        .unwrap();
+        assert_eq!(payload["items"][0]["id"], "cached-banner");
+        assert_eq!(payload["cache"]["status"], "stale");
+        assert_eq!(payload["cache"]["savedAtMs"], saved_at_ms);
+        assert!(
+            cached_recommendations(&runtime, &snapshot, false)
+                .unwrap()
+                .is_none()
+        );
+        runtime.configure_session(session("user-2"));
+        assert!(cached_recommendations(&runtime, &snapshot, true).is_err());
     }
 
     #[test]

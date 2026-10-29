@@ -16,6 +16,7 @@ const MAX_HOME_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SERIES_DETAIL_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SERIES_DETAIL_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMAGE_METADATA_BYTES: u64 = 16 * 1024;
+pub(crate) const HOME_RECOMMENDATION_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 
 #[derive(Debug)]
 pub(crate) struct CacheError {
@@ -115,11 +116,20 @@ impl HomeSnapshotCache {
         session: &MediaStationSession,
         payload: &Value,
     ) -> Result<(), CacheError> {
+        self.store_at(session, payload, now_ms())
+    }
+
+    fn store_at(
+        &self,
+        session: &MediaStationSession,
+        payload: &Value,
+        saved_at_ms: u64,
+    ) -> Result<(), CacheError> {
         let account_key = account_cache_key(session);
         let value = json!({
             "schemaVersion": HOME_SCHEMA_VERSION,
             "accountKey": account_key,
-            "savedAtMs": now_ms(),
+            "savedAtMs": saved_at_ms,
             "payload": payload,
         });
         let bytes = serde_json::to_vec(&value)
@@ -142,6 +152,78 @@ impl HomeSnapshotCache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(CacheError::io("home_snapshot_remove", &error)),
         }
+    }
+}
+
+/// Uses the same account-keyed atomic snapshot format as home, in its own directory.
+pub(crate) struct HomeRecommendationCache {
+    snapshots: HomeSnapshotCache,
+}
+
+impl HomeRecommendationCache {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self {
+            snapshots: HomeSnapshotCache::new(root),
+        }
+    }
+
+    pub(crate) fn load(
+        &self,
+        session: &MediaStationSession,
+        at_ms: u64,
+    ) -> Result<Option<HomeSnapshot>, CacheError> {
+        Ok(self
+            .load_for_display(session, at_ms)?
+            .filter(|snapshot| at_ms - snapshot.saved_at_ms < HOME_RECOMMENDATION_TTL_MS))
+    }
+
+    pub(crate) fn load_for_display(
+        &self,
+        session: &MediaStationSession,
+        at_ms: u64,
+    ) -> Result<Option<HomeSnapshot>, CacheError> {
+        // Expiration requests a new selection; it need not blank artwork already on disk.
+        // Future timestamps remain invalid, including after a clock rollback.
+        Ok(self
+            .snapshots
+            .load(session)?
+            .filter(|snapshot| snapshot.saved_at_ms <= at_ms))
+    }
+
+    pub(crate) fn store(
+        &self,
+        session: &MediaStationSession,
+        payload: &Value,
+        at_ms: u64,
+    ) -> Result<(), CacheError> {
+        self.snapshots.store_at(session, payload, at_ms)
+    }
+
+    pub(crate) fn remove(&self, session: &MediaStationSession) -> Result<(), CacheError> {
+        self.snapshots.remove(session)
+    }
+
+    pub(crate) fn update_favorite(
+        &self,
+        session: &MediaStationSession,
+        media_id: &str,
+        favorite: bool,
+    ) -> Result<(), CacheError> {
+        if let Some(mut cached) = self.snapshots.load(session)? {
+            if let Some(items) = cached
+                .payload
+                .get_mut("items")
+                .and_then(Value::as_array_mut)
+            {
+                for item in items {
+                    if item.get("id").and_then(Value::as_str) == Some(media_id) {
+                        item["isFavorite"] = json!(favorite);
+                    }
+                }
+            }
+            self.store(session, &cached.payload, cached.saved_at_ms)?;
+        }
+        Ok(())
     }
 }
 
@@ -829,6 +911,100 @@ mod tests {
             "MediaBrowser Client=\"test\"",
         )
         .expect("session should be valid")
+    }
+
+    #[test]
+    fn recommendations_persist_for_six_hours_and_isolate_server_and_account() {
+        let root = tempdir().unwrap();
+        let first = session("first-user");
+        let at = 1_000_000;
+        let payload = json!({"items": [{"id": "movie-1", "isFavorite": false}]});
+        HomeRecommendationCache::new(root.path().to_path_buf())
+            .store(&first, &payload, at)
+            .unwrap();
+        // Reconstructing the cache simulates a client restart.
+        let cache = HomeRecommendationCache::new(root.path().to_path_buf());
+        assert_eq!(
+            cache
+                .load(&first, at + HOME_RECOMMENDATION_TTL_MS - 1)
+                .unwrap()
+                .unwrap()
+                .payload,
+            payload
+        );
+        assert!(
+            cache
+                .load(&first, at + HOME_RECOMMENDATION_TTL_MS)
+                .unwrap()
+                .is_none()
+        );
+        let expired = cache
+            .load_for_display(&first, at + HOME_RECOMMENDATION_TTL_MS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.payload, payload);
+        assert_eq!(
+            expired.saved_at_ms, at,
+            "displaying an expired group must not extend its TTL"
+        );
+        assert!(cache.load_for_display(&first, at - 1).unwrap().is_none());
+        assert!(
+            cache
+                .load_for_display(&session("second-user"), at)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.load(&first, at - 1).unwrap().is_none(),
+            "a clock rollback must not create an indefinite cache"
+        );
+        assert!(cache.load(&session("second-user"), at).unwrap().is_none());
+        let other_server = MediaStationSession::new(
+            Url::parse("https://another.example.test").unwrap(),
+            "first-user",
+            "token",
+            "test",
+        )
+        .unwrap();
+        assert!(cache.load(&other_server, at).unwrap().is_none());
+        cache.update_favorite(&first, "movie-1", true).unwrap();
+        let updated = cache.load(&first, at + 1).unwrap().unwrap();
+        assert_eq!(updated.payload["items"][0]["isFavorite"], true);
+        assert_eq!(
+            updated.saved_at_ms, at,
+            "favorite updates must not extend the recommendation TTL"
+        );
+        cache
+            .store(
+                &first,
+                &json!({"items": [{"id": "movie-2"}]}),
+                at + HOME_RECOMMENDATION_TTL_MS,
+            )
+            .unwrap();
+        assert_eq!(
+            cache
+                .load(&first, at + HOME_RECOMMENDATION_TTL_MS)
+                .unwrap()
+                .unwrap()
+                .payload["items"][0]["id"],
+            "movie-2"
+        );
+    }
+
+    #[test]
+    fn recommendations_reject_corrupt_snapshots() {
+        let root = tempdir().unwrap();
+        let cache = HomeRecommendationCache::new(root.path().to_path_buf());
+        let account = session("first-user");
+        fs::write(
+            root.path()
+                .join(format!("{}.json", account_cache_key(&account))),
+            b"invalid-json",
+        )
+        .unwrap();
+        assert!(cache.load(&account, 1).is_err());
+        cache.remove(&account).unwrap();
+        assert!(cache.load(&account, 1).unwrap().is_none());
     }
 
     #[test]

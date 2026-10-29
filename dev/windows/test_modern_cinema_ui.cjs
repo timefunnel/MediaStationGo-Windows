@@ -170,7 +170,7 @@ lifecycle.renderLoading();
 assert.equal(bodyNode.children.length, 1, 'settings controls must not be cloned');
 
 // The actual rendered image footprint determines whether artwork is sharp enough.
-const heroContext = vm.createContext({ content: { clientWidth: 1064 }, window: { devicePixelRatio: 1.25 }, Math });
+const heroContext = vm.createContext({ content: { clientWidth: 1064 }, window: { devicePixelRatio: 1.25 }, heroArtworkMaxScale: 2, Math });
 vm.runInContext(handlerSource('heroArtworkFits'), heroContext);
 const heroFrame = { clientWidth: 1000, clientHeight: 300 };
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1920, height: 1080 }), true);
@@ -179,12 +179,24 @@ assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1280, height: 720 }
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 640, height: 360 }), false);
 assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1200, height: 1800 }), false);
 heroContext.window.devicePixelRatio = 3;
-assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1280, height: 720 }), false);
-assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 440 }, { width: 1280, height: 720 }), false, 'insufficient vertical resolution still excludes artwork');
+assert.equal(heroContext.heroArtworkFits(heroFrame, { width: 1280, height: 720 }), true);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 481 }, { width: 1280, height: 720 }), false, 'enlargement beyond the image quality limit must still exclude artwork');
 heroContext.window.devicePixelRatio = 1.25;
-assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 440 }, { width: 1280, height: 720 }), true, 'wide windows retain sharp artwork at its native pixel width');
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 440 }, { width: 1280, height: 720 }), true, 'wide windows may enlarge a qualified backdrop within its limit');
+for (const density of [1, 1.25, 1.5, 1.75, 2]) {
+    heroContext.window.devicePixelRatio = density;
+    for (const width of [960, 1280, 1920]) {
+        assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 240 }, { width, height: width * 9 / 16 }), true, `native-width artwork must qualify at ${density}x density without floating-point rejection`);
+    }
+}
+heroContext.window.devicePixelRatio = 1.5;
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 960 }, { width: 1280, height: 720 }), true, '1280x720 artwork fits exactly at the 2x enlargement limit and 150% display scaling');
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 2500, clientHeight: 961 }, { width: 1280, height: 720 }), false, 'artwork that exceeds the enlargement limit must still be excluded');
 heroContext.content.clientWidth = 375; heroContext.window.devicePixelRatio = 2;
-assert.equal(heroContext.heroArtworkFits({ clientWidth: 343 }, { width: 1280, height: 720 }), true);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 343, clientHeight: 417 }, { width: 1280, height: 720 }), true);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 480, clientHeight: 494 }, { width: 960, height: 540 }), true);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 960, clientHeight: 524 }, { width: 960, height: 540 }), true);
+assert.equal(heroContext.heroArtworkFits({ clientWidth: 961, clientHeight: 524 }, { width: 960, height: 540 }), false, 'stacked artwork must still respect the enlargement limit');
 console.log('MODERN_CINEMA_LAYOUT_TEST_OK: settings survive direct loading navigation without duplicate controls; artwork checks actual footprint, density and aspect ratio');
 
 // A failure uses the existing cleanup path and keeps late callbacks from reviving playback.
@@ -227,13 +239,15 @@ async function checkImageScheduling() {
     const images = vm.createContext({
         imageCache: new Map(), imagePending: new Map(), imageQueue: [],
         imageActive: 0, imageBackgroundActive: 0,
+        imagePriorityHero: null, imagePriorityUntil: 0, imagePriorityTimer: 0,
+        window: { clearTimeout() {} },
         nativeRequest(_channel, _action, args) {
             const request = { key: JSON.parse(args[0]).key, ...deferred() };
             requests.push(request); return request.promise;
         },
         updateImageCacheStatus() {}, scheduleImageCacheStatsRefresh() {}, console,
     });
-    for (const name of ['requestImage', 'imageMemoryKey', 'pumpImages']) vm.runInContext(handlerSource(name), images);
+    for (const name of ['requestImage', 'imageMemoryKey', 'pumpImages', 'releaseHomeHeroImagePriority']) vm.runInContext(handlerSource(name), images);
     const request = (key, background = false) => images.requestImage({ key }, 1280, { background });
     const complete = (key) => requests.find((entry) => entry.key === key).resolve({ key, dataUrl: 'data:image/png;base64,AA==' });
     const hero = request('slow-hero', true);
@@ -260,6 +274,34 @@ async function checkImageScheduling() {
     assert.equal(images.imagePending.size, 0);
     assert.equal(images.imageCache.has('failed-image@1280'), false);
 
+    const busyCovers = [request('cover-one'), request('cover-two')];
+    const waitingCover = request('cover-three');
+    const criticalHero = images.requestImage({ key: 'first-banner' }, 1280, { background: true, priority: true });
+    complete('cover-one'); await busyCovers[0]; await settle();
+    assert.equal(requests.at(-1).key, 'first-banner', 'first banner must not wait for the entire cover queue');
+    complete('cover-two'); await busyCovers[1]; await settle();
+    assert.equal(requests.at(-1).key, 'cover-three', 'one slot must remain available for visible covers');
+    complete('cover-three'); complete('first-banner'); await Promise.all([waitingCover, criticalHero]); await settle();
+    assert.equal(images.imageActive, 0);
+
+    const priorityHero = { isConnected: true };
+    images.imagePriorityHero = priorityHero; images.imagePriorityUntil = Date.now() + 3000;
+    const previousRequests = requests.length;
+    const heldCover = request('cold-cover');
+    assert.equal(requests.length, previousRequests, 'cold covers must briefly yield bandwidth to the first banner');
+    const firstArtwork = images.requestImage({ key: 'cold-banner' }, 1280, { background: true, priority: true });
+    assert.equal(requests.at(-1).key, 'cold-banner');
+    assert.equal(images.imageActive, 1, 'first-banner priority must avoid competing cover downloads');
+    complete('cold-banner'); await firstArtwork; await settle();
+    images.releaseHomeHeroImagePriority(priorityHero);
+    assert.equal(requests.at(-1).key, 'cold-cover', 'showing the banner must immediately release cover downloads');
+    complete('cold-cover'); await heldCover; await settle();
+    images.imagePriorityHero = priorityHero; images.imagePriorityUntil = Date.now() - 1;
+    const expiredHold = request('cover-after-budget');
+    assert.equal(requests.at(-1).key, 'cover-after-budget', 'slow banners must not withhold covers after the priority budget');
+    complete('cover-after-budget'); await expiredHold; await settle();
+    images.releaseHomeHeroImagePriority(priorityHero);
+
     const candidates = [1, 2, 3, 4, 5].map((id) => ({ id: String(id) }));
     const artRequests = []; let reveals = 0;
     const heroNode = { isConnected: true, dataset: {} };
@@ -279,6 +321,11 @@ async function checkImageScheduling() {
     await loading;
     assert.equal(artRequests.length, 4, 'stop downloading candidates once the carousel is complete');
     assert.equal(reveals, 2);
+    const oldPool = heroNode._artworkPool;
+    const failedRefresh = artwork.loadHeroCandidates(heroNode, [{ id: 'unavailable' }], 7);
+    artRequests.at(-1).reject(new Error('fixture artwork unavailable'));
+    await failedRefresh;
+    assert.equal(heroNode._artworkPool, oldPool, 'failed new artwork must not clear an already visible carousel');
     console.log('MODERN_CINEMA_IMAGES_TEST_OK: stalled hero does not block covers; foreground priority and deduplication preserve the two-request bound; first sharp artwork appears immediately');
 }
 

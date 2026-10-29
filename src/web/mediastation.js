@@ -28,7 +28,11 @@
     const homeRefreshDelayMs = 1200;
     const heroRotationIntervalMs = 9000;
     const heroCarouselMaxCards = 4;
+    const heroArtworkMaxScale = 2;
     const heroArtworkCache = new Map();
+    const homeRecommendationFailures = new WeakMap();
+    const homeRecommendationRefreshes = new WeakMap();
+    const homeHeroImagePriorityMs = 3000;
     const maximumContinueWatchingItems = 20;
     const libraryPageSize = 48;
     const maximumLibraryCacheEntries = 12;
@@ -103,6 +107,9 @@
     });
     let imageActive = 0;
     let imageBackgroundActive = 0;
+    let imagePriorityHero = null;
+    let imagePriorityUntil = 0;
+    let imagePriorityTimer = 0;
     let imageDiskStats = { imageBytes: 0, imageCount: 0 };
     let imageStatsTimer = 0;
     let interpolationComponentTimer = 0;
@@ -122,6 +129,9 @@
     let session = null;
     let homeData = null;
     let heroRevision = 0;
+    let responsiveLayoutFrame = 0;
+    let heroRecommendationTimer = 0;
+    let heroRecommendationVisibility = null;
     let appBackdropRevision = 0;
     let appBackdropSrc = '';
     let heroSlideTimer = 0;
@@ -1524,7 +1534,6 @@
     }
 
     async function initialize() {
-        await new Promise((resolve) => window.setTimeout(resolve, 280));
         try {
             const status = await nativeRequest('mediaStationSessionStatus', 'session_status');
             if (status.configured) {
@@ -1961,6 +1970,8 @@
 
     function createHomeHeroSkeleton() {
         const hero = element('section', 'home-hero home-skeleton-hero');
+        hero.style.setProperty('--hero-image-density', String(window.devicePixelRatio || 1));
+        hero.style.setProperty('--hero-image-max-scale', String(heroArtworkMaxScale));
         hero.setAttribute('role', 'status');
         hero.setAttribute('aria-label', '正在加载精选作品');
         hero.setAttribute('aria-busy', 'true');
@@ -1974,32 +1985,40 @@
         return hero;
     }
 
+    function createHomeRowSkeleton(landscape) {
+        const section = element('section', 'media-section');
+        section.setAttribute('aria-hidden', 'true');
+        const heading = element('div', 'section-heading home-skeleton-heading');
+        heading.append(element('span', 'home-skeleton-block'));
+        const carousel = element('div', 'home-row-carousel');
+        const row = element('div', `media-row home-media-row home-skeleton-row${landscape ? ' landscape' : ''}`);
+        for (let index = 0; index < (landscape ? 8 : 12); index += 1) {
+            const card = element('div', 'media-card placeholder-card');
+            const copy = element('div', 'placeholder-copy');
+            copy.append(element('span', 'placeholder-title'), element('span', 'placeholder-subtitle'));
+            card.append(element('div', 'placeholder-art'), copy);
+            row.append(card);
+        }
+        carousel.append(row);
+        section.append(heading, carousel);
+        return section;
+    }
+
     function renderHomeLoading() {
+        const initialHeroWidth = imageWidthFor(null, true, true);
+        stopHeroCarousel();
         replaceContent();
         const loading = element('div', 'home-loading');
         loading.setAttribute('aria-label', '正在加载首页');
         loading.setAttribute('aria-busy', 'true');
-        const band = element('div', 'page-band');
-        for (const landscape of [true, false]) {
-            const section = element('section', 'media-section');
-            section.setAttribute('aria-hidden', 'true');
-            const heading = element('div', 'section-heading home-skeleton-heading');
-            heading.append(element('span', 'home-skeleton-block'));
-            const carousel = element('div', 'home-row-carousel');
-            const row = element('div', `media-row home-media-row home-skeleton-row${landscape ? ' landscape' : ''}`);
-            for (let index = 0; index < (landscape ? 8 : 12); index += 1) {
-                const card = element('div', 'media-card placeholder-card');
-                const copy = element('div', 'placeholder-copy');
-                copy.append(element('span', 'placeholder-title'), element('span', 'placeholder-subtitle'));
-                card.append(element('div', 'placeholder-art'), copy);
-                row.append(card);
-            }
-            carousel.append(row);
-            section.append(heading, carousel);
-            band.append(section);
-        }
-        loading.append(createHomeHeroSkeleton(), band);
+        const featured = element('div', 'home-featured');
+        const band = element('div', 'page-band home-band'); band.append(createHomeRowSkeleton(true));
+        const hero = createHomeHero();
+        featured.append(hero._placeholder, hero, band);
+        const recent = element('div', 'page-band home-latest-band'); recent.append(createHomeRowSkeleton(false));
+        loading.append(featured, recent);
         content.append(loading);
+        activateHomeHero(hero, heroRevision, initialHeroWidth);
     }
 
     function renderEmpty(message) {
@@ -2024,8 +2043,13 @@
 
     async function loadHome(replaceHistory = false) {
         if (!homeData) renderHomeLoading();
+        const loading = content.querySelector('.home-loading');
+        const expectedSession = session;
         try {
-            homeData = await nativeRequest('mediaStationCatalog', 'home', ['home', JSON.stringify({ refresh: false })]);
+            const result = await nativeRequest('mediaStationCatalog', 'home', ['home', JSON.stringify({ refresh: false })]);
+            if (session !== expectedSession) return;
+            homeData = result;
+            if (loading && !loading.isConnected) return;
             appShell.dataset.initialHomeCache = homeData.cache?.status || 'unknown';
             history.length = replaceHistory ? 0 : history.length;
             setCurrentView({ kind: 'home', data: homeData }, !replaceHistory && currentView !== null);
@@ -2034,6 +2058,8 @@
             }
             if (homeData.cache?.status === 'hit') scheduleHomeRefresh();
         } catch (error) {
+            if (session !== expectedSession || (loading && !loading.isConnected)) return;
+            stopHeroCarousel();
             renderEmpty(friendlyError(error));
             showToast(friendlyError(error));
         }
@@ -2087,7 +2113,8 @@
     }
 
     function imageWidthFor(ref, landscape, hero = false) {
-        if (hero) return Math.min(2000, Math.max(1280, Math.ceil(content.clientWidth * Math.min(window.devicePixelRatio || 1, 2))));
+        // Stable sizes reuse the same disk image after a window resize or DPI change.
+        if (hero) return content.clientWidth * Math.min(window.devicePixelRatio || 1, 2) > 1280 ? 2000 : 1280;
         if (ref?.type === 'backdrop' || landscape) return 640;
         return 360;
     }
@@ -2170,20 +2197,22 @@
             });
     }
 
-    function requestImage(ref, width, { background = false } = {}) {
+    function requestImage(ref, width, { background = false, priority = false } = {}) {
         const memoryKey = imageMemoryKey(ref, width);
         const cached = imageCache.get(memoryKey);
         if (cached) return Promise.resolve(cached);
         const active = imagePending.get(memoryKey);
         if (active) {
-            if (!background) {
-                const queued = imageQueue.find((task) => task.memoryKey === memoryKey);
-                if (queued) { queued.background = false; pumpImages(); }
+            const queued = imageQueue.find((task) => task.memoryKey === memoryKey);
+            if (queued && (!background || priority)) {
+                if (!background) queued.background = false;
+                queued.priority ||= priority;
+                pumpImages();
             }
             return active;
         }
         const request = new Promise((resolve, reject) => {
-            imageQueue.push({ ref, width, memoryKey, background, resolve, reject });
+            imageQueue.push({ ref, width, memoryKey, background, priority, resolve, reject });
             pumpImages();
         });
         imagePending.set(memoryKey, request);
@@ -2201,7 +2230,12 @@
     function pumpImages() {
         while (imageActive < 2 && imageQueue.length > 0) {
             // Keep one native request slot available for visible covers while large artwork loads.
-            let index = imageQueue.findIndex((task) => !task.background);
+            let index = imageQueue.findIndex((task) => task.priority && (!task.background || imageBackgroundActive < 1));
+            if (index < 0) index = imageQueue.findIndex((task) => !task.background);
+            if (index >= 0 && !imageQueue[index].background && imagePriorityHero?.isConnected && Date.now() < imagePriorityUntil) {
+                index = imageBackgroundActive < 1 ? imageQueue.findIndex((task) => task.priority && task.background) : -1;
+                if (index < 0) break;
+            }
             if (index < 0) {
                 if (imageBackgroundActive >= 1) break;
                 index = 0;
@@ -2771,6 +2805,20 @@
         content.querySelectorAll('.carousel-row').forEach((row) => row._refreshCarousel?.());
     }
 
+    function scheduleResponsiveLayout() {
+        if (responsiveLayoutFrame) return;
+        responsiveLayoutFrame = window.requestAnimationFrame(() => {
+            responsiveLayoutFrame = 0;
+            closeEnhancementChoices();
+            refreshHeroArtworkQualification();
+            refreshMediaRowCarousels();
+            content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
+            if (currentDrawer === byId('account-drawer')) positionAccountPopover(currentDrawer, drawerTrigger);
+            positionPlayerPanel();
+            positionDanmakuPanel();
+        });
+    }
+
     function createSection(title, cards, options = {}) {
         if (!cards?.length) return null;
         const section = element('section', 'media-section');
@@ -2849,14 +2897,14 @@
     function heroArtworkFits(hero, art) {
         const width = hero.clientWidth;
         const stacked = content.clientWidth <= 740;
-        const height = stacked ? Math.min(width * 9 / 16, 300) : hero.clientHeight;
+        const height = hero.clientHeight;
         const density = window.devicePixelRatio || 1;
-        // Grow desktop artwork to its native pixel width even when the banner is wider.
-        const availableWidth = stacked ? width : Math.min(width, art.width / density);
-        const scale = Math.max(availableWidth / art.width, height / art.height);
+        // Match the bounded image footprint, rather than limiting a 4K banner
+        // to a small native-width patch. Compare physical pixels directly.
+        const requiredWidth = stacked ? width * density : Math.min(width * .88 * density, art.width * heroArtworkMaxScale);
         return art.width >= 960 && art.width / art.height >= 1.45
-            && art.width >= Math.ceil(art.width * scale * density)
-            && art.height >= Math.ceil(art.height * scale * density);
+            && art.width * heroArtworkMaxScale >= Math.ceil(requiredWidth)
+            && art.height * heroArtworkMaxScale >= Math.ceil(height * density);
     }
 
     async function loadHeroArtwork(hero, card, requestWidth = imageWidthFor(null, true, true)) {
@@ -2865,7 +2913,7 @@
         const key = JSON.stringify([session?.baseUrl, session?.userId, ref, requestWidth]);
         let art = heroArtworkCache.get(key);
         if (!art) {
-            const src = await requestImage(ref, requestWidth, { background: true });
+            const src = await requestImage(ref, requestWidth, { background: true, priority: !hero.dataset.mediaId });
             const image = new Image(); image.src = src; await image.decode();
             if (session !== expectedSession) throw new Error('账号已切换，取消旧账号精选图片');
             art = { src, width: image.naturalWidth, height: image.naturalHeight, requestWidth };
@@ -2875,10 +2923,11 @@
     }
 
     function refreshHeroArtworkQualification() {
-        if (currentView?.kind !== 'home') return;
+        content.querySelectorAll('.home-hero').forEach((hero) => {
+            hero.style.setProperty('--hero-image-density', String(window.devicePixelRatio || 1));
+        });
         const hero = content.querySelector('.home-hero:not(.home-skeleton-hero)');
         if (!hero?._artworkPool) return;
-        hero.style.setProperty('--hero-image-density', String(window.devicePixelRatio || 1));
         const cards = hero._artworkPool.filter((entry) => heroArtworkFits(hero, entry.art)).slice(0, heroCarouselMaxCards);
         const requestWidth = imageWidthFor(null, true, true);
         if (!hero._refreshingArtwork && hero._artworkPool.some((entry) => entry.art.requestWidth < requestWidth && !heroArtworkFits(hero, entry.art))) {
@@ -2907,7 +2956,7 @@
         hero._placeholder?.remove();
         delete hero._placeholder;
         const copy = element('div', 'hero-copy');
-        copy.append(element('p', 'hero-kicker', '最近添加'));
+        copy.append(element('p', 'hero-kicker', '为你推荐'));
         copy.append(element('h1', '', cardTitle(card, true)));
         const meta = element('p', 'hero-meta');
         [card.year, ...(card.genres || []).slice(0, 2), card.dynamicRange]
@@ -2936,25 +2985,97 @@
         next.style.transform = 'translateX(0)';
         if (active) { active.classList.remove('active'); active.style.transform = `translateX(${-direction * 100}%)`; }
         hero.dataset.mediaId = card.id;
+        releaseHomeHeroImagePriority(hero);
         if (focusInside) primary.focus({ preventScroll: true });
         if (animate) await new Promise((resolve) => window.setTimeout(resolve, 320));
         slides.forEach((slide) => { slide.classList.remove('sliding'); if (slide !== next) { slide.replaceChildren(); slide.style.transform = 'translateX(100%)'; } });
     }
 
     function stopHeroCarousel() {
+        releaseHomeHeroImagePriority(imagePriorityHero);
         window.clearTimeout(heroRotationTimer); heroRotationTimer = 0;
+        window.clearTimeout(heroRecommendationTimer); heroRecommendationTimer = 0;
+        if (heroRecommendationVisibility) document.removeEventListener('visibilitychange', heroRecommendationVisibility);
+        heroRecommendationVisibility = null;
         heroRevision += 1;
         heroCarouselController?.destroy(); heroCarouselController = null;
     }
 
-    function heroCandidates(data, latestSections) {
+    function heroCandidates(items) {
         const seen = new Set();
-        return [...latestSections.flatMap((section) => section.items || []), ...(data.latest || []), ...(data.resume || [])]
+        return items
             .filter((card) => {
                 const key = JSON.stringify(card?.backdropImage || card?.landscapeImage);
                 if (!card?.id || card.type === 'Episode' || card.type === 'CollectionFolder' || key === undefined || key === 'null' || seen.has(key)) return false;
                 seen.add(key); return true;
-            }).slice(0, 20);
+            });
+    }
+
+    function refreshHomeRecommendations(expectedSession, previousResult) {
+        const active = homeRecommendationRefreshes.get(expectedSession);
+        if (active) return active;
+        const update = nativeRequest('mediaStationCatalog', 'recommendations', ['recommendations', '{"refresh":true}'], 90000)
+            .then(value => ({ value }), error => {
+                homeRecommendationFailures.set(expectedSession, previousResult);
+                console.error('首页推荐更新失败，下次启动时重试：' + friendlyError(error));
+                return { error };
+            });
+        homeRecommendationRefreshes.set(expectedSession, update);
+        update.then(() => homeRecommendationRefreshes.delete(expectedSession));
+        return update;
+    }
+
+    async function loadHomeRecommendations(hero, revision, initialRequestWidth) {
+        if (hero._loadingRecommendations || revision !== heroRevision || !hero.isConnected) return;
+        hero._loadingRecommendations = true;
+        window.clearTimeout(heroRecommendationTimer); heroRecommendationTimer = 0;
+        const expectedSession = session;
+        let result;
+        let previousResult = null;
+        try {
+            // A failed refresh waits for the next application launch. Re-entering home
+            // can still display the same native-cache result without another network attempt.
+            if (homeRecommendationFailures.has(expectedSession)) {
+                result = homeRecommendationFailures.get(expectedSession);
+                if (result) await loadHeroCandidates(hero, heroCandidates(result.items), revision, initialRequestWidth);
+                return;
+            }
+            result = await nativeRequest('mediaStationCatalog', 'recommendations', ['recommendations', '{}'], 90000);
+            if (revision !== heroRevision || !hero.isConnected) return;
+            if (!Array.isArray(result.items) || !Number.isFinite(result.cache?.expiresAtMs)) {
+                throw new Error('服务器推荐结果或缓存有效期无效');
+            }
+            previousResult = result;
+            const expired = result.cache.expiresAtMs <= Date.now();
+            // Start refreshing independently of cached artwork decoding and carousel preparation.
+            const update = expired ? refreshHomeRecommendations(expectedSession, previousResult) : null;
+            await loadHeroCandidates(hero, heroCandidates(result.items), revision, initialRequestWidth);
+            if (update) {
+                const refreshed = await update;
+                if (refreshed.error || revision !== heroRevision || !hero.isConnected) return;
+                result = refreshed.value;
+                if (!Array.isArray(result.items) || !Number.isFinite(result.cache?.expiresAtMs) || result.cache.expiresAtMs <= Date.now()) {
+                    throw new Error('更新后的推荐结果或缓存有效期无效');
+                }
+                await loadHeroCandidates(hero, heroCandidates(result.items), revision, initialRequestWidth);
+            }
+            if (revision !== heroRevision || !hero.isConnected) return;
+            hero._recommendationsExpireAt = result.cache.expiresAtMs;
+            heroRecommendationTimer = window.setTimeout(() => {
+                heroRecommendationTimer = 0;
+                if (!document.hidden) void loadHomeRecommendations(hero, revision);
+            }, Math.max(1, result.cache.expiresAtMs - Date.now()));
+            if (result.cache.writeFailed) console.error('推荐已加载，但本地缓存保存失败');
+        } catch (error) {
+            homeRecommendationFailures.set(expectedSession, previousResult);
+            if (revision !== heroRevision || !hero.isConnected) return;
+            console.error('首页推荐加载失败，下次启动时重试：' + friendlyError(error));
+        } finally {
+            hero._loadingRecommendations = false;
+            if (revision === heroRevision && hero.isConnected) {
+                hero._placeholder?.remove(); delete hero._placeholder;
+            }
+        }
     }
 
     function startHeroCarousel(hero, cards, selectedId = '') {
@@ -3014,54 +3135,94 @@
     }
 
     async function loadHeroCandidates(hero, candidates, revision, initialRequestWidth) {
-        hero._artworkPool = [];
+        const pool = [];
+        const previousPool = hero._artworkPool;
         for (const [index, card] of candidates.entries()) {
             if (revision !== heroRevision || !hero.isConnected) return;
             try {
                 const art = await loadHeroArtwork(hero, card, index === 0 ? initialRequestWidth : undefined);
                 if (revision !== heroRevision || !hero.isConnected) return;
-                hero._artworkPool.push({ card, art });
+                pool.push({ card, art });
                 // Reveal the first sharp image immediately; complete the carousel in the background.
-                if (!hero.dataset.qualifiedIds && heroArtworkFits(hero, art)) refreshHeroArtworkQualification();
-                if (hero._artworkPool.filter((entry) => heroArtworkFits(hero, entry.art)).length >= heroCarouselMaxCards) break;
+                if (heroArtworkFits(hero, art)) {
+                    hero._artworkPool = pool;
+                    if (pool.filter((entry) => heroArtworkFits(hero, entry.art)).length === 1) refreshHeroArtworkQualification();
+                }
+                if (pool.filter((entry) => heroArtworkFits(hero, entry.art)).length >= heroCarouselMaxCards) break;
             } catch (error) { console.error('精选图片加载失败：' + friendlyError(error)); }
         }
         if (revision === heroRevision && hero.isConnected) {
+            if (!previousPool || pool.some((entry) => heroArtworkFits(hero, entry.art))) hero._artworkPool = pool;
             refreshHeroArtworkQualification();
             hero._placeholder?.remove();
             delete hero._placeholder;
         }
     }
 
+    function createHomeHero() {
+        const hero = element('section', 'home-hero hero-pending');
+        hero._session = session;
+        hero.style.setProperty('--hero-image-density', String(window.devicePixelRatio || 1));
+        hero.style.setProperty('--hero-image-max-scale', String(heroArtworkMaxScale));
+        hero.setAttribute('aria-label', '为你推荐');
+        hero._placeholder = createHomeHeroSkeleton();
+        hero.append(element('div', 'hero-slide'), element('div', 'hero-slide'));
+        return hero;
+    }
+
+    function activateHomeHero(hero, revision, initialHeroWidth) {
+        imagePriorityHero = hero;
+        imagePriorityUntil = Date.now() + homeHeroImagePriorityMs;
+        window.clearTimeout(imagePriorityTimer);
+        imagePriorityTimer = window.setTimeout(() => releaseHomeHeroImagePriority(hero), homeHeroImagePriorityMs);
+        heroRecommendationVisibility = () => {
+            if (!document.hidden && hero._recommendationsExpireAt <= Date.now()) void loadHomeRecommendations(hero, revision);
+        };
+        document.addEventListener('visibilitychange', heroRecommendationVisibility);
+        void loadHomeRecommendations(hero, revision, initialHeroWidth);
+    }
+
+    function releaseHomeHeroImagePriority(hero) {
+        if (imagePriorityHero !== hero) return;
+        imagePriorityHero = null;
+        imagePriorityUntil = 0;
+        window.clearTimeout(imagePriorityTimer); imagePriorityTimer = 0;
+        pumpImages();
+    }
+
     function renderHome(data) {
         // Measure before inserting cards; reading clientWidth after insertion
         // forces the entire new home layout into this same JavaScript task.
         const initialHeroWidth = imageWidthFor(null, true, true);
-        stopHeroCarousel(); replaceContent();
+        const existingHero = content.querySelector('.home-featured .home-hero:not(.home-skeleton-hero)');
+        const retainedHero = existingHero?._session === session ? existingHero : null;
+        if (!retainedHero) stopHeroCarousel();
+        replaceContent();
         const revision = heroRevision;
         const resumeItems = Array.isArray(data.resume) ? data.resume.slice(0, maximumContinueWatchingItems) : [];
         const latestSections = Array.isArray(data.latestSections) ? data.latestSections.filter((section) => section?.library && section.items?.length) : [];
-        const hero = element('section', 'home-hero hero-pending');
-        hero.setAttribute('aria-label', '最近添加精选');
-        hero._placeholder = createHomeHeroSkeleton();
-        hero.append(element('div', 'hero-slide'), element('div', 'hero-slide'));
-        const band = element('div', 'page-band');
+        const hero = retainedHero || createHomeHero();
+        const band = element('div', 'page-band home-band');
         const resume = createSection('继续观看', resumeItems, {
             key: 'resume', rowIndex: 1, landscape: true, episodeAsSeries: true, description: '接着上次的故事',
             more: () => setCurrentView({ kind: 'resume', data: homeData }),
             onClick: resumePlayback,
         });
+        if (resume) band.append(resume);
+        else band.append(element('div', 'empty-state', '暂无继续观看的作品'));
+        const featured = element('div', 'home-featured');
+        if (hero._placeholder) featured.append(hero._placeholder);
+        featured.append(hero, band);
+        const recent = element('div', 'page-band home-latest-band');
         const latestRows = latestSections.length
             ? latestSections.map((section, index) => createSection(`最近添加 · ${section.library.title}`, section.items, {
                 key: `latest:${section.library.id}`, rowIndex: index + 2, onClick: openDetail,
                 more: () => openLibrary(section.library),
             }))
             : [createSection('最近添加', data.latest, { key: 'latest', rowIndex: 2, onClick: openDetail })];
-        [resume, ...latestRows].filter(Boolean).forEach((section) => band.append(section));
-        if (!band.childElementCount) band.append(element('div', 'empty-state', '媒体库暂无内容'));
-        content.append(hero._placeholder, hero, band);
-        const candidates = heroCandidates(data, latestSections);
-        void loadHeroCandidates(hero, candidates, revision, initialHeroWidth);
+        latestRows.filter(Boolean).forEach((section) => recent.append(section));
+        content.append(featured, recent);
+        if (!retainedHero) activateHomeHero(hero, revision, initialHeroWidth);
     }
 
     function renderResume(data) {
@@ -8122,7 +8283,7 @@
     byId('sidebar-toggle').addEventListener('click', () => {
         appShell.classList.toggle(narrowSidebar.matches ? 'sidebar-open' : 'sidebar-collapsed');
         updateSidebarToggle();
-        requestAnimationFrame(refreshHeroArtworkQualification);
+        scheduleResponsiveLayout();
     });
     narrowSidebar.addEventListener('change', updateSidebarToggle);
     updateSidebarToggle();
@@ -8778,15 +8939,8 @@
         }, 120));
     }, { capture: true, passive: true });
 
-    window.addEventListener('resize', () => {
-        closeEnhancementChoices();
-        refreshHeroArtworkQualification();
-        refreshMediaRowCarousels();
-        content.querySelectorAll('.library-filter-group').forEach((group) => group._syncOverflow?.());
-        if (currentDrawer === byId('account-drawer')) positionAccountPopover(currentDrawer, drawerTrigger);
-        positionPlayerPanel();
-        positionDanmakuPanel();
-    }, { passive: true });
+    new ResizeObserver(scheduleResponsiveLayout).observe(content);
+    window.addEventListener('resize', scheduleResponsiveLayout, { passive: true });
 
     content.addEventListener('pointerdown', (event) => {
         stopSmoothScroll(content);

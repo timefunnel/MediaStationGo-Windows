@@ -49,15 +49,20 @@ async function main() {
     assert.deepEqual(away.counts(), { renders: 0, restores: 0 });
 
     const events = [];
-    const node = () => ({ children: [], dataset: {}, append(...children) { this.children.push(...children); }, setAttribute() {}, get childElementCount() { return this.children.length; } });
+    const node = () => ({ children: [], dataset: {}, style: { setProperty() {} }, append(...children) { this.children.push(...children); }, setAttribute() {}, get childElementCount() { return this.children.length; } });
     const render = vm.createContext({
         imageWidthFor() { events.push('measure');return 1440; },
         stopHeroCarousel() {}, replaceContent() { events.push('replace'); }, heroRevision: 1,
-        maximumContinueWatchingItems:20, element:node, createSection:() => null, createHomeHeroSkeleton:node, content:node(), heroCandidates:() => [],
+        document: { addEventListener() {} }, heroRecommendationVisibility: null,
+        window: { devicePixelRatio: 1.5, clearTimeout() {}, setTimeout() {} },
+        imagePriorityHero: null, imagePriorityUntil: 0, imagePriorityTimer: 0, homeHeroImagePriorityMs: 3000,
+        heroArtworkMaxScale: 2,
+        session: {},
+        maximumContinueWatchingItems:20, element:node, createSection:() => null, createHomeHeroSkeleton:node, content:{ ...node(), querySelector: () => null }, heroCandidates:() => [],
         resumePlayback() {}, openDetail() {},
-        loadHeroCandidates(hero, candidates, revision, width) { assert.equal(width,1440);events.push('artwork'); },
+        loadHomeRecommendations(hero, revision, width) { assert.equal(width,1440);events.push('artwork'); },
     });
-    vm.runInContext(handler('renderHome'), render);
+    for (const name of ['createHomeHero', 'activateHomeHero', 'renderHome']) vm.runInContext(handler(name), render);
     render.renderHome({ resume: [], latest: [], latestSections: [] });
     assert.deepEqual(events, ['measure','replace','artwork'], 'new DOM must not force the artwork width measurement');
 
@@ -71,6 +76,29 @@ async function main() {
     vm.runInContext(handler('loadHeroCandidates'), candidates);
     await candidates.loadHeroCandidates(hero, [{id:'one'},{id:'two'}],1,1440);
     assert.deepEqual(widths,[1440,undefined], 'only initial artwork should use the pre-mutation width; later requests remeasure after resize');
+    const imageSizes = vm.createContext({ content: { clientWidth: 1100 }, window: { devicePixelRatio: 1.5 } });
+    vm.runInContext(handler('imageWidthFor'), imageSizes);
+    assert.equal(imageSizes.imageWidthFor(null, true, true), 2000);
+    imageSizes.content.clientWidth = 1300;
+    assert.equal(imageSizes.imageWidthFor(null, true, true), 2000, 'resizing a large banner must reuse a stable cache width');
+    imageSizes.window.devicePixelRatio = 1;
+    imageSizes.content.clientWidth = 700;
+    assert.equal(imageSizes.imageWidthFor(null, true, true), 1280);
+    const frames = [], responsiveEvents = [];
+    const responsive = vm.createContext({
+        responsiveLayoutFrame: 0,
+        window: { requestAnimationFrame(callback) { frames.push(callback); return frames.length; } },
+        closeEnhancementChoices() {}, refreshHeroArtworkQualification() { responsiveEvents.push('hero'); },
+        refreshMediaRowCarousels() { responsiveEvents.push('rows'); },
+        content: { querySelectorAll: () => [] }, currentDrawer: null, byId: () => ({}),
+        positionPlayerPanel() {}, positionDanmakuPanel() {},
+    });
+    vm.runInContext(handler('scheduleResponsiveLayout'), responsive);
+    responsive.scheduleResponsiveLayout(); responsive.scheduleResponsiveLayout(); responsive.scheduleResponsiveLayout();
+    assert.equal(frames.length, 1, 'continuous resize notifications must coalesce into one frame');
+    frames[0]();
+    assert.deepEqual(responsiveEvents, ['hero', 'rows']);
+    responsive.scheduleResponsiveLayout(); assert.equal(frames.length, 2, 'later resize frames must still synchronize the components');
     console.log('HOME_REFRESH_OK: unchanged data preserves DOM; all content changes refresh; initial artwork measures before DOM replacement');
 }
 main().catch(error => { console.error(error);process.exitCode=1; });

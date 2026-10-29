@@ -16,6 +16,7 @@ const HEADER_LOCATION: &str = "location";
 const HEADER_USER_AGENT: &str = "user-agent";
 const MAX_EXTERNAL_RESOURCE_REDIRECTS: usize = 6;
 const CATALOG_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,People,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
+const HOME_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,MediaSources,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
 const BROWSE_FIELDS: &str = "Overview,RunTimeTicks,UserData,ImageTags,BackdropImageTags,ParentBackdropImageTags,ParentBackdropItemId,ParentLogoImageTag,ParentLogoItemId,PrimaryImageItemId,ProductionYear,CommunityRating,OfficialRating,Genres,SeriesId,SeriesName,SeasonId,ParentId,IndexNumber,ParentIndexNumber,ChildCount,RecursiveItemCount";
 const MAX_CATALOG_PAGE_SIZE: usize = 100;
 const HOME_RESUME_LIMIT: usize = 20;
@@ -700,8 +701,6 @@ impl MediaStationApiClient {
 
     pub fn load_home(&self, session: &MediaStationSession) -> Result<MediaHome, ApiError> {
         let libraries_url = endpoint(&session.base_url, &["Users", &session.user_id, "Views"])?;
-        let libraries = parse_media_cards(&self.get_json(session, &libraries_url)?)?;
-
         let mut resume_url = resume_endpoint(session)?;
         resume_url
             .query_pairs_mut()
@@ -711,22 +710,49 @@ impl MediaStationApiClient {
             .append_pair("Filters", "IsResumable")
             .append_pair("SortBy", "DatePlayed")
             .append_pair("SortOrder", "Descending")
-            .append_pair("Fields", CATALOG_FIELDS);
-        let resume = parse_media_cards(&self.get_json(session, &resume_url)?)?
-            .into_iter()
-            .take(HOME_RESUME_LIMIT)
-            .collect();
+            .append_pair("Fields", HOME_FIELDS);
+        let (libraries, resume) = std::thread::scope(|scope| {
+            let resume_worker = scope.spawn(|| {
+                parse_media_cards(&self.get_json(session, &resume_url)?)
+                    .map(|items| items.into_iter().take(HOME_RESUME_LIMIT).collect())
+            });
+            let libraries = self
+                .get_json(session, &libraries_url)
+                .and_then(|value| parse_media_cards(&value));
+            let resume = resume_worker.join().map_err(|_| ApiError::InvalidInput {
+                field: "home",
+                reason: "continue-watching worker failed".to_string(),
+            })?;
+            Ok::<_, ApiError>((libraries?, resume?))
+        })?;
 
-        let latest_by_library = libraries
-            .iter()
-            .map(|library| {
-                self.load_latest_items(session, &library.id, 18)
-                    .map(|items| MediaLibrarySection {
-                        library: library.clone(),
-                        items,
+        let mut latest_by_library = Vec::new();
+        for batch in libraries.chunks(4) {
+            let sections = std::thread::scope(|scope| {
+                let workers = batch
+                    .iter()
+                    .map(|library| {
+                        scope.spawn(move || {
+                            self.load_latest_items(session, &library.id, 18)
+                                .map(|items| MediaLibrarySection {
+                                    library: library.clone(),
+                                    items,
+                                })
+                        })
                     })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker.join().map_err(|_| ApiError::InvalidInput {
+                            field: "home",
+                            reason: "latest-items worker failed".to_string(),
+                        })?
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()
+            })?;
+            latest_by_library.extend(sections);
+        }
         let mut seen_latest = std::collections::HashSet::new();
         let latest = latest_by_library
             .iter()
@@ -759,8 +785,81 @@ impl MediaStationApiClient {
         url.query_pairs_mut()
             .append_pair("ParentId", parent_id)
             .append_pair("Limit", &limit.to_string())
-            .append_pair("Fields", CATALOG_FIELDS);
+            .append_pair("Fields", HOME_FIELDS);
         parse_media_cards(&self.get_json(session, &url)?)
+    }
+
+    /// Sample the user's full accessible catalogue with a small count probe and one random page.
+    /// UserId and the authenticated session enforce the same access boundary as library browsing.
+    pub fn load_home_recommendations(
+        &self,
+        session: &MediaStationSession,
+    ) -> Result<Vec<MediaCard>, ApiError> {
+        self.load_home_recommendations_with_random(session, &mut fastrand::Rng::new())
+    }
+
+    fn load_home_recommendations_with_random(
+        &self,
+        session: &MediaStationSession,
+        random: &mut fastrand::Rng,
+    ) -> Result<Vec<MediaCard>, ApiError> {
+        let mut candidates = self.load_recommendation_sample(session, random)?;
+        random.shuffle(&mut candidates);
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|card| {
+            matches!(
+                card.media_type.as_str(),
+                "Movie" | "Series" | "Video" | "MusicVideo"
+            ) && (card.backdrop_image.is_some() || card.landscape_image.is_some())
+                && seen.insert(card.id.clone())
+        });
+        Ok(candidates)
+    }
+
+    fn load_recommendation_sample(
+        &self,
+        session: &MediaStationSession,
+        random: &mut fastrand::Rng,
+    ) -> Result<Vec<MediaCard>, ApiError> {
+        const SAMPLE_SIZE: usize = 12;
+        let first = self.load_recommendation_page(session, 0, 1)?;
+        if first.total_record_count <= 1 {
+            return Ok(first.items);
+        }
+        let sample_size = SAMPLE_SIZE.min(first.total_record_count);
+        let start = random.usize(0..first.total_record_count);
+        let page = self.load_recommendation_page(session, start, sample_size)?;
+        let mut items = page.items;
+        if items.len() < sample_size && start > 0 {
+            items.extend(first.items.into_iter().take(sample_size - items.len()));
+            if items.len() < sample_size {
+                items.extend(
+                    self.load_recommendation_page(session, 1, sample_size - items.len())?
+                        .items,
+                );
+            }
+        }
+        Ok(items)
+    }
+
+    fn load_recommendation_page(
+        &self,
+        session: &MediaStationSession,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<MediaPage, ApiError> {
+        validate_page(start_index, limit)?;
+        let mut url = endpoint(&session.base_url, &["Items"])?;
+        url.query_pairs_mut()
+            .append_pair("UserId", &session.user_id)
+            .append_pair("StartIndex", &start_index.to_string())
+            .append_pair("Limit", &limit.to_string())
+            .append_pair("SortBy", "DateCreated")
+            .append_pair("SortOrder", "Descending")
+            .append_pair("Recursive", "true")
+            .append_pair("IncludeItemTypes", "Movie,Series,Video,MusicVideo")
+            .append_pair("Fields", BROWSE_FIELDS);
+        parse_media_page(&self.get_json(session, &url)?, start_index)
     }
 
     pub fn load_library_page(
@@ -3223,6 +3322,101 @@ mod tests {
     }
 
     #[test]
+    fn recommendations_probe_one_item_and_sample_the_full_user_catalogue() {
+        let seed = (0..1_000)
+            .find(|seed| fastrand::Rng::with_seed(*seed).usize(0..100) >= 90)
+            .unwrap();
+        let start = fastrand::Rng::with_seed(seed).usize(0..100);
+        let page = |offset: usize, end: usize| {
+            let body = json!({
+                "Items": (offset..end).map(|id| json!({"Id": format!("movie-{id}"), "Name": "Movie", "Type": "Movie", "BackdropImageTags": ["bg"]})).collect::<Vec<_>>(),
+                "StartIndex": offset, "TotalRecordCount": 100
+            }).to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let wrap = 12 - (100 - start) - 1;
+        let (base_url, server) =
+            serve_sequence(vec![page(0, 1), page(start, 100), page(1, 1 + wrap)]);
+        let items = MediaStationApiClient::new("test")
+            .unwrap()
+            .load_recommendation_sample(&session(base_url), &mut fastrand::Rng::with_seed(seed))
+            .unwrap();
+        assert_eq!(items.len(), 12);
+        assert_eq!(items[0].id, format!("movie-{start}"));
+        assert_eq!(items[100 - start].id, "movie-0");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for (request, (expected_start, expected_limit)) in
+            requests.iter().zip([(0, 1), (start, 12), (1, wrap)])
+        {
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(params["StartIndex"], expected_start.to_string());
+            assert_eq!(params["Limit"], expected_limit.to_string());
+            assert!(!params.contains_key("ParentId"));
+            assert_eq!(params["UserId"], "user-1");
+            assert_eq!(params["SortBy"], "DateCreated");
+            assert_eq!(params["Recursive"], "true");
+            assert_eq!(params["IncludeItemTypes"], "Movie,Series,Video,MusicVideo");
+            assert!(!params["Fields"].contains("MediaSources"));
+        }
+    }
+
+    #[test]
+    fn recommendations_scope_queries_to_the_user_and_exclude_folders_and_missing_artwork() {
+        let seed = (0..1_000)
+            .find(|seed| fastrand::Rng::with_seed(*seed).usize(0..4) == 0)
+            .unwrap();
+        let responses = [
+            json!({"Items": [{"Id":"movie-1", "Name":"Movie", "Type":"Movie", "BackdropImageTags":["bg"]}], "TotalRecordCount":4}),
+            json!({"Items": [
+                {"Id":"movie-1", "Name":"Movie", "Type":"Movie", "BackdropImageTags":["bg"]},
+                {"Id":"series-1", "Name":"Series", "Type":"Series", "BackdropImageTags":["bg"]},
+                {"Id":"no-art", "Name":"No art", "Type":"Movie"},
+                {"Id":"episode", "Name":"Episode", "Type":"Episode", "BackdropImageTags":["bg"]}
+            ], "StartIndex":0, "TotalRecordCount":4}),
+        ].into_iter().map(|value| {
+            let body = value.to_string();
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        }).collect();
+        let (base_url, server) = serve_sequence(responses);
+        let items = MediaStationApiClient::new("test")
+            .unwrap()
+            .load_home_recommendations_with_random(
+                &session(base_url),
+                &mut fastrand::Rng::with_seed(seed),
+            )
+            .unwrap();
+        let mut ids = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["movie-1", "series-1"]);
+        let requests = server.join().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /Items?")
+                    && request.contains("UserId=user-1"))
+        );
+        assert!(requests[0].contains("Limit=1&"));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
     fn favorites_page_uses_authenticated_server_filter_and_pagination()
     -> Result<(), Box<dyn std::error::Error>> {
         let body = json!({"Items": [{"Id":"movie-1","Name":"Movie","Type":"Movie","UserData":{"IsFavorite":true}}], "StartIndex":48,"TotalRecordCount":49}).to_string();
@@ -3483,7 +3677,7 @@ mod tests {
     }
 
     #[test]
-    fn home_limits_continue_watching_request_and_result_to_twenty_items() {
+    fn home_loads_independent_sections_concurrently_and_preserves_limits_and_order() {
         let response = |payload: Value| {
             let body = payload.to_string();
             format!(
@@ -3500,10 +3694,72 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let (base_url, server) = serve_sequence(vec![
-            response(json!({ "Items": [] })),
-            response(json!({ "Items": resume_items })),
-        ]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            // Neither startup query may wait for the other; latest sections
+            // must run in batches of four, while retaining library order.
+            for batch_size in [2, 4, 2] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut batch = Vec::new();
+                while batch.len() < batch_size {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = Vec::new();
+                            let mut buffer = [0_u8; 4096];
+                            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                                let count = stream.read(&mut buffer).unwrap();
+                                assert_ne!(count, 0, "request ended before its headers");
+                                request.extend_from_slice(&buffer[..count]);
+                            }
+                            batch.push((stream, String::from_utf8(request).unwrap()));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "home queries were serialized"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("home test listener failed: {error}"),
+                    }
+                }
+                for (mut stream, request) in batch.into_iter().rev() {
+                    let target = request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+                    let payload = match url.path() {
+                        "/Users/user-1/Views" => json!({"Items": (0..6).map(|index| json!({
+                            "Id": format!("library-{index}"), "Name": "Library", "Type": "CollectionFolder"
+                        })).collect::<Vec<_>>() }),
+                        "/Users/user-1/Items" => json!({ "Items": resume_items }),
+                        "/Users/user-1/Items/Latest" => {
+                            let parent = url
+                                .query_pairs()
+                                .find(|(key, _)| key == "ParentId")
+                                .unwrap()
+                                .1;
+                            json!([{"Id": format!("latest-{parent}"), "Name": "Latest", "Type": "Movie"}])
+                        }
+                        path => panic!("unexpected home route: {path}"),
+                    };
+                    stream.write_all(response(payload).as_bytes()).unwrap();
+                    requests.push(request);
+                }
+            }
+            requests
+        });
+        let base_url = Url::parse(&format!("http://{address}")).unwrap();
         let client =
             MediaStationApiClient::new("MediaStationWindows/0.1").expect("client should be valid");
 
@@ -3511,7 +3767,16 @@ mod tests {
             .load_home(&session(base_url))
             .expect("home should load");
         let requests = server.join().expect("server thread should finish");
-        let resume_target = requests[1]
+        assert_eq!(requests.len(), 8);
+        assert_eq!(home.latest_by_library.len(), 6);
+        for (index, section) in home.latest_by_library.iter().enumerate() {
+            assert_eq!(section.library.id, format!("library-{index}"));
+            assert_eq!(section.items[0].id, format!("latest-library-{index}"));
+        }
+        let resume_target = requests
+            .iter()
+            .find(|request| request.starts_with("GET /Users/user-1/Items?"))
+            .unwrap()
             .lines()
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
@@ -3546,6 +3811,12 @@ mod tests {
         );
         assert_eq!(home.resume.len(), 20);
         assert_eq!(home.resume[19].id, "episode-20");
+        assert!(!params["Fields"].split(',').any(|field| field == "People"));
+        assert!(
+            params["Fields"]
+                .split(',')
+                .any(|field| field == "MediaSources")
+        );
     }
 
     #[test]

@@ -194,6 +194,10 @@ $PreviewShim = @'
         try { input = JSON.parse(raw || '{}'); } catch { input = {}; }
         if (operation === 'favorites' || operation === 'set_favorite') return respond(requestId, operation, { code: 'preview_unavailable', message: '缓存没有收藏状态；此预览不连接服务器，不模拟收藏结果。' }, false);
         if (operation === 'home') return respond(requestId, operation, previewHome);
+        if (operation === 'recommendations') return respond(requestId, operation, {
+            items: catalog ? previewCards : [movie, series],
+            cache: { status: 'preview', expiresAtMs: Date.now() + 6 * 60 * 60 * 1000, writeFailed: false },
+        });
         if (operation === 'detail') return respond(requestId, operation, previewDetail(input.mediaId));
         if (operation === 'series_episodes') return respond(requestId, operation, { episodes: catalog ? (input.seasonId ? previewDetail(input.seriesId).episodesBySeason[input.seasonId] || [] : previewDetail(input.seriesId).episodes) : episodes });
         if (operation === 'cache_stats') return respond(requestId, operation, { imageBytes: imageMap.size * 42000, imageCount: imageMap.size });
