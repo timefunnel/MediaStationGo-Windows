@@ -1112,7 +1112,7 @@ impl MediaStationApiClient {
             .append_pair("UserId", &session.user_id)
             .append_pair("SearchTerm", query.trim())
             .append_pair("Recursive", "true")
-            .append_pair("IncludeItemTypes", "Movie,Series,Episode,Video,MusicVideo")
+            .append_pair("IncludeItemTypes", "Movie,Series,Video,MusicVideo")
             .append_pair("Limit", &limit.to_string())
             .append_pair("Fields", CATALOG_FIELDS);
         parse_media_cards(&self.get_json(session, &url)?)
@@ -4311,13 +4311,17 @@ mod tests {
     }
 
     #[test]
-    fn standard_emby_search_sends_items_query_and_parses_results() {
+    fn standard_emby_search_requests_works_without_episodes_and_parses_results() {
         let body = json!({
             "Items": [{
                 "Id": "movie-1",
                 "Name": "Search Hit",
                 "Type": "Movie",
                 "ImageTags": { "Primary": "poster-tag" }
+            }, {
+                "Id": "series-1",
+                "Name": "Search Series",
+                "Type": "Series"
             }]
         })
         .to_string();
@@ -4361,15 +4365,17 @@ mod tests {
         );
         assert_eq!(
             params.get("IncludeItemTypes").map(|value| value.as_ref()),
-            Some("Movie,Series,Episode,Video,MusicVideo")
+            Some("Movie,Series,Video,MusicVideo")
         );
         assert_eq!(params.get("Limit").map(|value| value.as_ref()), Some("12"));
         assert!(params.contains_key("Fields"));
         assert!(request_lower.contains("x-emby-token: secret-token"));
         assert!(request_lower.contains("user-agent: senplayer/1.0.0"));
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "movie-1");
         assert_eq!(results[0].title, "Search Hit");
+        assert_eq!(results[1].id, "series-1");
+        assert_eq!(results[1].media_type, "Series");
         assert_eq!(
             results[0].primary_image,
             Some(MediaImageRef {
