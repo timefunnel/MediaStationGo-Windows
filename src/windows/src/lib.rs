@@ -486,7 +486,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
-        &jfn_playback::window_source::MPV_WINDOW_SOURCE
+        &platform::WINDOWS_WINDOW_SOURCE
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {

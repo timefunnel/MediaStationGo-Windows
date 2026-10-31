@@ -2,7 +2,7 @@
 //! helpers, scale + geometry queries, and the WndProc hook that drives
 //! compositor resize + transition bookkeeping.
 //!
-//! All `g_win` state (HWND, cached scale, fullscreen bookkeeping, the
+//! All `g_win` state (HWND, fullscreen bookkeeping, the
 //! WndProc hook handle, the input thread JoinHandle) lives in this
 //! module behind a `Mutex<WinState>`.
 
@@ -23,12 +23,13 @@ use windows::Win32::System::Threading::{
     ProcessPowerThrottling, SetProcessInformation,
 };
 use windows::Win32::UI::Controls::MARGINS;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CWPSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
+    CWPSTRUCT, CallNextHookEx, GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HHOOK, IsIconic, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
-    UnhookWindowsHookEx, WH_CALLWNDPROC, WM_CLOSE, WM_SETFOCUS, WM_SIZE, WS_CAPTION, WS_THICKFRAME,
+    UnhookWindowsHookEx, WH_CALLWNDPROC, WM_CLOSE, WM_DPICHANGED, WM_SETFOCUS, WM_SIZE,
+    WM_WINDOWPOSCHANGED, WS_CAPTION, WS_THICKFRAME,
 };
 
 use jfn_mpv::api::{
@@ -37,10 +38,10 @@ use jfn_mpv::api::{
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::{
-    WindowExtent,
+    PhysicalSize, Scale, WindowExtent, WindowPos, WindowSnapshot, WindowSource,
     geometry::{Bounds, WindowGeometry, clamp_to_bounds},
 };
-use jfn_playback::ingest_driver::{jfn_playback_display_scale, jfn_playback_fullscreen};
+use jfn_playback::ingest_driver::jfn_playback_fullscreen;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 // Input thread lives in `crate::input`.
@@ -57,7 +58,6 @@ use crate::input::{
 
 struct WinState {
     mpv_hwnd_raw: usize,
-    cached_scale: f32,
 
     // Fullscreen-transition bookkeeping read/written by the WndProc and
     // the fullscreen toggle helpers.
@@ -73,7 +73,6 @@ impl WinState {
     const fn new() -> Self {
         Self {
             mpv_hwnd_raw: 0,
-            cached_scale: 1.0,
             was_fullscreen: false,
             was_minimized: false,
             restore_maximized_on_unfullscreen: false,
@@ -109,19 +108,17 @@ fn is_fullscreen_style(style: isize) -> bool {
 // =====================================================================
 
 pub fn win_get_scale() -> f32 {
-    let scale = jfn_playback_display_scale();
-    if scale > 0.0 {
-        let s = scale as f32;
-        STATE.lock().cached_scale = s;
-        return s;
+    let hwnd_raw = STATE.lock().mpv_hwnd_raw;
+    let dpi = if hwnd_raw == 0 {
+        // Before mpv creates the window, boot geometry uses the system DPI.
+        unsafe { GetDpiForSystem() }
+    } else {
+        unsafe { GetDpiForWindow(hwnd_from_raw(hwnd_raw)) }
+    };
+    if dpi == 0 {
+        tracing::error!(hwnd_raw, "Windows window DPI is unavailable");
     }
-    let cached = STATE.lock().cached_scale;
-    if cached > 0.0 {
-        return cached;
-    }
-    // Pre-mpv (default-geometry sizing at startup): ask the OS directly.
-    let dpi = unsafe { GetDpiForSystem() };
-    if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
+    dpi as f32 / 96.0
 }
 
 // Per-monitor DPI (GetDpiForMonitor) lives in Shcore.dll which isn't
@@ -131,11 +128,73 @@ pub fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
     if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
 }
 
-/// Keep Win32 input in the same coordinate space as CEF. Both consumers read
-/// the mpv-owned `WindowExtent`; this callback is needed because a display
-/// scale change can update that extent without producing a `WM_SIZE`.
-fn sync_input_geometry_from_mpv_extent() {
-    let Some(extent) = jfn_playback::ingest_driver::jfn_playback_window_extent() else {
+/// The native client rect and window DPI are authoritative on Windows. mpv's
+/// OSD properties can lag behind them while the window is idle or minimized.
+pub(crate) struct WindowsWindowSource;
+
+pub(crate) static WINDOWS_WINDOW_SOURCE: WindowsWindowSource = WindowsWindowSource;
+
+fn window_source_hwnd() -> HWND {
+    let hwnd_raw = STATE.lock().mpv_hwnd_raw;
+    if hwnd_raw != 0 || jfn_mpv_handle_get().is_null() {
+        return hwnd_from_raw(hwnd_raw);
+    }
+    // Startup waits for a usable WindowSource before calling win_init. Only
+    // obtain the native handle from mpv here; dimensions still come from Win32.
+    let mut wid = 0;
+    if unsafe { jfn_mpv_get_property_int(c"window-id".as_ptr(), &mut wid) } < 0 {
+        return HWND::default();
+    }
+    hwnd_from_raw(wid as usize)
+}
+
+impl WindowSource for WindowsWindowSource {
+    fn snapshot(&self) -> WindowSnapshot {
+        let hwnd = window_source_hwnd();
+        let (mut x, mut y) = (0, 0);
+        WindowSnapshot {
+            extent: native_window_extent(hwnd),
+            position: win_query_window_position(&mut x, &mut y).then_some(WindowPos { x, y }),
+            maximized: !hwnd.0.is_null() && unsafe { IsZoomed(hwnd) }.as_bool(),
+            fullscreen: !hwnd.0.is_null()
+                && is_fullscreen_style(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) }),
+        }
+    }
+}
+
+fn extent_from_client_geometry(width: c_int, height: c_int, dpi: u32) -> Option<WindowExtent> {
+    (width > 0 && height > 0 && dpi > 0).then(|| {
+        WindowExtent::new(
+            PhysicalSize {
+                w: width,
+                h: height,
+            },
+            Scale(dpi as f32 / 96.0),
+        )
+    })
+}
+
+fn native_window_extent(hwnd: HWND) -> Option<WindowExtent> {
+    if hwnd.0.is_null() || unsafe { IsIconic(hwnd) }.as_bool() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    if let Err(error) = unsafe { GetClientRect(hwnd, &mut rect) } {
+        tracing::warn!(?error, "Cannot read Windows client geometry");
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        tracing::warn!("Cannot read Windows client DPI");
+        return None;
+    }
+    extent_from_client_geometry(rect.right - rect.left, rect.bottom - rect.top, dpi)
+}
+
+/// Keep input and CEF on the same native source, including scale-only changes.
+fn sync_input_geometry_from_window() {
+    let hwnd = hwnd_from_raw(STATE.lock().mpv_hwnd_raw);
+    let Some(extent) = native_window_extent(hwnd) else {
         return;
     };
     let Some((logical_w, logical_h, physical_w, physical_h)) = input_geometry_from_extent(extent)
@@ -147,18 +206,9 @@ fn sync_input_geometry_from_mpv_extent() {
         logical_h,
         physical_w,
         physical_h,
-        "synchronizing Windows input geometry from mpv WindowExtent"
+        "synchronizing Windows input geometry from native client rect and DPI"
     );
     jfn_input_windows_resize_to_parent(logical_w, logical_h, physical_w, physical_h);
-}
-
-fn input_geometry_for_parent_size(
-    physical_w: c_int,
-    physical_h: c_int,
-) -> Option<(c_int, c_int, c_int, c_int)> {
-    let extent = jfn_playback::ingest_driver::jfn_playback_window_extent()?;
-    let geometry = input_geometry_from_extent(extent)?;
-    input_geometry_matches_parent(geometry, physical_w, physical_h).then_some(geometry)
 }
 
 fn input_geometry_from_extent(extent: WindowExtent) -> Option<(c_int, c_int, c_int, c_int)> {
@@ -168,12 +218,19 @@ fn input_geometry_from_extent(extent: WindowExtent) -> Option<(c_int, c_int, c_i
         .then_some((logical.w, logical.h, physical.w, physical.h))
 }
 
-fn input_geometry_matches_parent(
-    geometry: (c_int, c_int, c_int, c_int),
-    physical_w: c_int,
-    physical_h: c_int,
-) -> bool {
-    geometry.2 == physical_w && geometry.3 == physical_h
+fn sync_native_window_geometry(force_end: bool) {
+    let hwnd = hwnd_from_raw(STATE.lock().mpv_hwnd_raw);
+    let Some(extent) = native_window_extent(hwnd) else {
+        return;
+    };
+    let logical = extent.logical();
+    let physical = extent.physical();
+    crate::compositor::jfn_win_update_surface_size(
+        logical.w, logical.h, physical.w, physical.h, force_end,
+    );
+    // Notify only after native state is committed. Late mpv notifications also
+    // pull this same source, so stale OSD dimensions cannot shrink the browser.
+    jfn_platform_abi::notify_window_changed();
 }
 
 // =====================================================================
@@ -285,25 +342,7 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                     return unsafe { CallNextHookEx(Some(hook), n_code, wp, lp) };
                 }
 
-                let lparam = msg.lParam.0 as u32;
-                let pw = (lparam & 0xFFFF) as c_int;
-                let ph = ((lparam >> 16) & 0xFFFF) as c_int;
-                if pw > 0 && ph > 0 {
-                    // Prefer the same exact extent CEF receives. WM_SIZE may
-                    // race mpv's OSD update, so only use it when the physical
-                    // dimensions match and otherwise retain the old fallback.
-                    let (lw, lh) = input_geometry_for_parent_size(pw, ph)
-                        .map(|(lw, lh, _, _)| (lw, lh))
-                        .unwrap_or_else(|| {
-                            let cached = STATE.lock().cached_scale;
-                            let scale = if cached > 0.0 { cached } else { 1.0 };
-                            (
-                                (pw as f32 / scale).round() as c_int,
-                                (ph as f32 / scale).round() as c_int,
-                            )
-                        });
-                    jfn_input_windows_resize_to_parent(lw, lh, pw, ph);
-
+                if let Some(extent) = native_window_extent(hwnd_from_raw(target_hwnd_raw)) {
                     let style =
                         unsafe { GetWindowLongPtrW(hwnd_from_raw(target_hwnd_raw), GWL_STYLE) };
                     let fs = is_fullscreen_style(style);
@@ -323,6 +362,12 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                         // Restore from iconic — counterpart to the
                         // SIZE_MINIMIZED arm above.
                         jfn_playback::lifecycle::jfn_lifecycle_set_visible(true);
+                        tracing::info!(
+                            physical_w = extent.physical().w,
+                            physical_h = extent.physical().h,
+                            scale = extent.scale().0,
+                            "Windows window restored; synchronizing native geometry"
+                        );
                     } else if fs_changed {
                         STATE.lock().was_fullscreen = fs;
                         // A fullscreen change we didn't drive through the
@@ -343,15 +388,18 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
                     // the compositor, where the size captured at begin lives).
                     // The force-end flag covers a settled fullscreen edge whose
                     // physical size happens to be unchanged.
-                    crate::compositor::jfn_win_update_surface_size(
-                        lw,
-                        lh,
-                        pw,
-                        ph,
-                        fs_changed || recovering_from_minimize,
-                    );
+                    sync_native_window_geometry(fs_changed || recovering_from_minimize);
                 }
+            } else if msg.message == WM_DPICHANGED || msg.message == WM_WINDOWPOSCHANGED {
+                // WH_CALLWNDPROC runs before mpv's handler. DPI changes may
+                // resize the window in that handler; the subsequent position /
+                // size notifications then pull the final client rect again.
+                if msg.message == WM_DPICHANGED {
+                    tracing::info!(dpi = msg.wParam.0 & 0xffff, "Windows window DPI changed");
+                }
+                sync_native_window_geometry(false);
             } else if msg.message == WM_SETFOCUS {
+                sync_native_window_geometry(false);
                 jfn_input_windows_focus();
             } else if msg.message == WM_CLOSE {
                 tracing::info!("Windows window close received; initiating application shutdown");
@@ -403,9 +451,6 @@ pub fn win_init(_mpv: *mut c_void) -> bool {
     let hwnd_raw = wid as usize;
     STATE.lock().mpv_hwnd_raw = hwnd_raw;
 
-    // Seed cached_scale.
-    win_get_scale();
-
     // Enable DWM transparency so DComp visuals with premultiplied alpha work.
     let margins = MARGINS {
         cxLeftWidth: -1,
@@ -451,8 +496,8 @@ pub fn win_init(_mpv: *mut c_void) -> bool {
     // CEF already resizes from this payload-free notification. Subscribe the
     // input layer to the same source so a scale-only change cannot leave its
     // physical-to-logical mapping behind CEF's view size.
-    jfn_platform_abi::subscribe_window_changed(sync_input_geometry_from_mpv_extent);
-    sync_input_geometry_from_mpv_extent();
+    jfn_platform_abi::subscribe_window_changed(sync_input_geometry_from_window);
+    sync_native_window_geometry(false);
 
     tracing::info!("Windows DirectComposition compositor initialized");
     true
@@ -538,7 +583,7 @@ pub fn win_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, y:
 
 #[cfg(test)]
 mod tests {
-    use super::{input_geometry_from_extent, input_geometry_matches_parent};
+    use super::{extent_from_client_geometry, input_geometry_from_extent};
     use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
 
     #[test]
@@ -557,54 +602,39 @@ mod tests {
 
     #[test]
     fn scale_only_extent_change_updates_input_logical_size() {
-        let old = WindowExtent::with_logical(
-            PhysicalSize { w: 1311, h: 736 },
-            Scale(1.25),
-            LogicalSize { w: 1049, h: 589 },
-        );
-        let new = WindowExtent::with_logical(
-            PhysicalSize { w: 1311, h: 736 },
-            Scale(1.5),
-            LogicalSize { w: 874, h: 491 },
-        );
-
         assert_eq!(
-            input_geometry_from_extent(old),
+            extent_from_client_geometry(1311, 736, 120).and_then(input_geometry_from_extent),
             Some((1049, 589, 1311, 736))
         );
-        assert_eq!(input_geometry_from_extent(new), Some((874, 491, 1311, 736)));
+        assert_eq!(
+            extent_from_client_geometry(1311, 736, 144).and_then(input_geometry_from_extent),
+            Some((874, 491, 1311, 736))
+        );
     }
 
     #[test]
-    fn parent_resize_rejects_a_stale_mpv_extent() {
-        let matching = WindowExtent::with_logical(
-            PhysicalSize { w: 1311, h: 736 },
-            Scale(1.25),
-            LogicalSize { w: 1048, h: 589 },
+    fn background_dpi_resize_preserves_logical_size() {
+        // Captured failure: startup was 1515x955 at 125%, while the live
+        // client rect had become 1818x1146 at 150% with no user resize.
+        assert_eq!(
+            extent_from_client_geometry(1515, 955, 120).and_then(input_geometry_from_extent),
+            Some((1212, 764, 1515, 955))
         );
-        let different_size = WindowExtent::with_logical(
-            PhysicalSize { w: 1600, h: 900 },
-            Scale(1.25),
-            LogicalSize { w: 1280, h: 720 },
+        assert_eq!(
+            extent_from_client_geometry(1818, 1146, 144).and_then(input_geometry_from_extent),
+            Some((1212, 764, 1818, 1146))
         );
+    }
 
-        assert_eq!(
-            input_geometry_from_extent(matching),
-            Some((1048, 589, 1311, 736))
-        );
-        assert_eq!(
-            input_geometry_from_extent(different_size),
-            Some((1280, 720, 1600, 900))
-        );
-        assert!(input_geometry_matches_parent(
-            (1048, 589, 1311, 736),
-            1311,
-            736
-        ));
-        assert!(!input_geometry_matches_parent(
-            (1280, 720, 1600, 900),
-            1311,
-            736
-        ));
+    #[test]
+    fn invalid_native_geometry_is_not_replaced_with_a_cached_size() {
+        for (width, height, dpi) in [
+            (0, 720, 144),
+            (1280, 0, 144),
+            (-1, 720, 144),
+            (1280, 720, 0),
+        ] {
+            assert!(extent_from_client_geometry(width, height, dpi).is_none());
+        }
     }
 }
