@@ -1179,10 +1179,10 @@ body.player-mode .app-shell { display: none; }
 .theme-choice b { color: var(--text); font-size: 12px; font-weight: 620; }
 .theme-choice small { margin-top: 2px; color: var(--faint); font-size: 10px; }
 .frame-interpolation-settings { margin-top: 8px; padding-top: 18px; border-top: 1px solid rgba(255,255,255,0.085); }
-.settings-modal.is-signed-out .settings-authenticated { display: none !important; }
-.settings-modal.is-signed-out .settings-layout { display: block; min-height: 0; }
-.settings-modal.is-signed-out .settings-content { padding: 30px; }
-.settings-modal.is-signed-out .settings-preferences { width: min(520px, 100%); }
+.settings-preferences.is-signed-out .settings-authenticated { display: none !important; }
+.settings-preferences.is-signed-out .settings-layout { display: block; min-height: 0; }
+.settings-preferences.is-signed-out .settings-content { padding: 30px; }
+.settings-preferences.is-signed-out { width: min(520px, 100%); }
 
 @media (max-width: 760px) {
   .login-layout { grid-template-columns: 1fr; padding-top: 30px; }

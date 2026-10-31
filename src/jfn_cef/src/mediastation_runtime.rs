@@ -5193,12 +5193,21 @@ fn native_authorization_header(
 fn authentication_failure(error: &ApiError) -> LoadFailure {
     let code = match error {
         ApiError::HttpStatus {
-            status_code: 401 | 403,
-            ..
+            status_code: 401, ..
         } => "invalid_credentials",
+        ApiError::HttpStatus {
+            status_code: 403, ..
+        } => "authentication_forbidden",
+        ApiError::Transport { .. } => "authentication_transport_failed",
         _ => api_error_code(error),
     };
-    log_error(&format!("MediaStation authentication failed: code={code}"));
+    if let ApiError::HttpStatus { status_code, .. } = error {
+        log_error(&format!(
+            "MediaStation authentication failed: code={code} http_status={status_code}"
+        ));
+    } else {
+        log_error(&format!("MediaStation authentication failed: code={code}"));
+    }
     LoadFailure::new(code, "MediaStation authentication failed")
 }
 
@@ -8577,6 +8586,33 @@ mod tests {
     use jfn_playback::{MediaMetadata, PlaybackSnapshot};
     use std::io::Read as _;
     use std::net::TcpListener;
+
+    #[test]
+    fn authentication_failure_distinguishes_unauthorized_and_forbidden() {
+        for (status_code, expected_code) in [
+            (401, "invalid_credentials"),
+            (403, "authentication_forbidden"),
+            (502, "http_status"),
+        ] {
+            let error = ApiError::HttpStatus {
+                url: "https://private.example/Users/AuthenticateByName".to_string(),
+                status_code,
+                message: "sensitive server response".to_string(),
+            };
+            assert_eq!(
+                authentication_failure(&error).payload(),
+                json!({ "code": expected_code, "message": "MediaStation authentication failed" }),
+            );
+        }
+        let error = ApiError::Transport {
+            url: "https://private.example/Users/AuthenticateByName".to_string(),
+            message: "sensitive transport detail".to_string(),
+        };
+        assert_eq!(
+            authentication_failure(&error).payload(),
+            json!({ "code": "authentication_transport_failed", "message": "MediaStation authentication failed" }),
+        );
+    }
 
     fn session(user_id: &str) -> MediaStationSession {
         session_at(

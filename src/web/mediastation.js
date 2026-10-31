@@ -1193,7 +1193,9 @@
     function friendlyError(error) {
         if (!(error instanceof Error)) return '请求失败';
         const codes = {
-            invalid_credentials: '用户名或密码不正确',
+            invalid_credentials: '服务器未通过账号认证（HTTP 401），请核对账号密码及高级连接选项中的兼容身份。',
+            authentication_forbidden: '服务器拒绝访问（HTTP 403），请在连接设置中检查代理连接方式。',
+            authentication_transport_failed: '连接服务器失败，尚未完成账号验证。请检查代理连接方式，详细原因已记录到日志。',
             session_unavailable: '登录状态已失效',
             session_restore_failed: '无法恢复登录状态，请选择账号重新连接',
             catalog_load_failed: '媒体内容加载失败',
@@ -1410,7 +1412,7 @@
         byId('login-title').textContent = mode === 'update'
             ? '修改账号'
             : mode === 'server-user' ? '添加服务器用户'
-                : mode === 'add' ? '添加账号' : '登录媒体服务器';
+                : mode === 'add' ? '添加服务器' : '登录媒体服务器';
         setLoginLoading(false);
         byId('login-error').textContent = message;
         window.setTimeout(() => byId(baseUrl ? 'username' : 'server-url').focus(), 0);
@@ -1492,16 +1494,13 @@
     function beginAddAccount(baseUrl = '', lockServer = false, trigger = null, server = null) {
         loginReturnFocus = trigger || (session ? byId('account-open') : byId('login-add-account'));
         closeDrawer(false);
-        const selectedBaseUrl = baseUrl || session?.baseUrl || '';
-        const connection = server
-            || (session?.baseUrl === selectedBaseUrl && validConnectionProfile(session) ? session : null);
         showLogin(
-            selectedBaseUrl,
+            baseUrl,
             '',
             true,
             lockServer ? 'server-user' : 'add',
             null,
-            connection,
+            server,
         );
     }
 
@@ -1525,12 +1524,17 @@
         const target = loginReturnFocus;
         loginReturnFocus = null;
         if (session) {
-            loginView.classList.add('hidden');
-            appShell.classList.remove('hidden');
+            restoreAppAfterAccountChange();
             requestAnimationFrame(() => focusElement(target || byId('account-open')));
             return;
         }
         void showAccountGateway(loginAccountBaseUrl);
+    }
+
+    function restoreAppAfterAccountChange() {
+        loginView.classList.add('hidden');
+        appShell.classList.remove('hidden');
+        if (currentView?.kind === 'settings' && !content.contains(byId('settings-drawer'))) renderSettings();
     }
 
     async function initialize() {
@@ -1895,6 +1899,10 @@
     function parkSettings() {
         const components = byId('components-page');
         if (content.contains(components)) { components.classList.add('hidden'); document.body.append(components); }
+        parkSettingsDrawer();
+    }
+
+    function parkSettingsDrawer() {
         const settings = byId('settings-drawer');
         if (content.contains(settings)) {
             settings.classList.remove('settings-page', 'open');
@@ -5430,14 +5438,14 @@
         }
     }
 
-    function selectSettingsSection(section) {
+    function selectSettingsSection(section, signedIn = Boolean(session)) {
         const settings = byId('settings-drawer');
-        const signedIn = Boolean(session);
         const available = signedIn
             ? ['network', 'appearance', 'playback', 'storage', 'update']
             : ['network'];
         activeSettingsSection = available.includes(section) ? section : 'network';
-        settings.classList.toggle('is-signed-out', !signedIn);
+        // The animation clones this card, so its layout state must travel with it.
+        settings.querySelector('.settings-preferences').classList.toggle('is-signed-out', !signedIn);
         settings.querySelectorAll('.settings-section').forEach((panel) => {
             panel.classList.toggle('hidden', panel.dataset.settingsSection !== activeSettingsSection);
         });
@@ -5746,19 +5754,17 @@
     }
 
     function openSettings(trigger) {
-        selectSettingsSection(activeSettingsSection);
+        const signedIn = Boolean(session) && loginView.classList.contains('hidden');
+        if (!signedIn) parkSettingsDrawer();
+        selectSettingsSection(signedIn ? activeSettingsSection : 'network', signedIn);
         refreshProxySettings();
-        if (session) {
+        if (signedIn) {
             if (currentView?.kind !== 'settings') setCurrentView({ kind: 'settings', data: {} });
             refreshFrameInterpolationStatus(); refreshVideoComponents(); refreshUpdateControls();
             return;
         }
         openDrawer(byId('settings-drawer'), trigger);
         animateSettingsCard(trigger, true);
-        if (session) {
-            refreshFrameInterpolationStatus();
-            refreshUpdateControls();
-        }
     }
 
     function renderComponents() {
@@ -5865,8 +5871,7 @@
         loginMode = 'add';
         loginAccount = null;
         loginReturnFocus = null;
-        loginView.classList.add('hidden');
-        appShell.classList.remove('hidden');
+        restoreAppAfterAccountChange();
         byId('server-url').readOnly = false;
         setLoginConnection(null, false);
         byId('login-cancel').classList.add('hidden');
@@ -8404,7 +8409,7 @@
     byId('source-scrim').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeSourcePicker();
     });
-    byId('change-account-button').addEventListener('click', () => beginAddAccount(session?.baseUrl || ''));
+    byId('change-account-button').addEventListener('click', () => beginAddAccount());
     byId('login-add-account').addEventListener('click', (event) => beginAddAccount('', false, event.currentTarget));
     byId('account-delete-scrim').addEventListener('click', (event) => {
         if (event.target === event.currentTarget) closeDeleteAccountDialog();

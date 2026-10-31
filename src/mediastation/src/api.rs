@@ -650,14 +650,38 @@ impl MediaStationApiClient {
             "Pw": password,
         });
         let agent = self.agent_for_profile(profile)?;
+        let started = std::time::Instant::now();
         let response = agent
             .post(url.as_str())
             .header(HEADER_USER_AGENT, self.user_agent_for_profile(profile))
             .header(HEADER_EMBY_AUTHORIZATION, authorization)
             .header("content-type", "application/json; charset=utf-8")
             .send(payload.to_string())
-            .map_err(|error| transport_error(&url, error))?;
-        let payload = read_json_response(&url, response)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "CEF",
+                    "MediaStation authentication transport failed: stage=request host={} port={} proxy_mode={} client_profile={} elapsed_ms={} error={error}",
+                    url.host_str().unwrap_or_default(), url.port_or_known_default().unwrap_or_default(),
+                    profile.proxy.as_str(), profile.client.as_str(), started.elapsed().as_millis(),
+                );
+                transport_error(&url, error)
+            })?;
+        let status_code = response.status().as_u16();
+        tracing::info!(
+            target: "CEF",
+            "MediaStation authentication response: host={} port={} proxy_mode={} client_profile={} http_status={} elapsed_ms={}",
+            url.host_str().unwrap_or_default(), url.port_or_known_default().unwrap_or_default(),
+            profile.proxy.as_str(), profile.client.as_str(), status_code, started.elapsed().as_millis(),
+        );
+        let payload = read_json_response(&url, response).inspect_err(|error| {
+            if let ApiError::Transport { message, .. } = error {
+                tracing::warn!(
+                    target: "CEF",
+                    "MediaStation authentication transport failed: stage=response_body host={} http_status={} elapsed_ms={} error={message}",
+                    url.host_str().unwrap_or_default(), status_code, started.elapsed().as_millis(),
+                );
+            }
+        })?;
         let access_token = required_string(payload.get("AccessToken"), "AccessToken")?;
         let user = payload
             .get("User")
@@ -3817,6 +3841,55 @@ mod tests {
                 .split(',')
                 .any(|field| field == "MediaSources")
         );
+    }
+
+    #[test]
+    #[ignore = "read-only live probe; requires MEDIASTATION_PUBLIC_BASE_URL and a system proxy"]
+    fn server_transport_probe_without_credentials() {
+        let raw =
+            std::env::var("MEDIASTATION_PUBLIC_BASE_URL").expect("explicit public server URL");
+        let base_url = Url::parse(&raw).expect("valid public server URL");
+        validate_http_url("base_url", &base_url).expect("allowed HTTP origin");
+        assert!(base_url.username().is_empty() && base_url.password().is_none());
+        assert!(base_url.query().is_none() && base_url.fragment().is_none());
+        let url = endpoint(&base_url, &["System", "Info", "Public"]).expect("public endpoint");
+        let proxy = ureq::Proxy::try_from_env().expect("configured system proxy");
+        println!(
+            "PUBLIC_PROBE proxy_protocol={:?} proxy_host={} proxy_port={}",
+            proxy.protocol(),
+            proxy.host(),
+            proxy.port(),
+        );
+        let agent = build_api_agent(Some(proxy));
+        let mut response = agent
+            .get(url.as_str())
+            .header(HEADER_USER_AGENT, "MediaStationGoWindows/1.0.2")
+            .call()
+            .unwrap_or_else(|error| panic!("public endpoint transport error: {error:?}"));
+        println!("PUBLIC_PROBE http_status={}", response.status().as_u16());
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| panic!("public response body transport error: {error:?}"));
+        println!("PUBLIC_PROBE body_bytes={}", body.len());
+        // Check the login request path with an empty payload; never submit account credentials.
+        let login_url =
+            endpoint(&base_url, &["Users", "AuthenticateByName"]).expect("authentication endpoint");
+        let mut response = agent
+            .post(login_url.as_str())
+            .header(HEADER_USER_AGENT, "MediaStationGoWindows/1.0.2")
+            .header("content-type", "application/json; charset=utf-8")
+            .send("{}")
+            .unwrap_or_else(|error| panic!("empty login request transport error: {error:?}"));
+        println!(
+            "EMPTY_AUTH_PROBE http_status={}",
+            response.status().as_u16()
+        );
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| panic!("empty login response body error: {error:?}"));
+        println!("EMPTY_AUTH_PROBE body_bytes={}", body.len());
     }
 
     #[test]
