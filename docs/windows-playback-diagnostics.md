@@ -439,3 +439,78 @@ MKV 索引、起点探测、续播准确性、选轨及 libmpv DLL 均未修改�
 配套 libmpv DLL 哈希仍为
 `5265643476E609E7DD6E0483DEA767A8A50ABF15FC225AF85087DD3D9CD77E23`。
 没有修改安装目录或自动启动新的真实播放，未提交或推送。
+
+## 2026-10-29 标准 Emby HTTP 首个响应复用
+
+现场 v1.2.0 日志中，17:01:17 的 media_id=2862785 从 load 到首帧共
+14816 ms；准备阶段 3243 ms，其中 1 字节 Range 预检 3027 ms；native
+加载到首帧另需 11573 ms。该次为 `standard_emby_stream`，没有经过已有的
+115/CDN 文件头缓存路径。预检结束后约 7 秒才进入 `on_preloaded`，说明
+只看界面的 resolveMs 会漏掉 native 打开媒体和容器解析的等待；尚不能据此
+把这些时间全部归因于代理、解码器或服务器。
+
+本次仅调整标准 Emby HTTP 的客户端读取：
+
+- 继续由同一个 PlaybackSessionResolver 校验来源、逐跳解析 Location、
+  限制跳转次数并禁止 HTTPS 降级；同源携带 X-Emby-*，跨源移除凭据，UA
+  和代理模式沿用当前会话。标准读取发送 `Range: bytes=0-`，不再发送
+  `bytes=0-0` 后丢弃响应、交由 FFmpeg 重新请求。
+- 媒体 transport 保留校验成功的响应正文，连同 agent 和取消控制直接移交
+  native stream；URI 只包含本次 load 的唯一 ID。沿用同一份已解析链接
+  缓存，命中时直接向有效目标打开新的响应，不重复经过返链接口；UA、
+  来源、鉴权、代理或过期条件变化仍按原规则失效。活连接不进入链接缓存，
+  同一响应只能由匹配的 load
+  消费一次。新 load、停止和 loadfile 入队失败会释放未消费的响应。
+- 后续 Range 复用现有读取、延迟 seek、有限恢复和结构化失败逻辑；标准
+  HTTP 的自动跳转始终关闭，后续响应不能携带旧凭据自动跳到其他来源。
+  200 响应按不可 seek 的顺序流处理，206 校验范围及长度，拒绝编码后的
+  媒体正文和已知长度变化。HTTP 错误诊断会移除请求中的服务端凭据。
+- callback 流本身没有 mpv 的网络标记，因此仅为本次标准 HTTP 文件把
+  `cache=auto` 映射为 `cache=yes`，保留默认网络预读；显式 yes/no 不变。
+  既有 DirectStreamUrl/115 的 64 KiB 前缀缓存、UA、代理、取消及选轨路径
+  不启用这项映射。没有缩小探测大小、索引范围或解码缓存。
+
+新增 `playback startup stage` 的 `preloaded`、`file_loaded` 两个阶段，
+首帧日志补充 `native_to_preloaded_ms`、`preloaded_to_loaded_ms` 和
+`loaded_to_frame_ms`。这些阶段分别覆盖 native 打开和容器解析、选轨及初始
+续播加载、加载完成到实际首帧；外部字幕准备也可能计入相邻阶段，不能把
+其中某段直接等同于纯解码耗时。Range 日志继续记录响应头和首批数据时间。
+
+本地验证均使用 127.0.0.1 和已有 85807 字节 MP4，不访问真实片源：
+
+- 88 项 mediastation、54 项 mpv、66 项 playback、60 项 CEF runtime
+  单元测试通过。真实 loopback 验证了同源鉴权、跨源移除私密头、UA 一致、
+  首次响应直接读取、200 顺序流、无效 Range、403 和一次性 load 绑定，
+  同片缓存重播省去返链请求、但每次新开媒体响应，UA 变化重新解析。
+- libmpv 首帧对照给每次响应头增加 80 ms：默认网络缓存下从头播放
+  177 ms → 91 ms，续播 0.4 秒为 174 ms → 94 ms；请求均从 2 次降为
+  1 次。显式 cache=no/yes 同样只有 1 次请求，续播位置为 0.44 秒。
+  这是验证去掉重复请求的本地对照，不是实际远端视频的加速承诺。
+- 原有 64 KiB 前缀仅请求剩余数据并到达 0.44 秒首帧；提前选轨仍为
+  0 次加载后切轨，零起点 0 次 seek，非零续播 1 次 seek，外部字幕通过。
+- 停流后的 stop/switch/destroy 含 mpv 销毁约 181/186/181 ms。403 注入
+  仍只拒绝 3 次 Range，约 460 ms 上报结构化错误，不误报自然结束。
+  这两项集成测试共享全局错误回调，必须以 `--test-threads=1` 串行运行；
+  首次并行运行失败，单独及串行重跑均通过，未修改其生产逻辑来绕过测试。
+
+mpv/playback 的 Clippy 严格检查通过。mediastation 的严格 Clippy 被其他
+未提交的 `src/mediastation/src/api.rs:676` 的 manual_inspect 问题阻断，
+仅临时禁用该 lint 后通过。CEF Clippy 另有既存的 collapsible_if 一处与
+redundant_closure 两处，位于未改动的弹幕和元数据代码；临时排除这些
+既存 lint 后通过。没有修改其他任务代码或永久降低仓库 lint 级别。
+
+17:57:51（UTC+8）最终标准 Windows release 构建完成，Rust 阶段耗时
+47.02 秒；从仓库真实 D: 路径构建，CMake 4.4.4，使用现有 external mpv，
+没有创建盘符映射或隔离构建目录。两个 exe 均为 6257152 字节：
+
+```text
+build/jellium-desktop.exe
+build/cargo-target/release/jellium-desktop.exe
+SHA256 32AEEEE124A5C9A06B4E239994020B0465BC0EF14B243BAFCA75C9EBC5772A78
+```
+
+配套 libmpv-2.dll 与测试前一致：
+`4F85C5904481C30817FE41A9805B059540EB0A029DBE870DDBCDB30E44FF1469`。
+改动 Rust 文件的 rustfmt、git diff --check 通过；测试临时字幕无残留。
+未自动播放真实片源、替换安装目录、提交或推送。当前运行的安装版仍为
+16:53 的旧构建，实测本次优化需启动新的 build 目录程序。

@@ -42,6 +42,107 @@ static FAILURE_HANDLER: Mutex<Option<fn(StreamFailure)>> = Mutex::new(None);
 // loads cannot accumulate media bytes. The complete per-load URI binds the
 // bytes to the URL, UA, proxy mode, size, and unique session.
 static PENDING_INITIAL_HEAD: Mutex<Option<InitialHead>> = Mutex::new(None);
+static PENDING_HTTP_STREAM: Mutex<Option<PreparedHttpStream>> = Mutex::new(None);
+
+/// One load's live HTTP response. Credentials and the body stay in memory;
+/// the native URI contains only the unique load identifier.
+pub struct PreparedHttpStream {
+    stream: Stream,
+}
+
+impl PreparedHttpStream {
+    pub fn uri(&self) -> String {
+        format!("mediastation-http://{}", self.stream.session_id)
+    }
+}
+
+/// The caller's existing resolver owns redirect and credential policy. Each
+/// request here disables automatic redirects and replaces all request headers.
+pub struct HttpStreamPreparation(Mutex<Stream>);
+
+pub struct HttpStreamResponse {
+    pub status_code: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpStreamPreparation {
+    pub fn new(url: &str, user_agent: &str, proxy: StreamProxyMode) -> Result<Self, StreamError> {
+        let mut stream = Stream::new(
+            url,
+            user_agent,
+            None,
+            proxy,
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+        )
+        .ok_or_else(|| StreamError::Transport("proxy_unavailable".to_string()))?;
+        stream.http_headers = Some(Vec::new());
+        Ok(Self(Mutex::new(stream)))
+    }
+
+    pub fn open<'a>(
+        &self,
+        url: &str,
+        headers: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> Result<HttpStreamResponse, StreamError> {
+        let mut stream = self.0.lock();
+        stream.url = url.to_string();
+        stream.link_id = diagnostic_link_id(url);
+        stream.http_headers = Some(
+            headers
+                .filter(|(name, _)| {
+                    !name.eq_ignore_ascii_case("range") && !name.eq_ignore_ascii_case("user-agent")
+                })
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        );
+        let (response, started) = request_range(&mut stream, 0, "prepare", 1)?;
+        let status_code = response.status().as_u16();
+        let headers = [
+            "location",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "etag",
+            "last-modified",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect();
+        if matches!(status_code, 200 | 206) {
+            install_reader(&mut stream, response, started, 0, "prepare", 1)?;
+            stream.seekable = status_code == 206;
+        } else if status_code >= 400 {
+            log_http_failure(
+                &stream,
+                0,
+                "prepare",
+                1,
+                started.elapsed().as_millis(),
+                response,
+            );
+        }
+        Ok(HttpStreamResponse {
+            status_code,
+            headers,
+        })
+    }
+
+    pub fn finish(self) -> Result<PreparedHttpStream, StreamError> {
+        let stream = self.0.into_inner();
+        if stream.reader.is_none() {
+            return Err(StreamError::InvalidResponse(
+                "media_response_missing".to_string(),
+            ));
+        }
+        Ok(PreparedHttpStream { stream })
+    }
+}
 
 struct InitialHead {
     uri: String,
@@ -56,7 +157,28 @@ pub(crate) fn prepare_initial_head(uri: &str, bytes: Arc<[u8]>) -> Result<(), &'
         uri: uri.to_string(),
         bytes,
     });
+    *PENDING_HTTP_STREAM.lock() = None;
     Ok(())
+}
+
+pub(crate) fn prepare_load_stream(
+    uri: &str,
+    bytes: Arc<[u8]>,
+    http: Option<PreparedHttpStream>,
+) -> Result<(), &'static str> {
+    if let Some(http) = http {
+        if uri != http.uri() || !bytes.is_empty() {
+            return Err("prepared_http_stream");
+        }
+        prepare_initial_head(uri, bytes)?;
+        *PENDING_HTTP_STREAM.lock() = Some(http);
+        Ok(())
+    } else {
+        if uri.starts_with("mediastation-http://") {
+            return Err("prepared_http_stream_missing");
+        }
+        prepare_initial_head(uri, bytes)
+    }
 }
 
 fn take_initial_head(pending: &mut Option<InitialHead>, uri: &str) -> Arc<[u8]> {
@@ -71,6 +193,26 @@ fn take_initial_head(pending: &mut Option<InitialHead>, uri: &str) -> Arc<[u8]> 
 
 pub(crate) fn discard_initial_head(uri: &str) {
     let _ = take_initial_head(&mut PENDING_INITIAL_HEAD.lock(), uri);
+    let mut pending = PENDING_HTTP_STREAM.lock();
+    if pending.as_ref().is_some_and(|http| http.uri() == uri) {
+        *pending = None;
+    }
+}
+
+pub(crate) fn discard_pending_streams() {
+    *PENDING_INITIAL_HEAD.lock() = None;
+    *PENDING_HTTP_STREAM.lock() = None;
+}
+
+fn take_http_stream(
+    pending: &mut Option<PreparedHttpStream>,
+    uri: &str,
+) -> Option<PreparedHttpStream> {
+    if pending.as_ref().is_some_and(|http| http.uri() == uri) {
+        pending.take()
+    } else {
+        None
+    }
 }
 
 /// The callback may only enqueue work; stream callbacks must never call libmpv.
@@ -311,6 +453,8 @@ struct Stream {
     io: Arc<StreamIo>,
     url: String,
     user_agent: String,
+    http_headers: Option<Vec<(String, String)>>,
+    seekable: bool,
     content_length: Option<u64>,
     position: u64,
     reader: Option<ureq::BodyReader<'static>>,
@@ -346,6 +490,8 @@ impl Stream {
             io,
             url: url.to_string(),
             user_agent: user_agent.to_string(),
+            http_headers: None,
+            seekable: true,
             content_length,
             position: 0,
             reader: None,
@@ -378,6 +524,18 @@ impl Stream {
             "stream_id={} session_id={} link_id={:016x} request_seq={}",
             self.id, self.session_id, self.link_id, self.request_seq,
         )
+    }
+
+    fn redact_http_headers(&self, value: &str) -> String {
+        let mut value = value.to_string();
+        if let Some(headers) = &self.http_headers {
+            for (_, secret) in headers {
+                if !secret.is_empty() {
+                    value = value.replace(secret, "[redacted]");
+                }
+            }
+        }
+        value
     }
 
     fn fail(&mut self, phase: &'static str, offset: u64, error: StreamError) {
@@ -588,7 +746,7 @@ fn log_http_failure(
             .headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .map(|value| diagnostic_value(value, &stream.url))
+            .map(|value| diagnostic_value(&stream.redact_http_headers(value), &stream.url))
             .unwrap_or_default()
     };
     let server = header("Server");
@@ -602,7 +760,16 @@ fn log_http_failure(
     let (body, body_state) = read_error_body(response.into_body().into_reader(), deadline);
     *stream.error_body_deadline.0.lock() = None;
     let body_ms = body_started.elapsed().as_millis();
-    let error = cdn_error(&body, &stream.url);
+    let redacted_body = stream
+        .http_headers
+        .as_ref()
+        .map(|_| stream.redact_http_headers(&String::from_utf8_lossy(&body)));
+    let error = cdn_error(
+        redacted_body
+            .as_ref()
+            .map_or(body.as_slice(), |body| body.as_bytes()),
+        &stream.url,
+    );
     tracing::warn!(
         target: "mpv",
         "mediastation stream HTTP failure: {} phase={} attempt={} status={} host={} proxy_configured={} range=bytes={}- previous_offset={} old_reader_open={} header_ms={} body_ms={} user_agent={:?} server={:?} server_date={:?} content_type={:?} retry_after={:?} header_request_id={:?} body_state={} body_bytes={} error_format={} cdn_code={:?} cdn_message={:?} cdn_request_id={:?} cdn_ec={:?}",
@@ -620,6 +787,16 @@ fn open_reader_at(
     phase: &str,
     attempt: usize,
 ) -> Result<(), StreamError> {
+    let (response, started) = request_range(stream, offset, phase, attempt)?;
+    install_reader(stream, response, started, offset, phase, attempt)
+}
+
+fn request_range(
+    stream: &mut Stream,
+    offset: u64,
+    phase: &str,
+    attempt: usize,
+) -> Result<(ureq::http::Response<ureq::Body>, Instant), StreamError> {
     if stream.cancelled() {
         return Err(StreamError::Transport("cancelled".to_string()));
     }
@@ -639,11 +816,23 @@ fn open_reader_at(
     // A failed replacement must never leave reads attached to the old position.
     stream.reader = None;
     stream.first_read_pending = false;
-    let response = stream
+    let mut request = stream
         .agent
         .get(stream.url.as_str())
         .header("User-Agent", stream.user_agent.as_str())
-        .header("Range", range.as_str())
+        .header("Range", range.as_str());
+    if let Some(headers) = &stream.http_headers {
+        request = request
+            .config()
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .build()
+            .header("Accept-Encoding", "identity");
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+    }
+    let response = request
         .call()
         .map_err(|error| {
             if stream.io.is_cancelled() {
@@ -660,6 +849,18 @@ fn open_reader_at(
     if stream.cancelled() {
         return Err(StreamError::Transport("cancelled".to_string()));
     }
+    Ok((response, started))
+}
+
+fn install_reader(
+    stream: &mut Stream,
+    response: ureq::http::Response<ureq::Body>,
+    started: Instant,
+    offset: u64,
+    phase: &str,
+    attempt: usize,
+) -> Result<(), StreamError> {
+    let range = format!("bytes={offset}-");
     let status = response.status().as_u16();
     let header_ms = started.elapsed().as_millis();
     let content_range = response
@@ -702,6 +903,56 @@ fn open_reader_at(
             stream.diagnostic_context(), phase, attempt, status, range, cause,
         );
     }).map_err(StreamError::InvalidResponse)?;
+
+    if stream.http_headers.is_some() {
+        let invalid = |cause: &str| StreamError::InvalidResponse(cause.to_string());
+        if response
+            .headers()
+            .get("Content-Encoding")
+            .is_some_and(|encoding| encoding != "identity")
+        {
+            return Err(invalid("encoded_media_response"));
+        }
+        let length = if status == 206 {
+            let (range, total) = content_range
+                .and_then(|value| value.strip_prefix("bytes "))
+                .and_then(|value| value.split_once('/'))
+                .ok_or_else(|| invalid("content_range_invalid"))?;
+            let (start, end) = range
+                .split_once('-')
+                .ok_or_else(|| invalid("content_range_invalid"))?;
+            let start = start
+                .parse::<u64>()
+                .map_err(|_| invalid("content_range_invalid"))?;
+            let end = end
+                .parse::<u64>()
+                .map_err(|_| invalid("content_range_invalid"))?;
+            let total = if total == "*" {
+                None
+            } else {
+                Some(
+                    total
+                        .parse::<u64>()
+                        .map_err(|_| invalid("content_range_invalid"))?,
+                )
+            };
+            if end < start
+                || total.is_some_and(|total| end >= total)
+                || response.body().content_length().is_some_and(|length| {
+                    Some(length) != end.checked_sub(start).and_then(|v| v.checked_add(1))
+                })
+            {
+                return Err(invalid("content_range_length_mismatch"));
+            }
+            total
+        } else {
+            response.body().content_length()
+        };
+        if stream.content_length.is_some() && length != stream.content_length {
+            return Err(invalid("content_length_changed"));
+        }
+        stream.content_length = length;
+    }
 
     stream.reader = Some(response.into_body().into_reader());
     stream.position = offset;
@@ -968,6 +1219,17 @@ unsafe extern "C" fn open_cb(
     }
     let uri = unsafe { CStr::from_ptr(uri) }.to_bytes();
     let uri = String::from_utf8_lossy(uri).into_owned();
+    if uri.starts_with("mediastation-http://") {
+        let mut pending = PENDING_HTTP_STREAM.lock();
+        let Some(http) = take_http_stream(&mut pending, &uri) else {
+            tracing::warn!(target: "mpv", "mediastation HTTP response unavailable for native load");
+            return MPV_ERROR_LOADING_FAILED;
+        };
+        drop(pending);
+        tracing::info!(target: "mpv", "mediastation HTTP response handed to native stream: {} response_age_ms={}",
+            http.stream.diagnostic_context(), http.stream.reader_opened_at.map(|time| time.elapsed().as_millis()).unwrap_or_default());
+        return unsafe { install_cookie(http.stream, info) };
+    }
     // The final field identifies a single load, even when its link is reused.
     let rest = uri.strip_prefix("mediastation://").unwrap_or(&uri);
     let mut parts = rest.split('|');
@@ -1001,6 +1263,11 @@ unsafe extern "C" fn open_cb(
         return MPV_ERROR_LOADING_FAILED;
     }
     stream.initial_head = initial_head;
+    unsafe { install_cookie(stream, info) }
+}
+
+unsafe fn install_cookie(stream: Stream, info: *mut sys::mpv_stream_cb_info) -> c_int {
+    let seekable = stream.seekable;
     let cookie = StreamCookie {
         io: stream.io.clone(),
         inner: Mutex::new(stream),
@@ -1009,7 +1276,7 @@ unsafe extern "C" fn open_cb(
     let info = unsafe { &mut *info };
     info.cookie = cookie_ptr;
     info.read_fn = Some(read_cb);
-    info.seek_fn = Some(seek_cb);
+    info.seek_fn = seekable.then_some(seek_cb);
     info.size_fn = Some(size_cb);
     info.close_fn = Some(close_cb);
     info.cancel_fn = Some(cancel_cb);
@@ -1029,14 +1296,16 @@ pub unsafe fn register_protocol(handle: *mut sys::mpv_handle) {
     if handle.is_null() {
         return;
     }
-    let protocol = CString::new(PROTOCOL).unwrap_or_default();
-    let status = unsafe {
-        sys::mpv_stream_cb_add_ro(handle, protocol.as_ptr(), ptr::null_mut(), Some(open_cb))
-    };
-    if status != 0 {
-        tracing::warn!(target: "mpv", "mediastation stream protocol registration failed: {status}");
-    } else {
-        tracing::info!(target: "mpv", "mediastation stream protocol registered");
+    for protocol in [PROTOCOL, b"mediastation-http"] {
+        let protocol = CString::new(protocol).unwrap_or_default();
+        let status = unsafe {
+            sys::mpv_stream_cb_add_ro(handle, protocol.as_ptr(), ptr::null_mut(), Some(open_cb))
+        };
+        if status != 0 {
+            tracing::warn!(target: "mpv", "mediastation stream protocol registration failed: {status}");
+        } else {
+            tracing::info!(target: "mpv", "mediastation stream protocol registered");
+        }
     }
 }
 
@@ -1058,6 +1327,9 @@ pub fn build_uri(
 }
 
 pub fn session_id(uri: &str) -> Option<u64> {
+    if let Some(id) = uri.strip_prefix("mediastation-http://") {
+        return id.parse().ok().filter(|id| *id != 0);
+    }
     uri.strip_prefix("mediastation://")?
         .split('|')
         .nth(4)?
@@ -2139,6 +2411,103 @@ mod tests {
     }
 
     #[test]
+    fn retained_http_error_redacts_server_credentials() -> Result<(), Box<dyn std::error::Error>> {
+        let body = br#"{"message":"denied test-token test-auth"}"#;
+        let (url, server) =
+            spawn_range_server(vec![response(403, "Forbidden", None, body.len(), body)])?;
+        let mut stream = test_stream(&url, 6)?;
+        stream.http_headers = Some(vec![
+            ("x-emby-token".to_string(), "test-token".to_string()),
+            ("x-emby-authorization".to_string(), "test-auth".to_string()),
+        ]);
+        let error = open_reader_at(&mut stream, 0, "read", 1).expect_err("HTTP rejection");
+        let StreamError::Http { status, message } = error else {
+            return Err("expected HTTP error".into());
+        };
+        assert_eq!(status, 403);
+        assert_eq!(message, "denied [redacted] [redacted]");
+        assert_eq!(join_ranges(server)?, vec!["bytes=0-"]);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_http_handoff_requires_its_unique_load_and_is_consumed_once() -> std::io::Result<()>
+    {
+        let http = PreparedHttpStream {
+            stream: test_stream("http://127.0.0.1/media", 6)?,
+        };
+        let uri = http.uri();
+        let mut pending = Some(http);
+        assert!(take_http_stream(&mut pending, "mediastation-http://0").is_none());
+        assert!(take_http_stream(&mut pending, "mediastation://other").is_none());
+        assert!(pending.is_some());
+        assert!(take_http_stream(&mut pending, &uri).is_some());
+        assert!(take_http_stream(&mut pending, &uri).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_response_feeds_native_callbacks_without_reopening()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for status in [200, 206] {
+            let (url, server) = spawn_range_server(vec![response(
+                status,
+                "OK",
+                (status == 206).then_some("bytes 0-5/6"),
+                6,
+                b"abcdef",
+            )])?;
+            let preparation = HttpStreamPreparation::new(&url, "test-UA", StreamProxyMode::Direct)?;
+            preparation.open(&url, [("x-emby-token", "test-token")].into_iter())?;
+            let http = preparation.finish()?;
+            assert!(session_id(&http.uri()).is_some());
+            assert!(!http.uri().contains("test-token"));
+            let mut info: sys::mpv_stream_cb_info = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { install_cookie(http.stream, &mut info) }, 0);
+            assert_eq!(unsafe { size_cb(info.cookie) }, 6);
+            assert_eq!(info.seek_fn.is_some(), status == 206);
+            if status == 206 {
+                assert_eq!(unsafe { seek_cb(info.cookie, 0) }, 0);
+            }
+            let mut bytes = [0_u8; 6];
+            assert_eq!(
+                unsafe { read_cb(info.cookie, bytes.as_mut_ptr().cast(), 6) },
+                6
+            );
+            assert_eq!(&bytes, b"abcdef");
+            assert_eq!(stream_from_cookie(info.cookie).inner.lock().request_seq, 1);
+            unsafe {
+                close_cb(info.cookie);
+            }
+            assert_eq!(join_ranges(server)?, vec!["bytes=0-"]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_response_rejects_bad_ranges_and_http_errors_without_a_second_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (status, range) in [
+            (206, Some("bytes 1-6/7")),
+            (206, Some("bytes 0-9/10")),
+            (403, None),
+        ] {
+            let (url, server) =
+                spawn_range_server(vec![response(status, "Test", range, 6, b"abcdef")])?;
+            let preparation = HttpStreamPreparation::new(&url, "test-UA", StreamProxyMode::Direct)?;
+            let result = preparation.open(&url, std::iter::empty());
+            if status == 206 {
+                assert!(matches!(result, Err(StreamError::InvalidResponse(_))));
+            } else {
+                assert_eq!(result?.status_code, 403);
+            }
+            assert!(preparation.finish().is_err());
+            assert_eq!(join_ranges(server)?, vec!["bytes=0-"]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn initial_head_handoff_requires_the_complete_load_uri_and_is_consumed_once() {
         let uri = build_uri(
             "https://cdn.example/file",
@@ -2326,6 +2695,140 @@ mod tests {
         eprintln!(
             "recorded startup sequence, loopback 80ms/response, prefix already obtained: before={before_elapsed:?} (4 requests), after={after_elapsed:?} (2 requests)"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed libmpv and MPV_STREAM_TEST_FIXTURE; loopback HTTP only"]
+    fn native_http_response_handoff_preserves_start_and_resume_with_one_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{Command, Event, Handle, PropertyValue};
+        let bytes = std::fs::read(std::env::var("MPV_STREAM_TEST_FIXTURE")?)?;
+        let full_range = format!("bytes 0-{}/{}", bytes.len() - 1, bytes.len());
+        for (start, cache) in [(0.0, "auto"), (0.4, "auto"), (0.4, "no"), (0.4, "yes")] {
+            for handoff in [false, true] {
+                let mut responses = Vec::new();
+                if !handoff {
+                    responses.push(response(
+                        206,
+                        "Partial Content",
+                        Some(&format!("bytes 0-0/{}", bytes.len())),
+                        1,
+                        &bytes[..1],
+                    ));
+                }
+                responses.push(response(
+                    206,
+                    "Partial Content",
+                    Some(&full_range),
+                    bytes.len(),
+                    &bytes,
+                ));
+                let (url, server) =
+                    spawn_range_server_with_delay(responses, Duration::from_millis(80))?;
+                let handle = Handle::create()?;
+                for (name, value) in [
+                    ("config", "no"),
+                    ("vo", "null"),
+                    ("ao", "null"),
+                    ("terminal", "no"),
+                    ("hwdec", "no"),
+                    ("cache", cache),
+                    ("demuxer-readahead-secs", "0"),
+                ] {
+                    handle.set_option_string(name, value)?;
+                }
+                unsafe {
+                    register_protocol(handle.raw());
+                }
+                handle.initialize()?;
+                handle.observe_property_node(1, "video-frame-info")?;
+                let started = Instant::now();
+                let path = if handoff {
+                    let preparation =
+                        HttpStreamPreparation::new(&url, "test-UA", StreamProxyMode::Direct)?;
+                    preparation.open(&url, std::iter::empty())?;
+                    let http = preparation.finish()?;
+                    let uri = http.uri();
+                    prepare_load_stream(&uri, Arc::from([]), Some(http))?;
+                    CString::new(uri)?
+                } else {
+                    let agent: ureq::Agent =
+                        ureq::Agent::config_builder().proxy(None).build().into();
+                    let mut probe = agent.get(&url).header("Range", "bytes=0-0").call()?;
+                    probe.body_mut().as_reader().read_exact(&mut [0_u8; 1])?;
+                    drop(probe);
+                    CString::new(url)?
+                };
+                let mut options = vec![(
+                    "start".to_string(),
+                    if start == 0.0 {
+                        "none".to_string()
+                    } else {
+                        start.to_string()
+                    },
+                )];
+                if handoff
+                    && let Some(option) =
+                        unsafe { crate::api::retained_http_cache_option(handle.raw()) }?
+                {
+                    options.push(option);
+                }
+                let mut load = crate::command::LoadFileCommand::new(&path, &options)?;
+                crate::error::check(unsafe {
+                    sys::mpv_command_node_async(handle.raw(), 0, load.as_mut_ptr())
+                })?;
+                let (mut loaded, mut restarted, mut frame) = (false, false, false);
+                while started.elapsed() < Duration::from_secs(5) {
+                    match handle.wait_event(0.01) {
+                        Event::FileLoaded => loaded = true,
+                        Event::PlaybackRestart => restarted = true,
+                        Event::PropertyChange { id: 1, value, .. }
+                            if value != PropertyValue::None =>
+                        {
+                            frame = true
+                        }
+                        Event::EndFile(reason) => {
+                            return Err(format!("HTTP fixture failed: {reason:?}").into());
+                        }
+                        _ => {}
+                    }
+                    if loaded && restarted && frame {
+                        break;
+                    }
+                }
+                assert!(
+                    loaded && restarted && frame,
+                    "start={start} handoff={handoff}"
+                );
+                let elapsed = started.elapsed();
+                assert_eq!(
+                    handle.get_property_string("options/cache")?,
+                    if handoff && cache == "auto" {
+                        "yes"
+                    } else {
+                        cache
+                    }
+                );
+                let position = handle.get_property::<f64>("time-pos")?;
+                assert!((position - start).abs() < 0.2, "resume position {position}");
+                handle.command(&Command::new(["stop"])?)?;
+                let ranges = join_ranges(server)?;
+                assert_eq!(
+                    ranges,
+                    if handoff {
+                        vec!["bytes=0-"]
+                    } else {
+                        vec!["bytes=0-0", "bytes=0-"]
+                    }
+                );
+                eprintln!(
+                    "loopback native HTTP: handoff={handoff} cache={cache} start={start} position={position} first_frame_ms={} requests={}",
+                    elapsed.as_millis(),
+                    ranges.len()
+                );
+            }
+        }
         Ok(())
     }
 

@@ -472,6 +472,8 @@ struct RuntimeState {
 struct PlaybackStartupTiming {
     load_started: Instant,
     native_started: Instant,
+    preloaded: Option<Instant>,
+    file_loaded: Option<Instant>,
 }
 
 struct ActiveInterpolation {
@@ -538,6 +540,7 @@ struct NativeLoadRequest<'a> {
     url: &'a CString,
     options: &'a JfnMpvLoadOptions,
     initial_head: Arc<[u8]>,
+    http_stream: Option<jfn_mpv::stream_cb::PreparedHttpStream>,
     subtitle: Option<PreparedExternalSubtitle>,
     interpolation: Option<InterpolationPlan>,
     enhancement: jfn_frame_interpolation::enhancement::Selection,
@@ -887,7 +890,7 @@ impl MediaStationRuntime {
                 && let Some(timing) = state.startup_timing.take()
             {
                 log_info(&format!(
-                    "mediastation playback startup ready: media_id={:?} session_id={:?} prepare_ms={} native_to_started_ms={} total_ms={}",
+                    "mediastation playback startup ready: media_id={:?} session_id={:?} prepare_ms={} native_to_started_ms={} total_ms={} native_to_preloaded_ms={:?} preloaded_to_loaded_ms={:?} loaded_to_frame_ms={:?}",
                     state
                         .active_report
                         .as_ref()
@@ -899,6 +902,14 @@ impl MediaStationRuntime {
                         .as_millis(),
                     timing.native_started.elapsed().as_millis(),
                     timing.load_started.elapsed().as_millis(),
+                    timing
+                        .preloaded
+                        .map(|time| time.duration_since(timing.native_started).as_millis()),
+                    timing
+                        .preloaded
+                        .zip(timing.file_loaded)
+                        .map(|(preloaded, loaded)| loaded.duration_since(preloaded).as_millis()),
+                    timing.file_loaded.map(|time| time.elapsed().as_millis()),
                 ));
             }
             if matches!(
@@ -1744,6 +1755,8 @@ impl MediaStationRuntime {
         state.startup_timing = Some(PlaybackStartupTiming {
             load_started: load.load_started,
             native_started: Instant::now(),
+            preloaded: None,
+            file_loaded: None,
         });
         if let Some(session_id) = stream_session {
             pb_post(PbInput::StreamLoadStarting {
@@ -1762,10 +1775,11 @@ impl MediaStationRuntime {
             i64::try_from(load.start_ms.saturating_mul(1000)).unwrap_or(i64::MAX),
         ));
         if let Err(error) = unsafe {
-            jfn_mpv::api::jfn_mpv_load_file_with_initial_head(
+            jfn_mpv::api::jfn_mpv_load_file_with_stream(
                 load.url.as_ptr(),
                 load.options,
                 load.initial_head,
+                load.http_stream,
             )
         } {
             log_mpv_error(&error);
@@ -2468,9 +2482,39 @@ fn install_playback_cleanup(runtime: Weak<MediaStationRuntime>) {
         return;
     }
     jfn_playback::register_action_sink(Box::new(move |action| {
+        if !jfn_mpv::api::jfn_mpv_pending_tracks_match_current_file() {
+            return;
+        }
+        let Some(runtime) = track_runtime.upgrade() else {
+            return;
+        };
+        {
+            let mut state = runtime.state.lock();
+            let session_id = state.active_stream_session;
+            let media_id = state
+                .active_report
+                .as_ref()
+                .map(|active| active.source.media_id.clone());
+            if let Some(timing) = state.startup_timing.as_mut() {
+                let (stage, time) = match action.kind {
+                    jfn_playback::PlaybackActionKind::PreparePendingTracks => {
+                        ("preloaded", &mut timing.preloaded)
+                    }
+                    jfn_playback::PlaybackActionKind::ApplyPendingTrackSelectionAndPlay => {
+                        ("file_loaded", &mut timing.file_loaded)
+                    }
+                };
+                if time.is_none() {
+                    *time = Some(Instant::now());
+                    log_info(&format!(
+                        "mediastation playback startup stage: media_id={media_id:?} session_id={session_id:?} stage={stage} native_elapsed_ms={} total_ms={}",
+                        timing.native_started.elapsed().as_millis(),
+                        timing.load_started.elapsed().as_millis()
+                    ));
+                }
+            }
+        }
         if action.kind == jfn_playback::PlaybackActionKind::PreparePendingTracks
-            && jfn_mpv::api::jfn_mpv_pending_tracks_match_current_file()
-            && let Some(runtime) = track_runtime.upgrade()
             && let Err(failure) = runtime.prepare_loaded_subtitle()
         {
             log_error(&format!(
@@ -7216,8 +7260,24 @@ fn execute_load(
         resolve_input.proxy_mode,
         resolve_input.user_agent,
     ));
-    let playback = if source.standard_emby_stream {
-        runtime.resolver.resolve(&resolve_input)
+    let http_preparation = if source.standard_emby_stream {
+        Some(
+            jfn_mpv::stream_cb::HttpStreamPreparation::new(
+                resolve_input.source_url.as_str(),
+                &resolve_input.user_agent,
+                native_stream_proxy(resolve_input.proxy_mode),
+            )
+            .map_err(|error| {
+                LoadFailure::dynamic("playback_http_prepare_failed", error.to_string())
+            })?,
+        )
+    } else {
+        None
+    };
+    let playback = if let Some(preparation) = &http_preparation {
+        runtime
+            .resolver
+            .resolve_open_stream(&resolve_input, &NativeHttpTransport(preparation))
     } else {
         runtime.resolver.resolve_with_initial_head(&resolve_input)
     }
@@ -7247,7 +7307,7 @@ fn execute_load(
         media_user_agent,
         media_user_agent == Some(resolve_input.user_agent.as_str()),
         if source.standard_emby_stream {
-            "mpv_http"
+            "ureq_http_reused_response"
         } else {
             "ureq_stream"
         },
@@ -7275,15 +7335,14 @@ fn execute_load(
         .request_headers
         .to_mpv_http_header_fields()
         .map_err(header_encoding_failure)?;
-    // Same-origin Emby streams must stay on mpv's HTTP path so its
-    // X-Emby-* headers reach the server. Cross-origin CDN streams use the
-    // ureq-backed protocol because some CDNs reject ffmpeg's TLS fingerprint.
-    let use_mpv_http = source.standard_emby_stream;
-    let playback_url = CString::new(native_playback_url(
-        &playback,
-        use_mpv_http,
-        snapshot.session.connection.proxy,
-    ))
+    let http_stream = http_preparation
+        .map(jfn_mpv::stream_cb::HttpStreamPreparation::finish)
+        .transpose()
+        .map_err(|error| LoadFailure::dynamic("playback_http_prepare_failed", error.to_string()))?;
+    let playback_url = CString::new(match &http_stream {
+        Some(stream) => stream.uri(),
+        None => native_playback_url(&playback, snapshot.session.connection.proxy),
+    })
     .map_err(|_| {
         LoadFailure::new(
             "invalid_playback_url",
@@ -7383,11 +7442,8 @@ fn execute_load(
         start_ms: request.start_ms,
         url: &playback_url,
         options: &options,
-        initial_head: if use_mpv_http {
-            Arc::from([])
-        } else {
-            playback.initial_head.clone()
-        },
+        initial_head: playback.initial_head.clone(),
+        http_stream,
         subtitle: prepared_subtitle,
         interpolation: interpolation.clone(),
         enhancement: request.enhancement,
@@ -7442,29 +7498,47 @@ fn execute_load(
     }))
 }
 
-fn native_playback_url(
-    playback: &PlaybackSession,
-    use_mpv_http: bool,
-    proxy_mode: MediaStationProxyMode,
-) -> String {
-    match use_mpv_http {
-        true => playback.resolved_url.as_str().to_string(),
-        false => {
-            let media_user_agent = playback
-                .request_headers
-                .get("user-agent")
-                .unwrap_or("MediaStationGoWindows/0.1.0-dev");
-            jfn_mpv::stream_cb::build_uri(
-                playback.resolved_url.as_str(),
-                media_user_agent,
-                playback.content_length,
-                match proxy_mode {
-                    MediaStationProxyMode::Direct => jfn_mpv::stream_cb::StreamProxyMode::Direct,
-                    MediaStationProxyMode::System => jfn_mpv::stream_cb::StreamProxyMode::System,
-                },
-            )
+struct NativeHttpTransport<'a>(&'a jfn_mpv::stream_cb::HttpStreamPreparation);
+
+impl jfn_mediastation::ProbeTransport for NativeHttpTransport<'_> {
+    fn probe(
+        &self,
+        request: &jfn_mediastation::ProbeRequest,
+    ) -> Result<jfn_mediastation::ProbeResponse, jfn_mediastation::TransportError> {
+        let response = self
+            .0
+            .open(request.url.as_str(), request.headers.iter())
+            .map_err(|error| jfn_mediastation::TransportError::new(error.to_string()))?;
+        let mut headers = jfn_mediastation::HeaderMap::default();
+        for (name, value) in response.headers {
+            headers.insert(name, value);
         }
+        Ok(jfn_mediastation::ProbeResponse {
+            status_code: response.status_code,
+            headers,
+            initial_head: Arc::from([]),
+        })
     }
+}
+
+fn native_stream_proxy(proxy: MediaStationProxyMode) -> jfn_mpv::stream_cb::StreamProxyMode {
+    match proxy {
+        MediaStationProxyMode::Direct => jfn_mpv::stream_cb::StreamProxyMode::Direct,
+        MediaStationProxyMode::System => jfn_mpv::stream_cb::StreamProxyMode::System,
+    }
+}
+
+fn native_playback_url(playback: &PlaybackSession, proxy_mode: MediaStationProxyMode) -> String {
+    let media_user_agent = playback
+        .request_headers
+        .get("user-agent")
+        .unwrap_or("MediaStationGoWindows/0.1.0-dev");
+    jfn_mpv::stream_cb::build_uri(
+        playback.resolved_url.as_str(),
+        media_user_agent,
+        playback.content_length,
+        native_stream_proxy(proxy_mode),
+    )
 }
 
 fn frame_interpolation_payload(plan: &InterpolationPlan) -> Value {
@@ -8830,26 +8904,86 @@ mod tests {
     }
 
     #[test]
-    fn standard_server_playback_keeps_http_url_for_mpv_headers() {
-        let url = Url::parse("https://media.example/Videos/media-1/stream?Static=true")
-            .expect("URL should parse");
-        let playback = playback_session(url.clone(), DeliveryMode::Server);
-
-        assert_eq!(
-            native_playback_url(&playback, true, MediaStationProxyMode::System),
-            url.as_str()
-        );
-    }
-
-    #[test]
-    fn http_playback_keeps_cross_origin_url_for_proxy() {
-        let url = Url::parse("https://cdn.example/media-1.mkv").expect("URL should parse");
-        let playback = playback_session(url.clone(), DeliveryMode::DirectCdn);
-
-        assert_eq!(
-            native_playback_url(&playback, true, MediaStationProxyMode::System),
-            url.as_str()
-        );
+    fn retained_http_transport_uses_resolver_auth_policy_on_real_loopback_requests() {
+        fn serve(listener: TcpListener, response: String) -> thread::JoinHandle<String> {
+            thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("loopback request");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("read timeout");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).expect("read headers");
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                String::from_utf8(bytes).expect("HTTP headers")
+            })
+        }
+        for redirect in [false, true] {
+            let origin = TcpListener::bind("127.0.0.1:0").expect("origin listener");
+            let url = Url::parse(&format!(
+                "http://{}/stream",
+                origin.local_addr().expect("origin address")
+            ))
+            .expect("origin URL");
+            let media_response = "HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 0-5/6\r\nConnection: close\r\n\r\nabcdef";
+            let (origin_response, cdn_server) = if redirect {
+                let cdn = TcpListener::bind("127.0.0.1:0").expect("CDN listener");
+                (
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{}/media\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        cdn.local_addr().expect("CDN address")
+                    ),
+                    Some(serve(cdn, media_response.to_string())),
+                )
+            } else {
+                (media_response.to_string(), None)
+            };
+            let origin_server = serve(origin, origin_response);
+            let input = jfn_mediastation::ResolveInput {
+                user_id: "test-user".to_string(),
+                media_id: "test-media".to_string(),
+                source_url: url.clone(),
+                server_base_url: url,
+                user_agent: "test-UA".to_string(),
+                proxy_mode: MediaStationProxyMode::Direct,
+                auth: jfn_mediastation::ServerAuth::new("test-token", "test-auth")
+                    .expect("test auth"),
+            };
+            let preparation = jfn_mpv::stream_cb::HttpStreamPreparation::new(
+                input.source_url.as_str(),
+                &input.user_agent,
+                native_stream_proxy(input.proxy_mode),
+            )
+            .expect("media transport");
+            let playback = PlaybackSessionResolver::new(UreqTransport::new())
+                .resolve_open_stream(&input, &NativeHttpTransport(&preparation))
+                .expect("resolve full stream");
+            let prepared = preparation.finish().expect("retained response");
+            assert!(prepared.uri().starts_with("mediastation-http://"));
+            assert_eq!(playback.content_length, Some(6));
+            assert_eq!(playback.metrics.redirect_count, usize::from(redirect));
+            let request = origin_server
+                .join()
+                .expect("origin thread")
+                .to_ascii_lowercase();
+            assert!(request.contains("x-emby-token: test-token\r\n"));
+            assert!(request.contains("x-emby-authorization: test-auth\r\n"));
+            assert!(request.contains("range: bytes=0-\r\n"));
+            assert!(request.contains("user-agent: test-ua\r\n"));
+            if let Some(server) = cdn_server {
+                let request = server.join().expect("CDN thread").to_ascii_lowercase();
+                assert!(!request.contains("x-emby-"));
+                assert!(!request.contains("test-token"));
+                assert!(request.contains("user-agent: test-ua\r\n"));
+                assert!(request.contains("range: bytes=0-\r\n"));
+            }
+        }
     }
 
     #[test]
@@ -8858,7 +8992,7 @@ mod tests {
             Url::parse("https://cdn.example/video.mkv?sig=redacted").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
 
-        let native_url = native_playback_url(&playback, false, MediaStationProxyMode::Direct);
+        let native_url = native_playback_url(&playback, MediaStationProxyMode::Direct);
         assert_eq!(
             native_url.rsplit_once('|').map(|(prefix, _)| prefix),
             Some(
@@ -8875,7 +9009,7 @@ mod tests {
         let playback = playback_session(url, DeliveryMode::Server);
 
         assert!(
-            native_playback_url(&playback, false, MediaStationProxyMode::Direct)
+            native_playback_url(&playback, MediaStationProxyMode::Direct)
                 .starts_with("mediastation://")
         );
     }
@@ -8885,7 +9019,7 @@ mod tests {
         let url = Url::parse("https://cdn.example/video.mkv").expect("URL should parse");
         let playback = playback_session(url, DeliveryMode::DirectCdn);
 
-        let native_url = native_playback_url(&playback, false, MediaStationProxyMode::System);
+        let native_url = native_playback_url(&playback, MediaStationProxyMode::System);
         assert_eq!(native_url.split('|').nth(3), Some("system"));
         assert!(jfn_mpv::stream_cb::session_id(&native_url).is_some());
     }

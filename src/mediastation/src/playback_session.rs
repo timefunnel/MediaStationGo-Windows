@@ -619,6 +619,13 @@ pub struct PlaybackSessionResolver<T: ProbeTransport> {
     resolve_locks: Mutex<HashMap<SessionKey, Arc<Mutex<()>>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolveRead {
+    Probe,
+    CdnHead,
+    OpenStream,
+}
+
 impl<T: ProbeTransport> PlaybackSessionResolver<T> {
     pub fn new(transport: T) -> Self {
         Self {
@@ -633,7 +640,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
     }
 
     /// Read a bounded CDN header in the existing validation request for the
-    /// custom native stream. Standard mpv HTTP playback keeps its byte probe.
+    /// custom native stream.
     pub fn resolve_with_initial_head(
         &self,
         input: &ResolveInput,
@@ -649,11 +656,41 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         self.resolve_at_inner(input, now_epoch_ms, false)
     }
 
+    /// Validate redirects and credentials while the supplied media transport
+    /// retains the final response for playback. A live reader is per load and
+    /// must never come from the resolved-link cache.
+    pub fn resolve_open_stream(
+        &self,
+        input: &ResolveInput,
+        transport: &dyn ProbeTransport,
+    ) -> Result<PlaybackSession, PlaybackSessionError> {
+        self.resolve_with_transport(input, unix_epoch_ms(), ResolveRead::OpenStream, transport)
+    }
+
     fn resolve_at_inner(
         &self,
         input: &ResolveInput,
         now_epoch_ms: u64,
         read_initial_head: bool,
+    ) -> Result<PlaybackSession, PlaybackSessionError> {
+        self.resolve_with_transport(
+            input,
+            now_epoch_ms,
+            if read_initial_head {
+                ResolveRead::CdnHead
+            } else {
+                ResolveRead::Probe
+            },
+            &self.transport,
+        )
+    }
+
+    fn resolve_with_transport(
+        &self,
+        input: &ResolveInput,
+        now_epoch_ms: u64,
+        read: ResolveRead,
+        transport: &dyn ProbeTransport,
     ) -> Result<PlaybackSession, PlaybackSessionError> {
         input.validate()?;
         let key = SessionKey {
@@ -669,19 +706,36 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         };
         let _guard = resolve_lock.lock();
 
-        if let Some(cached) = self.sessions.lock().get(&key)
-            && cached.session.source_url == input.source_url
-            && cached.server_base_url == input.server_base_url
-            && cached.auth == input.auth
-            && cached.proxy_mode == input.proxy_mode
-            && cached.session.request_headers.get(HEADER_USER_AGENT)
-                == Some(input.user_agent.as_str())
-            && cached.session.is_reusable_at(now_epoch_ms)
+        let cached = self
+            .sessions
+            .lock()
+            .get(&key)
+            .filter(|cached| {
+                cached.session.source_url == input.source_url
+                    && cached.server_base_url == input.server_base_url
+                    && cached.auth == input.auth
+                    && cached.proxy_mode == input.proxy_mode
+                    && cached.session.request_headers.get(HEADER_USER_AGENT)
+                        == Some(input.user_agent.as_str())
+                    && cached.session.is_reusable_at(now_epoch_ms)
+            })
+            .map(|cached| cached.session.clone());
+        if read != ResolveRead::OpenStream
+            && let Some(cached) = &cached
         {
-            return Ok(cached.session.as_reused());
+            return Ok(cached.as_reused());
         }
 
-        let session = self.resolve_network(input, now_epoch_ms, read_initial_head)?;
+        // Reuse only the resolved target. Opening a new body is mandatory even
+        // on a cache hit, without repeating a server-to-CDN link request.
+        let mut session = self.resolve_network(
+            input,
+            now_epoch_ms,
+            read,
+            transport,
+            cached.as_ref().map(|session| &session.resolved_url),
+        )?;
+        session.metrics.reused = cached.is_some();
         let mut sessions = self.sessions.lock();
         // Keep a header only for the latest newly resolved item. Expired link
         // entries may remain in this map, but must not retain media buffers.
@@ -715,16 +769,21 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
         &self,
         input: &ResolveInput,
         now_epoch_ms: u64,
-        read_initial_head: bool,
+        read: ResolveRead,
+        transport: &dyn ProbeTransport,
+        cached_target: Option<&Url>,
     ) -> Result<PlaybackSession, PlaybackSessionError> {
         let started = Instant::now();
-        let mut current = input.source_url.clone();
+        let mut current = cached_target.unwrap_or(&input.source_url).clone();
         let mut redirect_count = 0;
 
         loop {
             let mut headers = HeaderMap::default();
             headers.insert(HEADER_USER_AGENT, input.user_agent.clone());
-            let range = if read_initial_head && !same_origin(&current, &input.server_base_url) {
+            let range = if read == ResolveRead::OpenStream {
+                "bytes=0-"
+            } else if read == ResolveRead::CdnHead && !same_origin(&current, &input.server_base_url)
+            {
                 INITIAL_HEAD_RANGE
             } else {
                 "bytes=0-0"
@@ -739,8 +798,7 @@ impl<T: ProbeTransport> PlaybackSessionResolver<T> {
                 "mediastation resolve probe request: media_id={:?} hop={} host={} range={} proxy_mode={:?} user_agent={:?}",
                 input.media_id, redirect_count, current.host_str().unwrap_or_default(), range, input.proxy_mode, input.user_agent,
             );
-            let response = self
-                .transport
+            let response = transport
                 .probe(&ProbeRequest {
                     url: current.clone(),
                     headers,
@@ -1147,6 +1205,117 @@ mod tests {
             .write_all(response.as_bytes())
             .expect("response should be writable");
         String::from_utf8(request).expect("HTTP request should be UTF-8")
+    }
+
+    #[test]
+    fn open_stream_uses_one_full_range_and_the_existing_credential_policy() {
+        let transport = FakeTransport::with_responses(vec![
+            response(302, &[(HEADER_LOCATION, "/redirect")]),
+            response(302, &[(HEADER_LOCATION, "https://cdn.example/video.mkv")]),
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-41/42")]),
+        ]);
+        let resolver = PlaybackSessionResolver::new(FakeTransport::with_responses(vec![]));
+        let session = resolver
+            .resolve_open_stream(&input("https://media.example/Videos/1/stream"), &transport)
+            .expect("open stream should resolve");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(request.headers.get(HEADER_RANGE), Some("bytes=0-"));
+            assert_eq!(
+                request.headers.get(HEADER_USER_AGENT),
+                Some("MediaStationWindows/0.1")
+            );
+        }
+        assert_eq!(
+            requests[1].headers.get(HEADER_EMBY_TOKEN),
+            Some("secret-token")
+        );
+        assert_eq!(requests[2].headers.get(HEADER_EMBY_TOKEN), None);
+        assert_eq!(requests[2].headers.get(HEADER_EMBY_AUTHORIZATION), None);
+        assert_eq!(session.content_length, Some(42));
+        assert!(!session.metrics.reused);
+        assert!(
+            resolver
+                .sessions
+                .lock()
+                .values()
+                .all(|cached| cached.session.initial_head.is_empty()),
+            "open streams cache link metadata, never media bytes or readers"
+        );
+    }
+
+    #[test]
+    fn open_stream_reuses_cached_target_but_opens_a_fresh_response_and_checks_ua() {
+        let transport = FakeTransport::with_responses(vec![
+            response(302, &[(HEADER_LOCATION, "https://cdn.example/video.mkv")]),
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-41/42")]),
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-41/42")]),
+            response(302, &[(HEADER_LOCATION, "https://cdn.example/video.mkv")]),
+            response(206, &[(HEADER_CONTENT_RANGE, "bytes 0-41/42")]),
+        ]);
+        let resolver = PlaybackSessionResolver::new(FakeTransport::with_responses(vec![]));
+        let mut input = input("https://media.example/stream");
+        assert!(
+            !resolver
+                .resolve_open_stream(&input, &transport)
+                .expect("first open")
+                .metrics
+                .reused
+        );
+        let replay = resolver
+            .resolve_open_stream(&input, &transport)
+            .expect("replay open");
+        assert!(replay.metrics.reused);
+        assert_eq!(replay.source_url, input.source_url);
+        input.user_agent = "new-UA".to_string();
+        assert!(
+            !resolver
+                .resolve_open_stream(&input, &transport)
+                .expect("changed UA open")
+                .metrics
+                .reused
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0].url, input.source_url);
+        assert_eq!(requests[1].url, requests[2].url);
+        assert_eq!(requests[2].headers.get(HEADER_EMBY_TOKEN), None);
+        assert_eq!(requests[3].url, input.source_url);
+        assert_eq!(requests[4].headers.get(HEADER_USER_AGENT), Some("new-UA"));
+    }
+
+    #[test]
+    fn open_stream_keeps_https_downgrade_and_redirect_limit_checks() {
+        let resolver = PlaybackSessionResolver::new(FakeTransport::with_responses(vec![]));
+        for (responses, downgrade) in [
+            (
+                vec![response(
+                    302,
+                    &[(HEADER_LOCATION, "http://media.example/insecure")],
+                )],
+                true,
+            ),
+            (
+                (0..=MAX_REDIRECTS)
+                    .map(|_| response(302, &[(HEADER_LOCATION, "/loop")]))
+                    .collect(),
+                false,
+            ),
+        ] {
+            let transport = FakeTransport::with_responses(responses);
+            let error = resolver
+                .resolve_open_stream(&input("https://media.example/stream"), &transport)
+                .expect_err("unsafe or looping redirect must fail");
+            assert!(if downgrade {
+                matches!(
+                    error,
+                    PlaybackSessionError::RedirectSecurityDowngrade { .. }
+                )
+            } else {
+                matches!(error, PlaybackSessionError::RedirectLimitExceeded { .. })
+            });
+        }
     }
 
     #[test]

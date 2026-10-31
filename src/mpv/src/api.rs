@@ -380,10 +380,12 @@ pub fn jfn_mpv_toggle_pause() {
     cmd(&[c"cycle", c"pause"]);
 }
 pub fn jfn_mpv_stop() {
+    crate::stream_cb::discard_pending_streams();
     cmd(&[c"stop"]);
 }
 
 pub fn jfn_mpv_stop_checked() -> crate::Result<()> {
+    crate::stream_cb::discard_pending_streams();
     named_command_async("stop", &[])
 }
 pub fn jfn_mpv_seek_absolute(secs: f64) {
@@ -629,6 +631,7 @@ pub enum LoadError {
     HandleUnavailable,
     InvalidArgument(&'static str),
     InvalidOption(std::ffi::NulError),
+    Property(crate::Error),
     Command(crate::Error),
 }
 
@@ -638,6 +641,9 @@ impl std::fmt::Display for LoadError {
             Self::HandleUnavailable => formatter.write_str("mpv handle is unavailable"),
             Self::InvalidArgument(name) => write!(formatter, "invalid load argument: {name}"),
             Self::InvalidOption(error) => write!(formatter, "invalid load option: {error}"),
+            Self::Property(error) => {
+                write!(formatter, "cannot read HTTP cache configuration: {error}")
+            }
             Self::Command(error) => write!(formatter, "mpv rejected loadfile: {error}"),
         }
     }
@@ -722,12 +728,29 @@ pub unsafe fn jfn_mpv_load_file_with_initial_head(
     opts: *const JfnMpvLoadOptions,
     initial_head: std::sync::Arc<[u8]>,
 ) -> Result<(), LoadError> {
+    unsafe { jfn_mpv_load_file_with_stream(path, opts, initial_head, None) }
+}
+
+/// Load with either the validated CDN prefix or one retained HTTP response.
+///
+/// # Safety
+/// `path` and `opts` follow the same lifetime requirements as `jfn_mpv_load_file`.
+pub unsafe fn jfn_mpv_load_file_with_stream(
+    path: *const c_char,
+    opts: *const JfnMpvLoadOptions,
+    initial_head: std::sync::Arc<[u8]>,
+    http: Option<crate::stream_cb::PreparedHttpStream>,
+) -> Result<(), LoadError> {
     let Some(path_c) = (unsafe { cstr(path) }) else {
         return Err(LoadError::InvalidArgument("path"));
     };
     let Some(o) = (unsafe { opts.as_ref() }) else {
         return Err(LoadError::InvalidArgument("options"));
     };
+    let handle = raw();
+    if handle.is_null() {
+        return Err(LoadError::HandleUnavailable);
+    }
 
     let ext_audio = unsafe { cstr_to_string(o.external_audio_url) };
     let ext_sub = unsafe { cstr_to_string(o.external_sub_url) };
@@ -748,6 +771,12 @@ pub unsafe fn jfn_mpv_load_file_with_initial_head(
         ("aid".to_string(), "no".to_string()),
         ("sid".to_string(), "no".to_string()),
     ];
+    if http.is_some()
+        && let Some(option) =
+            unsafe { retained_http_cache_option(handle) }.map_err(LoadError::Property)?
+    {
+        load_options.push(option);
+    }
     if o.subtitle_style_override {
         load_options.extend(media_station_subtitle_options(
             o.subtitle_font_size,
@@ -772,12 +801,8 @@ pub unsafe fn jfn_mpv_load_file_with_initial_head(
 
     let mut command =
         LoadFileCommand::new(path_c, &load_options).map_err(LoadError::InvalidOption)?;
-    let handle = raw();
-    if handle.is_null() {
-        return Err(LoadError::HandleUnavailable);
-    }
 
-    crate::stream_cb::prepare_initial_head(&path_c.to_string_lossy(), initial_head)
+    crate::stream_cb::prepare_load_stream(&path_c.to_string_lossy(), initial_head, http)
         .map_err(LoadError::InvalidArgument)?;
 
     // Keep a single authoritative selection, including the subtitle resolved
@@ -801,6 +826,25 @@ pub unsafe fn jfn_mpv_load_file_with_initial_head(
         return Err(LoadError::Command(error));
     }
     Ok(())
+}
+
+// libmpv stream callbacks do not identify their source as a network stream.
+// Preserve HTTP's default network cache, while honoring explicit yes/no.
+// This is per file and is never applied to the existing CDN prefix path.
+pub(crate) unsafe fn retained_http_cache_option(
+    handle: *mut sys::mpv_handle,
+) -> crate::Result<Option<(String, String)>> {
+    let value = unsafe { sys::mpv_get_property_string(handle, c"options/cache".as_ptr()) };
+    if value.is_null() {
+        return Err(crate::Error::new(
+            sys::mpv_error::MPV_ERROR_PROPERTY_UNAVAILABLE.0,
+        ));
+    }
+    let automatic = unsafe { CStr::from_ptr(value) } == c"auto";
+    unsafe {
+        sys::mpv_free(value.cast());
+    }
+    Ok(automatic.then(|| ("cache".to_string(), "yes".to_string())))
 }
 
 fn should_defer_audio_to_mpv(requested: bool, audio_track: i64, has_external_audio: bool) -> bool {
