@@ -274,9 +274,10 @@ pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
                         std::ptr::null_mut(),
                     );
                     if bytes > 1 {
-                        // bytes includes the terminating NUL.
-                        result.resize((bytes - 1) as usize, 0);
-                        WideCharToMultiByte(
+                        // With wide_len=-1 Windows writes the terminating NUL
+                        // too. Reserve it before conversion, then remove it.
+                        result.resize(bytes as usize, 0);
+                        let written = WideCharToMultiByte(
                             CP_UTF8,
                             0,
                             wbuf,
@@ -286,6 +287,20 @@ pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
                             std::ptr::null(),
                             std::ptr::null_mut(),
                         );
+                        if written == bytes {
+                            result.pop();
+                        } else {
+                            tracing::error!(
+                                "clipboard UTF-8 conversion returned {written} bytes, expected {bytes}: {}",
+                                std::io::Error::last_os_error()
+                            );
+                            result.clear();
+                        }
+                    } else if bytes == 0 {
+                        tracing::error!(
+                            "clipboard UTF-8 size query failed: {}",
+                            std::io::Error::last_os_error()
+                        );
                     }
                     GlobalUnlock(h);
                 }
@@ -293,7 +308,13 @@ pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
             CloseClipboard();
         }
     }
-    on_done(std::str::from_utf8(&result).unwrap_or(""));
+    match std::str::from_utf8(&result) {
+        Ok(text) => on_done(text),
+        Err(error) => {
+            tracing::error!("clipboard UTF-8 conversion produced invalid text: {error}");
+            on_done("");
+        }
+    }
 }
 
 /// Open an external URL via `ShellExecuteW(open)`.
