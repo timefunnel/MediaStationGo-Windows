@@ -160,7 +160,7 @@ const lifecycle = vm.createContext({
     content: contentNode, document: { body: bodyNode },
     byId: (id) => id === 'components-page' ? componentsNode : settingsDestroyed ? null : settingsNode, element: node,
 });
-for (const name of ['parkSettings', 'replaceContent', 'renderLoading']) vm.runInContext(handlerSource(name), lifecycle);
+for (const name of ['parkSettingsDrawer', 'parkSettings', 'replaceContent', 'renderLoading']) vm.runInContext(handlerSource(name), lifecycle);
 lifecycle.renderLoading();
 assert.equal(settingsDestroyed, false);
 assert.equal(bodyNode.children[0], settingsNode);
